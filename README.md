@@ -143,3 +143,26 @@ sudo systemctl start image_upload_handler.service
 Now, your Raspberry Pi should be running an FTP server, and the Python script will be triggered whenever a new .jpeg image is uploaded to the FTP directory. The solution should also survive a restart of the operating system.
 
 Please make sure to replace placeholders with your actual directory paths, usernames, and other specific details as needed.
+
+# Configuring senstive credentials as environment variables
+
+Open a terminal on your Raspberry Pi.
+
+Use a text editor like nano or vim to edit the user's .bashrc file. Replace <username> with the actual username of the local user:
+
+```
+nano /home/<username>/.bashrc
+``````
+Scroll to the end of the file and add your environment variable. For example, to create an environment variable named MY_VARIABLE with a value of my_value, add the following line:
+
+```
+export MY_VARIABLE="my_value"
+```
+Save the file and exit the text editor (in nano, you can press Ctrl+O to save and Ctrl+X to exit).
+
+
+To ensure that the changes take effect, either log out and log back in or restart your Raspberry Pi:
+
+```
+sudo reboot
+```
