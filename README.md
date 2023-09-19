@@ -1,5 +1,8 @@
 # Vehicle Gate Controller
 
+## Status
+Working prototype. Documentation is limited and untested, a working knowledge of linux is recommended, no guidance is provided on setting file and directory permissions etc.
+
 ## Overview
 
 This project is designed to run on a Raspberry Pi and serves as a vehicle gate controller for an electric gate. It receives still images of vehicles approaching an electric gate from a CCTV camera which uploads the images via FTP. It uses the PlateRecognizer API to attempt to detect vehicle license plates, matches them against a list of authorised vehicle license plates, and triggers a relay device to open the gate if a match is found. Additionally, it sends email notifications to alert users when a match is detected or when no match is found.
@@ -7,6 +10,7 @@ This project is designed to run on a Raspberry Pi and serves as a vehicle gate c
 ## Table of Contents
 
 - [Vehicle Gate Controller](#vehicle-gate-controller)
+  - [Status](#status)
   - [Overview](#overview)
   - [Table of Contents](#table-of-contents)
   - [Prerequisites](#prerequisites)
@@ -162,6 +166,9 @@ To maintain this project:
 
 ## Useful resources
 The [IPCamTalk Forum](https://ipcamtalk.com) has lots of useful information and support for commonly used CCTV cameras
+
 [TOpens](https://topens.com) offer low cost electric gate systems and accessories
+
 [Faac](https://www.faac.co.uk) offer high quality electric gate systems and accessories
+
 [Pi Relay v2 Library](https://github.com/sbcshop/PiRelay-V2/blob/main/PiRelay.py) offer a low cost Raspberry Pi Hat with 4 integrated relays
