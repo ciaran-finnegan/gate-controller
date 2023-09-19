@@ -1,0 +1,19 @@
+[Unit]
+Description=File Monitor Service
+After=network.target
+
+[Service]
+ExecStart=/opt/gate-controller/file_monitor.sh
+WorkingDirectory=/opt/gate-controller
+Restart=always
+User=root
+Group=filemonitor
+Environment=PLATE_RECOGNIZER_API_TOKEN=REPLACE_WITH_YOUR_API_TOKEN e.g. xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Environment=SMTP_SERVER=REPLACE_WITH_YOUR_SMTP_GATEWAY e.g. smtp.gmail.com
+Environment=SMTP_PORT=REPLACE_WITH_YOUR_SMTP_PORT e.g. 587
+Environment=SMTP_USERNAME=REPLACE_WITH_YOUR_SMTP_USERNAME e.g. something@gmail.com
+Environment=SMTP_PASSWORD=REPLACE_WITH_YOUR_SMTP_PASSWORD
+Environment=EMAIL_TO=REPLACE_WITH_YOUR_NOTIFICATIONS_RECIPIENTS_EMAIL_ADDRESS e.g. e.g. something@gmail.com
+
+[Install]
+WantedBy=multi-user.target
