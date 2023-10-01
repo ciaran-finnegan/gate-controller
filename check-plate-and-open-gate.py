@@ -226,12 +226,16 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
     db_filename = 'gate-controller-database.db'
     db_file_path = os.path.join(db_directory, db_filename)
 
-    # Ensure the database directory exists
+    # Log the db_file_path
+    logger.info(f'db_file_path: {db_file_path}')
+
+     # Ensure the database directory exists
     if not os.path.exists(db_directory):
         os.makedirs(db_directory)
-
+        
     # Check if the database file exists, and create it if it doesn't
     if not os.path.isfile(db_file_path):
+        logger.info(f'Database file does not exist. Creating...')
         # Connect to the database and create the "log" table
         conn = sqlite3.connect(db_file_path)
         cursor = conn.cursor()
@@ -251,7 +255,8 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
 
         conn.commit()
         conn.close()
-
+    else:
+        logger.info(f'Database file already exists.')
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
 
