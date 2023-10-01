@@ -270,19 +270,19 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
     except Exception as e:
         logger.error(f'Error while logging an entry: {str(e)}')
 
-
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
-    conn = sqlite3.connect('mydatabase.db')
+    conn = sqlite3.connect(db_file_path)  # Use db_file_path variable here
     cursor = conn.cursor()
 
     # Check for recent gate opening events
-    cursor.execute('SELECT COUNT(*) FROM log WHERE opened_gate="Yes" AND timestamp >= datetime("now", "-20 seconds")')
+    cursor.execute('SELECT COUNT(*) FROM log WHERE gate_opened="Yes" AND timestamp >= datetime("now", "-20 seconds")')
     count = cursor.fetchone()[0]
 
     conn.close()
 
     return count > 0
+
 
 # Entry point for running the script
 if __name__ == "__main__":
