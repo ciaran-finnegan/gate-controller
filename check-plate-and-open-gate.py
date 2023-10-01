@@ -56,19 +56,19 @@ smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
-logger.info(f'plate_recognizer_token_var: {plate_recognizer_token_var}')
+logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
-logger.info(f'fuzzy_match_threshold_var: {fuzzy_match_threshold_var}')
+logger.info(f'fuzzy_match_threshold: {fuzzy_match_threshold}')
 smtp_server = os.environ.get(smtp_server_var)
-logger.info(f'smtp_server_var: {smtp_server_var}')
+logger.info(f'smtp_server: {smtp_server}')
 smtp_port = int(os.environ.get(smtp_port_var, 587))
-logger.info(f'smtp_port_var: {smtp_port_var}')
+logger.info(f'smtp_port: {smtp_port}')
 smtp_username = os.environ.get(smtp_username_var)
-logger.info(f'smtp_username_var: {smtp_username_var}')
+logger.info(f'smtp_username: {smtp_username}')
 smtp_password = os.environ.get(smtp_password_var)
-logger.info(f'smtp_password_var: {smtp_password_var}')
+logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
-logger.info(f'email_to_var: {email_to_var}')
+logger.info(f'email_to: {email_to}')
 
 # Function to send email notification
 def send_email_notification(recipient, subject, message_body, script_start_time, fuzzy_match=False, gate_opened=False):
