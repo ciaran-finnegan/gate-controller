@@ -17,6 +17,37 @@ import PiRelay
 import sys
 import sqlite3
 
+# Specify the full path to the SQLite database directory and filename
+db_directory = '/opt/gate-controller/data/'
+db_filename = 'gate-controller-database.db'
+db_file_path = os.path.join(db_directory, db_filename)
+
+# Ensure the database directory exists
+if not os.path.exists(db_directory):
+    os.makedirs(db_directory)
+
+# Check if the database file exists, and create it if it doesn't
+if not os.path.isfile(db_file_path):
+    # Connect to the database and create the "log" table
+    conn = sqlite3.connect(db_file_path)
+    cursor = conn.cursor()
+
+    # Create the "log" table if it doesn't exist
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS log (
+            id INTEGER PRIMARY KEY,
+            timestamp DATETIME,
+            image_path TEXT,
+            plate_recognized TEXT,
+            score REAL,
+            fuzzy_match TEXT,
+            gate_opened TEXT
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
 # Configure logging
 logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gate.log',
                     level=logging.INFO,
