@@ -23,9 +23,6 @@ logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gat
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
-# Specify the full path to the SQLite database file
-db_file_path = '/opt/gate-controller/data/gate-controller-database.db'
-
 # Initialize PiRelay
 r1 = PiRelay.Relay("RELAY1")
 
@@ -53,7 +50,7 @@ smtp_password = os.environ.get(smtp_password_var)
 email_to = os.environ.get(email_to_var)
 
 # Function to send email notification
-def send_email_notification(recipient, subject, message_body, script_start_time, fuzzy_match=False, gate_opened=False):
+def send_email_notification(recipient, subject, message_body, script_start_time, fuzzy_match=False):
     try:
         # Create a connection to the SMTP server
         server = smtplib.SMTP(smtp_server, smtp_port)
@@ -100,11 +97,7 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
         server.sendmail(smtp_username, recipient, msg.as_string())
         server.quit()
 
-        if gate_opened:
-            logger.info(f'Email sent with execution time and attachment for {"Fuzzy Match" if fuzzy_match else "Exact Match"}')
-        else:
-            logger.info(f'Email sent for skipped gate opening event')
-
+        logger.info(f'Email sent with execution time and attachment for {"Fuzzy Match" if fuzzy_match else "Exact Match"}')
     except Exception as e:
         logger.error(f'Error sending email: {str(e)}')
 
@@ -117,6 +110,21 @@ def make_pirelay_call():
         logger.info(f'PiRelay call made to open the gate')
     except Exception as e:
         logger.error(f'Error making PiRelay call: {str(e)}')
+
+# Function to check if another gate opening event occurred in the last 20 seconds
+def is_recent_gate_opening_event():
+    conn = sqlite3.connect('mydatabase.db')
+    cursor = conn.cursor()
+
+    # Query the database to check if another event occurred in the last 20 seconds
+    current_time = time.time()
+    twenty_seconds_ago = current_time - 20
+    cursor.execute('SELECT COUNT(*) FROM log WHERE opened_gate="Yes" AND timestamp > ?', (twenty_seconds_ago,))
+    count = cursor.fetchone()[0]
+
+    conn.close()
+
+    return count > 0
 
 # Function to process the image file
 def process_image_file(image_file_path):
@@ -178,13 +186,12 @@ def process_image_file(image_file_path):
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {"Fuzzy Match" if score < 1.0 else "Exact Match"}.')
-                    send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
+                    send_email_notification(email_to, f'Gate Opening Skipped - Another Event in Progress',
                                             f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0)
-                    log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=False)
                 else:
                     # Perform gate opening logic
                     make_pirelay_call()
-                    log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
+                    log_entry(image_file_path, plate_recognized, score, script_start_time)
 
             else:
                 logger.info(f'No match found for vehicle license plate number: {plate_recognized}')
@@ -192,16 +199,15 @@ def process_image_file(image_file_path):
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
                                         f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time)
-                log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False)
 
     except Exception as e:
         # Log the error message
         logger.error(f'Error: {str(e)}')
 
 # Function to log an entry in the database
-def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+def log_entry(image_path, plate_recognized, score, script_start_time):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(db_file_path)
+    conn = sqlite3.connect('mydatabase.db')
     cursor = conn.cursor()
 
     cursor.execute('''
@@ -211,29 +217,15 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
             image_path TEXT,
             plate_recognized TEXT,
             score REAL,
-            fuzzy_match TEXT,
-            gate_opened TEXT
+            opened_gate TEXT
         )
     ''')
 
-    cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
-                   (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
+    cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, opened_gate) VALUES (?, ?, ?, ?, ?)',
+                   (current_time, image_path, plate_recognized, score, 'Yes' if score == 1.0 else 'No'))
 
     conn.commit()
     conn.close()
-
-# Function to check if another gate opening event occurred in the last 20 seconds
-def is_recent_gate_opening_event():
-    conn = sqlite3.connect('mydatabase.db')
-    cursor = conn.cursor()
-
-    # Check for recent gate opening events
-    cursor.execute('SELECT COUNT(*) FROM log WHERE opened_gate="Yes" AND timestamp >= datetime("now", "-20 seconds")')
-    count = cursor.fetchone()[0]
-
-    conn.close()
-
-    return count > 0
 
 # Entry point for running the script
 if __name__ == "__main__":
