@@ -216,31 +216,41 @@ def process_image_file(image_file_path):
 
     except Exception as e:
         # Log the error message
-        logger.error(f'Error: {str(e)}')
+        logger.error(f'Error processing image file: {str(e)}')
 
+# Function to log an entry in the database
 # Function to log an entry in the database
 def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS log (
-            id INTEGER PRIMARY KEY,
-            timestamp DATETIME,
-            image_path TEXT,
-            plate_recognized TEXT,
-            score REAL,
-            fuzzy_match TEXT,
-            gate_opened TEXT
-        )
-    ''')
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS log (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME,
+                image_path TEXT,
+                plate_recognized TEXT,
+                score REAL,
+                fuzzy_match TEXT,
+                gate_opened TEXT
+            )
+        ''')
 
-    cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
-                   (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
+        cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
+                       (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+
+        logger.info(f'Logged an entry in the database for plate: {plate_recognized}')
+
+    except sqlite3.Error as sql_error:
+        conn.rollback()  # Rollback the transaction on error
+        logger.error(f'SQLite error while logging an entry: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error while logging an entry: {str(e)}')
 
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
@@ -269,4 +279,4 @@ if __name__ == "__main__":
         process_image_file(image_file_path)
     except Exception as e:
         # Log any unhandled exceptions
-        logger.error(f'Unhandled exception: {str(e)}')
+        logger.error(f'Unhandled exception in main: {str(e)}')
