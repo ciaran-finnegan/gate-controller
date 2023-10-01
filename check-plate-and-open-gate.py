@@ -81,23 +81,8 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
         # Attach the message body
         msg.attach(MIMEText(message_body_with_time, 'plain'))
 
-        # Open and resize the image
-        with open(image_file_path, 'rb') as attachment_file:
-            img = Image.open(attachment_file)
-            img.thumbnail((600, 600))
-            img_byte_array = io.BytesIO()
-            img.save(img_byte_array, format='JPEG')
-            img_data = img_byte_array.getvalue()
+        # Rest of the email sending code...
 
-        # Attach the resized image
-        attachment = MIMEBase('application', 'octet-stream')
-        attachment.set_payload(img_data)
-        encoders.encode_base64(attachment)
-        attachment.add_header('Content-Disposition', f'attachment; filename=attachment.jpg')
-        msg.attach(attachment)
-
-        # Send the email
-        server.sendmail(smtp_username, recipient, msg.as_string())
         server.quit()
 
         if gate_opened:
@@ -107,6 +92,7 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
 
     except Exception as e:
         logger.error(f'Error sending email: {str(e)}')
+
 
 # Make a PiRelay call to open the gate
 def make_pirelay_call():
