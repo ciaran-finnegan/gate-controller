@@ -17,37 +17,6 @@ import PiRelay
 import sys
 import sqlite3
 
-# Specify the full path to the SQLite database directory and filename
-db_directory = '/opt/gate-controller/data/'
-db_filename = 'gate-controller-database.db'
-db_file_path = os.path.join(db_directory, db_filename)
-
-# Ensure the database directory exists
-if not os.path.exists(db_directory):
-    os.makedirs(db_directory)
-
-# Check if the database file exists, and create it if it doesn't
-if not os.path.isfile(db_file_path):
-    # Connect to the database and create the "log" table
-    conn = sqlite3.connect(db_file_path)
-    cursor = conn.cursor()
-
-    # Create the "log" table if it doesn't exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS log (
-            id INTEGER PRIMARY KEY,
-            timestamp DATETIME,
-            image_path TEXT,
-            plate_recognized TEXT,
-            score REAL,
-            fuzzy_match TEXT,
-            gate_opened TEXT
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
-
 # Configure logging
 logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gate.log',
                     level=logging.INFO,
@@ -86,7 +55,6 @@ smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
-print(os.environ)
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
 logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
@@ -250,13 +218,25 @@ def process_image_file(image_file_path):
         logger.error(f'Error processing image file: {str(e)}')
 
 # Function to log an entry in the database
-# Function to log an entry in the database
 def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(db_file_path)
-    cursor = conn.cursor()
+    
+    # Specify the full path to the SQLite database directory and filename
+    db_directory = '/opt/gate-controller/data/'
+    db_filename = 'gate-controller-database.db'
+    db_file_path = os.path.join(db_directory, db_filename)
 
-    try:
+    # Ensure the database directory exists
+    if not os.path.exists(db_directory):
+        os.makedirs(db_directory)
+
+    # Check if the database file exists, and create it if it doesn't
+    if not os.path.isfile(db_file_path):
+        # Connect to the database and create the "log" table
+        conn = sqlite3.connect(db_file_path)
+        cursor = conn.cursor()
+
+        # Create the "log" table if it doesn't exist
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS log (
                 id INTEGER PRIMARY KEY,
@@ -269,6 +249,13 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
             )
         ''')
 
+        conn.commit()
+        conn.close()
+
+    conn = sqlite3.connect(db_file_path)
+    cursor = conn.cursor()
+
+    try:
         cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
                        (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
 
@@ -282,6 +269,7 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
         logger.error(f'SQLite error while logging an entry: {str(sql_error)}')
     except Exception as e:
         logger.error(f'Error while logging an entry: {str(e)}')
+
 
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
