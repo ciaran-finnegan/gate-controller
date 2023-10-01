@@ -55,6 +55,7 @@ smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
+print(os.environ)
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
 logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
