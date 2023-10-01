@@ -217,10 +217,8 @@ def process_image_file(image_file_path):
         # Log the error message
         logger.error(f'Error processing image file: {str(e)}')
 
-# Function to log an entry in the database
-def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
-    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
+# Function to create the database table if it doesn't exist
+def create_database_table():
     # Specify the full path to the SQLite database directory and filename
     db_directory = '/opt/gate-controller/data/'
     db_filename = 'gate-controller-database.db'
@@ -229,14 +227,12 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
     # Log the db_file_path
     logger.info(f'db_file_path: {db_file_path}')
 
-     # Ensure the database directory exists
+    # Ensure the database directory exists
     if not os.path.exists(db_directory):
         os.makedirs(db_directory)
-        
-    # Check if the database file exists, and create it if it doesn't
-    if not os.path.isfile(db_file_path):
-        logger.info(f'Database file does not exist. Creating...')
-        # Connect to the database and create the "log" table
+
+    try:
+        # Connect to the database and create the "log" table if it doesn't exist
         conn = sqlite3.connect(db_file_path)
         cursor = conn.cursor()
 
@@ -255,8 +251,17 @@ def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_matc
 
         conn.commit()
         conn.close()
-    else:
-        logger.info(f'Database file already exists.')
+
+        logger.info(f'Database table created successfully.')
+    except sqlite3.Error as sql_error:
+        logger.error(f'SQLite error while creating the table: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error creating the table: {str(e)}')
+
+
+# Function to log an entry in the database
+def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(db_file_path)
     cursor = conn.cursor()
 
@@ -298,7 +303,8 @@ if __name__ == "__main__":
             sys.exit(1)
 
         image_file_path = sys.argv[1]
-
+        # Create the database and initialise the log table if it doesn't exist
+        create_database_table()
         # Process the image file
         process_image_file(image_file_path)
     except Exception as e:
