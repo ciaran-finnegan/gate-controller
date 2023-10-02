@@ -292,7 +292,7 @@ def is_recent_gate_opening_event():
     twenty_seconds_ago = current_time - 20
     logger.info(f'Time 20 seconds ago: {twenty_seconds_ago}')
     
-    cursor.execute('SELECT COUNT(*) FROM log WHERE opened_gate="Yes" AND timestamp > ?', (twenty_seconds_ago,))
+    cursor.execute('SELECT COUNT(*) FROM log WHERE gate_opened="Yes" AND timestamp > ?', (twenty_seconds_ago,))
     count = cursor.fetchone()[0]
     logger.info(f'Count of matching values in database log table: {count}')
 
