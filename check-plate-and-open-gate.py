@@ -289,7 +289,9 @@ def is_recent_gate_opening_event():
     # Query the database to check if another event occurred in the last 20 seconds
     current_time = time.time()
     logger.info(f'Current time: {current_time}')
-    twenty_seconds_ago = current_time - 20
+    # Calculate the timestamp 20 seconds ago in the format 'YYYY-MM-DD HH:MM:SS'
+    # Update based on your requirements, 20 seconds chosen as that is the delay before this gate automatically closes
+    twenty_seconds_ago = (datetime.datetime.now() - datetime.timedelta(seconds=20)).strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f'Time 20 seconds ago: {twenty_seconds_ago}')
     
     # Log the SQL query
