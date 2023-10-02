@@ -3,8 +3,21 @@
 # Directory to monitor
 directory_to_watch="/home/ftp-user"
 
+# Log directory and file
+log_directory="/opt/gate-controller/logs"
+log_file="$log_directory/file_monitor.log"
+
+# Create log directory if it doesn't exist
+if [ ! -d "$log_directory" ]; then
+    mkdir -p "$log_directory"
+fi
+
+# Create log file if it doesn't exist
+if [ ! -e "$log_file" ]; then
+    touch "$log_file"
+fi
+
 # Redirect stdout and stderr to the log file
-log_file="/opt/gate-controller/logs/file_monitor.log"
 exec >> "$log_file" 2>&1
 
 # Function to log a message with timestamp
