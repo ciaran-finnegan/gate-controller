@@ -186,7 +186,7 @@ def process_image_file(image_file_path):
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {"Fuzzy Match" if score < 1.0 else "Exact Match"}.')
-                    send_email_notification(email_to, f'Gate Opening Skipped - Another Event in Progress',
+                    send_email_notification(email_to, f'Gate Opening Skipped - Another Gate Opening Event in Progress',
                                             f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0)
                 else:
                     # Perform gate opening logic
