@@ -198,14 +198,14 @@ def process_image_file(image_file_path):
                 if is_recent_gate_opening_event():
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {"Fuzzy Match" if score < 1.0 else "Exact Match"}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
-                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0)
+                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
                     log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=False)
                 else:
                     # Perform gate opening logic
                     make_pirelay_call()
                     log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
                     send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_value}',
-                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0)
+                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
 
             else:
@@ -213,7 +213,7 @@ def process_image_file(image_file_path):
 
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
-                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time)
+                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time,gate_opened=False)
                 log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False)
 
     except Exception as e:
