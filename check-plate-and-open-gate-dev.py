@@ -116,12 +116,21 @@ def is_recent_gate_opening_event():
     conn = sqlite3.connect('mydatabase.db')
     cursor = conn.cursor()
 
+    logger.info(f'Checking for recent gate opening event')
     # Query the database to check if another event occurred in the last 20 seconds
     current_time = time.time()
+    logger.info(f'Current time: {current_time}')
     twenty_seconds_ago = current_time - 20
+    logger.info(f'Time 20 seconds ago: {twenty_seconds_ago}')
+    
     cursor.execute('SELECT COUNT(*) FROM log WHERE opened_gate="Yes" AND timestamp > ?', (twenty_seconds_ago,))
     count = cursor.fetchone()[0]
+    logger.info(f'Count of matching values in database log table: {count}')
 
+    # For debugging only
+    # Fetch and log each row of data
+    for row in cursor.fetchall():
+        logger.info(f'Database table query returned the following: {row}')
     conn.close()
 
     return count > 0
