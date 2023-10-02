@@ -192,6 +192,8 @@ def process_image_file(image_file_path):
                     # Perform gate opening logic
                     make_pirelay_call()
                     log_entry(image_file_path, plate_recognized, score, script_start_time)
+                    logger.info(f'logged gate opening event to database')
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate', f'Vehicle with licence plate number: {plate_recognized} is registered to {matched_value}', script_start_time, fuzzy_match={score < 1.0}')
 
             else:
                 logger.info(f'No match found for vehicle license plate number: {plate_recognized}')
