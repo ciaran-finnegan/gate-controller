@@ -318,8 +318,8 @@ def log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuz
 def log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
-        # Get the connection string from the environment variable
-        conn = psycopg2.connect(postgres_url)  # Make sure to require SSL for your connection
+        conn_str = f"dbname={postgres_database} user={postgres_user} password={postgres_password} host={postgres_host} port=5432 sslmode=require options=endpoint=ep-falling-mountain-55618104-pooler"
+        conn = psycopg2.connect(conn_str)  # Make sure to require SSL for your connection
 
         cursor = conn.cursor()
         
