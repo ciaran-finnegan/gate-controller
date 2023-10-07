@@ -187,6 +187,10 @@ sudo tail -f check-plate-and-open-gate.log
 ```
 ls -l /opt/gate-controller/file_monitor.sh
 chmod +x /opt/gate-controller/file_monitor.sh
+ls -l /opt/gate-controller/
+sudo chown -R filemonitor:root /opt/gate-controller
+sudo chmod -R 775 /opt/gate-controller
+
 ```
 
 ## Maintenance

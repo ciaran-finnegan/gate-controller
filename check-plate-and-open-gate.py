@@ -246,7 +246,7 @@ def process_image_file(image_file_path):
         # Log the error message
         logger.error(f'Error processing image file: {str(e)}')
 
-# Function to create the database table if it doesn't exist
+# Function to create the SQLite database table if it doesn't exist
 def create_database_table():
     # Specify the full path to the SQLite database directory and filename
     db_directory = '/opt/gate-controller/data/'
@@ -287,6 +287,29 @@ def create_database_table():
     except Exception as e:
         logger.error(f'Error creating the table: {str(e)}')
 
+# Function to create the PostgreSQL database table
+def create_table_postgres(conn):
+    try:
+        cursor = conn.cursor()
+        
+        # Create the "log" table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS log (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP,
+                image_path TEXT,
+                plate_recognized TEXT,
+                score REAL,
+                fuzzy_match BOOLEAN,
+                gate_opened BOOLEAN
+            )
+        ''')
+        conn.commit()
+        logger.info('PostgreSQL table checked/created successfully.')
+    except psycopg2.Error as sql_error:
+        logger.error(f'PostgreSQL error while creating/checking the table: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error creating/checking the table in PostgreSQL: {str(e)}')
 
 # Function to log an entry in the database(s)
 def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
@@ -319,8 +342,11 @@ def log_entry_postgres(image_path, plate_recognized, score, script_start_time, f
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         conn_str = f"dbname={postgres_database} user={postgres_user} password={postgres_password} host={postgres_host} port=5432 sslmode=require options=endpoint=ep-falling-mountain-55618104-pooler"
-        conn = psycopg2.connect(conn_str)  # Make sure to require SSL for your connection
-
+        conn = psycopg2.connect(conn_str)  
+        
+        # Ensure the log table exists
+        create_table_postgres(conn)
+        
         cursor = conn.cursor()
         
         # Execute the INSERT query
@@ -336,8 +362,8 @@ def log_entry_postgres(image_path, plate_recognized, score, script_start_time, f
     except Exception as e:
         logger.error(f'Error while logging an entry in PostgreSQL: {str(e)}')
     finally:
-        # Ensuring that the connection is closed even if an error occurs
         conn.close()
+
 
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
