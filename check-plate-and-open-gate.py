@@ -16,6 +16,7 @@ from PIL import Image
 import PiRelay
 import sys
 import sqlite3
+import psycopg2
 
 # Configure logging
 logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gate.log',
@@ -55,8 +56,18 @@ smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
+# PostgreSQL database configuration
+postgres_url_var = 'POSTGRES_URL'
+postgres_prisma_url_var = 'POSTGRES_PRISMA_URL'
+postgres_url_non_pooling_var = 'POSTGRES_URL_NON_POOLING'
+postgres_user_var = 'POSTGRES_USER'
+postgres_host_var = 'POSTGRES_HOST'
+postgres_password_var = 'POSTGRES_PASSWORD'
+postgres_database_var = 'POSTGRES_DATABASE'
+
+
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
-logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
+#logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
 logger.info(f'fuzzy_match_threshold: {fuzzy_match_threshold}')
 smtp_server = os.environ.get(smtp_server_var)
@@ -66,9 +77,24 @@ logger.info(f'smtp_port: {smtp_port}')
 smtp_username = os.environ.get(smtp_username_var)
 logger.info(f'smtp_username: {smtp_username}')
 smtp_password = os.environ.get(smtp_password_var)
-logger.info(f'smtp_password: {smtp_password}')
+#logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
 logger.info(f'email_to: {email_to}')
+postgres_url = os.environ.get(postgres_url_var)
+logger.info(f'postgres_url: {postgres_url}')
+postgres_prisma_url = os.environ.get(postgres_prisma_url_var)
+logger.info(f'postgres_prisma_url: {postgres_prisma_url}')
+postgres_url_non_pooling = os.environ.get(postgres_url_non_pooling_var)
+logger.info(f'postgres_url_non_pooling: {postgres_url_non_pooling}')
+postgres_user = os.environ.get(postgres_user_var)
+logger.info(f'postgres_user: {postgres_user}')
+postgres_host = os.environ.get(postgres_host_var)
+logger.info(f'postgres_host: {postgres_host}')
+postgres_password = os.environ.get(postgres_password_var)
+#logger.info(f'postgres_password: {postgres_password}')
+postgres_database = os.environ.get(postgres_database_var)
+logger.info(f'postgres_database: {postgres_database}')
+
 
 # Function to send email notification
 def send_email_notification(recipient, subject, message_body, script_start_time, fuzzy_match=False, gate_opened=False):
@@ -262,26 +288,60 @@ def create_database_table():
         logger.error(f'Error creating the table: {str(e)}')
 
 
-# Function to log an entry in the database
+# Function to log an entry in the database(s)
 def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    # SQLite Entry
+    log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuzzy_match, gate_opened)
+    
+    # PostgreSQL Entry
+    log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match, gate_opened)
+    
+# Function to log an entry in the local SQLite database
+def log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(db_file_path)
-    cursor = conn.cursor()
-
     try:
+        conn = sqlite3.connect(db_file_path)
+        cursor = conn.cursor()
         cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
                        (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
-
         conn.commit()
-        conn.close()
-
-        logger.info(f'Logged an entry in the database for plate: {plate_recognized}')
-
+        logger.info(f'Logged an entry in the SQLite database for plate: {plate_recognized}')
     except sqlite3.Error as sql_error:
-        conn.rollback()  # Rollback the transaction on error
         logger.error(f'SQLite error while logging an entry: {str(sql_error)}')
     except Exception as e:
-        logger.error(f'Error while logging an entry: {str(e)}')
+        logger.error(f'Error while logging an entry in SQLite: {str(e)}')
+    finally:
+        # Ensuring that the connection is closed even if an error occurs
+        conn.close()
+
+# Function to log an entry in the remote PostgreSQL database
+def log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            dbname=postgres_database_var,
+            user=postgres_user_var,
+            password=postgres_password_var,
+            host=postgres_host_var
+        )
+        cursor = conn.cursor()
+        
+        # Execute the INSERT query
+        cursor.execute('''
+            INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (current_time, image_path, plate_recognized, score, fuzzy_match, gate_opened))
+        
+        conn.commit()
+        logger.info(f'Logged an entry in the PostgreSQL database for plate: {plate_recognized}')
+    except psycopg2.Error as sql_error:
+        logger.error(f'PostgreSQL error while logging an entry: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error while logging an entry in PostgreSQL: {str(e)}')
+    finally:
+        # Ensuring that the connection is closed even if an error occurs
+        conn.close()
 
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
