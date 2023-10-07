@@ -318,14 +318,9 @@ def log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuz
 def log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
-        # Connect to the PostgreSQL database
-        conn = psycopg2.connect(
-            dbname=postgres_database,
-            user=postgres_user,
-            password=postgres_password,
-            host=postgres_host,
-            sslmode='require'  # Make sure to require SSL for your connection
-        )
+        # Get the connection string from the environment variable
+        conn = psycopg2.connect(postgres_url)  # Make sure to require SSL for your connection
+
         cursor = conn.cursor()
         
         # Execute the INSERT query
