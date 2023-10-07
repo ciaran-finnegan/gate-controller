@@ -323,7 +323,8 @@ def log_entry_postgres(image_path, plate_recognized, score, script_start_time, f
             dbname=postgres_database,
             user=postgres_user,
             password=postgres_password,
-            host=postgres_host
+            host=postgres_host,
+            sslmode='require'  # Make sure to require SSL for your connection
         )
         cursor = conn.cursor()
         
