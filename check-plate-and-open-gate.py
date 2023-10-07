@@ -320,10 +320,10 @@ def log_entry_postgres(image_path, plate_recognized, score, script_start_time, f
     try:
         # Connect to the PostgreSQL database
         conn = psycopg2.connect(
-            dbname=postgres_database_var,
-            user=postgres_user_var,
-            password=postgres_password_var,
-            host=postgres_host_var
+            dbname=postgres_database,
+            user=postgres_user,
+            password=postgres_password,
+            host=postgres_host
         )
         cursor = conn.cursor()
         

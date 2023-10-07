@@ -170,6 +170,7 @@ sudo python /opt/gate-controller/test_relay.py
 2. Check the systemd file-monitor service status and logs
    
 ```
+sudo systemctl daemon-reload
 sudo systemctl restart file-monitor.service
 sudo systemctl status file-monitor.service
 sudo tail -f /opt/gate-controller/logs/file-monitor.log
