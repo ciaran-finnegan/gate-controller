@@ -87,13 +87,10 @@ smtp_password = os.environ.get(smtp_password_var)
 #logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
 logger.info(f'email_to: {email_to}')
-<<<<<<< HEAD
 postgres_url = os.environ.get(postgres_url_var)
 logger.info(f'postgres_url: {postgres_url}')
-=======
 #postgres_url = os.environ.get(postgres_url_var)
 #logger.info(f'postgres_url: {postgres_url}')
->>>>>>> 8db65433596023a481592bed30eb3d2f982ddea4
 postgres_prisma_url = os.environ.get(postgres_prisma_url_var)
 logger.info(f'postgres_prisma_url: {postgres_prisma_url}')
 postgres_url_non_pooling = os.environ.get(postgres_url_non_pooling_var)
