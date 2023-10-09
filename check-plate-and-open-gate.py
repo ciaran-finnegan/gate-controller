@@ -230,7 +230,7 @@ def process_image_file(image_file_path):
             if best_match is not None:
                 matched_vehicle_data = csv_data.get(best_match, {})
                 matched_name = matched_vehicle_data.get('name', '')
-                logger.info(f'Match found for vehicle license plate number: {plate_recognized}, Registered to: {matched_value}')
+                logger.info(f'Match found for vehicle license plate number: {plate_recognized}, Registered to: {matched_name}')
 
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
@@ -243,8 +243,8 @@ def process_image_file(image_file_path):
                     make_pirelay_call()
                     log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
                 
-                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_value}',
-                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_name}',
+                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_name}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
 
             else:
