@@ -63,16 +63,6 @@ smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
-# PostgreSQL database configuration
-postgres_url_var = 'POSTGRES_URL'
-postgres_prisma_url_var = 'POSTGRES_PRISMA_URL'
-postgres_url_non_pooling_var = 'POSTGRES_URL_NON_POOLING'
-postgres_user_var = 'POSTGRES_USER'
-postgres_host_var = 'POSTGRES_HOST'
-postgres_password_var = 'POSTGRES_PASSWORD'
-postgres_database_var = 'POSTGRES_DATABASE'
-
-
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
 #logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
@@ -87,22 +77,7 @@ smtp_password = os.environ.get(smtp_password_var)
 #logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
 logger.info(f'email_to: {email_to}')
-postgres_url = os.environ.get(postgres_url_var)
-logger.info(f'postgres_url: {postgres_url}')
-#postgres_url = os.environ.get(postgres_url_var)
-#logger.info(f'postgres_url: {postgres_url}')
-postgres_prisma_url = os.environ.get(postgres_prisma_url_var)
-logger.info(f'postgres_prisma_url: {postgres_prisma_url}')
-postgres_url_non_pooling = os.environ.get(postgres_url_non_pooling_var)
-logger.info(f'postgres_url_non_pooling: {postgres_url_non_pooling}')
-postgres_user = os.environ.get(postgres_user_var)
-logger.info(f'postgres_user: {postgres_user}')
-postgres_host = os.environ.get(postgres_host_var)
-logger.info(f'postgres_host: {postgres_host}')
-postgres_password = os.environ.get(postgres_password_var)
-#logger.info(f'postgres_password: {postgres_password}')
-postgres_database = os.environ.get(postgres_database_var)
-logger.info(f'postgres_database: {postgres_database}')
+
 
 
 # Function to send email notification
