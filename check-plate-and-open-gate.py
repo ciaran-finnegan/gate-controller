@@ -18,22 +18,15 @@ import sys
 import sqlite3
 import psycopg2
 
-# Import the create_database_table and log_entry functions from db_utils.py
-
-from db_utils import create_database_table, log_entry
-
 # Configure logging
-
 logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gate.log',
                     level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Get the root logger (the logger you've configured with basicConfig)
-
 logger = logging.getLogger()
 
 # Create a handler for console output
-
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)  # Set the desired log level for the console
 console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -63,6 +56,16 @@ smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
+# PostgreSQL database configuration
+postgres_url_var = 'POSTGRES_URL'
+postgres_prisma_url_var = 'POSTGRES_PRISMA_URL'
+postgres_url_non_pooling_var = 'POSTGRES_URL_NON_POOLING'
+postgres_user_var = 'POSTGRES_USER'
+postgres_host_var = 'POSTGRES_HOST'
+postgres_password_var = 'POSTGRES_PASSWORD'
+postgres_database_var = 'POSTGRES_DATABASE'
+
+
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
 #logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
@@ -77,7 +80,20 @@ smtp_password = os.environ.get(smtp_password_var)
 #logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
 logger.info(f'email_to: {email_to}')
-
+#postgres_url = os.environ.get(postgres_url_var)
+#logger.info(f'postgres_url: {postgres_url}')
+postgres_prisma_url = os.environ.get(postgres_prisma_url_var)
+logger.info(f'postgres_prisma_url: {postgres_prisma_url}')
+postgres_url_non_pooling = os.environ.get(postgres_url_non_pooling_var)
+logger.info(f'postgres_url_non_pooling: {postgres_url_non_pooling}')
+postgres_user = os.environ.get(postgres_user_var)
+logger.info(f'postgres_user: {postgres_user}')
+postgres_host = os.environ.get(postgres_host_var)
+logger.info(f'postgres_host: {postgres_host}')
+postgres_password = os.environ.get(postgres_password_var)
+#logger.info(f'postgres_password: {postgres_password}')
+postgres_database = os.environ.get(postgres_database_var)
+logger.info(f'postgres_database: {postgres_database}')
 
 
 # Function to send email notification
@@ -183,12 +199,10 @@ def process_image_file(image_file_path):
             csv_data = {}
             with open('authorised_licence_plates.csv', 'r') as csv_file:
                 csv_reader = csv.reader(csv_file)
-                next(csv_reader)  # Skip the header if it exists
                 for row in csv_reader:
-                    if len(row) >= 5:
-                        plate, name, colour, make, model = [item.strip().lower() for item in row]
-                        csv_data[plate] = {'name': name, 'colour': colour, 'make': make, 'model': model}
-
+                    if len(row) >= 2:
+                        key, value = row[0].strip(), row[1].strip()
+                        csv_data[key.lower()] = value.lower()
 
             # Log the results
             logger.info('CSV data for authorised licence plate numbers:')
@@ -203,24 +217,21 @@ def process_image_file(image_file_path):
                     break
 
             if best_match is not None:
-                matched_vehicle_data = csv_data.get(best_match, {})
-                matched_name = matched_vehicle_data.get('name', '')
-                logger.info(f'Match found for vehicle license plate number: {plate_recognized}, Registered to: {matched_name}')
+                matched_value = csv_data.get(best_match, '')
+                logger.info(f'Match found for vehicle license plate number: {plate_recognized}, Registered to: {matched_value}')
 
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {"Fuzzy Match" if score < 1.0 else "Exact Match"}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
                                             f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
-                    log_entry(image_file_path, plate_recognized, score, fuzzy_match=score < 1.0, gate_opened=True)
-
+                    log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=False)
                 else:
                     # Perform gate opening logic
                     make_pirelay_call()
-                    log_entry(image_file_path, plate_recognized, score, fuzzy_match=score < 1.0, gate_opened=True)
-
-                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_name}',
-                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_name}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
+                    log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_value}',
+                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
 
             else:
@@ -229,11 +240,129 @@ def process_image_file(image_file_path):
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
                                         f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time,gate_opened=False)
-                log_entry(image_file_path, plate_recognized, score, fuzzy_match=score < 1.0, gate_opened=False)
+                log_entry(image_file_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False)
 
     except Exception as e:
         # Log the error message
         logger.error(f'Error processing image file: {str(e)}')
+
+# Function to create the SQLite database table if it doesn't exist
+def create_database_table():
+    # Specify the full path to the SQLite database directory and filename
+    db_directory = '/opt/gate-controller/data/'
+    db_filename = 'gate-controller-database.db'
+    db_file_path = os.path.join(db_directory, db_filename)
+
+    # Log the db_file_path
+    logger.info(f'db_file_path: {db_file_path}')
+
+    # Ensure the database directory exists
+    if not os.path.exists(db_directory):
+        os.makedirs(db_directory)
+
+    try:
+        # Connect to the database and create the "log" table if it doesn't exist
+        conn = sqlite3.connect(db_file_path)
+        cursor = conn.cursor()
+
+        # Create the "log" table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS log (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME,
+                image_path TEXT,
+                plate_recognized TEXT,
+                score REAL,
+                fuzzy_match TEXT,
+                gate_opened TEXT
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f'Database table created successfully.')
+    except sqlite3.Error as sql_error:
+        logger.error(f'SQLite error while creating the table: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error creating the table: {str(e)}')
+
+# Function to create the PostgreSQL database table
+def create_table_postgres(conn):
+    try:
+        cursor = conn.cursor()
+        
+        # Create the "log" table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS log (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP,
+                image_path TEXT,
+                plate_recognized TEXT,
+                score REAL,
+                fuzzy_match BOOLEAN,
+                gate_opened BOOLEAN
+            )
+        ''')
+        conn.commit()
+        logger.info('PostgreSQL table checked/created successfully.')
+    except psycopg2.Error as sql_error:
+        logger.error(f'PostgreSQL error while creating/checking the table: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error creating/checking the table in PostgreSQL: {str(e)}')
+
+# Function to log an entry in the database(s)
+def log_entry(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    # SQLite Entry
+    log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuzzy_match, gate_opened)
+    
+    # PostgreSQL Entry
+    log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match, gate_opened)
+    
+# Function to log an entry in the local SQLite database
+def log_entry_sqlite(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        conn = sqlite3.connect(db_file_path)
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) VALUES (?, ?, ?, ?, ?, ?)',
+                       (current_time, image_path, plate_recognized, score, 'Yes' if fuzzy_match else 'No', 'Yes' if gate_opened else 'No'))
+        conn.commit()
+        logger.info(f'Logged an entry in the SQLite database for plate: {plate_recognized}')
+    except sqlite3.Error as sql_error:
+        logger.error(f'SQLite error while logging an entry: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error while logging an entry in SQLite: {str(e)}')
+    finally:
+        # Ensuring that the connection is closed even if an error occurs
+        conn.close()
+
+# Function to log an entry in the remote PostgreSQL database
+def log_entry_postgres(image_path, plate_recognized, score, script_start_time, fuzzy_match=False, gate_opened=False):
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        conn_str = f"dbname={postgres_database} user={postgres_user} password={postgres_password} host={postgres_host} port=5432 sslmode=require options=endpoint=ep-falling-mountain-55618104-pooler"
+        conn = psycopg2.connect(conn_str)  
+        
+        # Ensure the log table exists
+        create_table_postgres(conn)
+        
+        cursor = conn.cursor()
+        
+        # Execute the INSERT query
+        cursor.execute('''
+            INSERT INTO log (timestamp, image_path, plate_recognized, score, fuzzy_match, gate_opened) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (current_time, image_path, plate_recognized, score, fuzzy_match, gate_opened))
+        
+        conn.commit()
+        logger.info(f'Logged an entry in the PostgreSQL database for plate: {plate_recognized}')
+    except psycopg2.Error as sql_error:
+        logger.error(f'PostgreSQL error while logging an entry: {str(sql_error)}')
+    except Exception as e:
+        logger.error(f'Error while logging an entry in PostgreSQL: {str(e)}')
+    finally:
+        conn.close()
 
 
 # Function to check if another gate opening event occurred in the last 20 seconds
