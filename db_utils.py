@@ -95,5 +95,13 @@ def log_entry(image_path: str, plate_recognized: str, score: float,
     """
     Log an entry in both the SQLite and PostgreSQL databases.
     """
+    logging.info(f"log_entry called with image_path: {image_path}, plate_recognized: {plate_recognized}, "
+                 f"score: {score}, fuzzy_match: {fuzzy_match}, gate_opened: {gate_opened}")
+    
     log_entry_sqlite(image_path, plate_recognized, score, fuzzy_match, gate_opened)
+    logging.info(f"log_entry_sqlite called with image_path: {image_path}, plate_recognized: {plate_recognized}, "
+                 f"score: {score}, fuzzy_match: {fuzzy_match}, gate_opened: {gate_opened}")
+    
     log_entry_postgres(image_path, plate_recognized, score, fuzzy_match, gate_opened)
+    logging.info(f"log_entry_postgres called with image_path: {image_path}, plate_recognized: {plate_recognized}, "
+                 f"score: {score}, fuzzy_match: {fuzzy_match}, gate_opened: {gate_opened}")
