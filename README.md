@@ -66,6 +66,9 @@ Environment=SMTP_PORT=REPLACE_WITH_YOUR_SMTP_PORT e.g. 587
 Environment=SMTP_USERNAME=REPLACE_WITH_YOUR_SMTP_USERNAME e.g. something@gmail.com
 Environment=SMTP_PASSWORD=REPLACE_WITH_YOUR_SMTP_PASSWORD
 Environment=EMAIL_TO=REPLACE_WITH_YOUR_NOTIFICATIONS_RECIPIENTS_EMAIL_ADDRESS e.g. e.g. something@gmail.com
+Environment=AWS_ACCESS_KEY=REPLACE_WITH_YOUR_AWS_ACCESS_KEY e.g. AKIAxxxxxxxxxxxxxxxxxxxx
+Environment=AWS_SECRET_KEY=REPACE_WITH_YOUR_AWS_SECRET_KEY e.g. xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Environment=AWS_S3_BUCKET=REPLACE_WITH_YOUR_AWS_S3_BUCKET e.g. my-bucket
 ```
 
 8. Install vsftpd (FTP Server) on Raspberry Pi:

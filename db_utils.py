@@ -4,12 +4,22 @@ import psycopg2
 import datetime
 import sqlite3
 
-# Import the log_entry function from db_utils.py
-from s3_utils import upload_image_to_s3
+# Import the database log_entry and create_table_sqlite functions from db_utils.py
+
+from db_utils import log_entry, create_table_sqlite
+
+# Import the configure_logger function from logger.py
+
+from logger import configure_logger
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+logger = configure_logger()
+
+# Import the upload_image_to_s3 function from s3_utils.py
+
+from s3_utils import upload_image_to_s3
+
 
 # PostgreSQL database configuration
 postgres_url_var = 'POSTGRES_URL'
