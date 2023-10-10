@@ -282,7 +282,7 @@ def process_image_file(image_file_path):
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
                                         f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time,gate_opened=False)
-                reason='Licence plate number could not be recognised or is not authorised'
+                reason='Licence plate number not recognised or not authorised'
 
                 # Log the event
                 # Set values for vehicle data to empty strings
