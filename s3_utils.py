@@ -5,10 +5,6 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
 from logger import configure_logger
 
-# Import the log_entry function from db_utils.py
-
-from db_utils import log_entry, create_table_sqlite
-
 # Configure logging
 
 logger = configure_logger()
