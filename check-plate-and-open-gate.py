@@ -193,8 +193,8 @@ def process_image_file(image_file_path):
                             csv_data[plate] = {'name': name, 'colour': colour, 'make': make, 'model': model}
             
             # Log the results
-            logger.info('CSV data for authorised licence plate numbers:')
-            logger.info(csv_data[plate])
+            logger.info('CSV data for authorised licence plate numbers loaded:')
+            logger.debug(csv_data[plate])
 
             # Compare the recognized plate to the values in the CSV (including fuzzy matching)
             best_match = None
@@ -203,10 +203,10 @@ def process_image_file(image_file_path):
                 match_score = fuzz.partial_ratio(plate_recognized, csv_key)
                 if match_score >= fuzzy_match_threshold:
                     best_match = csv_key
-                    if match_score == 1:
-                        fuzzy_match = False
+                    if match_score == 100:
+                        fuzzy_match = False # Exact match
                     else:
-                        fuzzy_match = True
+                        fuzzy_match = True  # Fuzzy match (greater than or equal to fuzzy_match_threshold)
                         break
                     break
 
@@ -227,9 +227,9 @@ def process_image_file(image_file_path):
 
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
-                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {"Fuzzy Match" if score < 1.0 else "Exact Match"}.')
+                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_recognized}, Registered to: {matched_value}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
-                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
+                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}, Registered to: {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
                     reason='Gate opening already in progress' 
                     log_entry(reason,
                             image_file_path,
@@ -257,7 +257,7 @@ def process_image_file(image_file_path):
                             vehicle_colour,
                             fuzzy_match,
                             gate_opened=True)
-                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {matched_value}',
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_recognized}, Registered to: {matched_value}',
                                             f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
 
@@ -267,7 +267,19 @@ def process_image_file(image_file_path):
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
                                         f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time,gate_opened=False)
-                reason='Licence plate number not accepted' 
+                reason='Licence plate number could not be recognised or is not authorised'
+
+                # Log the event
+                # Set values for vehicle data to empty strings
+                # Set fuzzy_match to False
+                # Set gate_opened to False 
+
+                plate_number = ''
+                vehicle_registered_to_name = ''
+                vehicle_make = ''
+                vehicle_model = ''
+                vehicle_colour = ''
+
                 log_entry(reason,
                             image_file_path,
                             plate_recognized,
@@ -283,8 +295,6 @@ def process_image_file(image_file_path):
     except Exception as e:
         # Log the error message
         logger.error(f'Error processing image file: {str(e)}')
-
-
 
 
 # Function to check if another gate opening event occurred in the last 20 seconds

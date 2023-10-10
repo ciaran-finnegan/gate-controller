@@ -60,16 +60,16 @@ def log_entry(reason,
                image_path,
                  plate_recognized,
                    score,
-                    plate_number=None,
-                     vehicle_registered_to_name=None,
-                      vehicle_make=None,
-                        vehicle_model=None,
-                          vehicle_colour=None,
-                           fuzzy_match=False,
-                            gate_opened=False):
+                    plate_number,
+                     vehicle_registered_to_name,
+                      vehicle_make,
+                        vehicle_model,
+                          vehicle_colour,
+                           fuzzy_match,
+                            gate_opened):
     # SQLite Entry
     logger.info(f'Logging an entry in the SQLite database log table.')
-    logger.info(f'Calling log_entry_sqlite(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
+    logger.info(f'Calling log_entry_sqlite(reason={reason}, image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
     log_entry_sqlite(reason,
                image_path,
                  plate_recognized,
@@ -85,7 +85,7 @@ def log_entry(reason,
     
     # PostgreSQL Entry
     logger.info(f'Logging an entry in the PostgreSQL database log table.')
-    logger.info(f'Calling log_entry_postgres(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
+    logger.info(f'Calling log_entry_postgres(reason={reason}, image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
     
     log_entry_postgres(reason,
                image_path,
@@ -114,6 +114,8 @@ def create_table_sqlite():
         cursor = conn.cursor()
 
         # Create the "log" table if it doesn't exist
+        # No boolean types in SQLite, fuzzy_match and gate_opened are stored as TEXT
+        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS log (
                 id INTEGER PRIMARY KEY,
@@ -122,8 +124,8 @@ def create_table_sqlite():
                 image_path TEXT,
                 plate_recognized TEXT,
                 score REAL,
-                fuzzy_match BOOLEAN,
-                gate_opened BOOLEAN,
+                fuzzy_match TEXT,
+                gate_opened TEXT,
                 plate_number TEXT,
                 vehicle_registered_to_name TEXT,
                 vehicle_make TEXT,
@@ -165,7 +167,7 @@ def create_table_postgres(conn):
             )
         ''')
         conn.commit()
-        logger.info('PostgreSQL table checked/created successfully.')
+        logger.info(f'PostgreSQL table checked/created successfully.')
     except psycopg2.Error as sql_error:
         logger.error(f'PostgreSQL error while creating/checking the table: {str(sql_error)}')
     except Exception as e:
@@ -200,6 +202,7 @@ def log_entry_sqlite(reason,
         conn.close()
 
 # Function to log an entry in the remote PostgreSQL database
+
 def log_entry_postgres(reason,
                        image_path,
                        plate_recognized,
