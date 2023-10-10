@@ -4,6 +4,8 @@ import psycopg2
 import datetime
 import sqlite3
 
+# Import the log_entry function from db_utils.py
+from s3_utils import upload_image_to_s3
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -87,6 +89,15 @@ def log_entry(reason,
     logger.info(f'Logging an entry in the PostgreSQL database log table.')
     logger.info(f'Calling log_entry_postgres(reason={reason}, image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
     
+    # First we need to upload the image to S3 and get the object URL
+    image_url = upload_image_to_s3(image_path)
+
+    # Then we can replace the local image_path with the S3 object URL
+
+    image_path = image_url
+
+    # Now we can log the entry in the PostgreSQL database
+
     log_entry_postgres(reason,
                image_path,
                plate_recognized,

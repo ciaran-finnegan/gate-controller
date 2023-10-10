@@ -18,18 +18,17 @@ import sys
 import sqlite3
 import psycopg2
 
+# Import the configure_logger function
+
+from logger import configure_logger
+
 # Import the log_entry function from db_utils.py
 
 from db_utils import log_entry, create_table_sqlite
 
 # Configure logging
 
-logging.basicConfig(filename='/opt/gate-controller/logs/check-plate-and-open-gate.log',
-                    level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Get the root logger (the logger you've configured with basicConfig)
-logger = logging.getLogger()
+logging = configure_logger()
 
 # Create a handler for console output
 console_handler = logging.StreamHandler()
