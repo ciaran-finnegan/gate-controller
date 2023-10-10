@@ -84,6 +84,9 @@ def log_entry(reason,
 
     
     # PostgreSQL Entry
+    logger.info(f'Logging an entry in the PostgreSQL database log table.')
+    logger.info(f'Calling log_entry_postgres(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
+    
     log_entry_postgres(reason,
                image_path,
                  plate_recognized,
@@ -95,10 +98,6 @@ def log_entry(reason,
                           vehicle_colour,
                            fuzzy_match,
                             gate_opened)
-    
-    logger.info(f'Logging an entry in the PostgreSQL database log table.')
-    logger.info(f'Calling log_entry_postgres(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
-    
 
 # Function to create the SQLite database table if it doesn't exist
 def create_table_sqlite():
@@ -125,11 +124,11 @@ def create_table_sqlite():
                 score REAL,
                 fuzzy_match BOOLEAN,
                 gate_opened BOOLEAN,
-                plate_number, TEXT,
-                vehicle_registered_to_name, TEXT,
-                vehicle_make, TEXT,
-                vehicle_model, TEXT,
-                vehicle_colour, TEXT
+                plate_number TEXT,
+                vehicle_registered_to_name TEXT,
+                vehicle_make TEXT,
+                vehicle_model TEXT,
+                vehicle_colour TEXT
             )
         ''')
 
@@ -159,10 +158,10 @@ def create_table_postgres(conn):
                 fuzzy_match BOOLEAN,
                 gate_opened BOOLEAN,
                 plate_number TEXT,
-                vehicle_registered_to_name, TEXT,
-                vehicle_make, TEXT,
-                vehicle_model, TEXT,
-                vehicle_colour, TEXT
+                vehicle_registered_to_name TEXT,
+                vehicle_make TEXT,
+                vehicle_model TEXT,
+                vehicle_colour TEXT
             )
         ''')
         conn.commit()
@@ -201,7 +200,17 @@ def log_entry_sqlite(reason,
         conn.close()
 
 # Function to log an entry in the remote PostgreSQL database
-def log_entry_postgres(image_path, reason, plate_recognized, score, fuzzy_match=False, gate_opened=False,  plate_number=None, vehicle_registered_to_name=None, vehicle_make=None, vehicle_model=None, vehicle_colour=None):
+def log_entry_postgres(reason,
+                       image_path,
+                       plate_recognized,
+                       score,
+                       fuzzy_match=False,
+                       gate_opened=False,
+                       plate_number=None,
+                       vehicle_registered_to_name=None,
+                       vehicle_make=None,
+                       vehicle_model=None,
+                       vehicle_colour=None):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         conn_str = f"dbname={postgres_database} user={postgres_user} password={postgres_password} host={postgres_host} port={postgres_port} sslmode={postgres_sslmode} options=endpoint={postgres_endpoint}"
@@ -214,9 +223,14 @@ def log_entry_postgres(image_path, reason, plate_recognized, score, fuzzy_match=
         
         # Execute the INSERT query
         cursor.execute('''
-            INSERT INTO log (timestamp, reason, image_path, plate_recognized, score, fuzzy_match, gate_opened, plate_number, vehicle_registered_to_name, vehicle_make, vehicle_model, vehicle_colour) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s  )
-        ''', (current_time, reason, image_path, plate_recognized, score, fuzzy_match, gate_opened, plate_number, vehicle_registered_to_name, vehicle_make, vehicle_model, vehicle_colour))
+        INSERT INTO log (
+            timestamp, reason, image_path, plate_recognized, score,
+            fuzzy_match, gate_opened, plate_number,
+            vehicle_registered_to_name, vehicle_make, vehicle_model, vehicle_colour)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (current_time, reason, image_path, plate_recognized, score,
+          fuzzy_match, gate_opened, plate_number,
+          vehicle_registered_to_name, vehicle_make, vehicle_model, vehicle_colour))
         
         conn.commit()
         logger.info(f'Logged an entry in the PostgreSQL database for plate: {plate_number}')
