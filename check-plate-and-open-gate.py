@@ -213,7 +213,6 @@ def process_image_file(image_file_path):
 
             if best_match is not None:
                 matched_value = csv_data.get(best_match, '')
-                logger.info(f'Match found for vehicle license plate number: {plate_recognized}, Registered to: {matched_value}')
                 
                 # Retrieve vehicle data based on matched plate number
 
@@ -225,12 +224,14 @@ def process_image_file(image_file_path):
                 vehicle_model = matched_value.get('model', '')
                 vehicle_colour = matched_value.get('colour', '')
 
+                logger.info(f'Match found for vehicle license plate number: {plate_number}, Registered to: {vehicle_registered_to_name}')
+
 
                 # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
-                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_recognized}, Registered to: {matched_value}.')
+                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_number}, Registered to: {vehicle_registered_to_name,}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
-                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}, Registered to: {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
+                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_number}, Registered to: {vehicle_registered_to_name,}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
                     # Log the event
                     # Set reason
                     # Set gate_opened to False
@@ -272,12 +273,12 @@ def process_image_file(image_file_path):
                             vehicle_model,
                             vehicle_colour)
                     
-                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_recognized}, Registered to: {matched_value}',
-                                            f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_number}, Registered to: {vehicle_registered_to_name,}',
+                                            f'Match found for licence plate number: {plate_number} which is registered to {vehicle_registered_to_name,}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
 
             else:
-                logger.info(f'No match found for vehicle license plate number: {plate_recognized}')
+                logger.info(f'No match found for vehicle license plate number: {plate_number}')
 
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
