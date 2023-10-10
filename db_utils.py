@@ -158,7 +158,7 @@ def create_table_postgres(conn):
                 score REAL,
                 fuzzy_match BOOLEAN,
                 gate_opened BOOLEAN,
-                plate_number, TEXT,
+                plate_number TEXT,
                 vehicle_registered_to_name, TEXT,
                 vehicle_make, TEXT,
                 vehicle_model, TEXT,
