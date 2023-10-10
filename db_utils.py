@@ -101,7 +101,7 @@ def log_entry(reason,
     
 
 # Function to create the SQLite database table if it doesn't exist
-def create__table_sqlite():
+def create_table_sqlite():
     # Log the db_file_path
     logger.info(f'SQLite db_file_path: {db_file_path}')
 
