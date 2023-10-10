@@ -28,16 +28,8 @@ from db_utils import log_entry, create_table_sqlite
 
 # Configure logging
 
-logging = configure_logger()
+logger = configure_logger()
 
-# Create a handler for console output
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  # Set the desired log level for the console
-console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(console_formatter)
-
-# Add the console handler to the root logger
-logger.addHandler(console_handler)
 
 # Specify the full path to the SQLite database file
 db_file_path = '/opt/gate-controller/data/gate-controller-database.db'
