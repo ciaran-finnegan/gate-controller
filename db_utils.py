@@ -60,13 +60,13 @@ def log_entry(reason,
                image_path,
                  plate_recognized,
                    score,
-                     fuzzy_match=False,
-                       gate_opened=False,
-                         plate_number=None,
-                           vehicle_registered_to_name=None,
-                             vehicle_make=None,
-                               vehicle_model=None,
-                                 vehicle_colour=None):
+                    plate_number=None,
+                     vehicle_registered_to_name=None,
+                      vehicle_make=None,
+                        vehicle_model=None,
+                          vehicle_colour=None,
+                           fuzzy_match=False,
+                            gate_opened=False):
     # SQLite Entry
     logger.info(f'Logging an entry in the SQLite database log table.')
     logger.info(f'Calling log_entry_sqlite(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
@@ -74,13 +74,13 @@ def log_entry(reason,
                image_path,
                  plate_recognized,
                    score,
-                     fuzzy_match,
-                       gate_opened,
-                         plate_number,
-                           vehicle_registered_to_name,
-                             vehicle_make,
-                               vehicle_model,
-                                 vehicle_colour)
+                    plate_number,
+                     vehicle_registered_to_name,
+                      vehicle_make,
+                        vehicle_model,
+                          vehicle_colour,
+                           fuzzy_match,
+                            gate_opened)
 
     
     # PostgreSQL Entry
@@ -88,13 +88,13 @@ def log_entry(reason,
                image_path,
                  plate_recognized,
                    score,
-                     fuzzy_match,
-                       gate_opened,
-                         plate_number,
-                           vehicle_registered_to_name,
-                             vehicle_make,
-                               vehicle_model,
-                                 vehicle_colour)
+                    plate_number,
+                     vehicle_registered_to_name,
+                      vehicle_make,
+                        vehicle_model,
+                          vehicle_colour,
+                           fuzzy_match,
+                            gate_opened)
     
     logger.info(f'Logging an entry in the PostgreSQL database log table.')
     logger.info(f'Calling log_entry_postgres(image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
