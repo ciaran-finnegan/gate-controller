@@ -199,6 +199,7 @@ def process_image_file(image_file_path):
             # Compare the recognized plate to the values in the CSV (including fuzzy matching)
             best_match = None
             match_score = 0  # Initialize match_score
+            fuzzy_match = False  # Initialize fuzzy_match
             for csv_key in csv_data.keys():
                 match_score = fuzz.partial_ratio(plate_recognized, csv_key)
                 if match_score >= fuzzy_match_threshold:
@@ -230,33 +231,47 @@ def process_image_file(image_file_path):
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_recognized}, Registered to: {matched_value}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
                                             f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_recognized}, Registered to: {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
+                    # Log the event
+                    # Set reason
+                    # Set gate_opened to False
+
+                    gate_opened = False
                     reason='Gate opening already in progress' 
                     log_entry(reason,
                             image_file_path,
                             plate_recognized,
                             match_score,
+                            fuzzy_match,
+                            gate_opened,
                             plate_number,
                             vehicle_registered_to_name,
                             vehicle_make,
                             vehicle_model,
-                            vehicle_colour,
-                            fuzzy_match,
-                            gate_opened=False)
+                            vehicle_colour)
+                    
                 else:
                     # Perform gate opening logic
+                    
                     make_pirelay_call()
+                    
+                    # Log the event
+                    # Set reason
+                    # Set gate_opened to True 
+
+                    gate_opened = True
                     reason='Licence plate number accepted' 
                     log_entry(reason,
                             image_file_path,
                             plate_recognized,
                             match_score,
+                            fuzzy_match,
+                            gate_opened,
                             plate_number,
                             vehicle_registered_to_name,
                             vehicle_make,
                             vehicle_model,
-                            vehicle_colour,
-                            fuzzy_match,
-                            gate_opened=True)
+                            vehicle_colour)
+                    
                     send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_recognized}, Registered to: {matched_value}',
                                             f'Match found for licence plate number: {plate_recognized} which is registered to {matched_value}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
                    
@@ -280,17 +295,20 @@ def process_image_file(image_file_path):
                 vehicle_model = ''
                 vehicle_colour = ''
 
+                fuzzy_match = False
+                gate_opened = False
+
                 log_entry(reason,
                             image_file_path,
                             plate_recognized,
                             match_score,
+                            fuzzy_match,
+                            gate_opened,
                             plate_number,
                             vehicle_registered_to_name,
                             vehicle_make,
                             vehicle_model,
-                            vehicle_colour,
-                            fuzzy_match=False,
-                            gate_opened=False)
+                            vehicle_colour)
 
     except Exception as e:
         # Log the error message

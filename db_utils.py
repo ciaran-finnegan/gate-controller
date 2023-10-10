@@ -58,29 +58,29 @@ db_file_path = os.path.join(db_directory, db_filename)
 # Function to log an entry in the database(s)
 def log_entry(reason,
                image_path,
-                 plate_recognized,
-                   score,
-                    plate_number,
-                     vehicle_registered_to_name,
-                      vehicle_make,
-                        vehicle_model,
-                          vehicle_colour,
-                           fuzzy_match,
-                            gate_opened):
+               plate_recognized,
+               score,
+               fuzzy_match,
+               gate_opened,
+               plate_number,
+               vehicle_registered_to_name,
+               vehicle_make,
+               vehicle_model,
+               vehicle_colour):
     # SQLite Entry
     logger.info(f'Logging an entry in the SQLite database log table.')
     logger.info(f'Calling log_entry_sqlite(reason={reason}, image_path={image_path}, plate_recognized={plate_recognized}, score,fuzzy_match={score}, gate_opened={gate_opened}).')
     log_entry_sqlite(reason,
                image_path,
-                 plate_recognized,
-                   score,
-                    plate_number,
-                     vehicle_registered_to_name,
-                      vehicle_make,
-                        vehicle_model,
-                          vehicle_colour,
-                           fuzzy_match,
-                            gate_opened)
+               plate_recognized,
+               score,
+               fuzzy_match,
+               gate_opened,
+               plate_number,
+               vehicle_registered_to_name,
+               vehicle_make,
+               vehicle_model,
+               vehicle_colour)
 
     
     # PostgreSQL Entry
@@ -89,15 +89,15 @@ def log_entry(reason,
     
     log_entry_postgres(reason,
                image_path,
-                 plate_recognized,
-                   score,
-                    plate_number,
-                     vehicle_registered_to_name,
-                      vehicle_make,
-                        vehicle_model,
-                          vehicle_colour,
-                           fuzzy_match,
-                            gate_opened)
+               plate_recognized,
+               score,
+               fuzzy_match,
+               gate_opened,
+               plate_number,
+               vehicle_registered_to_name,
+               vehicle_make,
+               vehicle_model,
+               vehicle_colour)
 
 # Function to create the SQLite database table if it doesn't exist
 def create_table_sqlite():
@@ -176,15 +176,15 @@ def create_table_postgres(conn):
 # Function to log an entry in the local SQLite database
 def log_entry_sqlite(reason,
                image_path,
-                 plate_recognized,
-                   score,
-                     fuzzy_match,
-                       gate_opened,
-                         plate_number,
-                           vehicle_registered_to_name,
-                             vehicle_make,
-                               vehicle_model,
-                                 vehicle_colour):
+               plate_recognized,
+               score,
+               fuzzy_match,
+               gate_opened,
+               plate_number,
+               vehicle_registered_to_name,
+               vehicle_make,
+               vehicle_model,
+               vehicle_colour):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         conn = sqlite3.connect(db_file_path)
@@ -207,13 +207,13 @@ def log_entry_postgres(reason,
                        image_path,
                        plate_recognized,
                        score,
-                       fuzzy_match=False,
-                       gate_opened=False,
-                       plate_number=None,
-                       vehicle_registered_to_name=None,
-                       vehicle_make=None,
-                       vehicle_model=None,
-                       vehicle_colour=None):
+                       fuzzy_match,
+                       gate_opened,
+                       plate_number,
+                       vehicle_registered_to_name,
+                       vehicle_make,
+                       vehicle_model,
+                       vehicle_colour):
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         conn_str = f"dbname={postgres_database} user={postgres_user} password={postgres_password} host={postgres_host} port={postgres_port} sslmode={postgres_sslmode} options=endpoint={postgres_endpoint}"
