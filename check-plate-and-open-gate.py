@@ -189,22 +189,19 @@ def process_image_file(image_file_path):
 
             # Compare the recognized plate to the values in the CSV (including fuzzy matching)
             best_match = None
-            match_score = 0  # Initialize match_score
-            fuzzy_match = False  # Initialize fuzzy_match
+            highest_match_score = 0  # Initialize the highest match score
+            fuzzy_match = False  # Initialize fuzzy match
+
             for csv_key in csv_data.keys():
                 match_score = fuzz.partial_ratio(plate_recognized, csv_key)
-                if match_score >= fuzzy_match_threshold:
+                if match_score > highest_match_score:  # Find the highest score
+                    highest_match_score = match_score
                     best_match = csv_key
-                    if match_score == 100:
-                        fuzzy_match = False # Exact match
-                    else:
-                        fuzzy_match = True  # Fuzzy match (greater than or equal to fuzzy_match_threshold)
-                        break
-                    break
+                    fuzzy_match = match_score != 100
 
             if best_match is not None:
                 matched_value = csv_data.get(best_match, '')
-                
+
                 # Retrieve vehicle data based on matched plate number
 
                 matched_value = csv_data.get(best_match, {})
