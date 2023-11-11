@@ -1,0 +1,77 @@
+severity_threshold: medium
+ignore_dirs:
+  - dir1
+ignore_paths:
+  - data/**/*
+notifications:
+  all-events-webhook:
+    events:
+      all:
+        minimum_severity: high
+        secret_types: [ ssh_key ]
+    targets:
+      webhook:
+        urls: [ https://example.com/123456 ]
+  findings-to-slack-and-email:
+    events:
+      new_code_findings:
+        minimum_severity: high
+      new_secret_findings:
+        types: [ ssh_key ]
+      new_dependency_findings:
+        minimum_severity: high
+    targets:
+      slack:
+        channels: [ "123456" ]
+      email:
+        addresses: [ ciaran.finnegan@gmail.com ]
+    repositories:
+      - config-file-parser
+      - dast-action
+      - cli
+scheduled_notifications:
+  new-findings:
+    schedule: "0 0 * * *"
+    topics:
+      all: true
+    targets:
+      slack:
+        channels: [ "123456" ]
+      email:
+        addresses: [ ciaran.finnegan@gmail.com ]
+    repositories:
+      - config-file-parser
+      - dast-action
+      - cli
+code:
+  ignore:
+    - cwes: [ 589 ] # Potential HTTP request made with variable url
+      reason: HTTP requests with variables in tests don't matter
+      paths: [ "**/tests/*" ]
+      repositories:
+        - config-file-parser
+        - dast-action
+        - cli
+    - rule_ids: [ python-sql-injection ]
+      reason: This code won't be going live until next year but we should fix it before then
+      expiry: "2021-12-31"
+dependencies:
+  ignore:
+    - cve: CVE-2021-1234
+      reason: This is a false positive
+    - cve: CVE-2021-5678
+      reason: This isn't exploitable in client applications but we should update it eventually
+      expiry: "2021-12-31"
+      repositories:
+        - dast-action
+        - cli
+secrets:
+  ignore:
+    - value: mocksecret123
+      reason: This is a test secret, it has no access to anything
+      paths: [ "**/tests/*" ]
+    - pattern: id[0-9]+
+      reason: These are not secrets, they are internal identifiers
+    - value: actualsecret123
+      reason: We can't remove this right now but we should
+      expiry: "2021-12-31"
