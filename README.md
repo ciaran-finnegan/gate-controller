@@ -257,6 +257,25 @@ sudo chmod -R 775 /opt/gate-controller
 
 ```
 
+5. Check that the plates and schedule are downloading
+
+```
+ sudo bash -c "source /home/filemonitor/.bashrc && python /opt/gate-controller/update_authorized_plates.py"
+INFO:__main__:Successfully updated /opt/gate-controller/authorised_licence_plates.csv and /opt/gate-controller/access_schedule.csv from PostgreSQL.
+
+cat /opt/gate-controller/access_schedule.csv
+day_of_week,start_time,end_time
+
+cat /opt/gate-controller/authorised_licence_plates.csv
+plate,name,colour,make,model
+```
+
+6. Run the script manually to check for errors
+
+```
+sudo -E python check-plate-and-open-gate.py /home/ftp-user/test.jpg
+```
+
 ## Maintenance
 
 To maintain this project:

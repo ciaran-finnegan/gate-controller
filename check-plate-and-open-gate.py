@@ -19,17 +19,13 @@ import sqlite3
 import psycopg2
 
 # Import the configure_logger function
-
 from logger import configure_logger
 
 # Import the log_entry function from db_utils.py
-
 from db_utils import log_entry, create_table_sqlite
 
 # Configure logging
-
 logger = configure_logger()
-
 
 # Specify the full path to the SQLite database file
 db_file_path = '/opt/gate-controller/data/gate-controller-database.db'
@@ -38,46 +34,33 @@ db_file_path = '/opt/gate-controller/data/gate-controller-database.db'
 r1 = PiRelay.Relay("RELAY1")
 
 # Retrieve configuration parameters, API, and Email credentials
-
-# PlateRecognizer API configuration
 plate_recognizer_token_var = 'PLATE_RECOGNIZER_API_TOKEN'
-
-# Fuzzy matching configuration
 fuzzy_match_threshold_var = 'FUZZY_MATCH_THRESHOLD'
-
-# Email configuration
 smtp_server_var = 'SMTP_SERVER'
 smtp_port_var = 'SMTP_PORT'
 smtp_username_var = 'SMTP_USERNAME'
 smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
-
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
-#logger.info(f'plate_recognizer_token: {plate_recognizer_token}')
 fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
-logger.info(f'fuzzy_match_threshold: {fuzzy_match_threshold}')
 smtp_server = os.environ.get(smtp_server_var)
-logger.info(f'smtp_server: {smtp_server}')
 smtp_port = int(os.environ.get(smtp_port_var, 587))
-logger.info(f'smtp_port: {smtp_port}')
 smtp_username = os.environ.get(smtp_username_var)
-logger.info(f'smtp_username: {smtp_username}')
 smtp_password = os.environ.get(smtp_password_var)
-#logger.info(f'smtp_password: {smtp_password}')
 email_to = os.environ.get(email_to_var)
-logger.info(f'email_to: {email_to}')
 
+# Paths to the CSV files
+plates_csv_file_path = '/opt/gate-controller/authorised_licence_plates.csv'
+schedule_csv_file_path = '/opt/gate-controller/access_schedule.csv'
 
 # Function to send email notification
 def send_email_notification(recipient, subject, message_body, script_start_time, fuzzy_match=False, gate_opened=False):
     try:
-        # Create a connection to the SMTP server
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()
         server.login(smtp_username, smtp_password)
 
-        # Include explanatory text, script start time, and elapsed time in the email body
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         elapsed_time = time.time() - script_start_time
         elapsed_time_formatted = f'{elapsed_time:.1f}'
@@ -89,16 +72,13 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
             f'Elapsed Time: {elapsed_time_formatted} seconds'
         )
 
-        # Create a MIME email message with attachments
         msg = MIMEMultipart()
         msg['From'] = smtp_username
         msg['To'] = recipient
         msg['Subject'] = subject
 
-        # Attach the message body
         msg.attach(MIMEText(message_body_with_time, 'plain'))
 
-        # Open and resize the image
         with open(image_file_path, 'rb') as attachment_file:
             img = Image.open(attachment_file)
             img.thumbnail((600, 600))
@@ -106,14 +86,12 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
             img.save(img_byte_array, format='JPEG')
             img_data = img_byte_array.getvalue()
 
-        # Attach the resized image
         attachment = MIMEBase('application', 'octet-stream')
         attachment.set_payload(img_data)
         encoders.encode_base64(attachment)
         attachment.add_header('Content-Disposition', f'attachment; filename=attachment.jpg')
         msg.attach(attachment)
 
-        # Send the email
         server.sendmail(smtp_username, recipient, msg.as_string())
         server.quit()
 
@@ -125,6 +103,34 @@ def send_email_notification(recipient, subject, message_body, script_start_time,
     except Exception as e:
         logger.error(f'Error sending email: {str(e)}')
 
+# Function to load access schedule from CSV file
+def load_access_schedule():
+    schedule = []
+    try:
+        with open(schedule_csv_file_path, mode='r', encoding='utf-8') as csv_file:
+            csv_reader = csv.DictReader(csv_file)
+            for row in csv_reader:
+                schedule.append({
+                    'day_of_week': row['day_of_week'].lower(),
+                    'start_time': datetime.datetime.strptime(row['start_time'], '%H:%M:%S').time(),
+                    'end_time': datetime.datetime.strptime(row['end_time'], '%H:%M:%S').time()
+                })
+        logger.info('Access schedule loaded successfully')
+    except Exception as e:
+        logger.error(f'Error loading access schedule: {str(e)}')
+    return schedule
+
+# Function to check if the current time falls within the access schedule
+def is_within_schedule(schedule):
+    current_time = datetime.datetime.now()
+    current_day = current_time.strftime('%A').lower()
+    current_time_only = current_time.time()
+
+    for entry in schedule:
+        if entry['day_of_week'] == current_day:
+            if entry['start_time'] <= current_time_only <= entry['end_time']:
+                return True
+    return False
 
 # Make a PiRelay call to open the gate
 def make_pirelay_call():
@@ -140,6 +146,22 @@ def make_pirelay_call():
 def process_image_file(image_file_path):
     script_start_time = time.time()
     try:
+        # Load access schedule
+        access_schedule = load_access_schedule()
+
+        # Check if the current time is within the access schedule
+        if is_within_schedule(access_schedule):
+            logger.info('Current time is within the access schedule, allowing all vehicles to access.')
+            make_pirelay_call()
+            
+            # Log the event with the reason for access
+            log_entry('Access permitted due to access policy schedule',
+                      image_file_path, '', 0, False, True, '', '', '', '', '')
+
+            send_email_notification(email_to, 'Gate Opening Alert - Access Permitted by Schedule',
+                                    'Gate was opened based on schedule access.', script_start_time, gate_opened=True)
+            return  # Exit the function after opening the gate based on the schedule
+
         # Upload the image to the Plate Recognizer API using requests
         regions = ["ie"]  # Change to your country
         with open(image_file_path, 'rb') as fp:
@@ -149,12 +171,10 @@ def process_image_file(image_file_path):
                 files=dict(upload=fp),
                 headers={'Authorization': f'Token {plate_recognizer_token}'})
 
-            # Log the response from Plate Recognizer API
             response_text = response.text
             logger.info(f'Plate Recognizer API Response Status Code: {response.status_code}')
             logger.info(f'Plate Recognizer API Response: {response_text}')
 
-            # Extract the recognized plate value from the API response
             plate_recognized = None
             try:
                 response_data = json.loads(response_text)
@@ -168,44 +188,28 @@ def process_image_file(image_file_path):
             except Exception as e:
                 logger.error(f'Error extracting recognized plate: {str(e)}')
 
-            # Now, retrieve the CSV file and store its contents in a dictionary
-            
-            # Dictionary to hold CSV data
             csv_data = {}
-            
-            # Open and read the CSV file
             with open('authorised_licence_plates.csv', 'r', encoding='utf-8') as csv_file:
                 csv_reader = csv.reader(csv_file)
-                next(csv_reader)  # Skip header row
+                next(csv_reader)
                 for row in csv_reader:
-                    # Ensure all expected columns are present
-                        if len(row) == 5:
-                            plate, name, colour, make, model = [item.strip().lower() for item in row]
-                            csv_data[plate] = {'name': name, 'colour': colour, 'make': make, 'model': model}
-            
-            # Log the results
-            logger.info('CSV data for authorised licence plate numbers loaded:')
-            logger.debug(csv_data[plate])
+                    if len(row) == 5:
+                        plate, name, colour, make, model = [item.strip().lower() for item in row]
+                        csv_data[plate] = {'name': name, 'colour': colour, 'make': make, 'model': model}
 
-            # Compare the recognized plate to the values in the CSV (including fuzzy matching)
             best_match = None
-            highest_match_score = 0  # Initialize the highest match score
-            fuzzy_match = False  # Initialize fuzzy match
+            highest_match_score = 0
+            fuzzy_match = False
 
             for csv_key in csv_data.keys():
                 match_score = fuzz.partial_ratio(plate_recognized, csv_key)
-                if match_score > highest_match_score:  # Find the highest score
+                if match_score > highest_match_score:
                     highest_match_score = match_score
                     best_match = csv_key
                     fuzzy_match = match_score != 100
 
             if best_match is not None:
-                matched_value = csv_data.get(best_match, '')
-
-                # Retrieve vehicle data based on matched plate number
-
                 matched_value = csv_data.get(best_match, {})
-                
                 plate_number = best_match
                 vehicle_registered_to_name = matched_value.get('name', '')
                 vehicle_make = matched_value.get('make', '')
@@ -214,95 +218,63 @@ def process_image_file(image_file_path):
 
                 logger.info(f'Match found for vehicle license plate number: {plate_number}, Registered to: {vehicle_registered_to_name}')
 
-
-                # Check if another gate opening event occurred in the last 20 seconds
                 if is_recent_gate_opening_event():
-                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_number}, Registered to: {vehicle_registered_to_name,}.')
+                    logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_number}, Registered to: {vehicle_registered_to_name}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
-                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_number}, Registered to: {vehicle_registered_to_name,}', script_start_time, fuzzy_match=score < 1.0,gate_opened=False)
-                    # Log the event
-                    # Set reason
-                    # Set gate_opened to False
-
-                    gate_opened = False
-                    reason='Gate opening already in progress' 
-                    log_entry(reason,
-                            image_file_path,
-                            plate_recognized,
-                            match_score,
-                            fuzzy_match,
-                            gate_opened,
-                            plate_number,
-                            vehicle_registered_to_name,
-                            vehicle_make,
-                            vehicle_model,
-                            vehicle_colour)
+                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_number}, Registered to: {vehicle_registered_to_name}', script_start_time, fuzzy_match=score < 1.0, gate_opened=False)
                     
+                    # Log the event for skipped gate opening
+                    log_entry('Gate opening skipped due to another recent event',
+                              image_file_path,
+                              plate_recognized,
+                              highest_match_score,
+                              fuzzy_match,
+                              gate_opened=False,
+                              plate_number=plate_number,
+                              vehicle_registered_to_name=vehicle_registered_to_name,
+                              vehicle_make=vehicle_make,
+                              vehicle_model=vehicle_model,
+                              vehicle_colour=vehicle_colour)
                 else:
                     # Perform gate opening logic
-                    
                     make_pirelay_call()
-                    
+
                     # Log the event
-                    # Set reason
-                    # Set gate_opened to True 
+                    log_entry('Licence plate number accepted',
+                              image_file_path,
+                              plate_recognized,
+                              highest_match_score,
+                              fuzzy_match,
+                              gate_opened=True,
+                              plate_number=plate_number,
+                              vehicle_registered_to_name=vehicle_registered_to_name,
+                              vehicle_make=vehicle_make,
+                              vehicle_model=vehicle_model,
+                              vehicle_colour=vehicle_colour)
 
-                    gate_opened = True
-                    reason='Licence plate number accepted' 
-                    log_entry(reason,
-                            image_file_path,
-                            plate_recognized,
-                            match_score,
-                            fuzzy_match,
-                            gate_opened,
-                            plate_number,
-                            vehicle_registered_to_name,
-                            vehicle_make,
-                            vehicle_model,
-                            vehicle_colour)
-                    
-                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_number}, Registered to: {vehicle_registered_to_name,}',
-                                            f'Match found for licence plate number: {plate_number} which is registered to {vehicle_registered_to_name,}', script_start_time, fuzzy_match=score < 1.0,gate_opened=True)
-                   
-
+                    send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_number}, Registered to: {vehicle_registered_to_name}',
+                                            f'Match found for licence plate number: {plate_number} which is registered to {vehicle_registered_to_name}', script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
             else:
-                logger.info(f'No match found for vehicle license plate number: {plate_number}')
+                logger.info(f'No match found for vehicle license plate number: {plate_recognized}')
 
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
-                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time,gate_opened=False)
-                reason='Licence plate number not recognised or not authorised'
+                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time, gate_opened=False)
 
                 # Log the event
-                # Set values for vehicle data to empty strings
-                # Set fuzzy_match to False
-                # Set gate_opened to False 
-
-                plate_number = ''
-                vehicle_registered_to_name = ''
-                vehicle_make = ''
-                vehicle_model = ''
-                vehicle_colour = ''
-
-                fuzzy_match = False
-                gate_opened = False
-
-                log_entry(reason,
-                            image_file_path,
-                            plate_recognized,
-                            match_score,
-                            fuzzy_match,
-                            gate_opened,
-                            plate_number,
-                            vehicle_registered_to_name,
-                            vehicle_make,
-                            vehicle_model,
-                            vehicle_colour)
-
+                log_entry('Licence plate number not recognised or not authorised',
+                          image_file_path,
+                          plate_recognized,
+                          0,
+                          fuzzy_match=False,
+                          gate_opened=False,
+                          plate_number='',
+                          vehicle_registered_to_name='',
+                          vehicle_make='',
+                          vehicle_model='',
+                          vehicle_colour='')
     except Exception as e:
-        # Log the error message
         logger.error(f'Error processing image file: {str(e)}')
-
 
 # Function to check if another gate opening event occurred in the last 20 seconds
 def is_recent_gate_opening_event():
@@ -310,33 +282,20 @@ def is_recent_gate_opening_event():
     cursor = conn.cursor()
 
     logger.info(f'Checking for recent gate opening event')
-    # Query the database to check if another event occurred in the last 20 seconds
     current_time = time.time()
-    logger.info(f'Current time: {current_time}')
-    # Calculate the timestamp 20 seconds ago in the format 'YYYY-MM-DD HH:MM:SS'
-    # Update based on your requirements, 20 seconds chosen as that is the delay before this gate automatically closes
     twenty_seconds_ago = (datetime.datetime.now() - datetime.timedelta(seconds=20)).strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f'Time 20 seconds ago: {twenty_seconds_ago}')
-    
-    # Log the SQL query
-    logger.info(f'SQL Query: SELECT COUNT(*) FROM log WHERE gate_opened="Yes" AND timestamp > {twenty_seconds_ago}')
+
     cursor.execute('SELECT COUNT(*) FROM log WHERE gate_opened="Yes" AND timestamp > ?', (twenty_seconds_ago,))
     count = cursor.fetchone()[0]
     logger.info(f'Count of matching values in database log table: {count}')
 
-    # For debugging only
-    # Fetch and log each row of data
-    for row in cursor.fetchall():
-        logger.info(f'Database table query returned the following: {row}')
     conn.close()
-
     return count > 0
-
 
 # Entry point for running the script
 if __name__ == "__main__":
     try:
-        # Get the path to the image file from command line arguments
         if len(sys.argv) != 2:
             print("Usage: python script.py /path/to/image.jpg")
             sys.exit(1)
@@ -347,5 +306,5 @@ if __name__ == "__main__":
         # Process the image file
         process_image_file(image_file_path)
     except Exception as e:
-        # Log any unhandled exceptions
         logger.error(f'Unhandled exception in main: {str(e)}')
+                                                                                                                                                                           
