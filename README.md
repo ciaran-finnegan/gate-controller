@@ -71,6 +71,8 @@ Environment=AWS_SECRET_KEY=REPACE_WITH_YOUR_AWS_SECRET_KEY e.g. xxxxxxxxxxxxxxxx
 Environment=AWS_S3_BUCKET=REPLACE_WITH_YOUR_AWS_S3_BUCKET e.g. my-bucket
 ```
 
+Alternatively these could be configured in a shell profile, e.g. /home/filemonitor/.bashrc
+
 8. Install vsftpd (FTP Server) on Raspberry Pi:
 
 First, you need to install the vsftpd package, which is a popular FTP server for Linux:
@@ -127,6 +129,25 @@ sudo systemctl enable file-monitor.service
 sudo systemctl start file-monitor.service
 ```
 This will monitor the specified directory for new .jpg files and trigger the Python script to process them.
+
+11. Configure the authorised vehicle plates to be updated from the server side database on a schedule, e.g. hourly
+
+This is done to reduce latency associated with checking the server side database in realtime for authorised vehicles
+
+Configure a cron job to run the update_authorized_plates.py script hourly:
+
+```
+crontab -e
+
+POSTGRES_URL="postgresql://postgres.redacted@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
+POSTGRES_PRISMA_URL="postgresql://postgres.redacted@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
+POSTGRES_URL_NON_POOLING="postgresql://postgres.redactedw@redacted.pooler.supabase.com:6543/postgres"
+POSTGRES_USER="postgres.redacted"
+POSTGRES_HOST="redacted.pooler.supabase.com"
+POSTGRES_PASSWORD="redacted"
+POSTGRES_DATABASE="postgres"
+
+0 * * * * /usr/bin/python3 /opt/gate-controller/update_authorized_plates.py
 
 # Testing
 
