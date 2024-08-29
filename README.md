@@ -40,7 +40,7 @@ A separate web application, which can be found [here](https://github.com/ciaran-
 
 ### Fuzzy Matching Explained
 
-Fuzzy matching is used to allow for minor discrepancies in the plate recognition process, such as partial visibility of a plate, minor scratches, or varying lighting conditions. The fuzzy matching process uses the `fuzzywuzzy` library to compare the recognised plate against the list of authorised plates with a similarity score ranging from 0 to 100:
+Fuzzy matching is used to allow for minor discrepancies in the plate recognition process, such as partial visibility of a plate or varying lighting conditions, headlight glare and rain. The fuzzy matching process uses the `fuzzywuzzy` library to compare the recognised plate against the list of authorised plates with a similarity score ranging from 0 to 100:
 
 - A **perfect match** score of 100 indicates the recognised plate exactly matches an authorised plate.
 - A **fuzzy match** score (e.g., 70-99) allows for slight differences but still recognises the plate as authorised, depending on the threshold set.
