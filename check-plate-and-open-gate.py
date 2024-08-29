@@ -43,7 +43,7 @@ smtp_password_var = 'SMTP_PASSWORD'
 email_to_var = 'EMAIL_TO'
 
 plate_recognizer_token = os.environ.get(plate_recognizer_token_var)
-fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))
+fuzzy_match_threshold = int(os.environ.get(fuzzy_match_threshold_var, 70))  # Default to 70 if not set
 smtp_server = os.environ.get(smtp_server_var)
 smtp_port = int(os.environ.get(smtp_port_var, 587))
 smtp_username = os.environ.get(smtp_username_var)
@@ -206,9 +206,11 @@ def process_image_file(image_file_path):
                 if match_score > highest_match_score:
                     highest_match_score = match_score
                     best_match = csv_key
-                    fuzzy_match = match_score != 100
+                    # Check if the match is above the threshold but not an exact match
+                    fuzzy_match = match_score >= fuzzy_match_threshold and match_score < 100
 
-            if best_match is not None:
+            # Decision making based on match score and threshold
+            if best_match is not None and highest_match_score >= fuzzy_match_threshold:
                 matched_value = csv_data.get(best_match, {})
                 plate_number = best_match
                 vehicle_registered_to_name = matched_value.get('name', '')
@@ -221,7 +223,8 @@ def process_image_file(image_file_path):
                 if is_recent_gate_opening_event():
                     logger.info(f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for {plate_number}, Registered to: {vehicle_registered_to_name}.')
                     send_email_notification(email_to, f'Gate Opening Alert - Skipped - Another Event in Progress',
-                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_number}, Registered to: {vehicle_registered_to_name}', script_start_time, fuzzy_match=score < 1.0, gate_opened=False)
+                                            f'Another gate opening event occurred in the last 20 seconds. Skipping gate opening for plate: {plate_number}, Registered to: {vehicle_registered_to_name}', 
+                                            script_start_time, fuzzy_match=fuzzy_match, gate_opened=False)
                     
                     # Log the event for skipped gate opening
                     log_entry('Gate opening skipped due to another recent event',
@@ -253,13 +256,15 @@ def process_image_file(image_file_path):
                               vehicle_colour=vehicle_colour)
 
                     send_email_notification(email_to, f'Gate Opening Alert - Opened Gate for {plate_number}, Registered to: {vehicle_registered_to_name}',
-                                            f'Match found for licence plate number: {plate_number} which is registered to {vehicle_registered_to_name}', script_start_time, fuzzy_match=score < 1.0, gate_opened=True)
+                                            f'Match found for licence plate number: {plate_number} which is registered to {vehicle_registered_to_name}', 
+                                            script_start_time, fuzzy_match=fuzzy_match, gate_opened=True)
             else:
                 logger.info(f'No match found for vehicle license plate number: {plate_recognized}')
 
                 # Send an email notification when no match is found
                 send_email_notification(email_to, f'Gate Opening Alert - No Match Found for Plate: {plate_recognized}, did not Open Gate',
-                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', script_start_time, gate_opened=False)
+                                        f'No match found or vehicle not registered for licence plate number: {plate_recognized}', 
+                                        script_start_time, gate_opened=False)
 
                 # Log the event
                 log_entry('Licence plate number not recognised or not authorised',
@@ -301,10 +306,9 @@ if __name__ == "__main__":
             sys.exit(1)
 
         image_file_path = sys.argv[1]
-        # Create the SQLlite database and initialise the log table if it doesn't exist
+        # Create the SQLite database and initialise the log table if it doesn't exist
         create_table_sqlite()
         # Process the image file
         process_image_file(image_file_path)
     except Exception as e:
         logger.error(f'Unhandled exception in main: {str(e)}')
-                                                                                                                                                                           
