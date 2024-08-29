@@ -178,3 +178,7 @@ Test the setup by uploading an image with a vehicle licence plate via FTP. Check
 - [TOpens](https://topens.com) - Electric gate systems and accessories.
 - [Faac](https://www.faac.co.uk) - High-quality gate systems and accessories.
 - [Pi Relay v2 Library](https://github.com/sbcshop/PiRelay-V2/blob/main/PiRelay.py) - Relay board for Raspberry Pi.
+
+## Contributors and thanks
+Thanks to [Kaja](https://github.com/kaja-osojnik) for web application styling.
+Thanks to the [IPCamTalk Forum](https://ipcamtalk.com) community for guidance on configuring Hikvision smart event detection policies.
