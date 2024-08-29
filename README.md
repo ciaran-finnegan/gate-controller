@@ -151,7 +151,7 @@ Test the setup by uploading an image with a vehicle licence plate via FTP. Check
 
 2. Check Service Status:
    sudo systemctl status file-monitor.service
-   sudo tail -f /opt/gate-controller/logs/file-monitor.log
+   sudo tail -f /opt/gate-controller/logs/file_monitor.log
 
 3. Check Script Logs:
    sudo tail -f check-plate-and-open-gate.log
@@ -164,6 +164,7 @@ Test the setup by uploading an image with a vehicle licence plate via FTP. Check
    sudo bash -c "source /home/filemonitor/.bashrc && python /opt/gate-controller/update_authorized_plates.py"
 
 6. Run the Script Manually:
+   source /home/filemonitor/.bashrc
    sudo -E python check-plate-and-open-gate.py /home/ftp-user/test.jpg
 
 ## Maintenance
