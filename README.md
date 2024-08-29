@@ -7,7 +7,7 @@ This is a Working prototype. Documentation is limited and untested; a working kn
 
 This project runs on a Raspberry Pi and serves as a vehicle gate controller for an electric gate. The system uses images captured by a CCTV camera and uploaded via FTP to recognise vehicle licence plates. It checks these plates against a list of authorised vehicles and triggers a relay to open the gate if a match is found. The system also sends email notifications to alert users when a match is detected or when no match is found.
 
-An alternative AWS hosted version can be found [here] (https://github.com/ciaran-finnegan/License-Plate-Recognition-Notifier). This version may introduce additional latency and requires a GSM Gate Opening Relay device to open the gate.
+An alternative AWS hosted version can be found [here](https://github.com/ciaran-finnegan/License-Plate-Recognition-Notifier). This version may introduce additional latency and requires a GSM Gate Opening Relay device to open the gate.
 
 A separate web application, which can be found [here](https://github.com/ciaran-finnegan/gate-controller-refine-front-end), allows users to manage authorised vehicles, view access logs, and configure system settings. The web application connects to Supabase, which hosts the PostgreSQL database and handles authentication, and AWS S3, which stores captured images. The web application is hosted on Netlify, which automatically builds and deploys the site from the GitHub repository. However, these services are not strictly required for basic functionality.
 
@@ -52,7 +52,7 @@ This approach provides flexibility and reduces the chance of rejecting authorise
 
 The web application provides an intuitive interface for managing gate access. Below is an example of the web application's UI showing the vehicle access log:
 
-![Gate Access Manager](redacted_gate_access_manager.png)
+![Gate Access Manager](https://github.com/ciaran-finnegan/gate-controller/blob/master/redacted_gate_access_manager.jpg)
 
 - **Vehicle Access Log:** Shows a history of vehicles that were granted access, along with the corresponding images and timestamps.
 - **Manage Vehicles:** Allows users to add or remove authorised vehicles.
