@@ -1,18 +1,63 @@
+# Vehicle Gate Controller
+
+## Status
+This is a Working prototype. Documentation is limited and untested; a working knowledge of Linux is recommended if you choose to implement.
+
+## Overview
+
+This project runs on a Raspberry Pi and serves as a vehicle gate controller for an electric gate. The system uses images captured by a CCTV camera and uploaded via FTP to recognise vehicle licence plates. It checks these plates against a list of authorised vehicles and triggers a relay to open the gate if a match is found. The system also sends email notifications to alert users when a match is detected or when no match is found.
+
+An alternative AWS hosted version can be found [here] (https://github.com/ciaran-finnegan/License-Plate-Recognition-Notifier). This version may introduce additional latency and requires a GSM Gate Opening Relay device to open the gate.
+
+A separate web application, which can be found [here](https://github.com/ciaran-finnegan/gate-controller-refine-front-end), allows users to manage authorised vehicles, view access logs, and configure system settings. The web application connects to Supabase, which hosts the PostgreSQL database and handles authentication, and AWS S3, which stores captured images. The web application is hosted on Netlify, which automatically builds and deploys the site from the GitHub repository. However, these services are not strictly required for basic functionality.
+
+## How It Works
+
+### System Overview
+
+1. **Image Capture and Upload**: A CCTV camera monitors the gate and captures images of approaching vehicles. These images are uploaded to the Raspberry Pi via FTP.
+
+2. **File Monitoring**: A file monitoring script (`file_monitor.sh`) continuously watches a specified directory for new images. When a new image (in `.jpg` format) is detected, the script triggers the `check-plate-and-open-gate.py` script to process the image.
+
+3. **Image Processing and Plate Recognition**:
+   - The image is sent to the Plate Recognizer API, which identifies the vehicle's licence plate number.
+   - The script logs the API response and extracts the recognised plate number and confidence score.
+
+4. **Fuzzy Matching**:
+   - The recognised plate number is compared against a list of authorised plates stored in a CSV file (`authorised_licence_plates.csv`).
+   - The fuzzy matching algorithm, using the `fuzzywuzzy` library, calculates a similarity score between the recognised plate and each authorised plate in the list.
+   - If the similarity score is above a configurable threshold (default is 70 but can be adjusted via the `FUZZY_MATCH_THRESHOLD` environment variable), the system considers it a match. This allows for slight variations in plate recognition due to factors like image quality or plate damage.
+
+5. **Access Decision**:
+   - If a match is found and the vehicle is authorised, the system sends a command to the relay (`PiRelay`) to open the gate for a few seconds and then close it.
+   - The event is logged, and an email notification is sent to the specified recipient detailing the gate opening event, including the image and the matched plate information.
+   - If no match is found or if the score is below the threshold, the gate remains closed, and a notification is sent stating that access was denied.
+
+6. **Logging and Notifications**:
+   - All events are logged in both a local SQLite database and optionally in a remote PostgreSQL database hosted on Supabase.
+   - Images can be uploaded to an AWS S3 bucket if configured, allowing remote access through the web application.
+   - Notifications include details of the event, such as whether access was granted based on a perfect match or a fuzzy match.
+
+### Fuzzy Matching Explained
+
+Fuzzy matching is used to allow for minor discrepancies in the plate recognition process, such as partial visibility of a plate, minor scratches, or varying lighting conditions. The fuzzy matching process uses the `fuzzywuzzy` library to compare the recognised plate against the list of authorised plates with a similarity score ranging from 0 to 100:
+
+- A **perfect match** score of 100 indicates the recognised plate exactly matches an authorised plate.
+- A **fuzzy match** score (e.g., 70-99) allows for slight differences but still recognises the plate as authorised, depending on the threshold set.
+- If the similarity score is below the threshold, the system treats the plate as unauthorised, and access is denied.
+
+This approach provides flexibility and reduces the chance of rejecting authorised vehicles due to minor recognition errors.
+
+## Web Application UI
+
+The web application provides an intuitive interface for managing gate access. Below is an example of the web application's UI showing the vehicle access log:
+
 ![Gate Access Manager](redacted_gate_access_manager.png)
 
 - **Vehicle Access Log:** Shows a history of vehicles that were granted access, along with the corresponding images and timestamps.
 - **Manage Vehicles:** Allows users to add or remove authorised vehicles.
 - **Manage Schedules:** Configure access schedules for specific times or days.
 - **Analytics:** Provides insights into gate usage patterns.
-
-## Table of Contents
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Web Application](#web-application)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Maintenance](#maintenance)
-- [Useful Resources](#useful-resources)
 
 ## Prerequisites
 
@@ -95,19 +140,6 @@ Optional:
     Add the following line:
     0 * * * * /usr/bin/python3 /opt/gate-controller/update_authorized_plates.py
 
-## Web Application
-
-The accompanying web application, Gate Controller Web Application, provides a user-friendly interface for managing authorised vehicle plates, viewing access logs, and configuring system settings.
-
-- **Database and Authentication:** The web application uses Supabase for managing the PostgreSQL database and handling user authentication.
-- **Image Storage:** Images captured by the system can optionally be stored in an AWS S3 bucket, allowing users to view them through the web application.
-- **Hosting and Deployment:** The front end of the web application is hosted on Netlify, which builds and deploys the site automatically from the GitHub repository.
-
-### Accessing the Web Application:
-1. Clone the web application repository:
-   git clone https://github.com/ciaran-finnegan/gate-controller-refine-front-end
-2. Follow the installation instructions in the repository’s README to set up the application.
-
 ## Testing
 
 Test the setup by uploading an image with a vehicle licence plate via FTP. Check the logs to verify that the plate was recognised and the gate was triggered accordingly.
@@ -142,7 +174,7 @@ Test the setup by uploading an image with a vehicle licence plate via FTP. Check
 
 ## Useful Resources
 
-- IPCamTalk Forum - Information and support for CCTV cameras.
-- TOpens - Electric gate systems and accessories.
-- Faac - High-quality gate systems and accessories.
-- Pi Relay v2 Library - Relay board for Raspberry Pi.
+- [IPCamTalk Forum](https://ipcamtalk.com) - Information and support for CCTV cameras.
+- [TOpens](https://topens.com) - Electric gate systems and accessories.
+- [Faac](https://www.faac.co.uk) - High-quality gate systems and accessories.
+- [Pi Relay v2 Library](https://github.com/sbcshop/PiRelay-V2/blob/main/PiRelay.py) - Relay board for Raspberry Pi.
