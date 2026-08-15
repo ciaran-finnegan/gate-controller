@@ -1,8 +1,11 @@
 import configparser
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -197,19 +200,50 @@ install_fixed_trust_anchors {shlex.quote(str(handoff))} {shlex.quote(str(systemd
             self.assertEqual("trusted helper\n", helper.read_text())
             self.assertEqual(0o555, handoff.stat().st_mode & 0o777)
 
+    @unittest.skipUnless(shutil.which("flock"), "requires the Linux flock command")
     def test_bootstrap_uses_same_nonblocking_lock_as_updater(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             lock = Path(temporary_directory) / "update.lock"
-            nested = f"source deployment/install.sh; acquire_install_lock {shlex.quote(str(lock))}"
-            command = f"""
-source deployment/install.sh
-acquire_install_lock {shlex.quote(str(lock))}
-bash -c {shlex.quote(nested)}
+            ready = Path(temporary_directory) / "lock-ready"
+            holder_script = """
+import fcntl
+import pathlib
+import sys
+import time
+
+with open(sys.argv[1], "w") as lock_file:
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    pathlib.Path(sys.argv[2]).touch()
+    time.sleep(30)
 """
-            completed = subprocess.run(
-                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            holder = subprocess.Popen(
+                [sys.executable, "-c", holder_script, str(lock), str(ready)],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
+            try:
+                for _ in range(100):
+                    if ready.exists():
+                        break
+                    if holder.poll() is not None:
+                        self.fail(f"lock holder exited early: {holder.stderr.read()}")
+                    time.sleep(0.01)
+                else:
+                    self.fail("lock holder did not become ready")
+
+                command = (
+                    "source deployment/install.sh; "
+                    f"acquire_install_lock {shlex.quote(str(lock))}"
+                )
+                completed = subprocess.run(
+                    ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+            finally:
+                holder.terminate()
+                holder.wait(timeout=5)
 
             self.assertNotEqual(0, completed.returncode)
             self.assertIn("another install or update is already running", completed.stderr)
