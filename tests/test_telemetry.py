@@ -1,6 +1,6 @@
 import re
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gate_controller.telemetry import (
     EventTelemetry,
@@ -288,6 +288,85 @@ class TelemetryWireTests(unittest.TestCase):
 
 
 class ProcessingTraceTests(unittest.TestCase):
+    def test_upstream_boundaries_anchor_wall_capture_to_monotonic_burst(self):
+        captured_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        monotonic = iter((101.0, 101.1, 101.2))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: captured_at + timedelta(seconds=1),
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.seed_upstream(captured_at, 100.5)
+        trace.mark_ocr_start()
+        telemetry = trace.finish()
+
+        self.assertEqual(telemetry.to_wire()["stage_durations"], {
+            "capture_to_burst_ms": 500,
+            "burst_to_ocr_ms": 600,
+            "ocr_ms": 0,
+            "end_to_end_ms": 1_200,
+        })
+
+    def test_upstream_capture_clamps_only_small_cross_clock_skew(self):
+        wall_anchor = datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+        monotonic = iter((101.0, 101.1, 101.2))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: wall_anchor,
+        )
+
+        trace.seed_upstream(
+            wall_anchor - timedelta(seconds=0.51),
+            100.48,
+        )
+        trace.mark_ocr_start()
+        telemetry = trace.finish()
+
+        self.assertEqual(telemetry.to_wire()["stage_durations"], {
+            "capture_to_burst_ms": 0,
+            "burst_to_ocr_ms": 620,
+            "ocr_ms": 0,
+            "end_to_end_ms": 720,
+        })
+
+    def test_inconsistent_upstream_capture_is_unavailable_not_fabricated(self):
+        wall_anchor = datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+        monotonic = iter((101.0, 101.1, 101.2))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: wall_anchor,
+        )
+
+        trace.seed_upstream(
+            wall_anchor - timedelta(seconds=0.8),
+            100.0,
+        )
+        trace.mark_ocr_start()
+        telemetry = trace.finish()
+
+        durations = telemetry.to_wire()["stage_durations"]
+        self.assertNotIn("capture_to_burst_ms", durations)
+        self.assertNotIn("end_to_end_ms", durations)
+        self.assertEqual(durations, {
+            "burst_to_ocr_ms": 1_100,
+            "ocr_ms": 0,
+        })
+
+    def test_invalid_upstream_timestamps_leave_all_derived_stages_unavailable(self):
+        monotonic = iter((101.0, 101.1, 101.2))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc),
+        )
+
+        trace.seed_upstream(datetime(2026, 8, 15, 10, 0), float("nan"))
+        trace.mark_ocr_start()
+        telemetry = trace.finish()
+
+        durations = telemetry.to_wire()["stage_durations"]
+        self.assertEqual(durations, {"ocr_ms": 0})
+
     def test_ocr_start_and_end_boundaries_do_not_double_count_work(self):
         monotonic = iter((10.0, 10.1, 10.15, 10.4, 10.45, 10.65, 10.7, 10.8, 11.0))
         trace = ProcessingTrace(

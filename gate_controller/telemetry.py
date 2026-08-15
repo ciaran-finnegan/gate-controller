@@ -17,6 +17,8 @@ MAX_ITEMS = 8
 MAX_STRING_LENGTH = 128
 MAX_DIMENSION = 16_384
 MAX_DELIVERY_ATTEMPT = 1_000
+MAX_UPSTREAM_INTERVAL_SECONDS = MAX_DURATION_MS / 1_000
+MAX_CLOCK_SKEW_SECONDS = 0.1
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
@@ -219,7 +221,8 @@ class ProcessingTrace:
         trace_id: str | None = None,
     ) -> None:
         self._monotonic_clock = monotonic_clock
-        self.captured_at = wall_clock()
+        self._wall_anchor = wall_clock()
+        self.captured_at = self._wall_anchor
         self.trace_id = _trace_id(trace_id) if trace_id is not None else str(uuid4())
         self._captured = monotonic_clock()
         self._burst: float | None = None
@@ -239,6 +242,31 @@ class ProcessingTrace:
         self._actuation_attempted = False
         self._relay_outcome = "not_attempted"
         self._finished_telemetry: EventTelemetry | None = None
+
+    def seed_upstream(
+        self,
+        received_at: datetime | None,
+        decision_started_at: float | None,
+    ) -> None:
+        """Anchor upstream wall and monotonic boundaries to this trace."""
+        capture = _wall_to_monotonic(
+            received_at, self._wall_anchor, self._captured
+        )
+        burst = _upstream_monotonic(decision_started_at, self._captured)
+
+        if received_at is not None or decision_started_at is not None:
+            self._captured = capture
+        if capture is not None:
+            self.captured_at = received_at
+        if decision_started_at is not None:
+            self._burst = burst
+
+        if capture is None or burst is None or capture <= burst:
+            return
+        if capture - burst <= MAX_CLOCK_SKEW_SECONDS:
+            self._captured = burst
+        else:
+            self._captured = None
 
     def mark_burst(self) -> None:
         if self._burst is None:
@@ -330,3 +358,36 @@ def _elapsed(start: float | None, end: float | None) -> float | None:
     if start is None or end is None:
         return None
     return max(0.0, (end - start) * 1_000)
+
+
+def _wall_to_monotonic(
+    received_at: datetime | None,
+    wall_anchor: datetime,
+    monotonic_anchor: float,
+) -> float | None:
+    if received_at is None:
+        return None
+    try:
+        age = (wall_anchor - received_at).total_seconds()
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(age) or not math.isfinite(monotonic_anchor):
+        return None
+    if age < -MAX_CLOCK_SKEW_SECONDS or age > MAX_UPSTREAM_INTERVAL_SECONDS:
+        return None
+    return monotonic_anchor - max(age, 0.0)
+
+
+def _upstream_monotonic(value: object, anchor: float) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp) or not math.isfinite(anchor):
+        return None
+    offset = timestamp - anchor
+    if offset > MAX_CLOCK_SKEW_SECONDS or offset < -MAX_UPSTREAM_INTERVAL_SECONDS:
+        return None
+    return min(timestamp, anchor)

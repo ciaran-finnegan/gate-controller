@@ -55,7 +55,10 @@ class GateProcessor:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
             return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
         trace = self._new_trace()
-        trace.mark_burst()
+        if received_at is not None or decision_started_at is not None:
+            trace.seed_upstream(received_at, decision_started_at)
+        if decision_started_at is None:
+            trace.mark_burst()
         received_at = received_at or self._clock()
         now = self._clock()
         if self._decision_clock() - started >= self._decision_timeout:
@@ -225,6 +228,8 @@ class GateProcessor:
             )
         if trace is None:
             trace = self._new_trace()
+            if received_at is not None:
+                trace.seed_upstream(received_at, None)
             trace.mark_burst()
         else:
             trace = _BestEffortTrace.wrap(trace)
@@ -310,6 +315,11 @@ class _BestEffortTrace:
 
     def mark_burst(self) -> None:
         self._call("mark_burst")
+
+    def seed_upstream(
+        self, received_at: datetime | None, decision_started_at: float | None
+    ) -> None:
+        self._call("seed_upstream", received_at, decision_started_at)
 
     def add_frame(self, frame) -> None:
         self._call("add_frame", frame)
