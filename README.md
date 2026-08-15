@@ -79,7 +79,9 @@ for migration, logs, retention, manual rollback, and optional private-token
 configuration.
 
 The bundled `PiRelay.py` adapter additionally needs Raspberry Pi GPIO support;
-the conditional `RPi.GPIO` requirement applies on supported Pi architectures.
+the conditional `rpi-lgpio` package provides its `RPi.GPIO`-compatible API on
+supported Pi architectures, including Raspberry Pi 5. Do not install it in the
+same virtual environment as the original `RPi.GPIO` package.
 Install the relay board vendor library if a different relay adapter is used.
 
 ## Optional Control Plane

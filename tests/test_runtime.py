@@ -5,9 +5,11 @@ from gate_controller.runtime import require_python_version
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_gpio_dependency_includes_armv6_raspberry_pis(self):
+    def test_gpio_dependency_uses_the_pi_5_compatible_rpi_gpio_provider(self):
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
 
+        self.assertIn("rpi-lgpio==0.6", requirements)
+        self.assertNotIn("RPi.GPIO==", requirements)
         self.assertIn('platform_machine == "armv6l"', requirements)
 
     def test_rejects_unsupported_python_versions_before_startup(self):

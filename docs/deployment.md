@@ -221,6 +221,11 @@ and the conditional Raspberry Pi GPIO package to exact versions. CI and the Pi
 therefore request the same versions instead of independently resolving broad
 ranges.
 
+The GPIO dependency is `rpi-lgpio`, which preserves the imported `RPi.GPIO` API
+while using the gpiochip interface required by Raspberry Pi 5. Do not install
+the original `RPi.GPIO` package in the same release virtual environment because
+both distributions provide the same Python module.
+
 The file is not a cross-architecture hash lock. Raspberry Pi and x86 CI can
 receive different wheels or source distributions for an exact version, and pip
 still trusts TLS, the configured package index, package-account security, and the

@@ -452,7 +452,7 @@ class DependencyLockTests(unittest.TestCase):
             "charset-normalizer": "3.5.0",
             "idna": "3.18",
             "urllib3": "2.7.0",
-            "RPi.GPIO": "0.7.1",
+            "rpi-lgpio": "0.6",
         }
         pinned_versions = {}
         for line in (REPOSITORY_ROOT / "requirements.txt").read_text(

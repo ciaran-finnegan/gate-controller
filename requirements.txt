@@ -8,5 +8,5 @@ charset-normalizer==3.5.0
 idna==3.18
 urllib3==2.7.0
 
-# Required only on the Raspberry Pi that directly drives the bundled PiRelay adapter.
-RPi.GPIO==0.7.1; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
+# RPi.GPIO-compatible gpiochip provider, including Raspberry Pi 5 support.
+rpi-lgpio==0.6; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
