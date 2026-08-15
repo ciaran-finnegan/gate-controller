@@ -213,6 +213,16 @@ class GateProcessor:
                        trace: ProcessingTrace | _BestEffortTrace | None = None,
                        idempotency_key: str | None = None) -> ProcessingResult:
         paths = tuple(Path(path) for path in paths)
+        idempotency_key = idempotency_key or _event_key(paths)
+        if self._store.event_exists(idempotency_key):
+            event_id = self._store.event_id(idempotency_key)
+            if self._outbox_enabled and event_id is not None:
+                self._store.ensure_outbox(event_id, self._outbox_payload(paths))
+            return ProcessingResult(
+                False,
+                self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
+                event_id,
+            )
         if trace is None:
             trace = self._new_trace()
             trace.mark_burst()
@@ -221,7 +231,7 @@ class GateProcessor:
         trace.mark_decision("denied", reason)
         event = GateEvent(
             source="ocr", reason=reason, opened=False,
-            idempotency_key=idempotency_key or _event_key(paths),
+            idempotency_key=idempotency_key,
             received_at=received_at or self._clock(), decision_at=self._clock(),
         )
         event_id = self._record(event, paths)

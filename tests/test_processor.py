@@ -555,6 +555,35 @@ class GateProcessorTests(unittest.TestCase):
             self.assertIsNone(result.telemetry)
             self.assertEqual(store.pending_outbox_count(), 1)
 
+    def test_duplicate_direct_skip_does_not_create_a_second_trace(self):
+        created_traces = []
+
+        def trace_factory(**kwargs):
+            trace = ProcessingTrace(**kwargs)
+            created_traces.append(trace)
+            return trace
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            frame = self._jpeg(directory, "duplicate-skip.jpg")
+            processor = self._processor(
+                store,
+                RecordingRelay([]),
+                SequenceRecognizer([]),
+                outbox=object(),
+                trace_factory=trace_factory,
+            )
+
+            first = processor.record_skipped((frame,), "queue_coalesced")
+            duplicate = processor.record_skipped((frame,), "queue_coalesced")
+
+            self.assertIsNotNone(first.telemetry)
+            self.assertEqual(duplicate.reason, "duplicate_event")
+            self.assertIsNone(duplicate.telemetry)
+            self.assertEqual(duplicate.event_id, first.event_id)
+            self.assertEqual(len(created_traces), 1)
+            self.assertEqual(store.pending_outbox_count(), 1)
+
     def test_processing_reuses_unique_frame_digests_for_identity_and_quality(self):
         recognizer = SequenceRecognizer([
             PlateObservation(None, 0.0),
