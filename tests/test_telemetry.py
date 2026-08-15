@@ -256,10 +256,37 @@ class TelemetryWireTests(unittest.TestCase):
 
         self.assertEqual(telemetry.to_wire(), telemetry.to_wire())
 
+    def test_to_wire_caps_frame_candidates_before_discarding_invalid_frames(self):
+        frames = [
+            FrameTelemetry(0, "not-a-digest", 1, 1, 0, 0, 0, 0),
+            *(
+                FrameTelemetry(index, f"{index:x}" * 64, 1, 1, 0, 0, 0, 0)
+                for index in range(1, 9)
+            ),
+        ]
+        telemetry = EventTelemetry(
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            stage_durations=StageDurations(),
+            frames=frames,
+            ocr_attempts=(),
+            decision_outcome="denied",
+            decision_reason="plate_not_authorised",
+            actuation_claim="not_requested",
+            actuation_attempted=False,
+            relay_outcome="not_attempted",
+            outbox_attempt=0,
+            delivery_state="pending",
+        )
+
+        self.assertEqual(
+            [frame["sequence"] for frame in telemetry.to_wire()["frames"]],
+            [1, 2, 3, 4, 5, 6, 7],
+        )
+
 
 class ProcessingTraceTests(unittest.TestCase):
-    def test_first_marks_win_and_finish_builds_bounded_telemetry(self):
-        monotonic = iter((10.0, 10.125, 10.2, 10.35, 10.4, 10.6, 10.9))
+    def test_ocr_start_and_end_boundaries_do_not_double_count_work(self):
+        monotonic = iter((10.0, 10.1, 10.15, 10.4, 10.45, 10.65, 10.7, 10.8, 11.0))
         trace = ProcessingTrace(
             monotonic_clock=lambda: next(monotonic),
             wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
@@ -268,51 +295,113 @@ class ProcessingTraceTests(unittest.TestCase):
 
         trace.mark_burst()
         trace.mark_burst()
-        trace.add_frame(FrameTelemetry(0, "a" * 64, 1920, 1080, 0.8, 0.4, 0.2, 0.1))
-        trace.add_ocr_attempt(OcrAttemptTelemetry(0, 75, "matched", "131D2696", 0.88, "Ford", "Blue"))
+        mark_ocr_start = getattr(trace, "mark_ocr_start", None)
+        self.assertIsNotNone(mark_ocr_start)
+        mark_ocr_start()
+        try:
+            no_plate = OcrAttemptTelemetry(frame_sequence=0, status="no_plate")
+        except TypeError as error:
+            self.fail(f"trace-timed OCR attempts still require a duration: {error}")
+        trace.add_ocr_attempt(no_plate)
+        mark_ocr_start()
+        trace.add_ocr_attempt(
+            OcrAttemptTelemetry(
+                frame_sequence=1,
+                status="matched",
+                plate="131D2696",
+                confidence=0.88,
+                make="Ford",
+                colour="Blue",
+            )
+        )
         trace.mark_decision("allowed", "plate_authorised")
         trace.mark_decision("denied", "ignored")
         trace.mark_actuation("claimed", True, "activated")
         telemetry = trace.finish(outbox_attempt=1, delivery_state="pending")
 
-        self.assertEqual(telemetry.to_wire(), {
-            "schema_version": 3,
-            "trace_id": "ae2398aa-7107-44f4-a723-290de0f8c7b2",
-            "taxonomy_version": 1,
-            "stage_durations": {
-                "capture_to_burst_ms": 125,
-                "burst_to_ocr_ms": 75,
-                "ocr_ms": 75,
-                "decision_ms": 150,
-                "decision_to_relay_ms": 50,
-                "end_to_end_ms": 600,
-            },
-            "frames": [{
-                "sequence": 0,
-                "digest": "a" * 64,
-                "width": 1920,
-                "height": 1080,
-                "sharpness": 0.8,
-                "brightness": 0.4,
-                "darkness": 0.2,
-                "highlight_clipping": 0.1,
-            }],
-            "ocr_attempts": [{
+        wire = telemetry.to_wire()
+        self.assertEqual(wire["stage_durations"], {
+            "capture_to_burst_ms": 100,
+            "burst_to_ocr_ms": 50,
+            "ocr_ms": 450,
+            "decision_ms": 50,
+            "decision_to_relay_ms": 100,
+            "end_to_end_ms": 1_000,
+        })
+        self.assertEqual(wire["ocr_attempts"], [
+            {
                 "frame_sequence": 0,
-                "duration_ms": 75,
+                "duration_ms": 250,
+                "status": "no_plate",
+                "plate": None,
+                "confidence": None,
+                "make": None,
+                "colour": None,
+            },
+            {
+                "frame_sequence": 1,
+                "duration_ms": 200,
                 "status": "matched",
                 "plate": "131D2696",
                 "confidence": 0.88,
                 "make": "Ford",
                 "colour": "Blue",
-            }],
-            "decision": {"outcome": "allowed", "reason": "plate_authorised"},
-            "actuation": {
-                "claim": "claimed",
-                "attempted": True,
-                "relay_outcome": "activated",
             },
-            "delivery": {"outbox_attempt": 1, "state": "pending"},
+        ])
+
+    def test_add_ocr_attempt_requires_an_explicit_start_mark(self):
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: 10.0,
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        with self.assertRaises(RuntimeError):
+            trace.add_ocr_attempt(OcrAttemptTelemetry(0, 0, "no_plate"))
+
+    def test_duplicate_actuation_and_finish_keep_the_first_terminal_snapshot(self):
+        monotonic = iter((10.0, 10.1, 10.2, 10.3, 10.4))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.mark_burst()
+        trace.mark_decision("allowed", "plate_authorised")
+        trace.mark_actuation("claimed", True, "activated")
+        trace.mark_actuation("ignored", False, "ignored")
+        first = trace.finish(outbox_attempt=0, delivery_state="pending")
+        second = trace.finish(outbox_attempt=2, delivery_state="delivered")
+
+        self.assertIs(first, second)
+        self.assertEqual(first.to_wire()["actuation"], {
+            "claim": "claimed",
+            "attempted": True,
+            "relay_outcome": "activated",
+        })
+        self.assertEqual(
+            first.to_wire()["delivery"],
+            {"outbox_attempt": 0, "state": "pending"},
+        )
+        self.assertEqual(first.to_wire()["stage_durations"]["end_to_end_ms"], 400)
+
+    def test_zero_ocr_terminal_result_reports_zero_work_and_omits_ocr_boundaries(self):
+        monotonic = iter((10.0, 10.1, 10.2, 10.4))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.mark_burst()
+        trace.mark_decision("denied", "capture_failed")
+        telemetry = trace.finish()
+
+        self.assertEqual(telemetry.to_wire()["ocr_attempts"], [])
+        self.assertEqual(telemetry.to_wire()["stage_durations"], {
+            "capture_to_burst_ms": 100,
+            "ocr_ms": 0,
+            "end_to_end_ms": 400,
         })
 
 

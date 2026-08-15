@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from itertools import islice
 import math
 import re
 import time
@@ -100,8 +101,8 @@ class FrameTelemetry:
 @dataclass(frozen=True)
 class OcrAttemptTelemetry:
     frame_sequence: int
-    duration_ms: float
-    status: str
+    duration_ms: float = 0.0
+    status: str = "unknown"
     plate: str | None = None
     confidence: float | None = None
     make: str | None = None
@@ -158,8 +159,12 @@ class EventTelemetry:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
-        object.__setattr__(self, "frames", tuple(self.frames))
-        object.__setattr__(self, "ocr_attempts", tuple(self.ocr_attempts))
+        object.__setattr__(self, "frames", tuple(islice(self.frames, MAX_ITEMS)))
+        object.__setattr__(
+            self,
+            "ocr_attempts",
+            tuple(islice(self.ocr_attempts, MAX_ITEMS)),
+        )
 
     def to_wire(self) -> dict[str, object]:
         frames: list[dict[str, object]] = []
@@ -213,8 +218,10 @@ class ProcessingTrace:
         self.trace_id = _trace_id(trace_id) if trace_id is not None else str(uuid4())
         self._captured = monotonic_clock()
         self._burst: float | None = None
-        self._first_ocr: float | None = None
-        self._last_ocr: float | None = None
+        self._first_ocr_start: float | None = None
+        self._pending_ocr_start: float | None = None
+        self._last_ocr_end: float | None = None
+        self._ocr_work_ms = 0.0
         self._decision: float | None = None
         self._actuation: float | None = None
         self._finished: float | None = None
@@ -225,6 +232,7 @@ class ProcessingTrace:
         self._actuation_claim = "not_requested"
         self._actuation_attempted = False
         self._relay_outcome = "not_attempted"
+        self._finished_telemetry: EventTelemetry | None = None
 
     def mark_burst(self) -> None:
         if self._burst is None:
@@ -234,14 +242,25 @@ class ProcessingTrace:
         if len(self._frames) < MAX_ITEMS:
             self._frames.append(frame)
 
+    def mark_ocr_start(self) -> None:
+        """Mark the start of the next OCR attempt before invoking OCR."""
+        if len(self._ocr_attempts) >= MAX_ITEMS or self._pending_ocr_start is not None:
+            return
+        self._pending_ocr_start = self._monotonic_clock()
+        if self._first_ocr_start is None:
+            self._first_ocr_start = self._pending_ocr_start
+
     def add_ocr_attempt(self, attempt: OcrAttemptTelemetry) -> None:
         if len(self._ocr_attempts) >= MAX_ITEMS:
             return
-        timestamp = self._monotonic_clock()
-        if self._first_ocr is None:
-            self._first_ocr = timestamp
-        self._last_ocr = timestamp
-        self._ocr_attempts.append(attempt)
+        if self._pending_ocr_start is None:
+            raise RuntimeError("mark_ocr_start must be called before add_ocr_attempt")
+        ended_at = self._monotonic_clock()
+        duration_ms = _elapsed(self._pending_ocr_start, ended_at) or 0.0
+        self._last_ocr_end = ended_at
+        self._pending_ocr_start = None
+        self._ocr_work_ms += duration_ms
+        self._ocr_attempts.append(replace(attempt, duration_ms=duration_ms))
 
     def mark_decision(self, outcome: str, reason: str) -> None:
         if self._decision is None:
@@ -263,17 +282,16 @@ class ProcessingTrace:
         delivery_state: str = "pending",
         delivery_lag_ms: float | None = None,
     ) -> EventTelemetry:
-        if self._finished is None:
-            self._finished = self._monotonic_clock()
-        return EventTelemetry(
+        if self._finished_telemetry is not None:
+            return self._finished_telemetry
+        self._finished = self._monotonic_clock()
+        self._finished_telemetry = EventTelemetry(
             trace_id=self.trace_id,
             stage_durations=StageDurations(
                 capture_to_burst_ms=_elapsed(self._captured, self._burst),
-                burst_to_ocr_ms=_elapsed(self._burst, self._first_ocr),
-                ocr_ms=sum(_duration(attempt.duration_ms) or 0 for attempt in self._ocr_attempts)
-                if self._ocr_attempts
-                else None,
-                decision_ms=_elapsed(self._last_ocr, self._decision),
+                burst_to_ocr_ms=_elapsed(self._burst, self._first_ocr_start),
+                ocr_ms=self._ocr_work_ms,
+                decision_ms=_elapsed(self._last_ocr_end, self._decision),
                 decision_to_relay_ms=_elapsed(self._decision, self._actuation),
                 end_to_end_ms=_elapsed(self._captured, self._finished),
                 delivery_lag_ms=delivery_lag_ms,
@@ -288,6 +306,7 @@ class ProcessingTrace:
             outbox_attempt=outbox_attempt,
             delivery_state=delivery_state,
         )
+        return self._finished_telemetry
 
 
 def _elapsed(start: float | None, end: float | None) -> float | None:
