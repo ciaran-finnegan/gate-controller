@@ -6,7 +6,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +16,18 @@ import gate_controller.outbox as outbox_module
 from gate_controller.models import GateEvent
 from gate_controller.outbox import EvidenceSpoolError, HttpOutboxSender, OutboxWorker
 from gate_controller.store import LocalStore
+from gate_controller.telemetry import EventTelemetry, StageDurations
+
+
+def _telemetry():
+    return EventTelemetry(
+        trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        stage_durations=StageDurations(end_to_end_ms=125),
+        frames=(), ocr_attempts=(),
+        decision_outcome="allowed", decision_reason="exact_match",
+        actuation_claim="claimed", actuation_attempted=True,
+        relay_outcome="activated", outbox_attempt=0, delivery_state="pending",
+    )
 
 
 class EvidenceSpoolTests(unittest.TestCase):
@@ -125,6 +137,67 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
+    def test_attempt_metadata_is_persisted_before_each_send_and_completed_after_success(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.attach_event_telemetry(event_id, _telemetry())
+        sent = []
+
+        def send(payload):
+            sent.append(payload)
+            if len(sent) == 1:
+                raise RuntimeError("offline")
+
+        worker = OutboxWorker(store, send=send)
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(sent[0]["telemetry"]["delivery"], {
+            "outbox_attempt": 1,
+            "state": "sending",
+        })
+        self.assertEqual(store.event_telemetry(event_id)["delivery"], {
+            "outbox_attempt": 1,
+            "state": "retry_pending",
+        })
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(sent[1]["telemetry"]["delivery"], {
+            "outbox_attempt": 2,
+            "state": "sending",
+        })
+        self.assertEqual(store.event_telemetry(event_id)["delivery"], {
+            "outbox_attempt": 2,
+            "state": "delivered",
+        })
+        with closing(sqlite3.connect(store.path)) as connection:
+            completed_at = connection.execute(
+                "SELECT completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()[0]
+        self.assertIsNotNone(completed_at)
+
+    def test_retention_runs_at_startup_then_no_more_than_hourly(self):
+        store, _ = self._queued_store()
+        calls = []
+        original = store.purge_delivered_telemetry
+
+        def record(cutoff):
+            calls.append(cutoff)
+            return original(cutoff)
+
+        store.purge_delivered_telemetry = record
+        now = [datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)]
+        worker = OutboxWorker(store, send=lambda payload: None, clock=lambda: now[0])
+
+        worker.run_once()
+        now[0] += timedelta(minutes=59)
+        worker.run_once()
+        now[0] += timedelta(minutes=2)
+        worker.run_once()
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(calls[1], datetime(2026, 7, 17, 13, 1, tzinfo=timezone.utc))
+
     def test_prepares_an_immutable_evidence_reference_without_a_local_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

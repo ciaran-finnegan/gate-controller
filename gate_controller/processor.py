@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -243,12 +244,21 @@ class GateProcessor:
         result = ProcessingResult(False, reason, event_id)
         return self._finish_result(trace, result)
 
-    @staticmethod
     def _finish_result(
-        trace: _BestEffortTrace, result: ProcessingResult
+        self, trace: _BestEffortTrace, result: ProcessingResult
     ) -> ProcessingResult:
         telemetry = trace.finish()
-        return result if telemetry is None else replace(result, telemetry=telemetry)
+        if telemetry is None:
+            return result
+        completed = replace(result, telemetry=telemetry)
+        if result.event_id is not None:
+            try:
+                self._store.attach_event_telemetry(result.event_id, telemetry)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "event_telemetry_attach status=persistence_failed"
+                )
+        return completed
 
     def _new_trace(self) -> _BestEffortTrace:
         return _BestEffortTrace.create(

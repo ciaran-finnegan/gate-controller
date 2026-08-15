@@ -2,6 +2,7 @@ import argparse
 import ipaddress
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ from .outbox import HttpOutboxSender, OutboxWorker
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
 from .store import LocalStore
+from .telemetry_export import export_telemetry
 from .worker import (
     DEFAULT_MAX_BURST_CANDIDATES, DEFAULT_MAX_CANDIDATE_BYTES,
     MAX_BURST_CANDIDATES, MAX_CANDIDATE_BYTES, run_worker,
@@ -30,6 +32,9 @@ def main() -> None:
         level=os.environ.get("GATE_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if len(sys.argv) > 1 and sys.argv[1] == "telemetry-export":
+        _run_telemetry_export(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser(description="Watch completed gate-camera uploads")
     authorised_default, database_default = default_runtime_paths(os.environ)
     parser.add_argument("--directory", type=Path,
@@ -108,6 +113,32 @@ def main() -> None:
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
     )
+
+
+def _run_telemetry_export(arguments: list[str]) -> None:
+    _, database_default = default_runtime_paths(os.environ)
+    parser = argparse.ArgumentParser(description="Export local gate telemetry")
+    parser.add_argument("--database", type=Path, default=database_default)
+    parser.add_argument("--format", choices=("json", "csv"), required=True)
+    parser.add_argument("--since", type=_iso8601, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parsed = parser.parse_args(arguments)
+    export_telemetry(
+        LocalStore(parsed.database),
+        format=parsed.format,
+        since=parsed.since,
+        output=parsed.output,
+    )
+
+
+def _iso8601(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an ISO8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,

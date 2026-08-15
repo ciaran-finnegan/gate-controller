@@ -5,6 +5,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import ActuationClaim, GateEvent, TerminalOutcome
+from .telemetry import EventTelemetry, MAX_DELIVERY_ATTEMPT, MAX_DURATION_MS
+
+
+_TELEMETRY_FRAME_KEYS = (
+    "sequence", "digest", "width", "height", "sharpness", "brightness",
+    "darkness", "highlight_clipping",
+)
+_TELEMETRY_OCR_KEYS = (
+    "frame_sequence", "duration_ms", "status", "plate", "confidence", "make", "colour",
+)
 
 
 class LocalStore:
@@ -267,6 +277,153 @@ class LocalStore:
             ).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
 
+    def attach_event_telemetry(self, event_id: int, telemetry: EventTelemetry) -> bool:
+        """Attach one trace after the terminal event transaction has committed."""
+        payload = _telemetry_payload(telemetry)
+        encoded = _encode_json(payload)
+        created_at = _timestamp(datetime.now(timezone.utc))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM events WHERE id = ?", (event_id,)
+            ).fetchone() is None:
+                raise KeyError(f"unknown event {event_id}")
+            existing = connection.execute(
+                "SELECT trace_id, payload FROM event_telemetry WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            inserted = existing is None
+            if existing is not None:
+                existing_payload = json.loads(existing[1])
+                if existing[0] != payload["trace_id"] or not _same_trace(
+                    existing_payload, payload
+                ):
+                    raise ValueError("event already has conflicting telemetry")
+                payload = existing_payload
+                encoded = _encode_json(payload)
+            else:
+                trace_owner = connection.execute(
+                    "SELECT event_id FROM event_telemetry WHERE trace_id = ?",
+                    (payload["trace_id"],),
+                ).fetchone()
+                if trace_owner is not None:
+                    raise ValueError("telemetry trace is already attached to another event")
+                connection.execute(
+                    """
+                    INSERT INTO event_telemetry (event_id, trace_id, payload, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (event_id, payload["trace_id"], encoded, created_at),
+                )
+            self._promote_pending_outbox(connection, event_id, payload)
+            connection.commit()
+            return inserted
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def event_telemetry(self, event_id: int) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row is not None else None
+
+    def event_telemetry_rows(self, since: datetime) -> list[dict]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT e.id, e.received_at, e.decision_at, e.relay_activated_at,
+                       e.source, e.reason, e.opened, e.authorised_plate,
+                       e.observed_plate, e.ocr_confidence, t.created_at, t.payload
+                FROM event_telemetry AS t
+                JOIN events AS e ON e.id = t.event_id
+                WHERE e.received_at >= ?
+                ORDER BY e.received_at, e.id
+                """,
+                (_timestamp(since),),
+            ).fetchall()
+        keys = (
+            "event_id", "received_at", "decision_at", "relay_activated_at", "source",
+            "reason", "opened", "authorised_plate", "observed_plate", "ocr_confidence",
+            "telemetry_created_at", "telemetry",
+        )
+        exported = []
+        for row in rows:
+            item = dict(zip(keys, row))
+            item["opened"] = bool(item["opened"])
+            item["telemetry"] = json.loads(item["telemetry"])
+            exported.append(item)
+        return exported
+
+    def prepare_outbox_attempt(self, item_id: int,
+                               attempted_at: datetime | None = None) -> dict | None:
+        attempted_at = attempted_at or datetime.now(timezone.utc)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT event_id, payload, created_at FROM outbox
+                WHERE id = ? AND completed_at IS NULL
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            event_id, payload_text, created_at = row
+            payload = json.loads(payload_text)
+            telemetry_row = connection.execute(
+                "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if telemetry_row is not None:
+                telemetry = json.loads(telemetry_row[0])
+                current_attempt = telemetry.get("delivery", {}).get("outbox_attempt", 0)
+                attempt = min(max(int(current_attempt), 0) + 1, MAX_DELIVERY_ATTEMPT)
+                telemetry["delivery"] = {"outbox_attempt": attempt, "state": "sending"}
+                queued_at = _parse_timestamp(created_at)
+                lag_ms = max(0, int((_as_utc(attempted_at) - queued_at).total_seconds() * 1000))
+                telemetry.setdefault("stage_durations", {})["delivery_lag_ms"] = min(
+                    lag_ms, MAX_DURATION_MS
+                )
+                self._write_telemetry_payload(connection, event_id, telemetry)
+                payload["schema_version"] = 3
+                payload["telemetry"] = telemetry
+                connection.execute(
+                    "UPDATE outbox SET payload = ? WHERE id = ? AND completed_at IS NULL",
+                    (_encode_json(payload), item_id),
+                )
+            connection.commit()
+            return payload
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_outbox_retry(self, item_id: int) -> None:
+        self._set_outbox_delivery_state(item_id, "retry_pending")
+
+    def purge_delivered_telemetry(self, cutoff: datetime) -> int:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM event_telemetry
+                WHERE created_at < ?
+                  AND EXISTS (
+                    SELECT 1 FROM outbox
+                    WHERE outbox.event_id = event_telemetry.event_id
+                      AND outbox.completed_at IS NOT NULL
+                  )
+                """,
+                (_timestamp(cutoff),),
+            )
+        return cursor.rowcount
+
     def pending_evidence_digests(self) -> set[str]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -341,11 +498,80 @@ class LocalStore:
             connection.execute("DELETE FROM command_ack_outbox WHERE command_id = ?", (command_id,))
 
     def complete_outbox_item(self, item_id: int, completed_at: datetime | None = None) -> None:
-        with closing(self._connect()) as connection, connection:
+        self._set_outbox_delivery_state(
+            item_id, "delivered", completed_at or datetime.now(timezone.utc)
+        )
+
+    def _set_outbox_delivery_state(self, item_id: int, state: str,
+                                   completed_at: datetime | None = None) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT event_id, payload FROM outbox WHERE id = ? AND completed_at IS NULL",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return
+            event_id, payload_text = row
+            payload = json.loads(payload_text)
+            telemetry_row = connection.execute(
+                "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if telemetry_row is not None:
+                telemetry = json.loads(telemetry_row[0])
+                attempt = telemetry.get("delivery", {}).get("outbox_attempt", 0)
+                telemetry["delivery"] = {
+                    "outbox_attempt": min(max(int(attempt), 0), MAX_DELIVERY_ATTEMPT),
+                    "state": state,
+                }
+                self._write_telemetry_payload(connection, event_id, telemetry)
+                payload["schema_version"] = 3
+                payload["telemetry"] = telemetry
             connection.execute(
-                "UPDATE outbox SET completed_at = ? WHERE id = ?",
-                (_timestamp(completed_at or datetime.now(timezone.utc)), item_id),
+                """
+                UPDATE outbox SET payload = ?, completed_at = ?
+                WHERE id = ? AND completed_at IS NULL
+                """,
+                (
+                    _encode_json(payload),
+                    _timestamp(completed_at) if completed_at is not None else None,
+                    item_id,
+                ),
             )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _write_telemetry_payload(connection: sqlite3.Connection, event_id: int,
+                                 telemetry: dict) -> None:
+        connection.execute(
+            "UPDATE event_telemetry SET payload = ? WHERE event_id = ?",
+            (_encode_json(telemetry), event_id),
+        )
+
+    @staticmethod
+    def _promote_pending_outbox(connection: sqlite3.Connection, event_id: int,
+                                telemetry: dict) -> None:
+        row = connection.execute(
+            "SELECT id, payload FROM outbox WHERE event_id = ? AND completed_at IS NULL",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return
+        outbox_id, payload_text = row
+        payload = json.loads(payload_text)
+        payload["schema_version"] = 3
+        payload["telemetry"] = telemetry
+        connection.execute(
+            "UPDATE outbox SET payload = ? WHERE id = ? AND completed_at IS NULL",
+            (_encode_json(payload), outbox_id),
+        )
 
     def _event_id(self, idempotency_key: str) -> int | None:
         with closing(self._connect()) as connection:
@@ -501,9 +727,17 @@ class LocalStore:
                     command_id TEXT PRIMARY KEY, status TEXT NOT NULL,
                     detail TEXT, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS event_telemetry (
+                    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                    trace_id TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS events_relay_cooldown ON events (opened, relay_activated_at);
                 CREATE INDEX IF NOT EXISTS events_received_cooldown ON events (opened, received_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_per_event ON outbox (event_id);
+                CREATE INDEX IF NOT EXISTS event_telemetry_created_at
+                    ON event_telemetry (created_at);
             """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(actuation_claims)")}
             for name in (
@@ -692,6 +926,46 @@ def _decode_optional_json(encoded: str | None) -> dict | None:
 
 def _timestamp(value: datetime) -> str:
     return _as_utc(value).isoformat()
+
+
+def _encode_json(value: dict) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _telemetry_payload(telemetry: EventTelemetry) -> dict:
+    raw = telemetry.to_wire()
+    if raw.get("schema_version") != 3:
+        raise ValueError("telemetry must use schema version 3")
+    return {
+        "trace_id": raw["trace_id"],
+        "taxonomy_version": raw["taxonomy_version"],
+        "stage_durations": dict(raw["stage_durations"]),
+        "frames": [
+            {key: frame[key] for key in _TELEMETRY_FRAME_KEYS if key in frame}
+            for frame in raw["frames"]
+        ],
+        "ocr_attempts": [
+            {key: attempt[key] for key in _TELEMETRY_OCR_KEYS if key in attempt}
+            for attempt in raw["ocr_attempts"]
+        ],
+        "decision": dict(raw["decision"]),
+        "actuation": dict(raw["actuation"]),
+        "delivery": dict(raw["delivery"]),
+    }
+
+
+def _same_trace(left: dict, right: dict) -> bool:
+    left_immutable = dict(left)
+    right_immutable = dict(right)
+    left_immutable.pop("delivery", None)
+    right_immutable.pop("delivery", None)
+    left_durations = dict(left_immutable.get("stage_durations", {}))
+    right_durations = dict(right_immutable.get("stage_durations", {}))
+    left_durations.pop("delivery_lag_ms", None)
+    right_durations.pop("delivery_lag_ms", None)
+    left_immutable["stage_durations"] = left_durations
+    right_immutable["stage_durations"] = right_durations
+    return left_immutable == right_immutable
 
 
 def _optional_timestamp(value: datetime | None) -> str | None:

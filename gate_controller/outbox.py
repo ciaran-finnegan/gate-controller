@@ -4,6 +4,7 @@ import os
 import tempfile
 import warnings
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from threading import Event
@@ -202,7 +203,8 @@ class OutboxWorker:
 
     def __init__(self, store, send: Callable[..., None], poll_interval: float = 5.0, *,
                  evidence_spool: EvidenceSpool | None = None,
-                 controller_id: str = "primary"):
+                 controller_id: str = "primary",
+                 clock: Callable[[], datetime] | None = None):
         self._store = store
         self._send = send
         self._poll_interval = poll_interval
@@ -210,6 +212,8 @@ class OutboxWorker:
             self._store.path.parent / "event-evidence"
         )
         self._controller_id = controller_id
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._last_retention_at: datetime | None = None
         try:
             self._store.bind_pending_outbox_controller(self._controller_id)
             self._evidence_spool.cleanup(self._store.pending_evidence_digests())
@@ -229,17 +233,29 @@ class OutboxWorker:
         return self._store.queue_outbox(event_id, self.prepare_payload())
 
     def run_once(self) -> int:
+        now = self._clock()
+        self._run_retention(now)
         completed = 0
-        for item_id, payload in self._store.pending_outbox_items():
+        for item_id, _queued_payload in self._store.pending_outbox_items():
             try:
+                payload = self._store.prepare_outbox_attempt(item_id, self._clock())
+                if payload is None:
+                    continue
                 image_digest = payload.get("image_sha256")
                 if image_digest is None:
                     self._send(payload)
                 else:
                     self._send(payload, self._evidence_spool.load(image_digest))
             except Exception:
+                try:
+                    self._store.mark_outbox_retry(item_id)
+                except Exception:
+                    pass
                 continue
-            self._store.complete_outbox_item(item_id)
+            try:
+                self._store.complete_outbox_item(item_id, self._clock())
+            except Exception:
+                continue
             if (
                 image_digest is not None
                 and image_digest not in self._store.pending_evidence_digests()
@@ -250,6 +266,18 @@ class OutboxWorker:
                     pass
             completed += 1
         return completed
+
+    def _run_retention(self, now: datetime) -> None:
+        if (
+            self._last_retention_at is not None
+            and now - self._last_retention_at < timedelta(hours=1)
+        ):
+            return
+        self._last_retention_at = now
+        try:
+            self._store.purge_delivered_telemetry(now - timedelta(days=30))
+        except Exception:
+            pass
 
     def run_forever(self, stop_event: Event) -> None:
         while not stop_event.is_set():

@@ -475,6 +475,47 @@ class GateProcessorTests(unittest.TestCase):
             trace_factory=lambda **kwargs: FailingTelemetryTrace("finish", **kwargs)
         )
 
+    def test_telemetry_persistence_failure_does_not_change_terminal_result(self):
+        class FailingTelemetryStore(LocalStore):
+            def attach_event_telemetry(self, event_id, telemetry):
+                raise sqlite3.OperationalError("telemetry disk full")
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            store = FailingTelemetryStore(Path(directory) / "gate.db")
+            relay_calls = []
+
+            result = self._processor(
+                store,
+                RecordingRelay(relay_calls),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+                outbox=object(),
+            ).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(result.reason, "exact_match")
+            self.assertIsNotNone(result.event_id)
+            self.assertIsNotNone(result.telemetry)
+            self.assertEqual(relay_calls, ["relay"])
+            self.assertEqual(store.event_payload(result.event_id)["reason"], "exact_match")
+
+    def test_terminal_result_telemetry_is_attached_to_its_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("NOPE", 0.95)),
+                outbox=object(),
+            ).process((frame,))
+
+            self.assertEqual(
+                store.event_telemetry(result.event_id)["trace_id"],
+                result.telemetry.trace_id,
+            )
+
     def test_after_relay_telemetry_failure_does_not_change_successful_processing(self):
         for operation in ("mark_relay_activation", "set_actuation_outcome"):
             with self.subTest(operation=operation):
