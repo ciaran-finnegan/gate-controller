@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll for a verified gate controller release
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=15s
+Persistent=true
+Unit=gate-controller-updater.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,36 @@
+[Unit]
+Description=CI-gated gate controller release updater
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsSymbolicLink=/opt/gate-controller-deploy/current
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/gate-controller-updater.env
+ExecStart=/usr/bin/flock --nonblock /run/gate-controller-updater/update.lock /usr/bin/python3 /usr/local/libexec/gate-controller/gate-controller-updater.py
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+RuntimeDirectory=gate-controller-updater
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/opt/gate-controller-deploy /run/gate-controller-updater
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -1,0 +1,327 @@
+import unittest
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+import gate_controller.__main__ as gate_main
+from gate_controller.__main__ import build_background_workers, default_runtime_paths
+from gate_controller.actuation import ActuationCoordinator
+from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
+from gate_controller.control_plane import CommandWorker, HeartbeatWorker
+from gate_controller.outbox import OutboxWorker
+from gate_controller.store import LocalStore
+
+
+class MainConfigurationTests(unittest.TestCase):
+    def test_main_forces_relay_safe_before_store_and_recovers_before_workers(self):
+        calls = []
+
+        class Relay:
+            def shutdown(self):
+                calls.append("relay_shutdown")
+
+        class Store:
+            path = Path("gate.db")
+
+            def recover_interrupted_actuations(self):
+                calls.append("recover")
+
+        class Authorised:
+            def get(self):
+                return ()
+
+        relay = Relay()
+        store = Store()
+
+        def create_relay(_adapter):
+            calls.append("relay")
+            return relay
+
+        def create_store(_path):
+            calls.append("store")
+            return store
+
+        with patch.dict(
+            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController", side_effect=create_relay
+        ), patch.object(
+            gate_main, "LocalStore", side_effect=create_store
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache", return_value=Authorised()
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker"):
+            gate_main.main()
+
+        self.assertLess(calls.index("relay"), calls.index("store"))
+        self.assertLess(calls.index("store"), calls.index("recover"))
+
+    def test_partial_supabase_configuration_fails_closed(self):
+        configurations = (
+            {"SUPABASE_URL": "https://project.supabase.co"},
+            {"SUPABASE_SERVICE_ROLE_KEY": "service-key"},
+            {
+                "SUPABASE_URL": "https://project.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "   ",
+            },
+        )
+        for environment in configurations:
+            with self.subTest(environment=environment):
+                store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+                self.addCleanup(
+                    lambda store=store: store.path.parent.exists()
+                    and __import__("shutil").rmtree(store.path.parent)
+                )
+
+                with self.assertRaisesRegex(ValueError, "SUPABASE_URL.*SUPABASE_SERVICE_ROLE_KEY"):
+                    build_background_workers(
+                        store, relay=object(), environment=environment, latest_image={}
+                    )
+
+    def test_configured_camera_upload_receiver_is_ready_before_the_first_vehicle(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        camera_directory = store.path.parent / "uploads"
+        camera_directory.mkdir()
+
+        _, _, status = build_background_workers(
+            store, relay=object(), environment={}, latest_image={},
+            camera_directory=camera_directory,
+        )
+
+        snapshot = status()
+        self.assertTrue(snapshot["camera_configured"])
+        self.assertTrue(snapshot["camera_upload_ready"])
+        self.assertIsNone(snapshot["last_camera_upload_at"])
+        self.assertFalse(snapshot["camera_upload_recent"])
+        self.assertFalse(snapshot["camera_connection_probed"])
+        self.assertIsNone(snapshot["camera_connected"])
+        self.assertNotIn("camera_available", snapshot)
+
+    def test_camera_inactivity_does_not_make_the_upload_receiver_unready(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        now = datetime.now(timezone.utc)
+        latest_image = {
+            "path": "/var/lib/gate-controller/uploads/latest.jpg",
+            "received_at": (now - timedelta(seconds=2)).isoformat(),
+        }
+        camera_directory = store.path.parent / "uploads"
+        camera_directory.mkdir()
+
+        _, _, status = build_background_workers(
+            store, relay=object(), environment={"GATE_CAMERA_STALE_SECONDS": "1"},
+            latest_image=latest_image, camera_directory=camera_directory,
+        )
+
+        snapshot = status()
+        self.assertTrue(snapshot["camera_upload_ready"])
+        self.assertFalse(snapshot["camera_upload_recent"])
+
+    def test_recent_camera_upload_is_reported_as_activity(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        latest_image = {
+            "path": "/var/lib/gate-controller/uploads/latest.jpg",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        camera_directory = store.path.parent / "uploads"
+        camera_directory.mkdir()
+
+        _, _, status = build_background_workers(
+            store, relay=object(), environment={"GATE_CAMERA_STALE_SECONDS": "60"},
+            latest_image=latest_image, camera_directory=camera_directory,
+        )
+
+        self.assertTrue(status()["camera_upload_recent"])
+
+    def test_status_includes_only_measured_relay_readiness_and_outcome(self):
+        class MeasuredRelay:
+            def status(self):
+                return {
+                    "ready": True,
+                    "last_outcome": "activated",
+                    "last_outcome_at": "2026-08-14T10:00:00+00:00",
+                }
+
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        _, _, status = build_background_workers(
+            store, relay=MeasuredRelay(), environment={}, latest_image={}
+        )
+
+        self.assertEqual(status()["relay"], {
+            "ready": True,
+            "last_outcome": "activated",
+            "last_outcome_at": "2026-08-14T10:00:00+00:00",
+        })
+
+    def test_outbox_url_requires_a_nonempty_bearer_token(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        with self.assertRaisesRegex(ValueError, "GATE_OUTBOX_BEARER_TOKEN"):
+            build_background_workers(store, relay=object(), environment={
+                "GATE_OUTBOX_URL": "https://sync.example/events",
+                "GATE_OUTBOX_BEARER_TOKEN": "   ",
+            })
+
+    def test_outbox_rejects_plain_http_for_non_loopback_hosts(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            build_background_workers(store, relay=object(), environment={
+                "GATE_OUTBOX_URL": "http://sync.example/events",
+                "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
+            })
+
+    def test_outbox_allows_authenticated_plain_http_on_loopback_for_local_testing(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        workers, _, _ = build_background_workers(store, relay=object(), environment={
+            "GATE_OUTBOX_URL": "http://127.0.0.1:54321/events",
+            "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
+        })
+
+        self.assertEqual([type(worker) for worker in workers], [OutboxWorker])
+
+    def test_runtime_path_defaults_use_the_writable_state_directory(self):
+        authorised, database = default_runtime_paths({})
+
+        self.assertEqual(
+            authorised, Path("/var/lib/gate-controller/authorised_licence_plates.csv")
+        )
+        self.assertEqual(database, Path("/var/lib/gate-controller/gate-controller.db"))
+
+    def test_example_authorisation_snapshot_uses_the_writable_state_directory(self):
+        example = Path(".env.example").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "GATE_AUTHORISED_PLATES=/var/lib/gate-controller/authorised_licence_plates.csv",
+            example,
+        )
+
+    def test_image_runtime_limits_are_configurable(self):
+        self.assertEqual(gate_main.image_runtime_limits({
+            "GATE_MAX_BURST_CANDIDATES": "5",
+            "GATE_MAX_CANDIDATE_IMAGE_BYTES": "1048576",
+        }), (5, 1048576))
+
+    def test_image_runtime_limits_reject_nonpositive_values(self):
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            gate_main.image_runtime_limits({"GATE_MAX_BURST_CANDIDATES": "0"})
+
+    def test_image_runtime_limits_reject_unsafe_upper_bounds(self):
+        unsafe = (
+            {"GATE_MAX_BURST_CANDIDATES": "17"},
+            {"GATE_MAX_CANDIDATE_IMAGE_BYTES": str(16 * 1024 * 1024 + 1)},
+        )
+        for environment in unsafe:
+            with self.subTest(environment=environment), self.assertRaisesRegex(
+                ValueError, "safe maximum"
+            ):
+                gate_main.image_runtime_limits(environment)
+
+    def test_example_environment_documents_candidate_limits(self):
+        example = Path(".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("GATE_MAX_BURST_CANDIDATES=8", example)
+        self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
+
+    def test_builds_optional_background_workers_without_changing_the_image_processor(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
+        environment = {
+            "SUPABASE_URL": "https://project.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            "GATE_CONTROLLER_ID": "pi-front-gate",
+            "GATE_OUTBOX_URL": "https://sync.example/events",
+            "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
+            "GATE_PROMPT_ARRIVAL": "/opt/gate-controller/prompts/arrival.wav",
+        }
+
+        plates = store.path.parent / "plates.csv"
+        plates.write_text("plate\n", encoding="utf-8")
+        workers, prompt_player, status = build_background_workers(
+            store, relay=object(), environment=environment,
+            authorised=AuthorisedPlateCache(plates),
+        )
+
+        self.assertEqual([type(worker) for worker in workers],
+                         [OutboxWorker, AuthorisationRefreshWorker, CommandWorker, HeartbeatWorker])
+        self.assertEqual(workers[0].prepare_payload()["controller_id"], "pi-front-gate")
+        self.assertTrue(prompt_player.available)
+        self.assertEqual(status()["queue_depth"], 0)
+        self.assertTrue(status()["audio_available"])
+        self.assertFalse(status()["camera_configured"])
+
+    def test_injects_the_shared_actuation_coordinator_into_command_workers(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
+        coordinator = ActuationCoordinator(store, relay=object())
+        environment = {
+            "SUPABASE_URL": "https://project.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            "GATE_CONTROLLER_ID": "pi-front-gate",
+        }
+
+        workers, _, _ = build_background_workers(
+            store, relay=object(), environment=environment, coordinator=coordinator
+        )
+
+        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
+        self.assertIs(command_worker._coordinator, coordinator)
+
+    def test_defaults_the_supabase_controller_identity_to_primary(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
+        workers, _, _ = build_background_workers(store, relay=object(), environment={
+            "SUPABASE_URL": "https://project.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+        })
+
+        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
+        self.assertEqual(command_worker._control_plane._controller_id, "primary")
+
+    def test_empty_supabase_controller_identity_also_defaults_to_primary(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
+        workers, _, _ = build_background_workers(store, relay=object(), environment={
+            "SUPABASE_URL": "https://project.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            "GATE_CONTROLLER_ID": "",
+        })
+
+        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
+        self.assertEqual(command_worker._control_plane._controller_id, "primary")
+
+
+if __name__ == "__main__":
+    unittest.main()
