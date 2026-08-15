@@ -1,0 +1,127 @@
+import tempfile
+import unittest
+from math import inf, nan
+from pathlib import Path
+from unittest.mock import patch
+
+from gate_controller.ocr import OcrResponseError, PlateRecognizerClient
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, json_error=None):
+        self.status_code = status_code
+        self._payload = payload
+        self._json_error = json_error
+
+    def json(self):
+        if self._json_error:
+            raise self._json_error
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def post(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class OcrClientTests(unittest.TestCase):
+    def setUp(self):
+        self.image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        self.image.write(b"test image")
+        self.image.close()
+        self.path = Path(self.image.name)
+
+    def tearDown(self):
+        self.path.unlink(missing_ok=True)
+
+    def test_propagates_request_timeout(self):
+        session = FakeSession(error=TimeoutError("request timed out"))
+        client = PlateRecognizerClient("token", session=session)
+
+        with self.assertRaisesRegex(TimeoutError, "request timed out"):
+            client.recognise(self.path)
+
+    def test_rejects_non_success_http_response(self):
+        client = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(status_code=503))
+        )
+
+        with self.assertRaisesRegex(OcrResponseError, "503"):
+            client.recognise(self.path)
+
+    def test_rejects_malformed_response_payload(self):
+        client = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(payload={"results": {}}))
+        )
+
+        with self.assertRaises(OcrResponseError):
+            client.recognise(self.path)
+
+    def test_returns_an_unknown_observation_for_an_empty_result_set(self):
+        client = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(payload={"results": []}))
+        )
+
+        observation = client.recognise(self.path)
+
+        self.assertIsNone(observation.plate)
+        self.assertEqual(observation.confidence, 0.0)
+
+    def test_extracts_plate_and_confidence_from_the_first_result(self):
+        session = FakeSession(
+            response=FakeResponse(
+                payload={"results": [{"plate": "12D 3456", "score": 0.93}]}
+            )
+        )
+        client = PlateRecognizerClient("token", session=session)
+
+        observation = client.recognise(self.path)
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertEqual(observation.confidence, 0.93)
+        self.assertEqual(session.calls[0][1]["timeout"], (1, 2))
+
+    def test_reuses_the_default_http_session_across_recognition_calls(self):
+        sessions = []
+
+        def create_session():
+            session = FakeSession(
+                response=FakeResponse(
+                    payload={"results": [{"plate": "12D3456", "score": 0.93}]}
+                )
+            )
+            sessions.append(session)
+            return session
+
+        with patch.object(PlateRecognizerClient, "_create_session", side_effect=create_session):
+            client = PlateRecognizerClient("token")
+            client.recognise(self.path)
+            client.recognise(self.path)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(len(sessions[0].calls), 2)
+
+    def test_rejects_confidence_outside_the_closed_zero_to_one_range(self):
+        for score in (-0.01, 1.01, nan, inf, -inf):
+            with self.subTest(score=score):
+                client = PlateRecognizerClient(
+                    "token",
+                    session=FakeSession(response=FakeResponse(
+                        payload={"results": [{"plate": "12D3456", "score": score}]}
+                    )),
+                )
+
+                with self.assertRaisesRegex(OcrResponseError, "confidence"):
+                    client.recognise(self.path)
+
+
+if __name__ == "__main__":
+    unittest.main()

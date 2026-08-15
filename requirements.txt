@@ -1,5 +1,12 @@
-Pillow==10.0.1
-python_Levenshtein==0.21.1
-Requests==2.31.0
-telepot==12.7
-watchdog==3.0.0
+Pillow==12.3.0
+requests==2.34.2
+watchdog==6.0.0
+
+# Exact transitive dependencies of requests; keep these aligned with its metadata.
+certifi==2026.7.22
+charset-normalizer==3.5.0
+idna==3.18
+urllib3==2.7.0
+
+# Required only on the Raspberry Pi that directly drives the bundled PiRelay adapter.
+RPi.GPIO==0.7.1; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"

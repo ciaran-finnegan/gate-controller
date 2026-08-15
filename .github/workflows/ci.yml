@@ -1,0 +1,88 @@
+name: Gate Controller CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-controller-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Gate controller tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install application requirements
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run complete unit suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python sources
+        run: python -m compileall -q gate_controller deployment tests
+
+  deployment-syntax:
+    name: Deployment syntax checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check shell syntax
+        run: |
+          bash -n deployment/install.sh
+          sh -n file_monitor.sh
+
+      - name: Check Python syntax
+        run: python -m compileall -q gate_controller deployment tests
+
+      - name: Check systemd unit syntax
+        run: |
+          sudo groupadd --force gpio
+          id gate-controller >/dev/null 2>&1 || sudo useradd --system --user-group --no-create-home gate-controller
+          sudo usermod -aG gpio gate-controller
+          sudo touch /etc/gate-controller.env
+          python -m venv .venv
+          mkdir -p "$RUNNER_TEMP/gate-controller-units"
+          sed "s|/opt/gate-controller-deploy/current|$GITHUB_WORKSPACE|g" \
+            file-monitor.service \
+            >"$RUNNER_TEMP/gate-controller-units/file-monitor.service"
+          sed "s|/opt/gate-controller-deploy/current|$GITHUB_WORKSPACE|g" \
+            deployment/systemd/gate-controller-updater.service \
+            >"$RUNNER_TEMP/gate-controller-units/gate-controller-updater.service"
+          cp deployment/systemd/gate-controller-updater.timer \
+            "$RUNNER_TEMP/gate-controller-units/gate-controller-updater.timer"
+          systemd-analyze verify \
+            "$RUNNER_TEMP/gate-controller-units/file-monitor.service" \
+            "$RUNNER_TEMP/gate-controller-units/gate-controller-updater.service" \
+            "$RUNNER_TEMP/gate-controller-units/gate-controller-updater.timer"
