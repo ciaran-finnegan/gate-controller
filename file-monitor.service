@@ -12,7 +12,7 @@ Group=gate-controller
 SupplementaryGroups=gpio
 WorkingDirectory=/var/lib/gate-controller
 EnvironmentFile=/etc/gate-controller.env
-Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/gate-controller-deploy/current
 ExecStartPre=/opt/gate-controller-deploy/current/.venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), "gate-controller requires Python 3.10+"'
 ExecStartPre=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller.relay_safe
 ExecStart=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller

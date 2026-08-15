@@ -32,6 +32,10 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
             "/var/lib/gate-controller",
             service.get("WorkingDirectory"),
         )
+        self.assertIn(
+            "PYTHONPATH=/opt/gate-controller-deploy/current",
+            service.get("Environment", ""),
+        )
         self.assertTrue(
             service.get("ExecStart", "").startswith(
                 "/opt/gate-controller-deploy/current/"
