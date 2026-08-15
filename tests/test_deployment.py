@@ -29,7 +29,7 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertEqual("gate-controller", service.get("Group"))
         self.assertEqual("0710", service.get("StateDirectoryMode"))
         self.assertEqual(
-            "/opt/gate-controller-deploy/current",
+            "/var/lib/gate-controller",
             service.get("WorkingDirectory"),
         )
         self.assertTrue(
