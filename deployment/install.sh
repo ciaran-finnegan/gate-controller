@@ -24,8 +24,10 @@ PREVIOUS_CURRENT=
 ACTIVATION_STARTED=false
 INSTALL_SUCCEEDED=false
 APP_WAS_ENABLED=false
+APP_WAS_ACTIVE=false
 UPDATER_WAS_ENABLED=false
 TRUST_ANCHOR_HANDOFF=
+FTP_PREVIOUS_HOME=
 
 usage() {
   cat <<'EOF'
@@ -206,6 +208,24 @@ configure_upload_directory() {
     || fail "$app_user cannot watch $upload_root"
 }
 
+configure_ftp_home() {
+  local ftp_user=$1
+  local upload_root=$2
+
+  usermod --home "$upload_root" "$ftp_user"
+}
+
+restore_application_activity() {
+  local previous_unit=$1
+  local was_active=$2
+
+  if [[ -f $previous_unit && $was_active == true ]]; then
+    systemctl restart "$APP_SERVICE"
+  else
+    systemctl stop "$APP_SERVICE"
+  fi
+}
+
 migrate_legacy_authorised_plates() {
   local legacy_file=$1
   local persistent_file=$2
@@ -279,6 +299,13 @@ install -d -o root -g root -m 0755 "${UPDATE_LOCK%/*}"
 acquire_install_lock "$UPDATE_LOCK"
 id "$FTP_USER" >/dev/null 2>&1 \
   || fail "the FTP upload account is required: $FTP_USER"
+while IFS=: read -r account _ _ _ _ home _; do
+  if [[ $account == "$FTP_USER" ]]; then
+    FTP_PREVIOUS_HOME=$home
+    break
+  fi
+done < <(getent passwd "$FTP_USER")
+[[ -n $FTP_PREVIOUS_HOME ]] || fail "cannot determine the home for $FTP_USER"
 
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
   || fail "Python 3.10 or newer is required"
@@ -383,6 +410,7 @@ rollback() {
     restore_path "$UPDATER_SERVICE"
     restore_path "$UPDATER_TIMER"
     restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+    configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
     if [[ $UPDATER_WAS_ENABLED == false ]]; then
       systemctl disable --now "$UPDATER_TIMER"
     fi
@@ -390,9 +418,7 @@ rollback() {
       systemctl disable "$APP_SERVICE"
     fi
     systemctl daemon-reload
-    if [[ -f $BACKUP_DIR/$APP_SERVICE ]]; then
-      systemctl restart "$APP_SERVICE"
-    fi
+    restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
   fi
   cleanup
   exit "$original_status"
@@ -441,11 +467,15 @@ fi
 if systemctl is-enabled --quiet "$APP_SERVICE"; then
   APP_WAS_ENABLED=true
 fi
+if systemctl is-active --quiet "$APP_SERVICE"; then
+  APP_WAS_ACTIVE=true
+fi
 if systemctl is-enabled --quiet "$UPDATER_TIMER"; then
   UPDATER_WAS_ENABLED=true
 fi
 
 ACTIVATION_STARTED=true
+configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"
 install_fixed_trust_anchors "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT" "$UPDATER_HELPER"
 rm -f -- "$CURRENT_LINK.new"
 ln -s "$RELEASE" "$CURRENT_LINK.new"

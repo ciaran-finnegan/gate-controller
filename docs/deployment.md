@@ -116,9 +116,12 @@ hardware relay or monostable timer for a fail-safe physical upper bound.
 
 Bootstrap adds `ftp-user` to the `gate-controller` group, configures
 `/var/lib/gate-controller` as `gate-controller:gate-controller` mode `0710`, and
-creates `uploads` as `ftp-user:gate-controller` mode `2770`. It then checks that
-the FTP account can traverse state and write uploads and that the application
-account can read and watch uploads. Any failed access check stops bootstrap.
+creates `uploads` as `ftp-user:gate-controller` mode `2770`. During activation it
+changes the FTP account home to that uploads directory, restoring the previous
+home if activation rolls back. It then checks that the FTP account can traverse
+state and write uploads and that the application account can read and watch
+uploads. Any failed access check stops bootstrap. FTP daemons with an explicit
+`local_root` must point it at the same directory.
 
 Configure the FTP daemon to create group-readable files. For vsftpd, use a local
 umask equivalent to `0007`; apply the corresponding owner/group and umask policy

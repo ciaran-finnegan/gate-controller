@@ -39,6 +39,7 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         )
         self.assertIn("-m gate_controller.relay_safe", service.get("ExecStartPre", ""))
         self.assertIn("-m gate_controller.relay_safe", service.get("ExecStopPost", ""))
+        self.assertFalse(service.get("ExecStopPost", "").startswith("-"))
         self.assertEqual("always", service.get("Restart"))
         self.assertEqual("512M", service.get("MemoryMax"))
 
@@ -481,6 +482,7 @@ configure_upload_directory \
   {shlex.quote(str(state_root))} \
   {shlex.quote(str(uploads))} \
   ftp-user gate-controller gate-controller
+configure_ftp_home ftp-user {shlex.quote(str(uploads))}
 """
 
             completed = subprocess.run(
@@ -502,8 +504,56 @@ configure_upload_directory \
                 account_actions,
             )
             self.assertIn("usermod -aG gate-controller ftp-user", account_actions)
+            self.assertIn(
+                f"usermod --home {uploads} ftp-user",
+                account_actions,
+            )
             self.assertIn("runuser ftp-user /usr/bin/test -w", account_actions)
             self.assertIn("runuser gate-controller /usr/bin/test -r", account_actions)
+
+    def test_rollback_restores_the_previous_application_activity(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            previous_unit = root / "file-monitor.service"
+            previous_unit.touch()
+            action_log = root / "actions.log"
+            command = f"""
+source deployment/install.sh
+systemctl() {{ printf '%s\n' "$*" >> {shlex.quote(str(action_log))}; }}
+restore_application_activity {shlex.quote(str(previous_unit))} false
+restore_application_activity {shlex.quote(str(previous_unit))} true
+rm {shlex.quote(str(previous_unit))}
+restore_application_activity {shlex.quote(str(previous_unit))} true
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "stop file-monitor.service",
+                    "restart file-monitor.service",
+                    "stop file-monitor.service",
+                ],
+                action_log.read_text().splitlines(),
+            )
+
+            installer = (REPOSITORY_ROOT / "deployment/install.sh").read_text()
+            self.assertIn('APP_WAS_ACTIVE=true', installer)
+            self.assertIn(
+                'restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"',
+                installer,
+            )
+            self.assertIn(
+                'configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"',
+                installer,
+            )
+            self.assertIn(
+                'configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"',
+                installer,
+            )
 
 
 class DependencyLockTests(unittest.TestCase):
