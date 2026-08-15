@@ -82,6 +82,10 @@ class FrameTelemetry:
     brightness: float
     darkness: float
     highlight_clipping: float
+    status: str = "ok"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _token(self.status))
 
     def to_wire(self) -> dict[str, object] | None:
         if not isinstance(self.digest, str) or not _SHA256.fullmatch(self.digest):

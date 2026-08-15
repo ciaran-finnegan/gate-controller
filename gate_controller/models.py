@@ -1,5 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .telemetry import EventTelemetry
 
 
 @dataclass(frozen=True)
@@ -72,3 +78,4 @@ class ProcessingResult:
     reason: str
     event_id: int | None = None
     decision: MatchDecision | None = None
+    telemetry: EventTelemetry | None = None
