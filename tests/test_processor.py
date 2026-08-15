@@ -1,13 +1,18 @@
+import hashlib
 import tempfile
 import unittest
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 from PIL import Image
 
+import gate_controller.images as image_tools
+import gate_controller.processor as processor_module
 from gate_controller.models import PlateObservation, RelayResult
 from gate_controller.outbox import EvidenceSpool, OutboxWorker
 from gate_controller.processor import GateProcessor
+from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
 from gate_controller.authorisation import AuthorisedPlateCache
 from gate_controller.images import rank_images
@@ -58,7 +63,8 @@ class RecordingRelay:
     def __init__(self, calls):
         self.calls = calls
 
-    def trigger(self, source, idempotency_key=None, *, pre_activation_inhibit=None):
+    def trigger(self, source, idempotency_key=None, *, pre_activation_inhibit=None,
+                on_activation=None):
         if pre_activation_inhibit is not None:
             inhibition = pre_activation_inhibit()
             if inhibition is not None:
@@ -68,6 +74,8 @@ class RecordingRelay:
                     idempotency_key=idempotency_key,
                 )
         self.calls.append("relay")
+        if on_activation is not None:
+            on_activation()
         return RelayResult(activated=True, reason="activated", idempotency_key=idempotency_key)
 
 
@@ -96,6 +104,46 @@ class RecordingOutbox:
 class FailingFinalizeStore(LocalStore):
     def finalize_actuation(self, claim, event):
         raise sqlite3.OperationalError("database unavailable after activation")
+
+
+class FailingTelemetryTrace:
+    def __init__(self, failure, **kwargs):
+        self._failure = failure
+        self._trace = ProcessingTrace(**kwargs)
+
+    def _call(self, operation, *args, **kwargs):
+        if self._failure == operation:
+            raise RuntimeError(f"{operation} telemetry failed")
+        return getattr(self._trace, operation)(*args, **kwargs)
+
+    def mark_burst(self):
+        return self._call("mark_burst")
+
+    def add_frame(self, frame):
+        return self._call("add_frame", frame)
+
+    def mark_ocr_start(self):
+        return self._call("mark_ocr_start")
+
+    def add_ocr_attempt(self, attempt):
+        return self._call("add_ocr_attempt", attempt)
+
+    def mark_decision(self, outcome, reason):
+        return self._call("mark_decision", outcome, reason)
+
+    def mark_relay_activation(self):
+        return self._call("mark_relay_activation")
+
+    def set_actuation_outcome(self, claim, attempted, relay_outcome):
+        return self._call("set_actuation_outcome", claim, attempted, relay_outcome)
+
+    def mark_actuation(self, claim, attempted, relay_outcome):
+        if self._failure in {"mark_relay_activation", "set_actuation_outcome"}:
+            raise RuntimeError(f"{self._failure} telemetry failed")
+        return self._trace.mark_actuation(claim, attempted, relay_outcome)
+
+    def finish(self):
+        return self._call("finish")
 
 
 class GateProcessorTests(unittest.TestCase):
@@ -152,7 +200,7 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(wire["ocr_attempts"], [{
             "frame_sequence": 0,
             "duration_ms": 50,
-            "status": "matched",
+            "status": "recognized",
             "plate": "12D3456",
             "confidence": 0.95,
             "make": "Ford",
@@ -231,13 +279,132 @@ class GateProcessorTests(unittest.TestCase):
                 recognizer,
             ).process((frame,))
 
-        attempt = result.telemetry.to_wire()["ocr_attempts"][0]
+        wire = result.telemetry.to_wire()
+        attempt = wire["ocr_attempts"][0]
         self.assertTrue(result.opened)
         self.assertEqual(recognizer.calls, [frame])
         self.assertEqual(relay_calls, ["relay"])
-        self.assertEqual(attempt["status"], "quality_unavailable")
+        self.assertEqual(wire["frames"][0]["status"], "quality_unavailable")
+        self.assertEqual(attempt["status"], "recognized")
         self.assertNotIn(str(frame), str(attempt))
         self.assertNotIn("do not expose", str(attempt))
+
+    def test_decision_to_relay_ends_at_activation_before_pulse_and_finalization(self):
+        trace_clock = MutableClock()
+        trace_clock.value = 10.0
+        calls = []
+
+        class BoundaryBackend:
+            def on(self):
+                calls.append("on")
+                trace_clock.value = 10.08
+
+            def off(self):
+                calls.append("off")
+
+        class AdvancingRecognizer(SequenceRecognizer):
+            def recognise(self, path):
+                result = super().recognise(path)
+                trace_clock.value = 10.05
+                return result
+
+        class AdvancingStore(LocalStore):
+            def finalize_actuation(self, *args, **kwargs):
+                calls.append("finalize")
+                trace_clock.value = 10.88
+                return super().finalize_actuation(*args, **kwargs)
+
+        def pulse(seconds):
+            calls.append(("sleep", seconds))
+            trace_clock.value = 10.58
+
+        recognizer = AdvancingRecognizer([PlateObservation("12D3456", 0.95)])
+        now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "activation.jpg")
+            store = AdvancingStore(Path(directory) / "gate.db")
+            relay = RelayController(
+                BoundaryBackend(), pulse_seconds=2, sleeper=pulse, clock=lambda: now
+            )
+            result = self._processor(
+                store,
+                relay,
+                recognizer,
+                clock=lambda: now,
+                telemetry_clock=trace_clock,
+            ).process((frame,))
+
+        durations = result.telemetry.to_wire()["stage_durations"]
+        self.assertTrue(result.opened)
+        self.assertEqual(recognizer.calls, [frame])
+        self.assertEqual(calls, ["off", "on", ("sleep", 2), "off", "finalize"])
+        self.assertEqual(durations["decision_to_relay_ms"], 30)
+        self.assertEqual(durations["end_to_end_ms"], 880)
+
+    def test_trace_factory_failure_does_not_change_successful_processing(self):
+        def fail_factory(**kwargs):
+            raise RuntimeError("trace creation failed")
+
+        self._assert_success_survives_telemetry_failure(trace_factory=fail_factory)
+
+    def test_quality_measurement_failure_does_not_change_successful_processing(self):
+        with patch(
+            "gate_controller.processor.measure_frame_quality",
+            side_effect=RuntimeError("quality failed"),
+        ):
+            self._assert_success_survives_telemetry_failure()
+
+    def test_trace_mark_failures_do_not_change_successful_processing(self):
+        for operation in (
+            "mark_burst",
+            "add_frame",
+            "mark_ocr_start",
+            "add_ocr_attempt",
+            "mark_decision",
+        ):
+            with self.subTest(operation=operation):
+                self._assert_success_survives_telemetry_failure(
+                    trace_factory=lambda operation=operation, **kwargs: FailingTelemetryTrace(
+                        operation, **kwargs
+                    )
+                )
+
+    def test_trace_finish_failure_does_not_suppress_the_processing_result(self):
+        self._assert_success_survives_telemetry_failure(
+            trace_factory=lambda **kwargs: FailingTelemetryTrace("finish", **kwargs)
+        )
+
+    def test_after_relay_telemetry_failure_does_not_change_successful_processing(self):
+        for operation in ("mark_relay_activation", "set_actuation_outcome"):
+            with self.subTest(operation=operation):
+                self._assert_success_survives_telemetry_failure(
+                    trace_factory=lambda operation=operation, **kwargs: FailingTelemetryTrace(
+                        operation, **kwargs
+                    )
+                )
+
+    def _assert_success_survives_telemetry_failure(self, trace_factory=None):
+        recognizer = SequenceRecognizer([PlateObservation("12D3456", 0.95)])
+        relay_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            kwargs = {} if trace_factory is None else {"trace_factory": trace_factory}
+            result = self._processor(
+                store,
+                RecordingRelay(relay_calls),
+                recognizer,
+                outbox=object(),
+                **kwargs,
+            ).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(result.reason, "exact_match")
+            self.assertIsNotNone(result.event_id)
+            self.assertIsNone(result.telemetry)
+            self.assertEqual(recognizer.calls, [frame])
+            self.assertEqual(relay_calls, ["relay"])
+            self.assertEqual(store.pending_outbox_count(), 1)
 
     def test_timeout_after_ocr_returns_a_finished_denied_trace_without_relay(self):
         decision_clock = MutableClock()
@@ -323,6 +490,106 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(len(created_traces), 1)
         self.assertEqual(recognizer.calls, [frame])
         self.assertEqual(relay_calls, ["relay"])
+
+    def test_direct_nonduplicate_skips_each_create_one_terminal_trace(self):
+        created_traces = []
+
+        def trace_factory(**kwargs):
+            trace = ProcessingTrace(**kwargs)
+            created_traces.append(trace)
+            return trace
+
+        recognizer = SequenceRecognizer([])
+        relay_calls = []
+        reasons = (
+            "candidate_coalesced",
+            "upload_incomplete",
+            "image_too_large",
+            "queue_coalesced",
+            "stale_startup",
+            "service_stopping",
+            "processing_error",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(
+                store,
+                RecordingRelay(relay_calls),
+                recognizer,
+                trace_factory=trace_factory,
+            )
+            results = [
+                processor.record_skipped(
+                    (self._jpeg(directory, f"{index}.jpg", 32 + index),), reason
+                )
+                for index, reason in enumerate(reasons)
+            ]
+
+        self.assertEqual(len(created_traces), len(reasons))
+        self.assertEqual(recognizer.calls, [])
+        self.assertEqual(relay_calls, [])
+        for result, reason in zip(results, reasons):
+            self.assertEqual(result.reason, reason)
+            self.assertEqual(result.telemetry.to_wire()["decision"], {
+                "outcome": "denied",
+                "reason": reason,
+            })
+
+    def test_direct_skip_trace_factory_failure_still_records_the_event(self):
+        def fail_factory(**kwargs):
+            raise RuntimeError("trace creation failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            frame = self._jpeg(directory, "skipped.jpg")
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                SequenceRecognizer([]),
+                outbox=object(),
+                trace_factory=fail_factory,
+            ).record_skipped((frame,), "processing_error")
+
+            self.assertEqual(result.reason, "processing_error")
+            self.assertIsNotNone(result.event_id)
+            self.assertIsNone(result.telemetry)
+            self.assertEqual(store.pending_outbox_count(), 1)
+
+    def test_processing_reuses_unique_frame_digests_for_identity_and_quality(self):
+        recognizer = SequenceRecognizer([
+            PlateObservation(None, 0.0),
+            PlateObservation("NOPE", 0.8),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 32),
+                self._jpeg(directory, "second.jpg", 224),
+            )
+            expected_digests = [
+                hashlib.sha256(frame.read_bytes()).hexdigest() for frame in frames
+            ]
+            store = LocalStore(Path(directory) / "gate.db")
+            with patch(
+                "gate_controller.processor._content_digest",
+                wraps=processor_module._content_digest,
+            ) as processor_digest, patch(
+                "gate_controller.images._content_digest",
+                wraps=image_tools._content_digest,
+            ) as quality_digest:
+                result = self._processor(
+                    store, RecordingRelay([]), recognizer
+                ).process(frames)
+
+            identity_exists = store.event_exists(expected_digests[0])
+
+        self.assertEqual(result.reason, "no_match")
+        self.assertTrue(identity_exists)
+        self.assertEqual(
+            [frame["digest"] for frame in result.telemetry.to_wire()["frames"]],
+            expected_digests,
+        )
+        self.assertEqual(processor_digest.call_count, len(frames))
+        quality_digest.assert_not_called()
 
     def test_activates_relay_before_persisting_or_queuing_optional_work(self):
         with tempfile.TemporaryDirectory() as directory:

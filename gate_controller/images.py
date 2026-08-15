@@ -14,13 +14,14 @@ QUALITY_UNAVAILABLE_DIGEST = hashlib.sha256(b"quality_unavailable").hexdigest()
 Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
 
 
-def measure_frame_quality(path: Path) -> FrameTelemetry:
+def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTelemetry:
     """Return bounded, downsampled quality proxies without exposing image paths."""
     path = Path(path)
-    try:
-        digest = _content_digest(path)
-    except OSError:
-        digest = QUALITY_UNAVAILABLE_DIGEST
+    if digest is None:
+        try:
+            digest = _content_digest(path)
+        except OSError:
+            digest = QUALITY_UNAVAILABLE_DIGEST
 
     try:
         if not _has_jpeg_signature(path):

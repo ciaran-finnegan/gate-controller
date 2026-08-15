@@ -99,6 +99,7 @@ class FrameTelemetry:
             "brightness": _ratio(self.brightness),
             "darkness": _ratio(self.darkness),
             "highlight_clipping": _ratio(self.highlight_clipping),
+            "status": self.status,
         }
 
 
@@ -228,6 +229,7 @@ class ProcessingTrace:
         self._ocr_work_ms = 0.0
         self._decision: float | None = None
         self._actuation: float | None = None
+        self._actuation_details_marked = False
         self._finished: float | None = None
         self._frames: list[FrameTelemetry] = []
         self._ocr_attempts: list[OcrAttemptTelemetry] = []
@@ -273,11 +275,22 @@ class ProcessingTrace:
             self._decision_reason = reason
 
     def mark_actuation(self, claim: str, attempted: bool, relay_outcome: str) -> None:
+        """Backward-compatible combined activation and outcome marker."""
+        self.mark_relay_activation()
+        self.set_actuation_outcome(claim, attempted, relay_outcome)
+
+    def mark_relay_activation(self) -> None:
         if self._actuation is None:
             self._actuation = self._monotonic_clock()
+
+    def set_actuation_outcome(
+        self, claim: str, attempted: bool, relay_outcome: str
+    ) -> None:
+        if not self._actuation_details_marked:
             self._actuation_claim = claim
             self._actuation_attempted = attempted
             self._relay_outcome = relay_outcome
+            self._actuation_details_marked = True
 
     def finish(
         self,

@@ -112,6 +112,7 @@ class TelemetryWireTests(unittest.TestCase):
                 "brightness": 0.4,
                 "darkness": 0.2,
                 "highlight_clipping": 0.1,
+                "status": "ok",
             }],
             "ocr_attempts": [{
                 "frame_sequence": 0,
@@ -142,6 +143,7 @@ class TelemetryWireTests(unittest.TestCase):
                 brightness=-1,
                 darkness=0.25,
                 highlight_clipping=3,
+                status="bad/status",
             )
             for index in range(9)
         )
@@ -188,6 +190,7 @@ class TelemetryWireTests(unittest.TestCase):
             "brightness": 0.0,
             "darkness": 0.25,
             "highlight_clipping": 1.0,
+            "status": "unknown",
         })
         self.assertEqual(wire["ocr_attempts"][0], {
             "frame_sequence": 7,
@@ -357,6 +360,32 @@ class ProcessingTraceTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             trace.add_ocr_attempt(OcrAttemptTelemetry(0, 0, "no_plate"))
+
+    def test_relay_duration_ends_at_activation_before_outcome_finalization(self):
+        monotonic = iter((10.0, 10.1, 10.2, 10.25, 10.9))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.mark_burst()
+        trace.mark_decision("allowed", "plate_authorised")
+        trace.mark_relay_activation()
+        trace.set_actuation_outcome("claimed", True, "activated")
+        telemetry = trace.finish()
+
+        self.assertEqual(telemetry.to_wire()["stage_durations"], {
+            "capture_to_burst_ms": 100,
+            "ocr_ms": 0,
+            "decision_to_relay_ms": 50,
+            "end_to_end_ms": 900,
+        })
+        self.assertEqual(telemetry.to_wire()["actuation"], {
+            "claim": "claimed",
+            "attempted": True,
+            "relay_outcome": "activated",
+        })
 
     def test_duplicate_actuation_and_finish_keep_the_first_terminal_snapshot(self):
         monotonic = iter((10.0, 10.1, 10.2, 10.3, 10.4))

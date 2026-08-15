@@ -1,3 +1,4 @@
+import inspect
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -22,7 +23,7 @@ class ActuationCoordinator:
 
     def actuate(self, event: GateEvent, *, outbox_payload: dict | None = None,
                 command_ack: tuple[str, datetime] | None = None,
-                pre_activation_inhibit=None) -> ActuationExecution:
+                pre_activation_inhibit=None, on_activation=None) -> ActuationExecution:
         key = event.idempotency_key
         if not key:
             raise ValueError("actuation events require an idempotency key")
@@ -96,18 +97,25 @@ class ActuationCoordinator:
                 return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
                                           "actuation_inhibit_error")
             inhibition = None
-            if pre_activation_inhibit is None:
-                relay_result = self._relay.trigger(event.source, idempotency_key=key)
-            else:
+            relay_kwargs = {"idempotency_key": key}
+            if pre_activation_inhibit is not None:
                 def check_inhibition():
                     nonlocal inhibition
                     inhibition = pre_activation_inhibit()
                     return inhibition
 
-                relay_result = self._relay.trigger(
-                    event.source, idempotency_key=key,
-                    pre_activation_inhibit=check_inhibition,
-                )
+                relay_kwargs["pre_activation_inhibit"] = check_inhibition
+            if on_activation is not None and _accepts_keyword(
+                self._relay.trigger, "on_activation"
+            ):
+                def notify_activation():
+                    try:
+                        on_activation()
+                    except Exception:
+                        pass
+
+                relay_kwargs["on_activation"] = notify_activation
+            relay_result = self._relay.trigger(event.source, **relay_kwargs)
             if inhibition is None:
                 self._last_attempt_monotonic = self._monotonic_clock()
             finalized = GateEvent(
@@ -149,3 +157,14 @@ def _linux_boot_id() -> str | None:
     except OSError:
         return None
     return boot_id or None
+
+
+def _accepts_keyword(callable_object, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )

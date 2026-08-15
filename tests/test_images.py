@@ -41,6 +41,18 @@ class ImageTests(unittest.TestCase):
                 self.assertGreaterEqual(metric, 0.0)
                 self.assertLessEqual(metric, 1.0)
 
+    def test_measure_frame_quality_reuses_a_precomputed_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "frame.jpg"
+            Image.new("L", (16, 8), color=128).save(frame, format="JPEG")
+            digest = hashlib.sha256(frame.read_bytes()).hexdigest()
+
+            with patch("gate_controller.images._content_digest") as content_digest:
+                quality = image_tools.measure_frame_quality(frame, digest=digest)
+
+            self.assertEqual(quality.digest, digest)
+            content_digest.assert_not_called()
+
     def test_measure_frame_quality_downsamples_before_filtering_for_sharpness(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = Path(directory) / "large.jpg"

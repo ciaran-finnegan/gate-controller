@@ -115,6 +115,40 @@ class RelayControllerTests(unittest.TestCase):
             "last_outcome_at": now.isoformat(),
         })
 
+    def test_activation_hook_runs_at_gpio_on_before_the_pulse(self):
+        backend = RecordingBackend()
+        calls = backend.calls
+        controller = RelayController(
+            backend,
+            pulse_seconds=2,
+            sleeper=lambda seconds: calls.append(("sleep", seconds)),
+        )
+
+        result = controller.trigger(
+            "ocr", "upload-1", on_activation=lambda: calls.append("activation")
+        )
+
+        self.assertTrue(result.activated)
+        self.assertEqual(calls, ["off", "on", "activation", ("sleep", 2), "off"])
+
+    def test_activation_hook_failure_does_not_change_the_relay_pulse(self):
+        backend = RecordingBackend()
+        calls = backend.calls
+        controller = RelayController(
+            backend,
+            pulse_seconds=2,
+            sleeper=lambda seconds: calls.append(("sleep", seconds)),
+        )
+
+        result = controller.trigger(
+            "ocr",
+            "upload-1",
+            on_activation=lambda: (_ for _ in ()).throw(RuntimeError("telemetry failed")),
+        )
+
+        self.assertTrue(result.activated)
+        self.assertEqual(calls, ["off", "on", ("sleep", 2), "off"])
+
     def test_initialization_and_shutdown_force_the_output_off(self):
         backend = RecordingBackend()
         controller = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
