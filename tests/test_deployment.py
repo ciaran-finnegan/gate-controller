@@ -284,6 +284,36 @@ install_fixed_trust_anchors {shlex.quote(str(handoff))} {shlex.quote(str(systemd
             self.assertEqual("existing\n", (existing / "keep").read_text())
             self.assertEqual("refreshed\n", helper.read_text())
 
+    def test_legacy_authorised_plates_are_migrated_once(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            legacy = root / "legacy.csv"
+            persistent = root / "authorised.csv"
+            legacy.write_text("plate,name\n131D2696,Felim\n")
+            command = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -o|-g) shift 2 ;; *) forwarded+=("$1"); shift ;; esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+migrate_legacy_authorised_plates \
+  {shlex.quote(str(legacy))} {shlex.quote(str(persistent))} app app
+printf 'replacement\n' > {shlex.quote(str(legacy))}
+migrate_legacy_authorised_plates \
+  {shlex.quote(str(legacy))} {shlex.quote(str(persistent))} app app
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("plate,name\n131D2696,Felim\n", persistent.read_text())
+            self.assertEqual(0o600, persistent.stat().st_mode & 0o777)
+
     def test_environment_file_rejects_insecure_mode_and_partial_supabase(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             env_file = Path(temporary_directory) / "gate-controller.env"

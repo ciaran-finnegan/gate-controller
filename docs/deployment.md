@@ -129,7 +129,9 @@ The legacy `/opt/gate-controller` directory is retained. If its old database is
 present at `/opt/gate-controller/data/gate-controller-database.db` and the new
 persistent database is absent, bootstrap copies it once to
 `/var/lib/gate-controller/gate-controller.db`. An existing persistent database
-is never replaced.
+is never replaced. The legacy `authorised_licence_plates.csv` is likewise copied
+once to `/var/lib/gate-controller/authorised_licence_plates.csv`; an existing
+persistent plate snapshot is never replaced.
 
 After bootstrap, verify both services:
 

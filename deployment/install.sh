@@ -206,6 +206,27 @@ configure_upload_directory() {
     || fail "$app_user cannot watch $upload_root"
 }
 
+migrate_legacy_authorised_plates() {
+  local legacy_file=$1
+  local persistent_file=$2
+  local owner=$3
+  local group=$4
+
+  if [[ -e $persistent_file || -L $persistent_file ]]; then
+    [[ -f $persistent_file && ! -L $persistent_file ]] \
+      || fail "$persistent_file must be a regular file"
+    return
+  fi
+  if [[ ! -e $legacy_file && ! -L $legacy_file ]]; then
+    return
+  fi
+  [[ -f $legacy_file && ! -L $legacy_file ]] \
+    || fail "$legacy_file must be a regular file"
+  install -m 0600 -o "$owner" -g "$group" \
+    "$legacy_file" "$persistent_file"
+  printf 'Migrated legacy authorised plates to %s\n' "$persistent_file"
+}
+
 verify_candidate_release() {
   local release=$1
 
@@ -309,6 +330,11 @@ usermod -aG gpio gate-controller
 
 configure_upload_directory \
   "$STATE_ROOT" "$UPLOAD_ROOT" "$FTP_USER" gate-controller gate-controller
+
+migrate_legacy_authorised_plates \
+  /opt/gate-controller/authorised_licence_plates.csv \
+  "$STATE_ROOT/authorised_licence_plates.csv" \
+  gate-controller gate-controller
 
 LEGACY_DATABASE=/opt/gate-controller/data/gate-controller-database.db
 PERSISTENT_DATABASE=$STATE_ROOT/gate-controller.db
