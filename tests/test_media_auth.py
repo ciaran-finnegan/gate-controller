@@ -1,0 +1,167 @@
+import base64
+import hashlib
+import hmac
+import json
+import time
+import unittest
+from pathlib import Path
+
+from gate_media_auth.__main__ import authorize_body
+from gate_media_auth.token import TokenValidationError, validate_media_token
+
+
+SECRET = "0123456789abcdef0123456789abcdef"
+
+
+def make_token(claims, secret=SECRET):
+    def encode(value):
+        return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+    header = encode(b'{"alg":"HS256","typ":"JWT"}')
+    payload = encode(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    signature = hmac.new(
+        secret.encode("utf-8"), f"{header}.{payload}".encode("ascii"), hashlib.sha256
+    ).digest()
+    return f"{header}.{payload}.{encode(signature)}"
+
+
+def valid_claims(now=1_700_000_000):
+    return {
+        "v": 1,
+        "sub": "viewer-42",
+        "controller": "primary",
+        "path": "gate",
+        "actions": ["read"],
+        "iat": now - 1,
+        "exp": now + 59,
+        "nonce": "nonce-42",
+    }
+
+
+class MediaTokenTests(unittest.TestCase):
+    def test_accepts_a_current_read_token_for_the_primary_gate(self):
+        claims = valid_claims()
+
+        result = validate_media_token(make_token(claims), SECRET, now=1_700_000_000)
+
+        self.assertEqual(claims, result)
+
+    def test_rejects_changed_payload_or_signature(self):
+        token = make_token(valid_claims())
+        header, payload, signature = token.split(".")
+        changed_payload = f"{header}.{payload[:-1]}{'A' if payload[-1] != 'A' else 'B'}.{signature}"
+        changed_signature = f"{header}.{payload}.{signature[:-1]}{'A' if signature[-1] != 'A' else 'B'}"
+
+        for value in (changed_payload, changed_signature):
+            with self.subTest(value=value), self.assertRaises(TokenValidationError):
+                validate_media_token(value, SECRET, now=1_700_000_000)
+
+    def test_rejects_expired_or_future_issued_tokens(self):
+        expired = valid_claims()
+        expired["exp"] = 1_699_999_999
+        future = valid_claims()
+        future["iat"] = 1_700_000_006
+
+        for claims in (expired, future):
+            with self.subTest(claims=claims), self.assertRaises(TokenValidationError):
+                validate_media_token(make_token(claims), SECRET, now=1_700_000_000)
+
+    def test_rejects_wrong_action_path_or_controller(self):
+        for field, value in (
+            ("actions", ["publish"]),
+            ("path", "other"),
+            ("controller", "secondary"),
+        ):
+            claims = valid_claims()
+            claims[field] = value
+            with self.subTest(field=field), self.assertRaises(TokenValidationError):
+                validate_media_token(make_token(claims), SECRET, now=1_700_000_000)
+
+    def test_rejects_malformed_base64_and_nonconstant_claim_shape(self):
+        malformed = ("not-base64", "a.b.c", "eyJhbGciOiJIUzI1NiJ9.!.signature")
+        extra_claim = valid_claims()
+        extra_claim["role"] = "admin"
+
+        for token in (*malformed, make_token(extra_claim)):
+            with self.subTest(token=token), self.assertRaises(TokenValidationError):
+                validate_media_token(token, SECRET, now=1_700_000_000)
+
+    def test_uses_compare_digest_for_signature_comparison(self):
+        source = (Path(__file__).resolve().parents[1] / "gate_media_auth/token.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("hmac.compare_digest", source)
+
+
+class MediaAuthServerTests(unittest.TestCase):
+    def test_returns_exact_200_for_valid_mediamtx_read_auth(self):
+        payload = json.dumps({
+            "user": "",
+            "password": "",
+            "token": make_token(valid_claims(int(time.time()))),
+            "ip": "127.0.0.1",
+            "action": "read",
+            "path": "gate",
+            "protocol": "webrtc",
+            "id": "session-42",
+            "query": "",
+            "userAgent": "test-agent",
+        })
+
+        status = authorize_body(payload.encode("utf-8"), SECRET, now=int(time.time()))
+
+        self.assertEqual(200, status)
+
+    def test_returns_exact_401_for_duplicate_unknown_or_missing_token_fields(self):
+        token = make_token(valid_claims(int(time.time())))
+        payloads = (
+            '{"token":"first","token":"second","action":"read","path":"gate"}',
+            json.dumps({"token": token, "action": "read", "path": "gate", "extra": True}),
+            json.dumps({"action": "read", "path": "gate"}),
+            json.dumps({"token": "Bearer ", "action": "read", "path": "gate"}),
+        )
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                status = authorize_body(payload.encode("utf-8"), SECRET, now=int(time.time()))
+                self.assertEqual(401, status)
+
+    def test_rejects_invalid_method_path_schema_and_oversized_requests(self):
+        invalid_action = json.dumps({
+            "token": make_token(valid_claims(int(time.time()))),
+            "action": "publish",
+            "path": "gate",
+        })
+        oversized = b"{" + (b"x" * 8_193) + b"}"
+
+        status = authorize_body(invalid_action.encode("utf-8"), SECRET, now=int(time.time()))
+        self.assertEqual(401, status)
+        status = authorize_body(oversized, SECRET, now=int(time.time()))
+        self.assertEqual(401, status)
+
+    def test_handler_does_not_log_request_fields_or_echo_them_in_responses(self):
+        source = (Path(__file__).resolve().parents[1] / "gate_media_auth/__main__.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("def log_message", source)
+        self.assertIn("def send_error", source)
+        self.assertNotIn("logger.info(payload", source)
+        self.assertNotIn("logger.warning(payload", source)
+        self.assertLessEqual(len('{"request_id":"0000000000000000"}'), 64)
+
+
+class IsolationTests(unittest.TestCase):
+    def test_media_package_has_no_controller_or_relay_import_or_call_path(self):
+        package = Path(__file__).resolve().parents[1] / "gate_media_auth"
+        forbidden = ("gate_controller.relay", "gate_controller.actuation", "PiRelay")
+        for source in package.glob("*.py"):
+            contents = source.read_text(encoding="utf-8")
+            for value in forbidden:
+                with self.subTest(source=source.name, value=value):
+                    self.assertNotIn(value, contents)
+
+
+if __name__ == "__main__":
+    unittest.main()

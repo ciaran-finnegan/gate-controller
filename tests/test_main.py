@@ -194,6 +194,23 @@ class MainConfigurationTests(unittest.TestCase):
             "last_outcome_at": "2026-08-14T10:00:00+00:00",
         })
 
+    def test_media_capabilities_are_best_effort_and_cannot_break_the_status_heartbeat(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        malformed = store.path.parent / "capabilities.json"
+        malformed.write_text("not-json", encoding="utf-8")
+
+        status = gate_main._controller_status(
+            store, type("Prompt", (), {"available": False})(), {}, relay=object(),
+            media_capabilities_path=malformed,
+        )
+
+        self.assertFalse(status["media"]["video"]["ready"])
+        self.assertEqual("gateway_unhealthy", status["media"]["video"]["reason"])
+        self.assertEqual(0, status["queue_depth"])
+
     def test_outbox_url_requires_a_nonempty_bearer_token(self):
         store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
         self.addCleanup(

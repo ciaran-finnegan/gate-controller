@@ -1,0 +1,31 @@
+# Secrets are supplied only through the root-owned /etc/gate-media.env file.
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+
+authMethod: http
+authHTTPAddress: http://127.0.0.1:9189/auth
+
+api: true
+apiAddress: 127.0.0.1:9997
+metrics: true
+metricsAddress: 127.0.0.1:9998
+
+rtsp: true
+rtspAddress: 127.0.0.1:8554
+rtmp: false
+hls: false
+srt: false
+
+# A TLS reverse proxy may expose only /gate/whep from this listener.
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: []
+
+pathDefaults:
+  sourceOnDemand: false
+
+paths:
+  gate:
+    source: ${GATE_MEDIA_RTSP_SOURCE}

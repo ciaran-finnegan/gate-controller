@@ -260,3 +260,60 @@ or a supervised manual rollback. It is not referenced by GitHub Actions, the
 updater, the application service, release health checks, or rollback. A broken
 or logged-out Tailscale client therefore cannot stop the gate or block automatic
 updates.
+
+## Isolated Live Media Gateway
+
+Live media is an optional, separate MediaMTX service. It has its own
+`gate-media` and `gate-media-auth` accounts, neither of which belongs to the
+GPIO group or can write `/var/lib/gate-controller`. A failed MediaMTX process,
+authorization sidecar, camera RTSP source, or media health check cannot stop or
+delay the gate controller, its heartbeat, OCR, command worker, or relay.
+
+The only integration is the nonsecret, atomically replaced
+`/run/gate-media/capabilities.json` snapshot. The controller treats a missing,
+stale, or malformed snapshot as unavailable media and continues its normal
+heartbeat. `video`, `listen`, and `talkback` are independent. All default to
+false; talkback remains `hardware_unverified` until a separate physical
+backchannel acceptance test is complete.
+
+Create the root-owned media environment before enabling the services. It must
+remain `root:root` mode `0600`; never put it in this repository or in a systemd
+unit. It contains `GATE_MEDIA_HMAC_SECRET` (at least 32 bytes) and the complete
+credential-bearing `GATE_MEDIA_RTSP_SOURCE`. The optional
+`GATE_MEDIA_VIDEO_VERIFIED=true` and `GATE_MEDIA_LISTEN_VERIFIED=true` switches
+are operator attestations after hardware validation, not defaults. Do not set
+talkback verified.
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/gate-media.env
+sudoedit /etc/gate-media.env
+```
+
+MediaMTX is deliberately not fetched by either bootstrap or the ordinary
+updater. Obtain a release archive and independently verified SHA-256 value by
+your approved release process, then make a root-owned checksum map with exactly
+three whitespace-separated columns: version, architecture (`arm64` or `armv7`),
+and SHA-256. No placeholder checksum is committed here.
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /root/gate-media-checksums.txt
+sudoedit /root/gate-media-checksums.txt
+sudo deployment/install-media.sh --source "$PWD" \
+  --mediamtx-archive /root/mediamtx.tar.gz \
+  --mediamtx-version REPLACE_WITH_APPROVED_VERSION \
+  --checksum-map /root/gate-media-checksums.txt
+```
+
+The installer validates the archive against the exact version/architecture map,
+installs only after `sha256sum --check` succeeds, verifies `mediamtx --version`,
+and leaves both services disabled when the required environment values are
+absent. The fixed application bootstrap may copy media scripts and units as
+root-owned references, but it never installs or replaces `/usr/local/bin/mediamtx`.
+
+Raw RTSP (`127.0.0.1:8554`), the MediaMTX API (`127.0.0.1:9997`), metrics
+(`127.0.0.1:9998`), and the authorization sidecar (`127.0.0.1:9189`) bind only
+to loopback. A TLS reverse proxy may expose the authenticated `/gate/whep`
+application endpoint; do not expose RTSP, API, metrics, the auth sidecar, WHIP,
+or any camera administration interface. The sidecar accepts only a valid
+short-lived HMAC token for `read`, controller `primary`, and path `gate`; it
+does not log tokens, camera URLs, passwords, or request bodies.
