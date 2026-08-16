@@ -10,6 +10,7 @@ UPDATER_SERVICE=gate-controller-updater.service
 UPDATER_TIMER=gate-controller-updater.timer
 SYSTEMD_ROOT=/etc/systemd/system
 UPDATER_HELPER=/usr/local/libexec/gate-controller/gate-controller-updater.py
+MEDIA_BOOTSTRAP_ROOT=/usr/local/libexec/gate-media-bootstrap
 STATE_ROOT=/var/lib/gate-controller
 UPLOAD_ROOT=$STATE_ROOT/uploads
 FTP_USER=ftp-user
@@ -145,6 +146,38 @@ install_fixed_trust_anchors() {
   install -o root -g root -m 0644 \
     "$release/deployment/systemd/$UPDATER_TIMER" \
     "$systemd_root/$UPDATER_TIMER"
+}
+
+install_fixed_media_bootstrap() {
+  local source=$1
+  local auth_source=$source/gate_media_auth
+  local gateway_source=$source/gate_media_gateway
+
+  install -d -o root -g root -m 0755 \
+    "$MEDIA_BOOTSTRAP_ROOT/gate_media_auth" "$MEDIA_BOOTSTRAP_ROOT/gate_media_gateway"
+  install -o root -g root -m 0755 \
+    "$source/deployment/install-media.sh" "$MEDIA_BOOTSTRAP_ROOT/install-media.sh"
+  install -o root -g root -m 0644 \
+    "$source/deployment/media/mediamtx.yml" "$MEDIA_BOOTSTRAP_ROOT/mediamtx.yml"
+  install -o root -g root -m 0644 \
+    "$source/deployment/media/nginx-whep-locations.conf.template" \
+    "$MEDIA_BOOTSTRAP_ROOT/nginx-whep-locations.conf.template"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-auth.service" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate-media-auth.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-gateway.service" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate-media-gateway.service"
+  install -o root -g root -m 0644 \
+    "$source/gate_media_config.py" "$MEDIA_BOOTSTRAP_ROOT/gate_media_config.py"
+  for name in __init__.py __main__.py token.py capabilities.py; do
+    install -o root -g root -m 0644 \
+      "$auth_source/$name" "$MEDIA_BOOTSTRAP_ROOT/gate_media_auth/$name"
+  done
+  for name in __init__.py __main__.py; do
+    install -o root -g root -m 0644 \
+      "$gateway_source/$name" "$MEDIA_BOOTSTRAP_ROOT/gate_media_gateway/$name"
+  done
 }
 
 backup_fixed_updater_helper() {
@@ -341,6 +374,21 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the updater service"
 [[ -f $SOURCE/deployment/systemd/$UPDATER_TIMER ]] \
   || fail "source does not contain the updater timer"
+[[ -f $SOURCE/deployment/install-media.sh ]] \
+  || fail "source does not contain the media installer"
+[[ -f $SOURCE/deployment/media/mediamtx.yml ]] \
+  || fail "source does not contain the MediaMTX config"
+[[ -f $SOURCE/deployment/media/nginx-whep-locations.conf.template ]] \
+  || fail "source does not contain the WHEP proxy template"
+[[ -f $SOURCE/deployment/systemd/gate-media-auth.service ]] \
+  || fail "source does not contain the media auth service"
+[[ -f $SOURCE/deployment/systemd/gate-media-gateway.service ]] \
+  || fail "source does not contain the media gateway service"
+[[ -f $SOURCE/gate_media_config.py ]] \
+  || fail "source does not contain the media config validator"
+[[ -f $SOURCE/gate_media_gateway/__init__.py \
+    && -f $SOURCE/gate_media_gateway/__main__.py ]] \
+  || fail "source does not contain the media gateway launcher"
 
 if ! id gate-controller >/dev/null 2>&1; then
   useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin gate-controller
@@ -477,6 +525,7 @@ fi
 ACTIVATION_STARTED=true
 configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"
 install_fixed_trust_anchors "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT" "$UPDATER_HELPER"
+install_fixed_media_bootstrap "$RELEASE"
 rm -f -- "$CURRENT_LINK.new"
 ln -s "$RELEASE" "$CURRENT_LINK.new"
 mv -Tf "$CURRENT_LINK.new" "$CURRENT_LINK"

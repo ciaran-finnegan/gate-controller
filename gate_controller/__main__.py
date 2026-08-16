@@ -13,6 +13,7 @@ from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, SupabasePlateFetcher,
 )
 from .control_plane import CommandWorker, HeartbeatWorker, SupabaseControlPlane
+from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import HttpOutboxSender, OutboxWorker
 from .processor import GateProcessor
@@ -220,6 +221,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
+                       media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        clock=None) -> dict:
     now = (clock or (lambda: datetime.now(timezone.utc)))()
     camera_upload_recent = _camera_is_fresh(
@@ -239,6 +241,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         "camera_connection_probed": False,
         "camera_connected": None,
         "relay": _relay_status(relay),
+        "media": read_media_capabilities(media_capabilities_path),
     }
     if authorised is not None:
         status["authorisation"] = authorised.status()

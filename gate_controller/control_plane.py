@@ -7,6 +7,7 @@ from time import monotonic
 import requests
 
 from .actuation import ActuationCoordinator
+from .media_capabilities import validated_media_capabilities
 from .models import GateEvent
 from .runtime import require_https_service_url
 
@@ -91,6 +92,7 @@ class SupabaseControlPlane:
                     },
                     "relay": status.get("relay", {}),
                     "authorisation": status.get("authorisation", {}),
+                    "media": validated_media_capabilities(status.get("media")),
                 },
             },
         )

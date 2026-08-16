@@ -1,0 +1,45 @@
+[Unit]
+Description=Gate MediaMTX loopback authorization sidecar
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gate-media-auth
+Group=gate-media-auth
+EnvironmentFile=/etc/gate-media-auth.env
+Environment=PYTHONPATH=/usr/local/lib/gate-media
+ExecStart=/usr/bin/python3 -m gate_media_auth
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+MemoryMax=64M
+CPUQuota=20%
+TasksMax=64
+UMask=0077
+ReadWritePaths=/run/gate-media
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
+NoExecPaths=/
+ExecPaths=/usr/bin/python3
+
+[Install]
+WantedBy=multi-user.target
