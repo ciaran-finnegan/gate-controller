@@ -20,6 +20,7 @@ _TELEMETRY_OCR_KEYS = (
 _MAX_TELEMETRY_PAGE_SIZE = 100
 _SNAPSHOT_PAGES_PER_STEP = 16
 _SNAPSHOT_BUSY_TIMEOUT_SECONDS = 0.25
+_SNAPSHOT_BUSY_SLICE_MS = 10
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -394,29 +395,31 @@ class LocalStore:
 
     def create_telemetry_snapshot(self, destination: Path) -> None:
         """Copy the live database in short backup steps with bounded busy waits."""
+        deadline = time.monotonic() + _SNAPSHOT_BUSY_TIMEOUT_SECONDS
         destination = Path(destination)
-        busy_started_at = None
 
-        def check_busy(status: int, _remaining: int, _total: int) -> None:
-            nonlocal busy_started_at
-            if status not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                busy_started_at = None
-                return
-            now = time.monotonic()
-            busy_started_at = now if busy_started_at is None else busy_started_at
-            if now - busy_started_at >= _SNAPSHOT_BUSY_TIMEOUT_SECONDS:
+        def apply_remaining_budget(connection: sqlite3.Connection) -> None:
+            remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1_000)
+            if remaining_ms <= 0:
                 raise TimeoutError("telemetry snapshot database remained busy")
+            busy_timeout_ms = min(remaining_ms, _SNAPSHOT_BUSY_SLICE_MS)
+            connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+
+        def check_deadline(status: int, _remaining: int, _total: int) -> None:
+            if status == sqlite3.SQLITE_DONE:
+                return
+            apply_remaining_budget(source)
 
         source_uri = f"{self.path.resolve().as_uri()}?mode=ro"
         with closing(sqlite3.connect(
-            source_uri, uri=True, timeout=0.05
-        )) as source, closing(sqlite3.connect(destination, timeout=0.05)) as snapshot:
-            source.execute("PRAGMA busy_timeout = 50")
+            source_uri, uri=True, timeout=0
+        )) as source, closing(sqlite3.connect(destination, timeout=0)) as snapshot:
+            apply_remaining_budget(source)
             source.backup(
                 snapshot,
                 pages=_SNAPSHOT_PAGES_PER_STEP,
-                progress=check_busy,
-                sleep=0.01,
+                progress=check_deadline,
+                sleep=0,
             )
 
     def prepare_outbox_attempt(self, item_id: int,

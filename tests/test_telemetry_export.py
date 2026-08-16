@@ -244,15 +244,11 @@ class TelemetryExportTests(unittest.TestCase):
             store, _ = self._store_with_telemetry(root)
             blocker = sqlite3.connect(store.path)
             blocker.execute("BEGIN EXCLUSIVE")
-
-            def short_live_connection():
-                return sqlite3.connect(store.path, timeout=0.05)
-
+            budget_seconds = 0.250
+            scheduler_tolerance_seconds = 0.030
             started = time.monotonic()
             try:
-                with mock.patch.object(
-                    store, "_connect", side_effect=short_live_connection
-                ), self.assertRaisesRegex(TimeoutError, "snapshot"):
+                with self.assertRaisesRegex(TimeoutError, "snapshot"):
                     export_telemetry(
                         store, format="json",
                         since=datetime(2026, 8, 1, tzinfo=timezone.utc),
@@ -262,7 +258,12 @@ class TelemetryExportTests(unittest.TestCase):
                 blocker.rollback()
                 blocker.close()
 
-            self.assertLess(time.monotonic() - started, 1.0)
+            elapsed = time.monotonic() - started
+            self.assertLessEqual(
+                elapsed,
+                budget_seconds + scheduler_tolerance_seconds,
+                f"snapshot contention took {elapsed:.3f}s",
+            )
 
     def test_export_requires_an_explicit_output_and_supported_format(self):
         with tempfile.TemporaryDirectory() as directory:
