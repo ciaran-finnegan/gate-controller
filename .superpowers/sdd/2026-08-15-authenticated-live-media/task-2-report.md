@@ -30,13 +30,20 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
   `primary`, canonical short-lived HS256 claims, and timing-safe signature
   comparison. It retains strict duplicate-key parsing, the 8 KiB request cap,
   exact `200`/`401` responses, and token-safe logging.
-- Gateway readiness uses a bounded loopback API response and requires the `gate`
-  path to be ready/available with nonempty bounded tracks.
+- Gateway readiness uses a bounded loopback API response and requires exactly
+  one ready/available `gate` path with a bounded list of recognized MediaMTX
+  1.19.3 track codecs. Video and listen readiness are derived independently;
+  H264-only, audio-only, and mixed paths cannot cross-enable capabilities, and
+  unknown or malformed tracks fail both closed.
 - Capability ingestion uses one nonblocking, no-follow open, validates `fstat`
   regular-file type and byte bounds, strict JSON, timestamps, and capability
   semantics, and fails closed for FIFO, symlink, malformed, oversized, stale,
   and future-dated inputs. Talkback is always forced to
   `hardware_unverified`.
+- Heartbeat RPC construction revalidates the exact bounded media object emitted
+  by `_controller_status`, forwards only its canonical video/listen/talkback
+  shape, and substitutes an unavailable snapshot for missing, malformed, or
+  unexpected in-memory data.
 - The installer accepts only version `1.19.3`. Its checksum map must be a
   root-owned `0600` regular nonsymlink beneath an owner-controlled directory;
   it is bounded and parsed from the same stable opened descriptor before any
@@ -62,6 +69,7 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 - `bd447f2 fix: harden isolated MediaMTX deployment`
 - `c28bbec fix: advertise pinned MediaMTX ICE host`
 - `5e71ed2 fix: use MediaMTX string-slice ICE host env`
+- `21de6ad fix: report media capabilities by track type`
 
 ## Tests
 
@@ -76,6 +84,21 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
   stdout `ResourceWarning`. After changing tests only, the protected launcher
   and file parser failed on the new unindexed contract. After the implementation
   change, those tests passed and the real binary loaded the pinned config.
+- This capability-integration RED run executed eight selected tests and failed
+  at the intended boundaries with `failures=6, errors=4`: RPC payloads omitted
+  media, malformed media had no fail-closed output, and feature-specific gateway
+  readiness did not exist. The corresponding GREEN run passed all eight.
+- `MEDIAMTX_1_19_3_BINARY=/private/tmp/mediamtx-v1.19.3-arm64/mediamtx
+  UV_CACHE_DIR=/private/tmp/gate-controller-uv-cache uv run --offline
+  --with-requirements requirements.txt python -W error::ResourceWarning -m
+  unittest tests.test_media_auth tests.test_media_deployment
+  tests.test_control_plane tests.test_main`: all 95 focused media/control-plane
+  tests passed, including the actual MediaMTX 1.19.3 config probe.
+- `MEDIAMTX_1_19_3_BINARY=/private/tmp/mediamtx-v1.19.3-arm64/mediamtx
+  UV_CACHE_DIR=/private/tmp/gate-controller-uv-cache uv run --offline
+  --with-requirements requirements.txt python -W error::ResourceWarning -m
+  unittest discover -s tests`: 290 tests ran; 289 passed and one Linux-only
+  `flock` test was skipped on macOS.
 - `MEDIAMTX_1_19_3_BINARY=/private/tmp/mediamtx-v1.19.3-arm64/mediamtx python3
   -W error::ResourceWarning -m unittest tests.test_media_auth
   tests.test_media_deployment -v`: all 46 passed, including the actual
@@ -91,21 +114,29 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 - `python3 -m compileall -q gate_media_config.py gate_media_gateway
   gate_media_auth gate_controller deployment tests/test_media_auth.py
   tests/test_media_deployment.py`: passed.
+- `python3 -m compileall -q gate_controller gate_media_auth
+  gate_media_gateway gate_media_config.py deployment tests`: passed.
 - `bash -n deployment/install-media.sh deployment/install.sh`: passed.
 - `python3 -m json.tool tests/fixtures/mediamtx-v1.19.3-schema.json`: passed.
 - `git diff --check`: passed.
 
 ## Concerns
 
-- No dependencies were installed and no release asset, binary, or checksum was
-  downloaded by this work. No deploy, push, or merge operation was performed.
-  The seven baseline dependency import errors therefore remain.
+- No project or system dependency install was performed, and no release asset,
+  binary, or checksum was downloaded by this work. The existing pinned uv cache
+  made the complete dependency suite available offline; bare Homebrew Python
+  still lacks requests, Pillow, and watchdog as previously reported. No deploy,
+  push, or merge operation was performed.
 - The coordinator-provided checksummed binary at
   `/private/tmp/mediamtx-v1.19.3-arm64/mediamtx` reported `v1.19.3`; both the
   actual-binary config probe and hermetic 1.19.3 schema/invariant probe passed.
 - `systemd-analyze` and nginx are unavailable in this macOS environment, so
   Linux unit loading, nginx config loading, and live integration were not
   executed here.
+- The first sandboxed real-binary probe loaded the pinned config but macOS
+  denied its loopback bind with `operation not permitted`. The same test passed
+  both alone and in the clean 95-test focused run after lifting only that socket
+  sandbox; no external network access was enabled.
 - No release archive or checksum is committed. Operators must physically fetch
   and independently approve the exact `1.19.3` architecture-specific archive
   and SHA-256 map before running the dedicated installer.
