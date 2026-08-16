@@ -19,7 +19,7 @@ _VIDEO_TRACKS = frozenset({
 })
 _AUDIO_TRACKS = frozenset({
     "Opus", "FLAC", "Vorbis", "MPEG-4 Audio", "MPEG-4 Audio LATM",
-    "MPEG-1/2 Audio", "AC3", "Speex", "G726", "G722", "G711", "LPCM",
+    "MPEG-1/2 Audio", "AC-3", "Speex", "G726", "G722", "G711", "LPCM",
 })
 _MEDIA_TRACKS = _VIDEO_TRACKS | _AUDIO_TRACKS
 

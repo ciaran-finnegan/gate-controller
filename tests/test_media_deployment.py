@@ -921,6 +921,16 @@ class MediaCapabilityTests(unittest.TestCase):
             unavailable = read_media_capabilities(target, max_age_seconds=60, now=100)
             self.assertEqual("gateway_unhealthy", unavailable["video"]["reason"])
 
+            noncanonical = default_capabilities()
+            noncanonical["observed_at"] = 100
+            noncanonical["media"]["video"] = {
+                "configured": True, "ready": False, "verified": False,
+                "reason": "hardware_unverified",
+            }
+            write_capabilities(target, noncanonical)
+            unavailable = read_media_capabilities(target, max_age_seconds=60, now=100)
+            self.assertEqual("gateway_unhealthy", unavailable["video"]["reason"])
+
     def test_reader_forces_talkback_to_hardware_unverified(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "capabilities.json"
@@ -961,6 +971,7 @@ class MediaGatewayHealthTests(unittest.TestCase):
         cases = (
             (["H264"], {"video": True, "listen": False}),
             (["MPEG-4 Audio"], {"video": False, "listen": True}),
+            (["AC-3"], {"video": False, "listen": True}),
             (["H264", "Opus"], {"video": True, "listen": True}),
         )
         environment = {

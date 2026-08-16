@@ -53,7 +53,7 @@ def validated_media_capabilities(value) -> dict:
     try:
         if not isinstance(value, dict) or set(value) != set(_FEATURES):
             raise ValueError("invalid media snapshot")
-        parsed = {feature: _parse_capability(value[feature]) for feature in _FEATURES}
+        parsed = {feature: _parse_capability(feature, value[feature]) for feature in _FEATURES}
     except (TypeError, ValueError, KeyError):
         return _unavailable("gateway_unhealthy")
     parsed["talkback"] = {
@@ -65,7 +65,7 @@ def validated_media_capabilities(value) -> dict:
     return parsed
 
 
-def _parse_capability(value) -> dict:
+def _parse_capability(feature: str, value) -> dict:
     if not isinstance(value, dict) or set(value) != {"configured", "ready", "verified", "reason"}:
         raise ValueError("invalid media capability")
     configured, ready, verified, reason = (
@@ -84,6 +84,15 @@ def _parse_capability(value) -> dict:
         raise ValueError("incoherent media capability")
     if reason == "ready" and not (configured and ready and verified):
         raise ValueError("incoherent media capability")
+    if feature != "talkback":
+        expected_reason = (
+            "not_configured" if not configured
+            else "gateway_unhealthy" if not ready
+            else "ready" if verified
+            else "hardware_unverified"
+        )
+        if reason != expected_reason:
+            raise ValueError("noncanonical media capability")
     return {"configured": configured, "ready": ready, "verified": verified, "reason": reason}
 
 
