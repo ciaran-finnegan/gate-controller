@@ -18,6 +18,7 @@ from gate_media_auth.capabilities import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PINNED_MEDIAMTX_VERSION = "1.19.3"
 
 
 def read_unit(relative_path):
@@ -25,6 +26,27 @@ def read_unit(relative_path):
     parser.optionxform = str
     parser.read(REPOSITORY_ROOT / relative_path, encoding="utf-8")
     return parser["Service"]
+
+
+def read_flat_yaml(relative_path):
+    values = {}
+    for line in (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith(("#", " ")) or ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        raw_value = raw_value.strip()
+        if raw_value == "true":
+            value = True
+        elif raw_value == "false":
+            value = False
+        elif raw_value == "[]":
+            value = []
+        elif raw_value.startswith('"'):
+            value = json.loads(raw_value)
+        else:
+            value = raw_value
+        values[key] = value
+    return values
 
 
 class MediaGatewayDeploymentTests(unittest.TestCase):
@@ -37,15 +59,143 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("apiAddress: 127.0.0.1:9997", config)
         self.assertIn("metricsAddress: 127.0.0.1:9998", config)
         self.assertIn("webrtcAddress: 127.0.0.1:8889", config)
-        self.assertIn("webrtcLocalUDPAddress: 127.0.0.1:8189", config)
-        self.assertIn("webrtcLocalTCPAddress: 127.0.0.1:8189", config)
+        self.assertIn('webrtcLocalUDPAddress: ""', config)
+        self.assertIn('webrtcLocalTCPAddress: ""', config)
         self.assertIn("gate:", config)
         self.assertNotIn("${", config)
         self.assertNotIn("    source:", config)
         self.assertNotRegex(config, r"rtsp://[^\s]*@")
+        self.assertIn("rtsp: false", config)
+        self.assertIn("rtspTransports: []", config)
         self.assertIn("hls: false", config)
         self.assertIn("rtmp: false", config)
         self.assertIn("srt: false", config)
+
+    def test_mediamtx_1_19_3_effective_listener_surface_is_complete(self):
+        config = read_flat_yaml("deployment/media/mediamtx.yml")
+        expected = {
+            "api": True,
+            "apiAddress": "127.0.0.1:9997",
+            "metrics": True,
+            "metricsAddress": "127.0.0.1:9998",
+            "pprof": False,
+            "pprofAddress": "127.0.0.1:9999",
+            "playback": False,
+            "playbackAddress": "127.0.0.1:9996",
+            "rtsp": False,
+            "rtspTransports": [],
+            "rtspAddress": "127.0.0.1:8554",
+            "rtspsAddress": "127.0.0.1:8322",
+            "rtpAddress": "127.0.0.1:8000",
+            "rtcpAddress": "127.0.0.1:8001",
+            "rtmp": False,
+            "rtmpAddress": "127.0.0.1:1935",
+            "rtmpsAddress": "127.0.0.1:1936",
+            "hls": False,
+            "hlsAddress": "127.0.0.1:8888",
+            "webrtc": True,
+            "webrtcAddress": "127.0.0.1:8889",
+            "webrtcLocalUDPAddress": "",
+            "webrtcLocalTCPAddress": "",
+            "webrtcIPsFromInterfaces": False,
+            "webrtcIPsFromInterfacesList": [],
+            "webrtcAdditionalHosts": [],
+            "webrtcICEServers2": [],
+            "srt": False,
+            "srtAddress": "127.0.0.1:8890",
+            "moq": False,
+            "moqAddress": "127.0.0.1:8891",
+        }
+
+        self.assertEqual(expected, {key: config.get(key) for key in expected})
+        for key, value in expected.items():
+            if key.endswith("Address") and value:
+                self.assertNotRegex(value, r"^(?::|0\.0\.0\.0:|\[::]:)")
+
+    def test_gateway_launcher_executes_only_with_complete_reachable_ice_and_turn(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway = self._write_valid_media_environments(root)
+            del auth
+            fake_binary = root / "mediamtx"
+            marker = root / "executed"
+            config = root / "mediamtx.yml"
+            config.write_text("paths: {}\n", encoding="utf-8")
+            fake_binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$GATEWAY_MARKER\"\n",
+                encoding="utf-8",
+            )
+            fake_binary.chmod(0o755)
+            valid_values = dict(
+                line.split("=", 1)
+                for line in gateway.read_text(encoding="utf-8").splitlines()
+            )
+            environment = dict(os.environ)
+            environment.update(valid_values)
+            environment["GATEWAY_MARKER"] = str(marker)
+            command = [
+                sys.executable, "-m", "gate_media_gateway",
+                str(fake_binary), str(config),
+            ]
+
+            accepted = subprocess.run(
+                command, cwd=REPOSITORY_ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+            self.assertEqual(str(config), marker.read_text(encoding="utf-8").strip())
+
+            for missing in (
+                "MTX_WEBRTCLOCALUDPADDRESS",
+                "MTX_WEBRTCLOCALTCPADDRESS",
+                "MTX_WEBRTCICESERVERS2_0_URL",
+                "MTX_WEBRTCICESERVERS2_0_USERNAME",
+                "MTX_WEBRTCICESERVERS2_0_PASSWORD",
+                "MTX_WEBRTCICESERVERS2_0_CLIENTONLY",
+            ):
+                with self.subTest(missing=missing):
+                    marker.unlink(missing_ok=True)
+                    invalid_environment = dict(environment)
+                    del invalid_environment[missing]
+                    rejected = subprocess.run(
+                        command, cwd=REPOSITORY_ROOT, env=invalid_environment,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, check=False,
+                    )
+                    self.assertNotEqual(0, rejected.returncode)
+                    self.assertFalse(marker.exists())
+                    self.assertNotIn("turn-password", rejected.stderr)
+
+            marker.unlink(missing_ok=True)
+            whitespace_environment = dict(environment)
+            whitespace_environment["MTX_WEBRTCICESERVERS2_0_PASSWORD"] = "turn password"
+            rejected_whitespace = subprocess.run(
+                command, cwd=REPOSITORY_ROOT, env=whitespace_environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, check=False,
+            )
+            self.assertNotEqual(0, rejected_whitespace.returncode)
+            self.assertFalse(marker.exists())
+
+    def test_installer_rejects_every_unpinned_mediamtx_version(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted = Path(temporary_directory) / "trusted"
+            trusted.mkdir(mode=0o700)
+            checksum_map = trusted / "checksums.txt"
+            checksum_map.write_text(
+                f"{PINNED_MEDIAMTX_VERSION} arm64 {'a' * 64}\n", encoding="utf-8"
+            )
+            checksum_map.chmod(0o600)
+            command = (
+                "source deployment/install-media.sh; "
+                f"lookup_mediamtx_checksum 1.19.2 arm64 {shlex.quote(str(checksum_map))}"
+            )
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
 
     def test_proxy_template_allows_only_whep_create_and_exact_teardown_routes(self):
         path = REPOSITORY_ROOT / "deployment/media/nginx-whep-locations.conf.template"
@@ -68,6 +218,12 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertEqual("/etc/gate-media-auth.env", auth.get("EnvironmentFile"))
         self.assertEqual("/etc/gate-media-gateway.env", gateway.get("EnvironmentFile"))
         self.assertNotEqual(auth.get("EnvironmentFile"), gateway.get("EnvironmentFile"))
+        self.assertEqual(
+            "/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx "
+            "/etc/gate-media/mediamtx.yml",
+            gateway.get("ExecStart"),
+        )
+        self.assertEqual("PYTHONPATH=/usr/local/lib/gate-media", gateway.get("Environment"))
 
     def test_media_units_are_restricted_nonroot_and_cannot_access_gpio_or_controller_state(self):
         for relative_path, user in (
@@ -92,6 +248,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 inaccessible = set(shlex.split(service.get("InaccessiblePaths", "")))
                 self.assertTrue(any("/var/lib/gate-controller" in path for path in inaccessible))
                 self.assertTrue(any("/opt/gate-controller-deploy" in path for path in inaccessible))
+                self.assertIn("-/opt/gate-controller", inaccessible)
                 self.assertTrue(any("gpio" in path for path in inaccessible))
                 self.assertEqual("/", service.get("NoExecPaths"))
                 self.assertTrue(service.get("ExecPaths"))
@@ -111,6 +268,10 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertNotIn("wget ", installer)
         self.assertIn("install_fixed_media_bootstrap", controller_installer)
         self.assertIn("nginx-whep-locations.conf.template", controller_installer)
+        self.assertIn("gate_media_config.py", controller_installer)
+        self.assertIn("gate_media_gateway", controller_installer)
+        self.assertIn("gate_media_config.py", installer)
+        self.assertIn("gate_media_gateway", installer)
         self.assertNotIn("install_mediamtx_binary", controller_installer)
         self.assertNotIn("/usr/local/bin/mediamtx", controller_installer)
 
@@ -145,14 +306,20 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
 
     def test_checksum_lookup_requires_an_exact_approved_version_and_architecture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            checksum_map = Path(temporary_directory) / "checksums.txt"
+            trusted = Path(temporary_directory) / "trusted"
+            trusted.mkdir(mode=0o700)
+            checksum_map = trusted / "checksums.txt"
             checksum = "a" * 64
             checksum_map.write_text(
-                f"1.2.3 arm64 {checksum}\n1.2.3 armv7 {'b' * 64}\n", encoding="utf-8"
+                f"{PINNED_MEDIAMTX_VERSION} arm64 {checksum}\n"
+                f"{PINNED_MEDIAMTX_VERSION} armv7 {'b' * 64}\n",
+                encoding="utf-8",
             )
+            checksum_map.chmod(0o600)
             command = (
                 "source deployment/install-media.sh; "
-                f"lookup_mediamtx_checksum 1.2.3 arm64 {shlex.quote(str(checksum_map))}"
+                f"lookup_mediamtx_checksum {PINNED_MEDIAMTX_VERSION} arm64 "
+                f"{shlex.quote(str(checksum_map))}"
             )
             completed = subprocess.run(
                 ["bash", "-c", command], cwd=REPOSITORY_ROOT,
@@ -162,20 +329,205 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertEqual(checksum, completed.stdout.strip())
 
+    def test_checksum_map_requires_trusted_mode_owner_directory_and_nonsymlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            trusted = root / "trusted"
+            trusted.mkdir(mode=0o700)
+            checksum_map = trusted / "checksums.txt"
+            checksum_map.write_text(
+                f"{PINNED_MEDIAMTX_VERSION} arm64 {'a' * 64}\n", encoding="utf-8"
+            )
+            checksum_map.chmod(0o600)
+
+            base = [
+                sys.executable, "-m", "gate_media_config", "checksum",
+                "--map", str(checksum_map), "--version", PINNED_MEDIAMTX_VERSION,
+                "--architecture", "arm64",
+            ]
+            accepted = subprocess.run(
+                base, cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+            checksum_map.chmod(0o640)
+            insecure_mode = subprocess.run(
+                base, cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(0, insecure_mode.returncode)
+            checksum_map.chmod(0o600)
+
+            trusted.chmod(0o770)
+            insecure_directory = subprocess.run(
+                base, cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(0, insecure_directory.returncode)
+            trusted.chmod(0o700)
+
+            link = trusted / "linked-checksums.txt"
+            link.symlink_to(checksum_map)
+            linked = subprocess.run(
+                [*base[:5], str(link), *base[6:]], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(0, linked.returncode)
+
+    def test_checksum_parser_uses_the_already_opened_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            original = root / "checksums.txt"
+            replacement = root / "replacement.txt"
+            original.write_text(
+                f"{PINNED_MEDIAMTX_VERSION} arm64 {'a' * 64}\n", encoding="utf-8"
+            )
+            replacement.write_text(
+                f"{PINNED_MEDIAMTX_VERSION} arm64 {'b' * 64}\n", encoding="utf-8"
+            )
+            script = """
+import os
+import sys
+from gate_media_config import lookup_checksum_from_fd
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+os.replace(sys.argv[2], sys.argv[1])
+try:
+    print(lookup_checksum_from_fd(descriptor, sys.argv[3], sys.argv[4]))
+finally:
+    os.close(descriptor)
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(original), str(replacement),
+                 PINNED_MEDIAMTX_VERSION, "arm64"],
+                cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("a" * 64, completed.stdout.strip())
+
+    def test_environment_parser_accepts_only_unique_exact_assignments(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway = self._write_valid_media_environments(root)
+            accepted = self._validate_media_environments(auth, gateway)
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+            malformed_values = (
+                "GATE_MEDIA_VIDEO_CONFIGURED =false\n",
+                "GATE_MEDIA_VIDEO_CONFIGURED=false \n",
+                "GATE_MEDIA_VIDEO_CONFIGURED=false\nGATE_MEDIA_VIDEO_CONFIGURED=false\n",
+                "UNKNOWN_MEDIA_SETTING=false\n",
+            )
+            original = auth.read_text(encoding="utf-8")
+            for malformed in malformed_values:
+                with self.subTest(malformed=malformed):
+                    auth.write_text(original + malformed, encoding="utf-8")
+                    auth.chmod(0o600)
+                    rejected = self._validate_media_environments(auth, gateway)
+                    self.assertNotEqual(0, rejected.returncode)
+
+            auth.write_bytes(original.replace("\n", "\r\n").encode("utf-8"))
+            auth.chmod(0o600)
+            rejected_crlf = self._validate_media_environments(auth, gateway)
+            self.assertNotEqual(0, rejected_crlf.returncode)
+
+    def test_environment_parser_rejects_cross_secrets_and_validates_hmac_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway = self._write_valid_media_environments(root)
+            auth_text = auth.read_text(encoding="utf-8")
+            gateway_text = gateway.read_text(encoding="utf-8")
+
+            auth.write_text(auth_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n")
+            auth.chmod(0o600)
+            self.assertNotEqual(
+                0, self._validate_media_environments(auth, gateway).returncode
+            )
+
+            auth.write_text(auth_text, encoding="utf-8")
+            auth.chmod(0o600)
+            gateway.write_text(gateway_text + "GATE_MEDIA_HMAC_SECRET=forbidden\n")
+            gateway.chmod(0o600)
+            self.assertNotEqual(
+                0, self._validate_media_environments(auth, gateway).returncode
+            )
+
+            gateway.write_text(gateway_text, encoding="utf-8")
+            gateway.chmod(0o600)
+            auth.write_text(auth_text.replace("x" * 32, "x" * 31), encoding="utf-8")
+            auth.chmod(0o600)
+            self.assertNotEqual(
+                0, self._validate_media_environments(auth, gateway).returncode
+            )
+
+            auth.write_text(auth_text.replace("x" * 32, "é" * 16), encoding="utf-8")
+            auth.chmod(0o600)
+            accepted_multibyte = self._validate_media_environments(auth, gateway)
+            self.assertEqual(0, accepted_multibyte.returncode, accepted_multibyte.stderr)
+
+    def test_environment_parser_validates_rtsp_ice_and_mediamtx_turn_values(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway = self._write_valid_media_environments(root)
+            valid_gateway = gateway.read_text(encoding="utf-8")
+            accepted = self._validate_media_environments(auth, gateway)
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+            replacements = (
+                ("rtsp://", "https://"),
+                ("10.0.0.5:8189", "0.0.0.0:8189"),
+                ("10.0.0.5:8189", "127.0.0.1:8189"),
+                ("turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
+                ("MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
+                ("MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
+            )
+            for old, new in replacements:
+                with self.subTest(replacement=(old, new)):
+                    gateway.write_text(valid_gateway.replace(old, new, 1), encoding="utf-8")
+                    gateway.chmod(0o600)
+                    rejected = self._validate_media_environments(auth, gateway)
+                    self.assertNotEqual(0, rejected.returncode)
+
+    def _write_valid_media_environments(self, root):
+        auth = root / "gate-media-auth.env"
+        gateway = root / "gate-media-gateway.env"
+        auth.write_text(
+            "GATE_MEDIA_HMAC_SECRET=" + "x" * 32 + "\n"
+            "GATE_MEDIA_VIDEO_CONFIGURED=true\n"
+            "GATE_MEDIA_VIDEO_VERIFIED=true\n"
+            "GATE_MEDIA_LISTEN_CONFIGURED=false\n"
+            "GATE_MEDIA_LISTEN_VERIFIED=false\n"
+            "GATE_MEDIA_TALKBACK_CONFIGURED=false\n",
+            encoding="utf-8",
+        )
+        gateway.write_text(
+            "MTX_PATHS_GATE_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
+            "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
+            "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
+            "MTX_WEBRTCICESERVERS2_0_URL=turns:turn.example.com:5349?transport=tcp\n"
+            "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n"
+            "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n"
+            "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            encoding="utf-8",
+        )
+        auth.chmod(0o600)
+        gateway.chmod(0o600)
+        return auth, gateway
+
+    def _validate_media_environments(self, auth, gateway):
+        return subprocess.run(
+            [sys.executable, "-m", "gate_media_config", "environment",
+             "--auth", str(auth), "--gateway", str(gateway)],
+            cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, check=False,
+        )
+
     def test_media_environment_files_reject_cross_contaminated_secrets(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth = root / "auth.env"
-            gateway = root / "gateway.env"
-            auth.write_text(
-                "GATE_MEDIA_HMAC_SECRET=0123456789abcdef0123456789abcdef\n"
-                "GATE_MEDIA_VIDEO_CONFIGURED=true\n",
-                encoding="utf-8",
-            )
-            gateway.write_text(
-                "MTX_PATHS_GATE_SOURCE=rtsp://camera.example/stream\n",
-                encoding="utf-8",
-            )
+            auth, gateway = self._write_valid_media_environments(root)
             base = (
                 "source deployment/install-media.sh; "
                 f"MEDIA_AUTH_ENV={shlex.quote(str(auth))}; "
@@ -228,7 +580,7 @@ install() {{
   command install "${{forwarded[@]}}"
 }}
 MEDIA_ARCHIVE_ROOT={shlex.quote(str(linked_private))}
-stage_mediamtx_archive {shlex.quote(str(archive))} 1.2.3 arm64
+stage_mediamtx_archive {shlex.quote(str(archive))} {PINNED_MEDIAMTX_VERSION} arm64
 """
             completed = subprocess.run(
                 ["bash", "-c", command], cwd=REPOSITORY_ROOT,
@@ -242,7 +594,9 @@ stage_mediamtx_archive {shlex.quote(str(archive))} 1.2.3 arm64
     def test_installer_hashes_and_extracts_the_same_private_staged_archive(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            archive, checksum_map = self._make_mediamtx_archive(root, "1.2.3")
+            archive, checksum_map = self._make_mediamtx_archive(
+                root, PINNED_MEDIAMTX_VERSION
+            )
             private = root / "private"
             binary = root / "bin/mediamtx"
             fake_bin = self._make_sha256sum(root, archive)
@@ -256,7 +610,7 @@ install() {{
 normalize_architecture() {{ printf 'arm64\n'; }}
 MEDIA_ARCHIVE_ROOT={shlex.quote(str(private))}
 MEDIA_BINARY={shlex.quote(str(binary))}
-install_mediamtx_binary {shlex.quote(str(archive))} 1.2.3 {shlex.quote(str(checksum_map))}
+install_mediamtx_binary {shlex.quote(str(archive))} {PINNED_MEDIAMTX_VERSION} {shlex.quote(str(checksum_map))}
 """
             environment = dict(os.environ)
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
@@ -267,10 +621,10 @@ install_mediamtx_binary {shlex.quote(str(archive))} 1.2.3 {shlex.quote(str(check
             )
 
             self.assertEqual(0, completed.returncode, completed.stderr)
-            stable = private / "mediamtx-1.2.3-arm64.tar.gz"
+            stable = private / f"mediamtx-{PINNED_MEDIAMTX_VERSION}-arm64.tar.gz"
             self.assertTrue(stable.is_file())
             self.assertEqual(0o600, stable.stat().st_mode & 0o777)
-            self.assertIn("1.2.3", subprocess.check_output(
+            self.assertIn(PINNED_MEDIAMTX_VERSION, subprocess.check_output(
                 [str(binary), "--version"], text=True
             ))
             self.assertFalse(binary.with_suffix(".new").exists())
@@ -294,7 +648,7 @@ install() {{
 normalize_architecture() {{ printf 'arm64\n'; }}
 MEDIA_ARCHIVE_ROOT={shlex.quote(str(private))}
 MEDIA_BINARY={shlex.quote(str(binary))}
-install_mediamtx_binary {shlex.quote(str(archive))} 1.2.3 {shlex.quote(str(checksum_map))}
+install_mediamtx_binary {shlex.quote(str(archive))} {PINNED_MEDIAMTX_VERSION} {shlex.quote(str(checksum_map))}
 """
             environment = dict(os.environ)
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
@@ -341,7 +695,10 @@ main {arguments}
             bundle.add(executable, arcname="mediamtx")
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         checksum_map = root / "checksums.txt"
-        checksum_map.write_text(f"1.2.3 arm64 {checksum}\n", encoding="utf-8")
+        checksum_map.write_text(
+            f"{PINNED_MEDIAMTX_VERSION} arm64 {checksum}\n", encoding="utf-8"
+        )
+        checksum_map.chmod(0o600)
         return archive, checksum_map
 
     def _make_sha256sum(self, root, original_archive, mutate_original=True):

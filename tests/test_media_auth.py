@@ -6,7 +6,9 @@ import time
 import unittest
 from pathlib import Path
 
+import gate_media_auth.__main__ as media_auth_main
 from gate_media_auth.__main__ import authorize_body
+from gate_media_config import MediaConfigError
 from gate_media_auth.token import TokenValidationError, validate_media_token
 
 
@@ -180,11 +182,35 @@ class MediaAuthServerTests(unittest.TestCase):
         self.assertLessEqual(len('{"request_id":"0000000000000000"}'), 64)
 
 
+class MediaAuthConfigurationTests(unittest.TestCase):
+    def test_runtime_environment_rejects_gateway_credentials_and_invalid_flags(self):
+        self.assertTrue(hasattr(media_auth_main, "validated_auth_environment"))
+        valid = {
+            "GATE_MEDIA_HMAC_SECRET": SECRET,
+            "GATE_MEDIA_VIDEO_CONFIGURED": "false",
+            "GATE_MEDIA_VIDEO_VERIFIED": "false",
+            "GATE_MEDIA_LISTEN_CONFIGURED": "false",
+            "GATE_MEDIA_LISTEN_VERIFIED": "false",
+            "GATE_MEDIA_TALKBACK_CONFIGURED": "false",
+        }
+
+        self.assertEqual(valid, media_auth_main.validated_auth_environment(valid))
+        for extra in (
+            {"MTX_PATHS_GATE_SOURCE": "rtsp://camera.example/stream"},
+            {"GATE_MEDIA_VIDEO_CONFIGURED": " false"},
+        ):
+            with self.subTest(extra=extra), self.assertRaises(MediaConfigError):
+                media_auth_main.validated_auth_environment({**valid, **extra})
+
+
 class IsolationTests(unittest.TestCase):
     def test_media_package_has_no_controller_or_relay_import_or_call_path(self):
-        package = Path(__file__).resolve().parents[1] / "gate_media_auth"
+        root = Path(__file__).resolve().parents[1]
+        sources = [root / "gate_media_config.py"]
+        sources.extend((root / "gate_media_auth").glob("*.py"))
+        sources.extend((root / "gate_media_gateway").glob("*.py"))
         forbidden = ("gate_controller.relay", "gate_controller.actuation", "PiRelay")
-        for source in package.glob("*.py"):
+        for source in sources:
             contents = source.read_text(encoding="utf-8")
             for value in forbidden:
                 with self.subTest(source=source.name, value=value):

@@ -1,4 +1,6 @@
-# The credential-bearing source is supplied only as MTX_PATHS_GATE_SOURCE.
+# Effective listener and transport schema pinned to MediaMTX 1.19.3.
+# The source, reachable ICE binds, and TURN credentials are supplied only by the
+# strictly validated /etc/gate-media-gateway.env MTX_ overrides.
 logLevel: info
 logDestinations: [stdout]
 readTimeout: 10s
@@ -11,19 +13,40 @@ api: true
 apiAddress: 127.0.0.1:9997
 metrics: true
 metricsAddress: 127.0.0.1:9998
+pprof: false
+pprofAddress: 127.0.0.1:9999
+playback: false
+playbackAddress: 127.0.0.1:9996
 
-rtsp: true
+# The camera is an RTSP client source. No RTSP server transport is exposed.
+rtsp: false
+rtspTransports: []
 rtspAddress: 127.0.0.1:8554
-rtmp: false
-hls: false
-srt: false
+rtspsAddress: 127.0.0.1:8322
+rtpAddress: 127.0.0.1:8000
+rtcpAddress: 127.0.0.1:8001
 
-# A TLS reverse proxy may expose only the WHEP create and teardown routes.
+rtmp: false
+rtmpAddress: 127.0.0.1:1935
+rtmpsAddress: 127.0.0.1:1936
+hls: false
+hlsAddress: 127.0.0.1:8888
+srt: false
+srtAddress: 127.0.0.1:8890
+moq: false
+moqAddress: 127.0.0.1:8891
+
+# nginx proxies WHEP HTTP signaling only. Media uses the validated ICE/TURN
+# settings injected by the gateway environment; there is no local fallback.
 webrtc: true
 webrtcAddress: 127.0.0.1:8889
 webrtcAllowOrigins: []
-webrtcLocalUDPAddress: 127.0.0.1:8189
-webrtcLocalTCPAddress: 127.0.0.1:8189
+webrtcLocalUDPAddress: ""
+webrtcLocalTCPAddress: ""
+webrtcIPsFromInterfaces: false
+webrtcIPsFromInterfacesList: []
+webrtcAdditionalHosts: []
+webrtcICEServers2: []
 
 pathDefaults:
   sourceOnDemand: false

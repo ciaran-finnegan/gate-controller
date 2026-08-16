@@ -8,6 +8,12 @@ import secrets
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from gate_media_config import (
+    MediaConfigError,
+    relevant_auth_environment,
+    validate_auth_environment,
+)
+
 from .capabilities import MediaHealthPublisher
 from .token import TokenValidationError, _unique_object, validate_media_token
 
@@ -119,6 +125,11 @@ def _allows_read(payload: dict, secret: str, *, now: int) -> bool:
     return True
 
 
+def validated_auth_environment(environment) -> dict[str, str]:
+    """Return only the exact effective auth settings or fail closed."""
+    return validate_auth_environment(relevant_auth_environment(environment))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Loopback MediaMTX authorization sidecar")
     parser.add_argument("--host", default=LOOPBACK_HOST)
@@ -128,13 +139,15 @@ def main() -> None:
         parser.error("the media auth sidecar must bind 127.0.0.1")
     if not 1 <= arguments.port <= 65535:
         parser.error("port must be between 1 and 65535")
-    secret = os.environ.get("GATE_MEDIA_HMAC_SECRET", "")
-    if len(secret.encode("utf-8")) < 32:
-        parser.error("GATE_MEDIA_HMAC_SECRET must be at least 32 bytes")
+    try:
+        environment = validated_auth_environment(os.environ)
+    except MediaConfigError as error:
+        parser.error(str(error))
+    secret = environment["GATE_MEDIA_HMAC_SECRET"]
     server = MediaAuthServer((arguments.host, arguments.port), secret)
     publisher = MediaHealthPublisher(
-        os.environ.get("GATE_MEDIA_CAPABILITIES_FILE", "/run/gate-media/capabilities.json"),
-        os.environ,
+        "/run/gate-media/capabilities.json",
+        environment,
     )
     server.logger.info("media authorization sidecar started on loopback")
     publisher.start()

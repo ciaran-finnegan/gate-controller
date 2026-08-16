@@ -14,6 +14,7 @@ MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_BINARY=/usr/local/bin/mediamtx
 MEDIA_ARCHIVE_ROOT=/var/lib/gate-media/archives
 SYSTEMD_ROOT=/etc/systemd/system
+PINNED_MEDIAMTX_VERSION=1.19.3
 SOURCE=
 MEDIAMTX_ARCHIVE=
 MEDIAMTX_VERSION=
@@ -28,8 +29,8 @@ usage() {
 Usage: sudo deployment/install-media.sh --source PATH --mediamtx-archive PATH \
   --mediamtx-version VERSION --checksum-map PATH --allowed-origin HTTPS_ORIGIN
 
-The archive and checksum map are operator-supplied, pre-approved local files.
-This installer never downloads release assets or invents a checksum.
+The archive and checksum map are operator-supplied, pre-approved local files for
+MediaMTX 1.19.3. This installer never downloads assets or invents a checksum.
 EOF
 }
 
@@ -55,20 +56,10 @@ lookup_mediamtx_checksum() {
   local version=$1
   local architecture=$2
   local map=$3
-  local map_version map_architecture checksum extra matched=
+  local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
 
-  [[ -f $map && ! -L $map ]] || fail "checksum map must be a regular file"
-  while read -r map_version map_architecture checksum extra || [[ -n ${map_version:-} ]]; do
-    [[ -n ${map_version:-} && ${map_version:0:1} != '#' ]] || continue
-    [[ -z ${extra:-} ]] || fail "checksum map has an invalid row"
-    [[ $checksum =~ ^[A-Fa-f0-9]{64}$ ]] || fail "checksum map has an invalid SHA-256"
-    if [[ $map_version == "$version" && $map_architecture == "$architecture" ]]; then
-      [[ -z $matched ]] || fail "checksum map has duplicate version and architecture"
-      matched=$checksum
-    fi
-  done <"$map"
-  [[ -n $matched ]] || fail "no approved checksum for MediaMTX $version $architecture"
-  printf '%s\n' "$matched"
+  python3 "$validator" checksum --map "$map" --version "$version" \
+    --architecture "$architecture"
 }
 
 validate_root_file() {
@@ -91,12 +82,10 @@ PY
 }
 
 media_environment_complete() {
-  [[ -f $MEDIA_AUTH_ENV && ! -L $MEDIA_AUTH_ENV \
-      && -f $MEDIA_GATEWAY_ENV && ! -L $MEDIA_GATEWAY_ENV ]] \
-    && grep -Eq '^GATE_MEDIA_HMAC_SECRET=.{32,}$' "$MEDIA_AUTH_ENV" \
-    && ! grep -Eq '^(MTX_|GATE_MEDIA_RTSP_SOURCE=)' "$MEDIA_AUTH_ENV" \
-    && grep -Eq '^MTX_PATHS_GATE_SOURCE=.+$' "$MEDIA_GATEWAY_ENV" \
-    && ! grep -Eq '^GATE_MEDIA_HMAC_SECRET=' "$MEDIA_GATEWAY_ENV"
+  local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
+
+  python3 "$validator" environment --auth "$MEDIA_AUTH_ENV" --gateway "$MEDIA_GATEWAY_ENV" \
+    >/dev/null
 }
 
 reject_gpio_membership() {
@@ -233,6 +222,7 @@ install_mediamtx_binary() {
 install_fixed_media_files() {
   local source=$1
   local source_auth=$source/gate_media_auth
+  local source_gateway=$source/gate_media_gateway
 
   [[ -f $source/deployment/media/mediamtx.yml ]] || fail "MediaMTX config is missing"
   [[ -f $source/deployment/media/nginx-whep-locations.conf.template ]] \
@@ -240,8 +230,12 @@ install_fixed_media_files() {
   [[ -f $source/deployment/systemd/gate-media-auth.service ]] || fail "media auth unit is missing"
   [[ -f $source/deployment/systemd/gate-media-gateway.service ]] || fail "media gateway unit is missing"
   [[ -d $source_auth ]] || fail "media auth package is missing"
+  [[ -f $source_gateway/__init__.py && -f $source_gateway/__main__.py ]] \
+    || fail "media gateway launcher is missing"
+  [[ -f $source/gate_media_config.py ]] || fail "media config validator is missing"
   install -d -o root -g root -m 0755 "$MEDIA_CONFIG_ROOT" "$MEDIA_LIBRARY"
-  install -d -o root -g root -m 0755 "$MEDIA_LIBRARY/gate_media_auth"
+  install -d -o root -g root -m 0755 \
+    "$MEDIA_LIBRARY/gate_media_auth" "$MEDIA_LIBRARY/gate_media_gateway"
   install -o root -g gate-media -m 0640 \
     "$source/deployment/media/mediamtx.yml" "$MEDIA_CONFIG"
   install -o root -g root -m 0640 \
@@ -254,6 +248,11 @@ install_fixed_media_files() {
   install -o root -g root -m 0644 "$source_auth/__main__.py" "$MEDIA_LIBRARY/gate_media_auth/__main__.py"
   install -o root -g root -m 0644 "$source_auth/token.py" "$MEDIA_LIBRARY/gate_media_auth/token.py"
   install -o root -g root -m 0644 "$source_auth/capabilities.py" "$MEDIA_LIBRARY/gate_media_auth/capabilities.py"
+  install -o root -g root -m 0644 "$source/gate_media_config.py" "$MEDIA_LIBRARY/gate_media_config.py"
+  install -o root -g root -m 0644 \
+    "$source_gateway/__init__.py" "$MEDIA_LIBRARY/gate_media_gateway/__init__.py"
+  install -o root -g root -m 0644 \
+    "$source_gateway/__main__.py" "$MEDIA_LIBRARY/gate_media_gateway/__main__.py"
   install -o root -g root -m 0644 /dev/stdin "$MEDIA_TMPFILES" <<'EOF'
 d /run/gate-media 0775 root gate-media-auth -
 EOF
@@ -277,11 +276,12 @@ main() {
   [[ -n $SOURCE && -n $MEDIAMTX_ARCHIVE && -n $MEDIAMTX_VERSION \
       && -n $CHECKSUM_MAP && -n $ALLOWED_ORIGIN ]] \
     || fail "source, archive, version, checksum map, and allowed origin are required"
-  [[ $MEDIAMTX_VERSION =~ ^[0-9][0-9A-Za-z._-]{0,63}$ ]] || fail "invalid MediaMTX version"
+  [[ $MEDIAMTX_VERSION == "$PINNED_MEDIAMTX_VERSION" ]] \
+    || fail "MediaMTX version must be $PINNED_MEDIAMTX_VERSION"
   SOURCE=$(readlink -f "$SOURCE")
   [[ -d $SOURCE ]] || fail "source checkout does not exist"
 
-  for command in grep id install mktemp mv python3 readlink rm sha256sum \
+  for command in id install mktemp mv python3 readlink rm sha256sum \
     systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
