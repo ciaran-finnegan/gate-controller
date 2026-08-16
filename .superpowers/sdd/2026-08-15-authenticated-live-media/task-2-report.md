@@ -11,10 +11,11 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 - A non-root launcher fails closed before executing MediaMTX unless its exact
   effective environment contains a valid RTSP camera source, matching explicit
   non-wildcard/non-loopback ICE UDP and TCP binds, an exact
-  `MTX_WEBRTCADDITIONALHOSTS_0` match for that bind IP, and complete
-  MediaMTX-side TURN configuration. nginx exposes only exact WHEP creation and
-  bounded teardown routes with one exact HTTPS CORS origin; it does not carry
-  media.
+  `MTX_WEBRTCADDITIONALHOSTS` single-IP match for that bind IP, and complete
+  MediaMTX-side TURN configuration. The indexed form is rejected because
+  MediaMTX 1.19.3 loads string slices from one comma-separated environment
+  value. nginx exposes only exact WHEP creation and bounded teardown routes with
+  one exact HTTPS CORS origin; it does not carry media.
 - The pinned 1.19.3 config uses the real `moqHTTP2Address` and
   `moqHTTP3Address` fields on loopback while MoQ remains disabled. A hermetic
   fixture derived from the pinned `Conf` field surface rejects unknown global
@@ -56,10 +57,11 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 
 ## Commits
 
-- `dea5ac9 feat: add isolated gate media gateway`
-- `3914752 fix: harden isolated media gateway`
-- `440c9b5 fix: harden isolated MediaMTX deployment`
-- `dd890b9 fix: advertise pinned MediaMTX ICE host`
+- `e56ac75 feat: add isolated gate media gateway`
+- `c95cdde fix: harden isolated media gateway`
+- `bd447f2 fix: harden isolated MediaMTX deployment`
+- `c28bbec fix: advertise pinned MediaMTX ICE host`
+- `5e71ed2 fix: use MediaMTX string-slice ICE host env`
 
 ## Tests
 
@@ -70,17 +72,22 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 - The final P1 cycle first produced four expected failures for the omitted
   additional-host contract and invalid MoQ field, then passed all four after
   the minimal validator/config change.
-- `python3 -m unittest tests.test_media_auth tests.test_media_deployment -v`:
-  46 run; 45 passed and the optional real MediaMTX 1.19.3 binary probe skipped
-  because no verified binary was available.
+- The follow-up real-binary cycle reproduced the 1.19.3 validation failure and
+  stdout `ResourceWarning`. After changing tests only, the protected launcher
+  and file parser failed on the new unindexed contract. After the implementation
+  change, those tests passed and the real binary loaded the pinned config.
+- `MEDIAMTX_1_19_3_BINARY=/private/tmp/mediamtx-v1.19.3-arm64/mediamtx python3
+  -W error::ResourceWarning -m unittest tests.test_media_auth
+  tests.test_media_deployment -v`: all 46 passed, including the actual
+  `v1.19.3` binary config probe, with no `ResourceWarning`.
 - `python3 -m unittest tests.test_deployment tests.test_runtime -v`: 18 passed,
   one skipped because the Linux `flock` command is unavailable on macOS.
-- `python3 -m unittest discover -s tests`: 151 entries; 142 passed, seven
-  pre-existing import errors, and two skips (the Linux-only test and unavailable
-  verified MediaMTX binary). The import errors are exactly `requests` for
-  `test_authorisation`, `test_control_plane`, and `test_main`; Pillow (`PIL`)
-  for `test_images`, `test_outbox`, and `test_processor`; and `watchdog` for
-  `test_worker` under Homebrew Python 3.14.6.
+- `MEDIAMTX_1_19_3_BINARY=/private/tmp/mediamtx-v1.19.3-arm64/mediamtx python3
+  -m unittest discover -s tests`: 151 entries; 143 passed, seven pre-existing
+  import errors, and one Linux-only skip. The import errors are exactly
+  `requests` for `test_authorisation`, `test_control_plane`, and `test_main`;
+  Pillow (`PIL`) for `test_images`, `test_outbox`, and `test_processor`; and
+  `watchdog` for `test_worker` under Homebrew Python 3.14.6.
 - `python3 -m compileall -q gate_media_config.py gate_media_gateway
   gate_media_auth gate_controller deployment tests/test_media_auth.py
   tests/test_media_deployment.py`: passed.
@@ -91,12 +98,11 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 ## Concerns
 
 - No dependencies were installed and no release asset, binary, or checksum was
-  downloaded. No deploy, push, or merge operation was performed. The seven
-  baseline dependency import errors therefore remain.
-- The official pinned source and release metadata were inspected, but shell
-  network permission for fetching the signed release assets was unavailable and
-  no local MediaMTX binary existed. The committed optional real-binary config
-  probe therefore skipped; the hermetic 1.19.3 schema/invariant probe passed.
+  downloaded by this work. No deploy, push, or merge operation was performed.
+  The seven baseline dependency import errors therefore remain.
+- The coordinator-provided checksummed binary at
+  `/private/tmp/mediamtx-v1.19.3-arm64/mediamtx` reported `v1.19.3`; both the
+  actual-binary config probe and hermetic 1.19.3 schema/invariant probe passed.
 - `systemd-analyze` and nginx are unavailable in this macOS environment, so
   Linux unit loading, nginx config loading, and live integration were not
   executed here.
