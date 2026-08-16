@@ -10,9 +10,254 @@ from pathlib import Path
 
 from gate_controller.models import GateEvent
 from gate_controller.store import LocalStore
+from gate_controller.telemetry import EventTelemetry, FrameTelemetry, StageDurations
+
+
+def _telemetry(trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2", *, reason="exact_match"):
+    return EventTelemetry(
+        trace_id=trace_id,
+        stage_durations=StageDurations(end_to_end_ms=125),
+        frames=(),
+        ocr_attempts=(),
+        decision_outcome="allowed" if reason == "exact_match" else "denied",
+        decision_reason=reason,
+        actuation_claim="claimed" if reason == "exact_match" else "not_requested",
+        actuation_attempted=reason == "exact_match",
+        relay_outcome="activated" if reason == "exact_match" else "not_attempted",
+        outbox_attempt=0,
+        delivery_state="pending",
+    )
 
 
 class LocalStoreTests(unittest.TestCase):
+    def test_frame_quality_status_survives_persistence_and_outbox_attachment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key="quality-status",
+                    received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+                ),
+                {"controller_id": "pi-front-gate"},
+            )
+            telemetry = EventTelemetry(
+                trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+                stage_durations=StageDurations(end_to_end_ms=125),
+                frames=(FrameTelemetry(
+                    sequence=0, digest="a" * 64, width=1, height=1,
+                    sharpness=0, brightness=0, darkness=0,
+                    highlight_clipping=0, status="quality_unavailable",
+                ),),
+                ocr_attempts=(), decision_outcome="denied",
+                decision_reason="no_match", actuation_claim="not_requested",
+                actuation_attempted=False, relay_outcome="not_attempted",
+                outbox_attempt=0, delivery_state="pending",
+            )
+
+            store.attach_event_telemetry(event_id, telemetry)
+            item_id, queued = store.pending_outbox_items()[0]
+            attempted = store.prepare_outbox_attempt(
+                item_id, datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+            )
+
+            self.assertEqual(
+                store.event_telemetry(event_id)["frames"][0]["status"],
+                "quality_unavailable",
+            )
+            self.assertEqual(
+                queued["telemetry"]["frames"][0]["status"],
+                "quality_unavailable",
+            )
+            self.assertEqual(
+                attempted["telemetry"]["frames"][0]["status"],
+                "quality_unavailable",
+            )
+
+    def test_telemetry_pages_use_received_at_and_event_id_as_a_stable_keyset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            received_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+            event_ids = []
+            for index in range(5):
+                event_id = store.record_event(GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key=f"page-{index}", received_at=received_at,
+                ))
+                store.attach_event_telemetry(
+                    event_id,
+                    _telemetry(
+                        f"00000000-0000-4000-8000-00000000000{index}",
+                        reason="no_match",
+                    ),
+                )
+                event_ids.append(event_id)
+
+            first = store.event_telemetry_page(received_at, limit=2)
+            second = store.event_telemetry_page(
+                received_at,
+                after=(first[-1]["received_at"], first[-1]["event_id"]),
+                limit=2,
+            )
+            third = store.event_telemetry_page(
+                received_at,
+                after=(second[-1]["received_at"], second[-1]["event_id"]),
+                limit=2,
+            )
+
+            self.assertEqual(
+                [row["event_id"] for row in first + second + third], event_ids
+            )
+            self.assertEqual([len(first), len(second), len(third)], [2, 2, 1])
+
+    def test_migration_adds_the_bounded_event_telemetry_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+
+            with closing(sqlite3.connect(store.path)) as connection:
+                columns = connection.execute("PRAGMA table_info(event_telemetry)").fetchall()
+                indexes = connection.execute("PRAGMA index_list(event_telemetry)").fetchall()
+
+            self.assertEqual(
+                [(row[1], row[2], row[5]) for row in columns],
+                [
+                    ("event_id", "INTEGER", 1),
+                    ("trace_id", "TEXT", 0),
+                    ("payload", "TEXT", 0),
+                    ("created_at", "TEXT", 0),
+                ],
+            )
+            self.assertTrue(any(row[2] for row in indexes), indexes)
+
+    def test_attach_is_idempotent_and_promotes_only_the_pending_outbox_to_v3(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="exact_match", opened=True,
+                    idempotency_key="telemetry-one",
+                    received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+                ),
+                {"event_id": None, "controller_id": "pi-front-gate"},
+            )
+            telemetry = _telemetry()
+
+            self.assertTrue(store.attach_event_telemetry(event_id, telemetry))
+            self.assertFalse(store.attach_event_telemetry(event_id, telemetry))
+
+            saved = store.event_telemetry(event_id)
+            _, queued = store.pending_outbox_items()[0]
+            self.assertEqual(saved["trace_id"], telemetry.trace_id)
+            self.assertNotIn("schema_version", saved)
+            self.assertEqual(queued["schema_version"], 3)
+            self.assertEqual(queued["telemetry"], saved)
+            self.assertEqual(queued["controller_id"], "pi-front-gate")
+
+    def test_attach_rejects_event_and_trace_identity_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            first = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="telemetry-first", received_at=datetime.now(timezone.utc),
+            ))
+            second = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="telemetry-second", received_at=datetime.now(timezone.utc),
+            ))
+            store.attach_event_telemetry(first, _telemetry(reason="no_match"))
+
+            with self.assertRaises(ValueError):
+                store.attach_event_telemetry(
+                    first,
+                    _telemetry("b92dcb71-dd3c-4a82-b522-093f75746295", reason="no_match"),
+                )
+            with self.assertRaises(ValueError):
+                store.attach_event_telemetry(second, _telemetry(reason="no_match"))
+
+    def test_attach_does_not_rewrite_a_completed_v2_outbox_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="already-sent", received_at=datetime.now(timezone.utc),
+            ))
+            item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+            store.complete_outbox_item(item_id)
+            with closing(sqlite3.connect(store.path)) as connection:
+                before = connection.execute(
+                    "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+                ).fetchone()
+
+            self.assertTrue(store.attach_event_telemetry(
+                event_id, _telemetry(reason="no_match")
+            ))
+
+            with closing(sqlite3.connect(store.path)) as connection:
+                after = connection.execute(
+                    "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+                ).fetchone()
+            self.assertEqual(after, before)
+            self.assertIsNotNone(store.event_telemetry(event_id))
+
+    def test_retention_removes_only_old_telemetry_with_completed_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            now = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+            event_ids = []
+            for index in range(3):
+                event_id = store.record_event(GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key=f"retention-{index}", received_at=now,
+                ))
+                item_id = store.queue_outbox(event_id, {
+                    "controller_id": "pi-front-gate",
+                    "image_sha256": f"{index + 1}" * 64,
+                })
+                store.attach_event_telemetry(
+                    event_id,
+                    _telemetry(
+                        f"00000000-0000-4000-8000-00000000000{index}", reason="no_match"
+                    ),
+                )
+                if index != 1:
+                    store.complete_outbox_item(item_id, now)
+                event_ids.append(event_id)
+            with closing(sqlite3.connect(store.path)) as connection:
+                before = {
+                    event_id: json.loads(payload)
+                    for event_id, payload in connection.execute(
+                        "SELECT event_id, payload FROM outbox"
+                    ).fetchall()
+                }
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                connection.execute(
+                    "UPDATE event_telemetry SET created_at = ? WHERE event_id IN (?, ?)",
+                    (
+                        (now - timedelta(days=31)).isoformat(),
+                        event_ids[0], event_ids[1],
+                    ),
+                )
+
+            removed = store.purge_delivered_telemetry(now - timedelta(days=30))
+
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.event_telemetry(event_ids[0]))
+            self.assertIsNotNone(store.event_telemetry(event_ids[1]))
+            self.assertIsNotNone(store.event_telemetry(event_ids[2]))
+            with closing(sqlite3.connect(store.path)) as connection:
+                after = {
+                    event_id: json.loads(payload)
+                    for event_id, payload in connection.execute(
+                        "SELECT event_id, payload FROM outbox"
+                    ).fetchall()
+                }
+            stripped = dict(before[event_ids[0]])
+            stripped.pop("telemetry")
+            stripped["schema_version"] = 2
+            self.assertEqual(after[event_ids[0]], stripped)
+            self.assertEqual(after[event_ids[1]], before[event_ids[1]])
+            self.assertEqual(after[event_ids[2]], before[event_ids[2]])
+
     def test_migrates_legacy_truthy_cooldown_values(self):
         for legacy_value in ("True", "Yes", 1):
             with self.subTest(legacy_value=legacy_value), tempfile.TemporaryDirectory() as directory:

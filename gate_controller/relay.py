@@ -22,7 +22,7 @@ class RelayController:
         self._last_outcome_at = self._clock()
 
     def trigger(self, source: str, idempotency_key: str | None = None, *,
-                pre_activation_inhibit=None) -> RelayResult:
+                pre_activation_inhibit=None, on_activation=None) -> RelayResult:
         with self._lock:
             if self._latched:
                 self._record_outcome("relay_latched")
@@ -38,6 +38,11 @@ class RelayController:
             try:
                 self._relay.on()
                 activated_at = self._clock()
+                if on_activation is not None:
+                    try:
+                        on_activation()
+                    except Exception:
+                        pass
                 self._sleeper(self._pulse_seconds)
             except BaseException as error:
                 if not self._deenergize():

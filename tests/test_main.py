@@ -14,6 +14,25 @@ from gate_controller.store import LocalStore
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "sys.argv",
+            [
+                "gate-controller", "telemetry-export", "--database", "gate.db",
+                "--format", "json", "--since", "2026-08-01T00:00:00Z",
+                "--output", "telemetry.json",
+            ],
+        ), patch.object(gate_main, "require_python_version"), patch.object(
+            gate_main, "LocalStore", return_value=object()
+        ) as create_store, patch.object(
+            gate_main, "export_telemetry", return_value=1, create=True
+        ) as export, patch.object(gate_main, "PiRelayAdapter") as relay:
+            gate_main.main()
+
+        create_store.assert_called_once_with(Path("gate.db"))
+        export.assert_called_once()
+        relay.assert_not_called()
+
     def test_main_forces_relay_safe_before_store_and_recovers_before_workers(self):
         calls = []
 

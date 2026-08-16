@@ -5,9 +5,89 @@ from time import monotonic, sleep
 
 from PIL import Image, ImageFilter, ImageStat
 
+from .telemetry import FrameTelemetry
+
 
 MAX_IMAGE_PIXELS = 16_000_000
+QUALITY_SIZE = (320, 180)
+QUALITY_UNAVAILABLE_DIGEST = hashlib.sha256(b"quality_unavailable").hexdigest()
 Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
+
+
+def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTelemetry:
+    """Return bounded, downsampled quality proxies without exposing image paths."""
+    path = Path(path)
+    if digest is None:
+        try:
+            digest = _content_digest(path)
+        except OSError:
+            digest = QUALITY_UNAVAILABLE_DIGEST
+
+    try:
+        if not _has_jpeg_signature(path):
+            raise ValueError("invalid image signature")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                if image.format != "JPEG":
+                    raise ValueError("invalid image format")
+                width, height = image.size
+                image.draft("L", QUALITY_SIZE)
+                image.load()
+                image.thumbnail(QUALITY_SIZE, Image.Resampling.BILINEAR)
+                grayscale = image.convert("L")
+
+        histogram = grayscale.histogram()
+        pixel_count = max(sum(histogram), 1)
+        brightness = sum(value * count for value, count in enumerate(histogram)) / (
+            255 * pixel_count
+        )
+        darkness = sum(histogram[:33]) / pixel_count
+        highlight_clipping = sum(histogram[240:]) / pixel_count
+        sharpness = _sharpness_proxy(grayscale)
+        return FrameTelemetry(
+            sequence=0,
+            digest=digest,
+            width=width,
+            height=height,
+            sharpness=sharpness,
+            brightness=brightness,
+            darkness=darkness,
+            highlight_clipping=highlight_clipping,
+        )
+    except (
+        OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
+    ):
+        return FrameTelemetry(
+            sequence=0,
+            digest=digest,
+            width=1,
+            height=1,
+            sharpness=0.0,
+            brightness=0.0,
+            darkness=0.0,
+            highlight_clipping=0.0,
+            status="quality_unavailable",
+        )
+
+
+def _sharpness_proxy(grayscale: Image.Image) -> float:
+    if grayscale.width < 3 or grayscale.height < 3:
+        return 0.0
+    laplacian = grayscale.filter(ImageFilter.Kernel(
+        (3, 3),
+        (0, 1, 0, 1, -4, 1, 0, 1, 0),
+        scale=1,
+        offset=128,
+    ))
+    interior = laplacian.crop((1, 1, laplacian.width - 1, laplacian.height - 1))
+    histogram = interior.histogram()
+    pixel_count = max(sum(histogram), 1)
+    mean_deviation = sum(
+        abs(value - 128) * count for value, count in enumerate(histogram)
+    ) / pixel_count
+    return min(mean_deviation / 128, 1.0)
+
 
 def wait_until_readable(path: Path, timeout: float, poll_interval: float = 0.1) -> bool:
     """Wait for a complete, decodable image without treating partial uploads as valid."""

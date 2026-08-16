@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,10 +6,82 @@ from unittest.mock import patch
 
 from PIL import Image
 
+import gate_controller.images as image_tools
 from gate_controller.images import rank_images, wait_until_readable
 
 
 class ImageTests(unittest.TestCase):
+    def _measure_frame_quality(self, path: Path):
+        measure = getattr(image_tools, "measure_frame_quality", None)
+        self.assertIsNotNone(measure, "measure_frame_quality is not implemented")
+        return measure(path)
+
+    def test_measure_frame_quality_reports_dimensions_and_bounded_luma_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "split.jpg"
+            image = Image.new("L", (16, 8))
+            image.putdata([0 if x < 8 else 255 for _y in range(8) for x in range(16)])
+            image.save(frame, format="JPEG", quality=100, subsampling=0)
+
+            quality = self._measure_frame_quality(frame)
+
+            self.assertEqual(quality.sequence, 0)
+            self.assertEqual(quality.digest, hashlib.sha256(frame.read_bytes()).hexdigest())
+            self.assertEqual((quality.width, quality.height), (16, 8))
+            self.assertAlmostEqual(quality.brightness, 0.5, delta=0.01)
+            self.assertAlmostEqual(quality.darkness, 0.5, delta=0.01)
+            self.assertAlmostEqual(quality.highlight_clipping, 0.5, delta=0.01)
+            self.assertGreater(quality.sharpness, 0.0)
+            for metric in (
+                quality.sharpness,
+                quality.brightness,
+                quality.darkness,
+                quality.highlight_clipping,
+            ):
+                self.assertGreaterEqual(metric, 0.0)
+                self.assertLessEqual(metric, 1.0)
+
+    def test_measure_frame_quality_reuses_a_precomputed_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "frame.jpg"
+            Image.new("L", (16, 8), color=128).save(frame, format="JPEG")
+            digest = hashlib.sha256(frame.read_bytes()).hexdigest()
+
+            with patch("gate_controller.images._content_digest") as content_digest:
+                quality = image_tools.measure_frame_quality(frame, digest=digest)
+
+            self.assertEqual(quality.digest, digest)
+            content_digest.assert_not_called()
+
+    def test_measure_frame_quality_downsamples_before_filtering_for_sharpness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "large.jpg"
+            Image.new("L", (640, 360), color=128).save(frame, format="JPEG")
+            filtered_sizes = []
+            original_filter = Image.Image.filter
+
+            def record_filter(image, image_filter):
+                filtered_sizes.append(image.size)
+                return original_filter(image, image_filter)
+
+            with patch.object(Image.Image, "filter", autospec=True, side_effect=record_filter):
+                quality = self._measure_frame_quality(frame)
+
+            self.assertEqual((quality.width, quality.height), (640, 360))
+            self.assertEqual(filtered_sizes, [(320, 180)])
+
+    def test_measure_frame_quality_returns_a_redacted_status_for_invalid_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "private-camera-frame.jpg"
+            frame.write_bytes(b"not a jpeg: exceptionally sensitive details")
+
+            quality = self._measure_frame_quality(frame)
+
+            self.assertRegex(quality.status, r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+            self.assertEqual(quality.status, "quality_unavailable")
+            self.assertNotIn(str(frame), quality.status)
+            self.assertNotIn("sensitive", quality.status)
+
     def test_rejects_non_jpeg_magic_without_invoking_pillow(self):
         with tempfile.TemporaryDirectory() as directory:
             disguised = Path(directory) / "disguised.jpg"

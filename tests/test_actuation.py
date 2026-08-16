@@ -34,6 +34,41 @@ class FailingMarkStore(LocalStore):
 
 
 class ActuationCoordinatorTests(unittest.TestCase):
+    def test_forwards_activation_hook_without_delaying_finalization(self):
+        now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        calls = []
+
+        class CallbackRelay:
+            def trigger(self, source, idempotency_key=None, *, on_activation=None):
+                calls.append("relay")
+                on_activation()
+                return RelayResult(True, "activated", idempotency_key, now)
+
+        class FinalizationStore(LocalStore):
+            def finalize_actuation(self, *args, **kwargs):
+                calls.append("finalize")
+                return super().finalize_actuation(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = ActuationCoordinator(
+                FinalizationStore(Path(directory) / "gate.db"),
+                CallbackRelay(),
+                clock=lambda: now,
+            ).actuate(
+                GateEvent(
+                    source="ocr",
+                    reason="exact_match",
+                    opened=False,
+                    idempotency_key="ocr-1",
+                    received_at=now,
+                    decision_at=now,
+                ),
+                on_activation=lambda: calls.append("activation"),
+            )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(calls, ["relay", "activation", "finalize"])
+
     def test_successful_finalization_durably_queues_the_command_ack_before_restart(self):
         now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
