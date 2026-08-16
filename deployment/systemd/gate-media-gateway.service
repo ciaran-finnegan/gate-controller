@@ -10,7 +10,7 @@ StartLimitBurst=5
 Type=simple
 User=gate-media
 Group=gate-media
-EnvironmentFile=/etc/gate-media.env
+EnvironmentFile=/etc/gate-media-gateway.env
 ExecStart=/usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml
 Restart=always
 RestartSec=5s
@@ -36,6 +36,9 @@ RestrictSUIDSGID=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
+InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
+NoExecPaths=/
+ExecPaths=/usr/local/bin/mediamtx
 
 [Install]
 WantedBy=multi-user.target

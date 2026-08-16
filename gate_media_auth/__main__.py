@@ -95,7 +95,7 @@ def authorize_body(body: bytes, secret: str, *, now: int) -> int:
         payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return 401
-    if not isinstance(payload, dict) or not set(payload).issubset(_ALLOWED_FIELDS):
+    if not isinstance(payload, dict) or set(payload) != _ALLOWED_FIELDS:
         return 401
     return 200 if _allows_read(payload, secret, now=now) else 401
 

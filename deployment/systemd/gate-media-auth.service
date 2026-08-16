@@ -9,7 +9,7 @@ StartLimitBurst=5
 Type=simple
 User=gate-media-auth
 Group=gate-media-auth
-EnvironmentFile=/etc/gate-media.env
+EnvironmentFile=/etc/gate-media-auth.env
 Environment=PYTHONPATH=/usr/local/lib/gate-media
 ExecStart=/usr/bin/python3 -m gate_media_auth
 Restart=always
@@ -37,6 +37,9 @@ RestrictSUIDSGID=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
+InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
+NoExecPaths=/
+ExecPaths=/usr/bin/python3
 
 [Install]
 WantedBy=multi-user.target

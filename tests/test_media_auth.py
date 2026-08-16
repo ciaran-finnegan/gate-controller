@@ -38,6 +38,21 @@ def valid_claims(now=1_700_000_000):
     }
 
 
+def valid_auth_request(now):
+    return {
+        "user": "",
+        "password": "",
+        "token": make_token(valid_claims(now)),
+        "ip": "127.0.0.1",
+        "action": "read",
+        "path": "gate",
+        "protocol": "webrtc",
+        "id": "session-42",
+        "query": "",
+        "userAgent": "test-agent",
+    }
+
+
 class MediaTokenTests(unittest.TestCase):
     def test_accepts_a_current_read_token_for_the_primary_gate(self):
         claims = valid_claims()
@@ -96,22 +111,35 @@ class MediaTokenTests(unittest.TestCase):
 
 class MediaAuthServerTests(unittest.TestCase):
     def test_returns_exact_200_for_valid_mediamtx_read_auth(self):
-        payload = json.dumps({
-            "user": "",
-            "password": "",
-            "token": make_token(valid_claims(int(time.time()))),
-            "ip": "127.0.0.1",
-            "action": "read",
-            "path": "gate",
-            "protocol": "webrtc",
-            "id": "session-42",
-            "query": "",
-            "userAgent": "test-agent",
-        })
+        payload = json.dumps(valid_auth_request(int(time.time())))
 
         status = authorize_body(payload.encode("utf-8"), SECRET, now=int(time.time()))
 
         self.assertEqual(200, status)
+
+    def test_rejects_removal_of_every_required_mediamtx_auth_field(self):
+        now = int(time.time())
+        valid = valid_auth_request(now)
+
+        for field in valid:
+            incomplete = dict(valid)
+            incomplete.pop(field)
+            with self.subTest(field=field):
+                status = authorize_body(
+                    json.dumps(incomplete).encode("utf-8"), SECRET, now=now
+                )
+                self.assertEqual(401, status)
+
+    def test_rejects_every_non_webrtc_protocol(self):
+        now = int(time.time())
+        for protocol in ("rtsp", "rtmp", "hls", "srt", ""):
+            payload = valid_auth_request(now)
+            payload["protocol"] = protocol
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    401,
+                    authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
+                )
 
     def test_returns_exact_401_for_duplicate_unknown_or_missing_token_fields(self):
         token = make_token(valid_claims(int(time.time())))

@@ -1,4 +1,4 @@
-# Secrets are supplied only through the root-owned /etc/gate-media.env file.
+# The credential-bearing source is supplied only as MTX_PATHS_GATE_SOURCE.
 logLevel: info
 logDestinations: [stdout]
 readTimeout: 10s
@@ -18,14 +18,15 @@ rtmp: false
 hls: false
 srt: false
 
-# A TLS reverse proxy may expose only /gate/whep from this listener.
+# A TLS reverse proxy may expose only the WHEP create and teardown routes.
 webrtc: true
-webrtcAddress: :8889
+webrtcAddress: 127.0.0.1:8889
 webrtcAllowOrigins: []
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcLocalTCPAddress: 127.0.0.1:8189
 
 pathDefaults:
   sourceOnDemand: false
 
 paths:
-  gate:
-    source: ${GATE_MEDIA_RTSP_SOURCE}
+  gate: {}

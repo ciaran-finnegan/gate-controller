@@ -4,16 +4,21 @@ import json
 import os
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 
 _GATEWAY_API = "http://127.0.0.1:9997/v3/paths/list"
+_MAX_GATEWAY_API_BYTES = 64 * 1024
+_MAX_GATEWAY_PATHS = 64
+_MAX_TRACKS = 16
 
 
 def default_capabilities() -> dict:
     return {
+        "observed_at": int(time.time()),
         "media": {
             "video": _capability(False, False, False, "not_configured"),
             "listen": _capability(False, False, False, "not_configured"),
@@ -24,7 +29,7 @@ def default_capabilities() -> dict:
 
 def capability_snapshot(environment, gateway_ready: bool) -> dict:
     """Build a conservative, nonsecret snapshot from explicit operator settings."""
-    video_configured = bool((environment.get("GATE_MEDIA_RTSP_SOURCE") or "").strip())
+    video_configured = _enabled(environment.get("GATE_MEDIA_VIDEO_CONFIGURED"))
     listen_configured = _enabled(environment.get("GATE_MEDIA_LISTEN_CONFIGURED"))
     talkback_configured = _enabled(environment.get("GATE_MEDIA_TALKBACK_CONFIGURED"))
     video_ready = video_configured and gateway_ready
@@ -32,6 +37,7 @@ def capability_snapshot(environment, gateway_ready: bool) -> dict:
     video_verified = video_ready and _enabled(environment.get("GATE_MEDIA_VIDEO_VERIFIED"))
     listen_verified = listen_ready and _enabled(environment.get("GATE_MEDIA_LISTEN_VERIFIED"))
     return {
+        "observed_at": int(time.time()),
         "media": {
             "video": _capability(video_configured, video_ready, video_verified,
                                   _reason(video_configured, video_ready, video_verified)),
@@ -99,12 +105,44 @@ class MediaHealthPublisher:
             self._stopped.wait(self._interval_seconds)
 
 
-def _gateway_is_ready() -> bool:
+def _gateway_is_ready(*, opener=urllib.request.urlopen) -> bool:
     try:
-        with urllib.request.urlopen(_GATEWAY_API, timeout=1) as response:
-            return response.status == 200
-    except (OSError, urllib.error.URLError, ValueError):
+        with opener(_GATEWAY_API, timeout=1) as response:
+            if response.status != 200:
+                return False
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) > _MAX_GATEWAY_API_BYTES:
+                return False
+            return gateway_status_ready(response.read(_MAX_GATEWAY_API_BYTES + 1))
+    except (OSError, urllib.error.URLError, TypeError, ValueError):
         return False
+
+
+def gateway_status_ready(body: bytes) -> bool:
+    """Return true only for a bounded API response with a ready gate path and tracks."""
+    if not isinstance(body, bytes) or not body or len(body) > _MAX_GATEWAY_API_BYTES:
+        return False
+    try:
+        payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        return False
+    items = payload["items"]
+    if len(items) > _MAX_GATEWAY_PATHS:
+        return False
+    for item in items:
+        if not isinstance(item, dict) or item.get("name") != "gate":
+            continue
+        if item.get("ready") is not True and item.get("available") is not True:
+            return False
+        tracks = item.get("tracks")
+        return (
+            isinstance(tracks, list)
+            and 0 < len(tracks) <= _MAX_TRACKS
+            and all(isinstance(track, str) and 0 < len(track) <= 64 for track in tracks)
+        )
+    return False
 
 
 def _enabled(value) -> bool:
@@ -134,3 +172,12 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result

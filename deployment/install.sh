@@ -158,6 +158,9 @@ install_fixed_media_bootstrap() {
   install -o root -g root -m 0644 \
     "$source/deployment/media/mediamtx.yml" "$MEDIA_BOOTSTRAP_ROOT/mediamtx.yml"
   install -o root -g root -m 0644 \
+    "$source/deployment/media/nginx-whep-locations.conf.template" \
+    "$MEDIA_BOOTSTRAP_ROOT/nginx-whep-locations.conf.template"
+  install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-auth.service" \
     "$MEDIA_BOOTSTRAP_ROOT/gate-media-auth.service"
   install -o root -g root -m 0644 \
@@ -367,6 +370,8 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the media installer"
 [[ -f $SOURCE/deployment/media/mediamtx.yml ]] \
   || fail "source does not contain the MediaMTX config"
+[[ -f $SOURCE/deployment/media/nginx-whep-locations.conf.template ]] \
+  || fail "source does not contain the WHEP proxy template"
 [[ -f $SOURCE/deployment/systemd/gate-media-auth.service ]] \
   || fail "source does not contain the media auth service"
 [[ -f $SOURCE/deployment/systemd/gate-media-gateway.service ]] \

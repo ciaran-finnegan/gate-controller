@@ -2,27 +2,40 @@
 
 set -Eeuo pipefail
 
-MEDIA_ENV=/etc/gate-media.env
+MEDIA_AUTH_ENV=/etc/gate-media-auth.env
+MEDIA_GATEWAY_ENV=/etc/gate-media-gateway.env
 MEDIA_CONFIG_ROOT=/etc/gate-media
 MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml
+MEDIA_PROXY_TEMPLATE=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf.template
+MEDIA_PROXY_CONFIG=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf
 MEDIA_RUNTIME=/run/gate-media
 MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_BINARY=/usr/local/bin/mediamtx
+MEDIA_ARCHIVE_ROOT=/var/lib/gate-media/archives
 SYSTEMD_ROOT=/etc/systemd/system
 SOURCE=
 MEDIAMTX_ARCHIVE=
 MEDIAMTX_VERSION=
 CHECKSUM_MAP=
+ALLOWED_ORIGIN=
+EXTRACTED_MEDIA_DIR=
+STAGED_MEDIA_BINARY=
+STAGED_MEDIA_ARCHIVE=
 
 usage() {
   cat <<'EOF'
 Usage: sudo deployment/install-media.sh --source PATH --mediamtx-archive PATH \
-  --mediamtx-version VERSION --checksum-map PATH
+  --mediamtx-version VERSION --checksum-map PATH --allowed-origin HTTPS_ORIGIN
 
 The archive and checksum map are operator-supplied, pre-approved local files.
 This installer never downloads release assets or invents a checksum.
 EOF
+}
+
+require_option_value() {
+  local option=$1
+  [[ $# -ge 2 ]] || fail "$option requires a value"
 }
 
 fail() {
@@ -78,29 +91,143 @@ PY
 }
 
 media_environment_complete() {
-  grep -Eq '^GATE_MEDIA_HMAC_SECRET=.+$' "$MEDIA_ENV" \
-    && grep -Eq '^GATE_MEDIA_RTSP_SOURCE=.+$' "$MEDIA_ENV"
+  [[ -f $MEDIA_AUTH_ENV && ! -L $MEDIA_AUTH_ENV \
+      && -f $MEDIA_GATEWAY_ENV && ! -L $MEDIA_GATEWAY_ENV ]] \
+    && grep -Eq '^GATE_MEDIA_HMAC_SECRET=.{32,}$' "$MEDIA_AUTH_ENV" \
+    && ! grep -Eq '^(MTX_|GATE_MEDIA_RTSP_SOURCE=)' "$MEDIA_AUTH_ENV" \
+    && grep -Eq '^MTX_PATHS_GATE_SOURCE=.+$' "$MEDIA_GATEWAY_ENV" \
+    && ! grep -Eq '^GATE_MEDIA_HMAC_SECRET=' "$MEDIA_GATEWAY_ENV"
+}
+
+reject_gpio_membership() {
+  local account=$1
+  local group
+  for group in $(id -nG "$account"); do
+    [[ $group != gpio ]] || fail "$account must not belong to the gpio group"
+  done
+}
+
+disable_media_services() {
+  systemctl disable --now gate-media-gateway.service gate-media-auth.service \
+    >/dev/null 2>&1 || true
+}
+
+cleanup_media_install() {
+  if [[ -n $EXTRACTED_MEDIA_DIR \
+      && $EXTRACTED_MEDIA_DIR == "$MEDIA_ARCHIVE_ROOT"/.extract.* ]]; then
+    rm -rf -- "$EXTRACTED_MEDIA_DIR"
+  fi
+  if [[ -n $STAGED_MEDIA_BINARY \
+      && $STAGED_MEDIA_BINARY == "$MEDIA_BINARY".new.* ]]; then
+    rm -f -- "$STAGED_MEDIA_BINARY"
+  fi
+  if [[ -n $STAGED_MEDIA_ARCHIVE \
+      && $STAGED_MEDIA_ARCHIVE == "$MEDIA_ARCHIVE_ROOT"/.archive.* ]]; then
+    rm -f -- "$STAGED_MEDIA_ARCHIVE"
+  fi
+}
+
+on_media_install_failure() {
+  local status=$?
+  [[ $status -ne 0 ]] || status=1
+  trap - ERR INT TERM
+  disable_media_services
+  cleanup_media_install
+  exit "$status"
+}
+
+render_proxy_config() {
+  local template=$1
+  local output=$2
+  local allowed_origin=$3
+
+  python3 - "$template" "$output" "$allowed_origin" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+template = Path(sys.argv[1])
+output = Path(sys.argv[2])
+origin = sys.argv[3]
+parsed = urlsplit(origin)
+if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+        or parsed.path or parsed.query or parsed.fragment
+        or not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname)
+        or parsed.port is not None and not 1 <= parsed.port <= 65535):
+    raise SystemExit("invalid exact HTTPS media origin")
+source = template.read_text(encoding="utf-8")
+placeholder = "__GATE_MEDIA_ALLOWED_ORIGIN__"
+if placeholder not in source:
+    raise SystemExit("media proxy template placeholder is missing")
+rendered = source.replace(placeholder, origin).encode("utf-8")
+temporary = Path(f"{output}.new.{os.getpid()}")
+descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+try:
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(rendered)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, output)
+finally:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+PY
+}
+
+stage_mediamtx_archive() {
+  local archive=$1
+  local version=$2
+  local architecture=$3
+  local stable=$MEDIA_ARCHIVE_ROOT/mediamtx-$version-$architecture.tar.gz
+
+  [[ ! -e $MEDIA_ARCHIVE_ROOT || -d $MEDIA_ARCHIVE_ROOT && ! -L $MEDIA_ARCHIVE_ROOT ]] \
+    || fail "private MediaMTX archive directory must not be a symlink"
+  install -d -o root -g root -m 0700 "$MEDIA_ARCHIVE_ROOT"
+  [[ -d $MEDIA_ARCHIVE_ROOT && ! -L $MEDIA_ARCHIVE_ROOT ]] \
+    || fail "private MediaMTX archive directory must be a directory"
+  STAGED_MEDIA_ARCHIVE=$MEDIA_ARCHIVE_ROOT/.archive.$$
+  install -o root -g root -m 0600 "$archive" "$STAGED_MEDIA_ARCHIVE"
+  [[ -f $STAGED_MEDIA_ARCHIVE && ! -L $STAGED_MEDIA_ARCHIVE ]] \
+    || fail "staged MediaMTX archive must be a regular file"
+  mv -f -- "$STAGED_MEDIA_ARCHIVE" "$stable"
+  STAGED_MEDIA_ARCHIVE=
+  printf '%s\n' "$stable"
 }
 
 install_mediamtx_binary() {
   local archive=$1
   local version=$2
   local checksum_map=$3
-  local architecture checksum extracted
+  local architecture checksum stable candidate version_output
   architecture=$(normalize_architecture)
   checksum=$(lookup_mediamtx_checksum "$version" "$architecture" "$checksum_map")
   [[ -f $archive && ! -L $archive ]] || fail "MediaMTX archive must be a regular file"
-  printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status - \
+  stable=$(stage_mediamtx_archive "$archive" "$version" "$architecture")
+  [[ -f $stable && ! -L $stable ]] || fail "private MediaMTX archive must be regular"
+  printf '%s  %s\n' "$checksum" "$stable" | sha256sum --check --status - \
     || fail "MediaMTX archive SHA-256 does not match approved map"
-  extracted=$(mktemp -d)
-  trap 'rm -rf -- "$extracted"' RETURN
-  tar -xzf "$archive" -C "$extracted" mediamtx
-  [[ -x $extracted/mediamtx ]] || fail "MediaMTX archive has no executable mediamtx"
-  install -o root -g root -m 0755 "$extracted/mediamtx" "$MEDIA_BINARY"
-  "$MEDIA_BINARY" --version | grep -F -- "$version" >/dev/null \
+  EXTRACTED_MEDIA_DIR=$(mktemp -d "$MEDIA_ARCHIVE_ROOT/.extract.XXXXXX")
+  tar --no-same-owner --no-same-permissions -xzf "$stable" -C "$EXTRACTED_MEDIA_DIR" mediamtx
+  candidate=$EXTRACTED_MEDIA_DIR/mediamtx
+  [[ -f $candidate && ! -L $candidate && -x $candidate ]] \
+    || fail "MediaMTX archive has no regular executable mediamtx"
+  install -d -o root -g root -m 0755 "${MEDIA_BINARY%/*}"
+  STAGED_MEDIA_BINARY=$MEDIA_BINARY.new.$$
+  install -o root -g root -m 0755 "$candidate" "$STAGED_MEDIA_BINARY"
+  [[ -f $STAGED_MEDIA_BINARY && ! -L $STAGED_MEDIA_BINARY && -x $STAGED_MEDIA_BINARY ]] \
+    || fail "staged MediaMTX binary must be a regular executable"
+  version_output=$("$STAGED_MEDIA_BINARY" --version)
+  [[ $version_output == "$version" || $version_output == "v$version" \
+      || $version_output == *" $version" || $version_output == *" v$version" ]] \
     || fail "installed MediaMTX version does not match $version"
-  rm -rf -- "$extracted"
-  trap - RETURN
+  mv -f -- "$STAGED_MEDIA_BINARY" "$MEDIA_BINARY"
+  STAGED_MEDIA_BINARY=
+  rm -rf -- "$EXTRACTED_MEDIA_DIR"
+  EXTRACTED_MEDIA_DIR=
 }
 
 install_fixed_media_files() {
@@ -108,6 +235,8 @@ install_fixed_media_files() {
   local source_auth=$source/gate_media_auth
 
   [[ -f $source/deployment/media/mediamtx.yml ]] || fail "MediaMTX config is missing"
+  [[ -f $source/deployment/media/nginx-whep-locations.conf.template ]] \
+    || fail "WHEP proxy template is missing"
   [[ -f $source/deployment/systemd/gate-media-auth.service ]] || fail "media auth unit is missing"
   [[ -f $source/deployment/systemd/gate-media-gateway.service ]] || fail "media gateway unit is missing"
   [[ -d $source_auth ]] || fail "media auth package is missing"
@@ -115,6 +244,8 @@ install_fixed_media_files() {
   install -d -o root -g root -m 0755 "$MEDIA_LIBRARY/gate_media_auth"
   install -o root -g gate-media -m 0640 \
     "$source/deployment/media/mediamtx.yml" "$MEDIA_CONFIG"
+  install -o root -g root -m 0640 \
+    "$source/deployment/media/nginx-whep-locations.conf.template" "$MEDIA_PROXY_TEMPLATE"
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-auth.service" "$SYSTEMD_ROOT/gate-media-auth.service"
   install -o root -g root -m 0644 \
@@ -129,45 +260,57 @@ EOF
 }
 
 main() {
+  trap on_media_install_failure ERR INT TERM
+  trap cleanup_media_install EXIT
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --source) SOURCE=$2; shift 2 ;;
-      --mediamtx-archive) MEDIAMTX_ARCHIVE=$2; shift 2 ;;
-      --mediamtx-version) MEDIAMTX_VERSION=$2; shift 2 ;;
-      --checksum-map) CHECKSUM_MAP=$2; shift 2 ;;
+      --source) require_option_value "$@"; SOURCE=$2; shift 2 ;;
+      --mediamtx-archive) require_option_value "$@"; MEDIAMTX_ARCHIVE=$2; shift 2 ;;
+      --mediamtx-version) require_option_value "$@"; MEDIAMTX_VERSION=$2; shift 2 ;;
+      --checksum-map) require_option_value "$@"; CHECKSUM_MAP=$2; shift 2 ;;
+      --allowed-origin) require_option_value "$@"; ALLOWED_ORIGIN=$2; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) fail "unknown argument: $1" ;;
     esac
   done
   [[ $EUID -eq 0 ]] || fail "run this installer with sudo"
-  [[ -n $SOURCE && -n $MEDIAMTX_ARCHIVE && -n $MEDIAMTX_VERSION && -n $CHECKSUM_MAP ]] \
-    || fail "source, archive, version, and checksum map are required"
+  [[ -n $SOURCE && -n $MEDIAMTX_ARCHIVE && -n $MEDIAMTX_VERSION \
+      && -n $CHECKSUM_MAP && -n $ALLOWED_ORIGIN ]] \
+    || fail "source, archive, version, checksum map, and allowed origin are required"
   [[ $MEDIAMTX_VERSION =~ ^[0-9][0-9A-Za-z._-]{0,63}$ ]] || fail "invalid MediaMTX version"
   SOURCE=$(readlink -f "$SOURCE")
   [[ -d $SOURCE ]] || fail "source checkout does not exist"
 
-  for command in grep install mktemp readlink rm sha256sum systemctl tar uname useradd; do
+  for command in grep id install mktemp mv python3 readlink rm sha256sum \
+    systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
   for account in gate-media gate-media-auth; do
     if ! id "$account" >/dev/null 2>&1; then
       useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin "$account"
     fi
+    reject_gpio_membership "$account"
   done
-  if [[ ! -e $MEDIA_ENV ]]; then
-    install -o root -g root -m 0600 /dev/null "$MEDIA_ENV"
-  fi
-  validate_root_file "$MEDIA_ENV" 600
+  for environment_file in "$MEDIA_AUTH_ENV" "$MEDIA_GATEWAY_ENV"; do
+    if [[ ! -e $environment_file ]]; then
+      install -o root -g root -m 0600 /dev/null "$environment_file"
+    fi
+    validate_root_file "$environment_file" 600
+  done
   install_fixed_media_files "$SOURCE"
+  render_proxy_config "$MEDIA_PROXY_TEMPLATE" "$MEDIA_PROXY_CONFIG" "$ALLOWED_ORIGIN"
   install_mediamtx_binary "$MEDIAMTX_ARCHIVE" "$MEDIAMTX_VERSION" "$CHECKSUM_MAP"
   systemd-tmpfiles --create "$MEDIA_TMPFILES"
   systemctl daemon-reload
   if media_environment_complete; then
     systemctl enable --now gate-media-auth.service gate-media-gateway.service
   else
-    systemctl disable --now gate-media-gateway.service gate-media-auth.service || true
-    printf 'Media services remain disabled until /etc/gate-media.env has source and HMAC values.\n'
+    disable_media_services
+    printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
   fi
+  trap - ERR INT TERM
+  cleanup_media_install
+  trap - EXIT
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

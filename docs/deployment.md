@@ -276,18 +276,29 @@ heartbeat. `video`, `listen`, and `talkback` are independent. All default to
 false; talkback remains `hardware_unverified` until a separate physical
 backchannel acceptance test is complete.
 
-Create the root-owned media environment before enabling the services. It must
-remain `root:root` mode `0600`; never put it in this repository or in a systemd
-unit. It contains `GATE_MEDIA_HMAC_SECRET` (at least 32 bytes) and the complete
-credential-bearing `GATE_MEDIA_RTSP_SOURCE`. The optional
-`GATE_MEDIA_VIDEO_VERIFIED=true` and `GATE_MEDIA_LISTEN_VERIFIED=true` switches
-are operator attestations after hardware validation, not defaults. Do not set
-talkback verified.
+Create two disjoint root-owned environments before enabling the services. Both
+must remain `root:root` mode `0600`; never put either file in this repository or
+in a systemd unit. `/etc/gate-media-auth.env` contains the HMAC secret and only
+nonsecret capability flags. `/etc/gate-media-gateway.env` contains the camera
+source as MediaMTX's native `MTX_PATHS_GATE_SOURCE` override and optional
+MediaMTX transport settings. The installer rejects a camera source in the auth
+environment or an HMAC secret in the gateway environment.
 
 ```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/gate-media.env
-sudoedit /etc/gate-media.env
+sudo install -o root -g root -m 0600 /dev/null /etc/gate-media-auth.env
+sudo install -o root -g root -m 0600 /dev/null /etc/gate-media-gateway.env
+sudoedit /etc/gate-media-auth.env
+sudoedit /etc/gate-media-gateway.env
 ```
+
+The auth environment requires `GATE_MEDIA_HMAC_SECRET` of at least 32
+characters. Set `GATE_MEDIA_VIDEO_CONFIGURED=true` only after configuring the
+gateway source. `GATE_MEDIA_VIDEO_VERIFIED=true` and
+`GATE_MEDIA_LISTEN_VERIFIED=true` are operator attestations after physical
+validation, not defaults. Never set talkback verified. The gateway environment
+requires `MTX_PATHS_GATE_SOURCE=rtsp://...` including the camera credentials.
+The verifier never receives that file, and MediaMTX never receives the auth
+file.
 
 MediaMTX is deliberately not fetched by either bootstrap or the ordinary
 updater. Obtain a release archive and independently verified SHA-256 value by
@@ -301,19 +312,34 @@ sudoedit /root/gate-media-checksums.txt
 sudo deployment/install-media.sh --source "$PWD" \
   --mediamtx-archive /root/mediamtx.tar.gz \
   --mediamtx-version REPLACE_WITH_APPROVED_VERSION \
-  --checksum-map /root/gate-media-checksums.txt
+  --checksum-map /root/gate-media-checksums.txt \
+  --allowed-origin https://REPLACE_WITH_EXACT_APP_ORIGIN
 ```
 
 The installer validates the archive against the exact version/architecture map,
-installs only after `sha256sum --check` succeeds, verifies `mediamtx --version`,
-and leaves both services disabled when the required environment values are
-absent. The fixed application bootstrap may copy media scripts and units as
-root-owned references, but it never installs or replaces `/usr/local/bin/mediamtx`.
+first stages it as root-owned mode `0600` under
+`/var/lib/gate-media/archives`, then hashes and extracts that same stable file.
+It requires the extracted candidate to be a regular non-symlink executable,
+verifies the candidate's version, and only then atomically replaces
+`/usr/local/bin/mediamtx`. Every installer error disables both media services;
+missing required environment values also leave them disabled. The fixed
+application bootstrap may copy media scripts, units, and proxy templates as
+root-owned references, but it never installs the MediaMTX binary.
 
 Raw RTSP (`127.0.0.1:8554`), the MediaMTX API (`127.0.0.1:9997`), metrics
-(`127.0.0.1:9998`), and the authorization sidecar (`127.0.0.1:9189`) bind only
-to loopback. A TLS reverse proxy may expose the authenticated `/gate/whep`
-application endpoint; do not expose RTSP, API, metrics, the auth sidecar, WHIP,
-or any camera administration interface. The sidecar accepts only a valid
-short-lived HMAC token for `read`, controller `primary`, and path `gate`; it
-does not log tokens, camera URLs, passwords, or request bodies.
+(`127.0.0.1:9998`), plain WebRTC HTTP (`127.0.0.1:8889`), default ICE UDP/TCP
+(`127.0.0.1:8189`), and the authorization sidecar (`127.0.0.1:9189`) bind only
+to loopback. A deployment using direct private ingress may set exact private-IP
+`MTX_WEBRTCLOCALUDPADDRESS` and `MTX_WEBRTCLOCALTCPADDRESS` values in the gateway
+environment; never use wildcard binds. TURN remains the public-network path
+when transports stay on loopback.
+
+The installer root-renders the exact allowed HTTPS origin into
+`/etc/gate-media/nginx-whep-locations.conf`. Include it only inside the
+dedicated TLS server for the media public origin. It proxies `POST`/`OPTIONS`
+on exact `/gate/whep` and `DELETE`/`OPTIONS` on bounded teardown resource paths;
+no catch-all route proxies to MediaMTX. Do not expose RTSP, API, metrics, the
+auth sidecar, WHIP, or camera administration. The sidecar requires every field
+in the pinned MediaMTX auth schema, protocol `webrtc`, action `read`, controller
+`primary`, and path `gate`; it does not log tokens, camera URLs, passwords, or
+request bodies.
