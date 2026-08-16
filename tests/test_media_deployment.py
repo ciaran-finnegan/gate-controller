@@ -135,7 +135,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             )
         udp_host = environment["MTX_WEBRTCLOCALUDPADDRESS"].rsplit(":", 1)[0]
         tcp_host = environment["MTX_WEBRTCLOCALTCPADDRESS"].rsplit(":", 1)[0]
-        additional_hosts = [environment["MTX_WEBRTCADDITIONALHOSTS_0"]]
+        additional_hosts = environment["MTX_WEBRTCADDITIONALHOSTS"].split(",")
 
         self.assertFalse(config["webrtcIPsFromInterfaces"])
         self.assertEqual(udp_host, tcp_host)
@@ -162,7 +162,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             "MTX_METRICSADDRESS": "127.0.0.1:0",
             "MTX_WEBRTCADDRESS": "127.0.0.1:0",
             "MTX_WEBRTCLOCALUDPADDRESS": "127.0.0.1:0",
-            "MTX_WEBRTCADDITIONALHOSTS_0": "127.0.0.1",
+            "MTX_WEBRTCADDITIONALHOSTS": "127.0.0.1",
         })
         process = subprocess.Popen(
             [binary, str(REPOSITORY_ROOT / "deployment/media/mediamtx.yml")],
@@ -172,14 +172,13 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         try:
             time.sleep(1)
             returncode = process.poll()
-            output = ""
-            if returncode is not None and process.stdout:
-                output = process.stdout.read()
-            self.assertIsNone(returncode, output)
+            if returncode is not None:
+                output, _ = process.communicate(timeout=5)
+                self.fail(output)
         finally:
             if process.poll() is None:
                 process.terminate()
-                process.wait(timeout=5)
+            process.communicate(timeout=5)
 
     def test_gateway_launcher_executes_only_with_complete_reachable_ice_and_turn(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -217,7 +216,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             for missing in (
                 "MTX_WEBRTCLOCALUDPADDRESS",
                 "MTX_WEBRTCLOCALTCPADDRESS",
-                "MTX_WEBRTCADDITIONALHOSTS_0",
+                "MTX_WEBRTCADDITIONALHOSTS",
                 "MTX_WEBRTCICESERVERS2_0_URL",
                 "MTX_WEBRTCICESERVERS2_0_USERNAME",
                 "MTX_WEBRTCICESERVERS2_0_PASSWORD",
@@ -545,11 +544,18 @@ finally:
             valid_gateway = gateway.read_text(encoding="utf-8")
             accepted = self._validate_media_environments(auth, gateway)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
+            additional_host = "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5"
             replacements = (
                 ("rtsp://", "https://"),
                 ("10.0.0.5:8189", "0.0.0.0:8189"),
                 ("10.0.0.5:8189", "127.0.0.1:8189"),
-                ("MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.5", "MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.6"),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.6"),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5,10.0.0.6"),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=0.0.0.0"),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=127.0.0.1"),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS="),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5 "),
+                (additional_host, "MTX_WEBRTCADDITIONALHOSTS" + "_0=10.0.0.5"),
                 ("turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
                 ("MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
                 ("MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
@@ -577,7 +583,7 @@ finally:
             "MTX_PATHS_GATE_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
-            "MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.5\n"
+            "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
             "MTX_WEBRTCICESERVERS2_0_URL=turns:turn.example.com:5349?transport=tcp\n"
             "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n"
             "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n"
