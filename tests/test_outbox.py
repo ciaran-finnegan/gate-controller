@@ -137,6 +137,96 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
+    def test_malformed_telemetry_falls_back_to_the_original_v2_delivery(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {
+            "controller_id": "pi-front-gate",
+            "image_status": "unavailable_before_queue",
+        })
+        original_v2 = store.pending_outbox_items()[0][1]
+        store.attach_event_telemetry(event_id, _telemetry())
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET payload = ? WHERE event_id = ?",
+                ("{malformed", event_id),
+            )
+        sent = []
+
+        with self.assertLogs("gate_controller.store", level="WARNING") as logs:
+            completed = OutboxWorker(store, send=sent.append).run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(sent, [original_v2])
+        self.assertEqual(sent[0]["schema_version"], 2)
+        self.assertNotIn("telemetry", sent[0])
+        self.assertEqual(sent[0]["image_status"], "unavailable_before_queue")
+        self.assertEqual(store.pending_outbox_count(), 0)
+        self.assertTrue(any(
+            "outbox_telemetry_enrichment status=fallback_v2 reason=malformed"
+            in entry for entry in logs.output
+        ))
+        with closing(sqlite3.connect(store.path)) as connection:
+            saved = json.loads(connection.execute(
+                "SELECT payload FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()[0])
+        self.assertEqual(saved, original_v2)
+
+    def test_telemetry_rewrite_failure_falls_back_without_blocking_delivery(self):
+        store, event_id = self._queued_store()
+        store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        original_v2 = store.pending_outbox_items()[0][1]
+        store.attach_event_telemetry(event_id, _telemetry())
+        original_write = store._write_telemetry_payload
+        writes = 0
+
+        def fail_first_write(connection, target_event_id, telemetry):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise sqlite3.OperationalError("telemetry rewrite failed")
+            return original_write(connection, target_event_id, telemetry)
+
+        sent = []
+        with mock.patch.object(
+            store, "_write_telemetry_payload", side_effect=fail_first_write
+        ), self.assertLogs("gate_controller.store", level="WARNING") as logs:
+            completed = OutboxWorker(store, send=sent.append).run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(sent, [original_v2])
+        self.assertEqual(store.pending_outbox_count(), 0)
+        self.assertTrue(any(
+            "outbox_telemetry_enrichment status=fallback_v2 reason=rewrite_failed"
+            in entry for entry in logs.output
+        ))
+
+    def test_telemetry_commit_failure_returns_the_recovered_v2_payload(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        original_v2 = store.pending_outbox_items()[0][1]
+        store.attach_event_telemetry(event_id, _telemetry())
+        connection = store._connect()
+
+        class CommitFailingConnection:
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("telemetry commit failed")
+
+        with mock.patch.object(
+            store, "_connect", return_value=CommitFailingConnection()
+        ), self.assertLogs("gate_controller.store", level="WARNING") as logs:
+            payload = store.prepare_outbox_attempt(
+                item_id, datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+            )
+
+        self.assertEqual(payload, original_v2)
+        self.assertTrue(any(
+            "outbox_telemetry_enrichment status=fallback_v2 reason=rewrite_failed"
+            in entry for entry in logs.output
+        ))
+
     def test_attempt_metadata_is_persisted_before_each_send_and_completed_after_success(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})

@@ -9,6 +9,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from .store import LocalStore
+
 
 _TOP_LEVEL_KEYS = (
     "trace_id", "taxonomy_version", "stage_durations", "frames", "ocr_attempts",
@@ -21,7 +23,7 @@ _NESTED_KEYS = {
     ),
     "frames": (
         "sequence", "digest", "width", "height", "sharpness", "brightness",
-        "darkness", "highlight_clipping",
+        "darkness", "highlight_clipping", "status",
     ),
     "ocr_attempts": (
         "frame_sequence", "duration_ms", "status", "plate", "confidence", "make",
@@ -40,6 +42,8 @@ _CSV_FIELDS = (
     "actuation_claim", "actuation_attempted", "relay_outcome", "outbox_attempt",
     "delivery_state",
 )
+_EXPORT_PAGE_SIZE = 100
+_DATABASE_SIDECARS = ("", "-wal", "-shm", "-journal")
 
 
 def export_telemetry(store, *, format: str, since: datetime,
@@ -51,9 +55,32 @@ def export_telemetry(store, *, format: str, since: datetime,
     if since.tzinfo is None:
         raise ValueError("telemetry export since timestamp must include a timezone")
     output = Path(output)
-    rows = [_safe_row(row) for row in store.event_telemetry_rows(since)]
-    _atomic_write(output, lambda destination: _write(destination, format, rows))
-    return len(rows)
+    protected_paths = _database_paths(store.path)
+    _validate_output_path(output, protected_paths)
+    with tempfile.TemporaryDirectory(
+        prefix=".telemetry-snapshot-", dir=output.parent
+    ) as snapshot_directory:
+        snapshot_path = Path(snapshot_directory) / "telemetry.db"
+        store.create_telemetry_snapshot(snapshot_path)
+        snapshot = LocalStore(snapshot_path)
+        rows = _snapshot_rows(snapshot, since)
+        return _atomic_write(
+            output,
+            lambda destination: _write(destination, format, rows),
+            protected_paths,
+        )
+
+
+def _snapshot_rows(store: LocalStore, since: datetime):
+    after = None
+    while True:
+        page = store.event_telemetry_page(
+            since, after=after, limit=_EXPORT_PAGE_SIZE
+        )
+        if not page:
+            return
+        yield from page
+        after = (page[-1]["received_at"], page[-1]["event_id"])
 
 
 def _safe_row(row: dict) -> dict:
@@ -103,15 +130,24 @@ def _scalar(value: object) -> bool:
     return value is None or isinstance(value, (bool, int, float, str))
 
 
-def _write(destination, format: str, rows: list[dict]) -> None:
+def _write(destination, format: str, rows) -> int:
     if format == "json":
-        json.dump(rows, destination, indent=2, sort_keys=True)
-        destination.write("\n")
-        return
+        count = 0
+        destination.write("[")
+        for raw_row in rows:
+            destination.write("," if count else "")
+            destination.write("\n  ")
+            json.dump(_safe_row(raw_row), destination, sort_keys=True)
+            count += 1
+        destination.write("\n]\n" if count else "]\n")
+        return count
     writer = csv.DictWriter(destination, fieldnames=_CSV_FIELDS)
     writer.writeheader()
-    for row in rows:
-        writer.writerow(_csv_row(row))
+    count = 0
+    for raw_row in rows:
+        writer.writerow(_csv_row(_safe_row(raw_row)))
+        count += 1
+    return count
 
 
 def _csv_row(row: dict) -> dict:
@@ -138,7 +174,7 @@ def _csv_row(row: dict) -> dict:
     return flattened
 
 
-def _atomic_write(output: Path, write) -> None:
+def _atomic_write(output: Path, write, protected_paths: tuple[Path, ...]) -> int:
     parent = output.parent
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".telemetry-", suffix=".tmp", dir=parent
@@ -148,16 +184,44 @@ def _atomic_write(output: Path, write) -> None:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as destination:
             descriptor = -1
-            write(destination)
+            count = write(destination)
             destination.flush()
             os.fsync(destination.fileno())
+        _validate_output_path(output, protected_paths)
         os.replace(temporary, output)
         output.chmod(0o600)
         _fsync_directory(parent)
+        return count
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+
+
+def _database_paths(database: Path) -> tuple[Path, ...]:
+    absolute = Path(os.path.abspath(os.fspath(database)))
+    resolved = absolute.resolve(strict=False)
+    protected = {
+        Path(f"{base}{suffix}")
+        for base in (absolute, resolved)
+        for suffix in _DATABASE_SIDECARS
+    }
+    return tuple(protected)
+
+
+def _validate_output_path(output: Path, protected_paths: tuple[Path, ...]) -> None:
+    candidate = Path(os.path.abspath(os.fspath(output)))
+    resolved_candidate = candidate.resolve(strict=False)
+    for protected in protected_paths:
+        resolved_protected = protected.resolve(strict=False)
+        if candidate == protected or resolved_candidate == resolved_protected:
+            raise ValueError("telemetry output must not target the live database or sidecars")
+        try:
+            same_file = candidate.samefile(protected)
+        except OSError:
+            same_file = False
+        if same_file:
+            raise ValueError("telemetry output must not alias the live database or sidecars")
 
 
 def _fsync_directory(path: Path) -> None:
