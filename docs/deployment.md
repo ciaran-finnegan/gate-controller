@@ -305,14 +305,16 @@ GATE_MEDIA_TALKBACK_CONFIGURED=false
 The gateway environment contains exactly these MediaMTX 1.19.3 overrides.
 `MTX_PATHS_GATE_SOURCE` must use `rtsp` or `rtsps`. Both ICE listeners must use
 the same explicit, non-loopback, non-wildcard IP that is reachable on the Pi;
-hostnames are not accepted for binds. A MediaMTX-side TURN entry and nonempty
-credentials are mandatory, and `CLIENTONLY=false` allows both MediaMTX and the
-browser to use that relay.
+hostnames are not accepted for binds. `MTX_WEBRTCADDITIONALHOSTS_0` must be that
+exact IP so MediaMTX can advertise the listeners while interface discovery is
+disabled. A MediaMTX-side TURN entry and nonempty credentials are mandatory,
+and `CLIENTONLY=false` allows both MediaMTX and the browser to use that relay.
 
 ```text
 MTX_PATHS_GATE_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_PATH
 MTX_WEBRTCLOCALUDPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCLOCALTCPADDRESS=REPLACE_PI_IP:8189
+MTX_WEBRTCADDITIONALHOSTS_0=REPLACE_PI_IP
 MTX_WEBRTCICESERVERS2_0_URL=turns:REPLACE_TURN_HOST:5349?transport=tcp
 MTX_WEBRTCICESERVERS2_0_USERNAME=REPLACE_TURN_USER
 MTX_WEBRTCICESERVERS2_0_PASSWORD=REPLACE_TURN_PASSWORD

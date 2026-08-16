@@ -34,7 +34,8 @@ hlsAddress: 127.0.0.1:8888
 srt: false
 srtAddress: 127.0.0.1:8890
 moq: false
-moqAddress: 127.0.0.1:8891
+moqHTTP2Address: 127.0.0.1:8892
+moqHTTP3Address: 127.0.0.1:8892
 
 # nginx proxies WHEP HTTP signaling only. Media uses the validated ICE/TURN
 # settings injected by the gateway environment; there is no local fallback.

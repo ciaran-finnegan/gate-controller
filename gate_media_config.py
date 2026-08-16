@@ -30,6 +30,7 @@ _GATEWAY_KEYS = frozenset({
     "MTX_PATHS_GATE_SOURCE",
     "MTX_WEBRTCLOCALUDPADDRESS",
     "MTX_WEBRTCLOCALTCPADDRESS",
+    "MTX_WEBRTCADDITIONALHOSTS_0",
     "MTX_WEBRTCICESERVERS2_0_URL",
     "MTX_WEBRTCICESERVERS2_0_USERNAME",
     "MTX_WEBRTCICESERVERS2_0_PASSWORD",
@@ -144,6 +145,8 @@ def validate_gateway_environment(values: Mapping[str, str]) -> dict[str, str]:
     tcp_host, _ = _parse_ice_bind(selected["MTX_WEBRTCLOCALTCPADDRESS"])
     if udp_host != tcp_host:
         raise MediaConfigError("ICE listeners must use the same reachable address")
+    if selected["MTX_WEBRTCADDITIONALHOSTS_0"] != udp_host:
+        raise MediaConfigError("advertised ICE host must match the listener address")
     _validate_turn_url(selected["MTX_WEBRTCICESERVERS2_0_URL"])
     for key in (
         "MTX_WEBRTCICESERVERS2_0_USERNAME",

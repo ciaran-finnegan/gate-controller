@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -104,13 +105,81 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             "srt": False,
             "srtAddress": "127.0.0.1:8890",
             "moq": False,
-            "moqAddress": "127.0.0.1:8891",
+            "moqHTTP2Address": "127.0.0.1:8892",
+            "moqHTTP3Address": "127.0.0.1:8892",
         }
 
         self.assertEqual(expected, {key: config.get(key) for key in expected})
+        self.assertNotIn("moqAddress", config)
         for key, value in expected.items():
             if key.endswith("Address") and value:
                 self.assertNotRegex(value, r"^(?::|0\.0\.0\.0:|\[::]:)")
+
+    def test_mediamtx_1_19_3_hermetic_schema_and_validation_probe(self):
+        schema = json.loads(
+            (REPOSITORY_ROOT / "tests/fixtures/mediamtx-v1.19.3-schema.json")
+            .read_text(encoding="utf-8")
+        )
+        config = read_flat_yaml("deployment/media/mediamtx.yml")
+        configured_globals = set(config) - {"pathDefaults", "paths"}
+        self.assertEqual("1.19.3", schema["version"])
+        self.assertEqual(set(), configured_globals - set(schema["globalKeys"]))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _auth, gateway = self._write_valid_media_environments(
+                Path(temporary_directory)
+            )
+            environment = dict(
+                line.split("=", 1)
+                for line in gateway.read_text(encoding="utf-8").splitlines()
+            )
+        udp_host = environment["MTX_WEBRTCLOCALUDPADDRESS"].rsplit(":", 1)[0]
+        tcp_host = environment["MTX_WEBRTCLOCALTCPADDRESS"].rsplit(":", 1)[0]
+        additional_hosts = [environment["MTX_WEBRTCADDITIONALHOSTS_0"]]
+
+        self.assertFalse(config["webrtcIPsFromInterfaces"])
+        self.assertEqual(udp_host, tcp_host)
+        self.assertEqual([udp_host], additional_hosts)
+        self.assertTrue(additional_hosts)
+
+    def test_actual_mediamtx_1_19_3_loads_pinned_config_when_binary_is_supplied(self):
+        binary = os.environ.get("MEDIAMTX_1_19_3_BINARY")
+        if not binary:
+            self.skipTest("MEDIAMTX_1_19_3_BINARY is not available")
+        version = subprocess.run(
+            [binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        self.assertEqual(0, version.returncode, version.stderr)
+        self.assertIn(version.stdout.strip(), {"1.19.3", "v1.19.3"})
+
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("MTX_", "RTSP_"))
+        }
+        environment.update({
+            "MTX_APIADDRESS": "127.0.0.1:0",
+            "MTX_METRICSADDRESS": "127.0.0.1:0",
+            "MTX_WEBRTCADDRESS": "127.0.0.1:0",
+            "MTX_WEBRTCLOCALUDPADDRESS": "127.0.0.1:0",
+            "MTX_WEBRTCADDITIONALHOSTS_0": "127.0.0.1",
+        })
+        process = subprocess.Popen(
+            [binary, str(REPOSITORY_ROOT / "deployment/media/mediamtx.yml")],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            time.sleep(1)
+            returncode = process.poll()
+            output = ""
+            if returncode is not None and process.stdout:
+                output = process.stdout.read()
+            self.assertIsNone(returncode, output)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
 
     def test_gateway_launcher_executes_only_with_complete_reachable_ice_and_turn(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -148,6 +217,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             for missing in (
                 "MTX_WEBRTCLOCALUDPADDRESS",
                 "MTX_WEBRTCLOCALTCPADDRESS",
+                "MTX_WEBRTCADDITIONALHOSTS_0",
                 "MTX_WEBRTCICESERVERS2_0_URL",
                 "MTX_WEBRTCICESERVERS2_0_USERNAME",
                 "MTX_WEBRTCICESERVERS2_0_PASSWORD",
@@ -479,6 +549,7 @@ finally:
                 ("rtsp://", "https://"),
                 ("10.0.0.5:8189", "0.0.0.0:8189"),
                 ("10.0.0.5:8189", "127.0.0.1:8189"),
+                ("MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.5", "MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.6"),
                 ("turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
                 ("MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
                 ("MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
@@ -506,6 +577,7 @@ finally:
             "MTX_PATHS_GATE_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
+            "MTX_WEBRTCADDITIONALHOSTS_0=10.0.0.5\n"
             "MTX_WEBRTCICESERVERS2_0_URL=turns:turn.example.com:5349?transport=tcp\n"
             "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n"
             "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n"
