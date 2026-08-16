@@ -945,7 +945,7 @@ class MediaCapabilityTests(unittest.TestCase):
             "GATE_MEDIA_VIDEO_CONFIGURED": "true",
             "GATE_MEDIA_VIDEO_VERIFIED": "true",
             "GATE_MEDIA_LISTEN_CONFIGURED": "false",
-        }, True)
+        }, {"video": True, "listen": False})
 
         self.assertTrue(snapshot["media"]["video"]["configured"])
         self.assertTrue(snapshot["media"]["video"]["verified"])
@@ -955,17 +955,35 @@ class MediaCapabilityTests(unittest.TestCase):
 
 class MediaGatewayHealthTests(unittest.TestCase):
     def setUp(self):
-        self.assertTrue(hasattr(media_health, "gateway_status_ready"))
+        self.assertTrue(hasattr(media_health, "gateway_status_readiness"))
 
-    def test_gate_path_requires_available_or_ready_and_nonempty_tracks(self):
+    def test_gate_path_reports_video_and_listen_readiness_by_recognized_track_type(self):
+        cases = (
+            (["H264"], {"video": True, "listen": False}),
+            (["MPEG-4 Audio"], {"video": False, "listen": True}),
+            (["H264", "Opus"], {"video": True, "listen": True}),
+        )
+        environment = {
+            "GATE_MEDIA_VIDEO_CONFIGURED": "true",
+            "GATE_MEDIA_VIDEO_VERIFIED": "true",
+            "GATE_MEDIA_LISTEN_CONFIGURED": "true",
+            "GATE_MEDIA_LISTEN_VERIFIED": "true",
+        }
         for flag in ("ready", "available"):
-            payload = json.dumps({
-                "itemCount": 1,
-                "pageCount": 1,
-                "items": [{"name": "gate", flag: True, "tracks": ["H264"]}],
-            }).encode("utf-8")
-            with self.subTest(flag=flag):
-                self.assertTrue(media_health.gateway_status_ready(payload))
+            for tracks, expected in cases:
+                payload = json.dumps({
+                    "itemCount": 1,
+                    "pageCount": 1,
+                    "items": [{"name": "gate", flag: True, "tracks": tracks}],
+                }).encode("utf-8")
+                with self.subTest(flag=flag, tracks=tracks):
+                    readiness = media_health.gateway_status_readiness(payload)
+                    self.assertEqual(expected, readiness)
+                    media = capability_snapshot(environment, readiness)["media"]
+                    self.assertEqual(expected["video"], media["video"]["ready"])
+                    self.assertEqual(expected["video"], media["video"]["verified"])
+                    self.assertEqual(expected["listen"], media["listen"]["ready"])
+                    self.assertEqual(expected["listen"], media["listen"]["verified"])
 
         unavailable = (
             {"name": "gate", "ready": False, "tracks": ["H264"]},
@@ -975,7 +993,28 @@ class MediaGatewayHealthTests(unittest.TestCase):
         for item in unavailable:
             payload = json.dumps({"itemCount": 1, "pageCount": 1, "items": [item]}).encode()
             with self.subTest(item=item):
-                self.assertFalse(media_health.gateway_status_ready(payload))
+                self.assertEqual(
+                    {"video": False, "listen": False},
+                    media_health.gateway_status_readiness(payload),
+                )
+
+    def test_gateway_health_fails_closed_for_unknown_or_malformed_tracks(self):
+        invalid_tracks = (
+            ["Generic"],
+            ["H264", "unknown"],
+            ["H264", ""],
+            ["H264", {"codec": "Opus"}],
+            "H264",
+        )
+        for tracks in invalid_tracks:
+            payload = json.dumps({
+                "items": [{"name": "gate", "ready": True, "tracks": tracks}],
+            }).encode()
+            with self.subTest(tracks=tracks):
+                self.assertEqual(
+                    {"video": False, "listen": False},
+                    media_health.gateway_status_readiness(payload),
+                )
 
     def test_gateway_health_rejects_malformed_duplicate_and_oversized_responses(self):
         payloads = (
@@ -985,7 +1024,10 @@ class MediaGatewayHealthTests(unittest.TestCase):
         )
         for payload in payloads:
             with self.subTest(size=len(payload)):
-                self.assertFalse(media_health.gateway_status_ready(payload))
+                self.assertEqual(
+                    {"video": False, "listen": False},
+                    media_health.gateway_status_readiness(payload),
+                )
 
     def test_gateway_health_reads_only_a_bounded_response(self):
         body = json.dumps({
@@ -1010,7 +1052,10 @@ class MediaGatewayHealthTests(unittest.TestCase):
 
         response = Response()
 
-        self.assertTrue(_gateway_is_ready(opener=lambda *_args, **_kwargs: response))
+        self.assertEqual(
+            {"video": True, "listen": False},
+            _gateway_is_ready(opener=lambda *_args, **_kwargs: response),
+        )
         self.assertEqual(65_537, response.limit)
 
 

@@ -1,4 +1,6 @@
+import json
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -6,8 +8,9 @@ from unittest.mock import patch
 
 from gate_controller.audio import PromptPlayer
 from gate_controller.actuation import ActuationCoordinator
+from gate_controller import __main__ as gate_main
 from gate_controller.control_plane import (
-    CommandWorker, ControlPlaneError, GateCommand, SupabaseControlPlane,
+    CommandWorker, ControlPlaneError, GateCommand, HeartbeatWorker, SupabaseControlPlane,
 )
 from gate_controller.models import GateEvent, RelayResult
 from gate_controller.store import LocalStore
@@ -16,6 +19,33 @@ from gate_controller.store import LocalStore
 HEARTBEAT_RPC_ARGUMENTS = (
     "p_controller_id", "p_camera_timestamp", "p_queue_depth", "p_capabilities",
 )
+
+HEALTHY_MEDIA = {
+    "video": {"configured": True, "ready": True, "verified": True, "reason": "ready"},
+    "listen": {
+        "configured": True, "ready": True, "verified": False,
+        "reason": "hardware_unverified",
+    },
+    "talkback": {
+        "configured": False, "ready": False, "verified": False,
+        "reason": "hardware_unverified",
+    },
+}
+
+UNAVAILABLE_MEDIA = {
+    "video": {
+        "configured": False, "ready": False, "verified": False,
+        "reason": "gateway_unhealthy",
+    },
+    "listen": {
+        "configured": False, "ready": False, "verified": False,
+        "reason": "gateway_unhealthy",
+    },
+    "talkback": {
+        "configured": False, "ready": False, "verified": False,
+        "reason": "hardware_unverified",
+    },
+}
 
 
 class FakeResponse:
@@ -295,6 +325,7 @@ class ControlPlaneTests(unittest.TestCase):
                 "refreshed_at": "2026-08-14T09:59:00+00:00",
                 "last_error": None,
             },
+            "media": HEALTHY_MEDIA,
         })
 
         url, request = session.calls[0]
@@ -327,10 +358,115 @@ class ControlPlaneTests(unittest.TestCase):
                         "refreshed_at": "2026-08-14T09:59:00+00:00",
                         "last_error": None,
                     },
+                    "media": HEALTHY_MEDIA,
                 },
             },
         )
         self.assertEqual(tuple(request["json"]), HEARTBEAT_RPC_ARGUMENTS)
+
+    def test_controller_status_callback_forwards_validated_media_to_heartbeat_rpc(self):
+        now = datetime.now(timezone.utc)
+        uploaded_at = (now - timedelta(seconds=5)).isoformat()
+        session = FakeSession([FakeResponse(payload={})])
+        control_plane = SupabaseControlPlane(
+            "https://project.supabase.co", "service-key", "pi-front-gate", session=session
+        )
+
+        class StatusSource:
+            available = True
+
+            @staticmethod
+            def status():
+                return {
+                    "available": True,
+                    "stale": False,
+                    "refreshed_at": now.isoformat(),
+                    "last_error": None,
+                }
+
+        class Relay:
+            @staticmethod
+            def status():
+                return {
+                    "ready": True,
+                    "last_outcome": "activated",
+                    "last_outcome_at": uploaded_at,
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capabilities_path = root / "capabilities.json"
+            capabilities_path.write_text(json.dumps({
+                "observed_at": int(time.time()),
+                "media": HEALTHY_MEDIA,
+            }), encoding="utf-8")
+            store = LocalStore(root / "gate.db")
+            status = lambda: gate_main._controller_status(
+                store,
+                StatusSource(),
+                {"path": "/camera/latest.jpg", "received_at": uploaded_at},
+                StatusSource(),
+                relay=Relay(),
+                camera_directory=root,
+                media_capabilities_path=capabilities_path,
+                clock=lambda: now,
+            )
+
+            self.assertTrue(HeartbeatWorker(control_plane, status).run_once())
+
+        url, request = session.calls[0]
+        self.assertEqual(url, "https://project.supabase.co/rest/v1/rpc/update_controller_status")
+        self.assertEqual(request["json"], {
+            "p_controller_id": "pi-front-gate",
+            "p_camera_timestamp": uploaded_at,
+            "p_queue_depth": 0,
+            "p_capabilities": {
+                "audio_available": True,
+                "audio_prompts": True,
+                "camera": {
+                    "configured": True,
+                    "upload_ready": True,
+                    "last_upload_at": uploaded_at,
+                    "upload_recent": True,
+                    "connection_probed": False,
+                    "connected": None,
+                },
+                "relay": {
+                    "ready": True,
+                    "last_outcome": "activated",
+                    "last_outcome_at": uploaded_at,
+                },
+                "authorisation": {
+                    "available": True,
+                    "stale": False,
+                    "refreshed_at": now.isoformat(),
+                    "last_error": None,
+                },
+                "media": HEALTHY_MEDIA,
+            },
+        })
+
+    def test_heartbeat_media_fails_closed_for_malformed_or_unexpected_values(self):
+        malformed_values = (
+            None,
+            {"video": HEALTHY_MEDIA["video"]},
+            {**HEALTHY_MEDIA, "unexpected": "must-not-leak"},
+            {**HEALTHY_MEDIA, "video": {**HEALTHY_MEDIA["video"], "secret": "no"}},
+        )
+        for media in malformed_values:
+            with self.subTest(media=media):
+                session = FakeSession([FakeResponse(payload={})])
+                control_plane = SupabaseControlPlane(
+                    "https://project.supabase.co", "service-key", "pi-front-gate",
+                    session=session,
+                )
+
+                control_plane.heartbeat({"media": media})
+
+                forwarded = session.calls[0][1]["json"]["p_capabilities"]["media"]
+                self.assertEqual(UNAVAILABLE_MEDIA, forwarded)
+                self.assertNotIn("must-not-leak", json.dumps(forwarded))
+                self.assertNotIn("secret", json.dumps(forwarded))
 
     def test_duplicate_command_id_does_not_reactivate_the_relay_after_ack_failure(self):
         now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)

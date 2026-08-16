@@ -14,6 +14,14 @@ _GATEWAY_API = "http://127.0.0.1:9997/v3/paths/list"
 _MAX_GATEWAY_API_BYTES = 64 * 1024
 _MAX_GATEWAY_PATHS = 64
 _MAX_TRACKS = 16
+_VIDEO_TRACKS = frozenset({
+    "AV1", "VP9", "VP8", "H265", "H264", "MPEG-4 Video", "MPEG-1/2 Video", "M-JPEG",
+})
+_AUDIO_TRACKS = frozenset({
+    "Opus", "FLAC", "Vorbis", "MPEG-4 Audio", "MPEG-4 Audio LATM",
+    "MPEG-1/2 Audio", "AC3", "Speex", "G726", "G722", "G711", "LPCM",
+})
+_MEDIA_TRACKS = _VIDEO_TRACKS | _AUDIO_TRACKS
 
 
 def default_capabilities() -> dict:
@@ -27,13 +35,14 @@ def default_capabilities() -> dict:
     }
 
 
-def capability_snapshot(environment, gateway_ready: bool) -> dict:
+def capability_snapshot(environment, gateway_readiness) -> dict:
     """Build a conservative, nonsecret snapshot from explicit operator settings."""
+    gateway_readiness = _validated_gateway_readiness(gateway_readiness)
     video_configured = _enabled(environment.get("GATE_MEDIA_VIDEO_CONFIGURED"))
     listen_configured = _enabled(environment.get("GATE_MEDIA_LISTEN_CONFIGURED"))
     talkback_configured = _enabled(environment.get("GATE_MEDIA_TALKBACK_CONFIGURED"))
-    video_ready = video_configured and gateway_ready
-    listen_ready = listen_configured and gateway_ready
+    video_ready = video_configured and gateway_readiness["video"]
+    listen_ready = listen_configured and gateway_readiness["listen"]
     video_verified = video_ready and _enabled(environment.get("GATE_MEDIA_VIDEO_VERIFIED"))
     listen_verified = listen_ready and _enabled(environment.get("GATE_MEDIA_LISTEN_VERIFIED"))
     return {
@@ -105,44 +114,59 @@ class MediaHealthPublisher:
             self._stopped.wait(self._interval_seconds)
 
 
-def _gateway_is_ready(*, opener=urllib.request.urlopen) -> bool:
+def _gateway_is_ready(*, opener=urllib.request.urlopen) -> dict:
     try:
         with opener(_GATEWAY_API, timeout=1) as response:
             if response.status != 200:
-                return False
+                return _unready_gateway()
             content_length = response.headers.get("Content-Length")
             if content_length is not None and int(content_length) > _MAX_GATEWAY_API_BYTES:
-                return False
-            return gateway_status_ready(response.read(_MAX_GATEWAY_API_BYTES + 1))
-    except (OSError, urllib.error.URLError, TypeError, ValueError):
-        return False
+                return _unready_gateway()
+            return gateway_status_readiness(response.read(_MAX_GATEWAY_API_BYTES + 1))
+    except (AttributeError, OSError, urllib.error.URLError, TypeError, ValueError):
+        return _unready_gateway()
 
 
-def gateway_status_ready(body: bytes) -> bool:
-    """Return true only for a bounded API response with a ready gate path and tracks."""
+def gateway_status_readiness(body: bytes) -> dict:
+    """Return independent readiness for recognized gate-path video and audio tracks."""
     if not isinstance(body, bytes) or not body or len(body) > _MAX_GATEWAY_API_BYTES:
-        return False
+        return _unready_gateway()
     try:
         payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return False
+        return _unready_gateway()
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-        return False
+        return _unready_gateway()
     items = payload["items"]
     if len(items) > _MAX_GATEWAY_PATHS:
-        return False
-    for item in items:
-        if not isinstance(item, dict) or item.get("name") != "gate":
-            continue
-        if item.get("ready") is not True and item.get("available") is not True:
-            return False
-        tracks = item.get("tracks")
-        return (
-            isinstance(tracks, list)
-            and 0 < len(tracks) <= _MAX_TRACKS
-            and all(isinstance(track, str) and 0 < len(track) <= 64 for track in tracks)
-        )
-    return False
+        return _unready_gateway()
+    gate_paths = [item for item in items if isinstance(item, dict) and item.get("name") == "gate"]
+    if len(gate_paths) != 1:
+        return _unready_gateway()
+    gate_path = gate_paths[0]
+    if gate_path.get("ready") is not True and gate_path.get("available") is not True:
+        return _unready_gateway()
+    tracks = gate_path.get("tracks")
+    if (not isinstance(tracks, list)
+            or not 0 < len(tracks) <= _MAX_TRACKS
+            or not all(isinstance(track, str) and track in _MEDIA_TRACKS for track in tracks)):
+        return _unready_gateway()
+    return {
+        "video": any(track in _VIDEO_TRACKS for track in tracks),
+        "listen": any(track in _AUDIO_TRACKS for track in tracks),
+    }
+
+
+def _validated_gateway_readiness(value) -> dict:
+    if (not isinstance(value, dict)
+            or set(value) != {"video", "listen"}
+            or not all(isinstance(value[feature], bool) for feature in ("video", "listen"))):
+        return _unready_gateway()
+    return {"video": value["video"], "listen": value["listen"]}
+
+
+def _unready_gateway() -> dict:
+    return {"video": False, "listen": False}
 
 
 def _enabled(value) -> bool:

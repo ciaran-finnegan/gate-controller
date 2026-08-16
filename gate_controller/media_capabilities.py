@@ -43,19 +43,26 @@ def read_media_capabilities(path: Path, *, max_age_seconds: float = 30.0, now=No
                 or observed_at > current_time
                 or observed_at < current_time - max_age_seconds):
             raise ValueError("invalid media timestamp")
-        media = decoded["media"]
-        if not isinstance(media, dict) or set(media) != set(_FEATURES):
-            raise ValueError("invalid media snapshot")
-        parsed = {feature: _parse_capability(media[feature]) for feature in _FEATURES}
-        parsed["talkback"] = {
-            "configured": parsed["talkback"]["configured"],
-            "ready": False,
-            "verified": False,
-            "reason": "hardware_unverified",
-        }
-        return parsed
+        return validated_media_capabilities(decoded["media"])
     except (UnicodeDecodeError, TypeError, ValueError, KeyError, json.JSONDecodeError):
         return _unavailable("gateway_unhealthy")
+
+
+def validated_media_capabilities(value) -> dict:
+    """Return a canonical bounded media object or a conservative unavailable state."""
+    try:
+        if not isinstance(value, dict) or set(value) != set(_FEATURES):
+            raise ValueError("invalid media snapshot")
+        parsed = {feature: _parse_capability(value[feature]) for feature in _FEATURES}
+    except (TypeError, ValueError, KeyError):
+        return _unavailable("gateway_unhealthy")
+    parsed["talkback"] = {
+        "configured": parsed["talkback"]["configured"],
+        "ready": False,
+        "verified": False,
+        "reason": "hardware_unverified",
+    }
+    return parsed
 
 
 def _parse_capability(value) -> dict:
