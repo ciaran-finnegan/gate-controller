@@ -5,6 +5,15 @@ from gate_controller.runtime import require_https_or_loopback_service_url, requi
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_runtime_import_graph_has_no_supabase_or_s3_clients(self):
+        runtime_files = [path for path in Path("gate_controller").glob("*.py")]
+        forbidden = []
+        for path in runtime_files:
+            text = path.read_text()
+            if "Supabase" in text or "boto3" in text or "s3_utils" in text:
+                forbidden.append(str(path))
+        self.assertEqual(forbidden, [])
+
     def test_gpio_dependency_uses_the_pi_5_compatible_rpi_gpio_provider(self):
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
 

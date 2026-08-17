@@ -11,10 +11,9 @@ from .audio import PromptPlayer
 from .actuation import ActuationCoordinator
 from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
-    SupabasePlateFetcher,
 )
 from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
-from .control_plane import CommandWorker, HeartbeatWorker, SupabaseControlPlane
+from .control_plane import HeartbeatWorker
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import CloudflareOutboxSender, HttpOutboxSender, OutboxWorker
@@ -154,10 +153,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
-    supabase_configured = _supabase_configured(environment)
     cloudflare_configured = _cloudflare_configured(environment)
-    if supabase_configured and cloudflare_configured:
-        raise ValueError("Supabase and Cloudflare configuration cannot be used together")
     if cloudflare_configured:
         cloudflare_client = CloudflareServiceClient(
             environment["GATE_CLOUDFLARE_API_URL"].strip(),
@@ -195,30 +191,11 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             ),
             controller_id=controller_id,
         ))
-    if not supabase_configured:
-        return tuple(workers), prompt_player, lambda: _controller_status(
-            store, prompt_player, latest_image, relay=relay,
-            camera_directory=camera_directory,
-            camera_stale_seconds=camera_stale_seconds,
-        )
-    supabase_url = environment["SUPABASE_URL"].strip()
-    service_key = environment["SUPABASE_SERVICE_ROLE_KEY"].strip()
-    control_plane = SupabaseControlPlane(supabase_url, service_key, controller_id)
-    if authorised is not None:
-        workers.append(AuthorisationRefreshWorker(
-            authorised, SupabasePlateFetcher(supabase_url, service_key),
-            poll_interval=float(environment.get("GATE_AUTHORISATION_REFRESH_SECONDS", "30")),
-        ))
-    status = lambda: _controller_status(
-        store, prompt_player, latest_image, authorised, relay=relay,
+    return tuple(workers), prompt_player, lambda: _controller_status(
+        store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
     )
-    workers.extend((
-        CommandWorker(control_plane, relay, store, prompt_player=prompt_player, coordinator=coordinator),
-        HeartbeatWorker(control_plane, status),
-    ))
-    return tuple(workers), prompt_player, status
 
 
 def _configured_prompts(environment) -> dict[str, Path]:
@@ -307,16 +284,6 @@ def _camera_is_fresh(timestamp: str | None, now: datetime, stale_seconds: float)
     return timedelta(0) <= age <= timedelta(seconds=stale_seconds)
 
 
-def _supabase_configured(environment) -> bool:
-    url = (environment.get("SUPABASE_URL") or "").strip()
-    service_key = (environment.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
-    if bool(url) != bool(service_key):
-        raise ValueError(
-            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together"
-        )
-    return bool(url)
-
-
 def _cloudflare_configured(environment) -> bool:
     variables = (
         "GATE_CLOUDFLARE_API_URL",
@@ -330,7 +297,7 @@ def _cloudflare_configured(environment) -> bool:
 
 
 def _cloud_configured(environment) -> bool:
-    return _supabase_configured(environment) or _cloudflare_configured(environment)
+    return _cloudflare_configured(environment)
 
 
 def _validated_outbox_token(url: str, token: str | None) -> str:

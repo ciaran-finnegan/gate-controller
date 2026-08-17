@@ -6,10 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock
 
-import requests
-
 from .matching import normalise_plate
-from .runtime import require_https_service_url
 
 
 class AuthorisationError(RuntimeError):
@@ -131,31 +128,6 @@ def _snapshot_is_stale(now: datetime, refreshed_at: datetime,
     except (TypeError, ValueError):
         return True
     return age < timedelta(0) or age > max_staleness
-
-
-class SupabasePlateFetcher:
-    def __init__(self, url: str, service_key: str, *, session=None,
-                 timeout: tuple[float, float] = (1, 3)):
-        base_url = require_https_service_url(url, "SUPABASE_URL")
-        self._url = f"{base_url}/rest/v1/plates"
-        self._session = session or requests.Session()
-        self._timeout = timeout
-        self._headers = {
-            "apikey": service_key,
-            "Authorization": f"Bearer {service_key}",
-        }
-
-    def __call__(self) -> list[dict]:
-        response = self._session.get(
-            self._url, params={"select": "plate", "order": "plate.asc"},
-            headers=self._headers, timeout=self._timeout,
-        )
-        if not 200 <= response.status_code < 300:
-            raise AuthorisationError(f"Supabase plates returned HTTP {response.status_code}")
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise AuthorisationError("Supabase plates returned invalid JSON")
-        return payload
 
 
 class CloudflarePlateFetcher:

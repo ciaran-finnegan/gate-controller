@@ -2,7 +2,7 @@
 
 The controller watches completed JPEG uploads from a local camera, recognises
 plates, applies a fail-closed local policy, and activates a Pi relay. Recognition
-never waits for optional Supabase, event delivery, or audio services. A
+never waits for optional Cloudflare delivery, event delivery, or audio services. A
 cloud-managed plate snapshot remains usable only for its configured bounded
 staleness window, after which authorization fails closed.
 
@@ -13,14 +13,14 @@ staleness window, after which authorization fails closed.
 - OCR, parsing, network, cloud, and audio failures leave the gate closed.
 - A durable global activation marker is committed before GPIO is energized;
   optional event delivery remains off the recognition path.
-- Remote commands are short-lived, claimed through Supabase RPC, acknowledged
-  with `completed`, `failed`, or `expired`, and use a persisted idempotency key.
-  Open-command expiry is checked again under the relay lock immediately before
-  GPIO activation; an expired command is finalized without pulsing the relay.
+- Remote commands reach a loopback-only command server through Cloudflare
+  Tunnel and Access. They are short-lived, controller-bound, and use a
+  persisted idempotency key. Expiry is checked again under the relay lock
+  immediately before GPIO activation; an expired command never pulses the relay.
 - The image processor and every configured background worker are supervised.
   Unexpected exit or fatal failure terminates the process so systemd restarts it.
 - The browser never reaches the Pi, GPIO relay, camera, RTSP stream, or FTP
-  service directly. It uses authenticated Supabase RPC only.
+  service directly. Cloudflare Access protects the tunnelled command endpoint.
 
 ## Install And Update
 
@@ -40,9 +40,9 @@ sudo install -m 0600 -o root -g root .env.example /etc/gate-controller.env
 ```
 
 Edit `/etc/gate-controller.env` with real credentials and paths before running
-the installer. It contains the Plate Recognizer token and, only when remote
-control is enabled, the Pi's Supabase service-role key. Never commit that file
-or put its values in a systemd unit.
+the installer. It contains the Plate Recognizer token and, when Cloudflare
+delivery is enabled, the Access service-token credentials. Never commit that
+file or put its values in a systemd unit.
 
 Configure branch protection on `master` to require the three stable checks listed
 in [the deployment guide](docs/deployment.md). Then bootstrap from a clean
@@ -84,23 +84,21 @@ supported Pi architectures, including Raspberry Pi 5. Do not install it in the
 same virtual environment as the original `RPi.GPIO` package.
 Install the relay board vendor library if a different relay adapter is used.
 
-## Optional Control Plane
+## Optional Cloudflare Service
 
-Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `GATE_CONTROLLER_ID` to
-enable the Pi control plane. The browser calls `request_gate_command`; the Pi
-uses only `claim_gate_command`, `complete_gate_command`, and
-`update_controller_status`. Supported command values are `open_gate` and
-`play_prompt`. Prompt files are fixed by the two `GATE_PROMPT_*` settings;
-request payloads cannot select arbitrary commands or file paths. `SUPABASE_URL`
-must be an absolute HTTPS URL, including in local and test configuration; the
-controller rejects it before constructing service-role authentication headers.
+Set `GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`,
+`GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET`, and `GATE_CONTROLLER_ID` to enable
+Cloudflare-backed plate refresh, status reporting, and event delivery. The
+controller ID defaults to `primary`. Plate snapshots are atomically applied to
+the local cache and fail closed when older than
+`GATE_AUTHORISATION_MAX_STALENESS_SECONDS`; recognition only reads that in-memory
+snapshot and never waits for a network request.
 
-The controller ID defaults to `primary`, matching the web app. The same
-background service refreshes `public.plates` through Supabase REST every 30
-seconds, atomically updates the local snapshot, applies revocations without a
-restart, and fails closed when a cloud-managed snapshot is older than
-`GATE_AUTHORISATION_MAX_STALENESS_SECONDS`. Recognition only reads the in-memory
-snapshot and never waits for Supabase.
+Remote commands are accepted only by the loopback command server at
+`POST /commands`, exposed through the authenticated Cloudflare Tunnel. Supported
+commands are `open_gate` and `play_prompt`; fixed `GATE_PROMPT_*` settings map
+prompt keys to local files, and request payloads cannot select arbitrary shell
+commands or file paths.
 
 Set `GATE_OUTBOX_URL` only for an authenticated server-side event endpoint and
 set `GATE_OUTBOX_BEARER_TOKEN` to the secret it validates. Do not point this at
