@@ -1,4 +1,4 @@
-from urllib.parse import urljoin
+import math
 
 import requests
 
@@ -20,7 +20,7 @@ class CloudflareServiceClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.session = session or requests.Session()
-        self.timeout = timeout
+        self.timeout = self._require_bounded_timeout(timeout)
 
     def get_json(self, path):
         response = self.session.get(
@@ -42,7 +42,23 @@ class CloudflareServiceClient:
     def _service_url(self, path):
         if not isinstance(path, str) or not path.startswith("/"):
             raise ValueError("Cloudflare service request path must be an absolute path")
-        return urljoin(f"{self.base_url}/", path.lstrip("/"))
+        return f"{self.base_url}{path}"
+
+    @staticmethod
+    def _require_bounded_timeout(timeout):
+        if (
+            not isinstance(timeout, tuple)
+            or len(timeout) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                for value in timeout
+            )
+        ):
+            raise ValueError("Cloudflare service timeout must be a finite positive (connect, read) tuple")
+        return timeout
 
     def _headers(self):
         return {

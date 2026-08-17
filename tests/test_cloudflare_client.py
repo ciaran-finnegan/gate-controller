@@ -78,6 +78,19 @@ class CloudflareServiceClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "absolute path"):
             client.get_json("api/controller/plates")
 
+    def test_cloudflare_client_keeps_scheme_like_paths_on_the_configured_service_origin(self):
+        session = RecordingSession()
+        client = CloudflareServiceClient(
+            "https://gate.example.com", "id", "secret", session=session,
+        )
+
+        client.get_json("/https://evil.example/api/controller/plates")
+
+        self.assertEqual(
+            session.requests[0].url,
+            "https://gate.example.com/https://evil.example/api/controller/plates",
+        )
+
     def test_cloudflare_client_checks_http_status_before_returning_json(self):
         response = RecordingResponse(status_error=RuntimeError("service unavailable"))
         session = RecordingSession(response)
@@ -100,3 +113,11 @@ class CloudflareServiceClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GATE_CLOUDFLARE_API_URL"):
             CloudflareServiceClient("http://gate.example.com", "id", "secret")
         CloudflareServiceClient("http://127.0.0.1:8787", "id", "secret")
+
+    def test_cloudflare_client_rejects_unbounded_or_invalid_timeouts(self):
+        for timeout in (None, (1, None), (0, 1), (1, 0), (float("inf"), 1), (1,), "1,2"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout"):
+                    CloudflareServiceClient(
+                        "https://gate.example.com", "id", "secret", timeout=timeout,
+                    )

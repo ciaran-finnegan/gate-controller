@@ -76,3 +76,46 @@ Raspberry Pi `RPi.GPIO`; and root-level `test_upload_image_to_s3.py` requires
 
 - Full `unittest discover` is not green in this macOS development environment
   because of the three pre-existing, non-Task-1 root-level tests listed above.
+
+## Review Fix: URL Origin And Timeout Validation
+
+### RED Evidence
+
+Command:
+
+```sh
+.venv/bin/python -m unittest tests.test_cloudflare_client -v
+```
+
+Result: expected failure before the fix. The origin regression recorded an
+unsafe request URL of `https://evil.example/api/controller/plates` for the
+path `/https://evil.example/api/controller/plates`. The timeout regression
+also showed that `None`, malformed tuples, non-positive values, and infinity
+were all accepted. `Ran 8 tests`; `FAILED (failures=8)`.
+
+### GREEN Verification
+
+Command:
+
+```sh
+.venv/bin/python -m unittest tests.test_cloudflare_client tests.test_runtime -v
+```
+
+Result: PASS. `Ran 12 tests in 0.002s`, `OK`.
+
+Command:
+
+```sh
+git diff --check
+```
+
+Result: PASS. No output and no whitespace errors.
+
+### Fix Summary
+
+- Service URLs are formed by appending a validated absolute path to the
+  validated base URL, so a scheme-like path cannot replace the configured
+  origin or receive Cloudflare Access service-token headers.
+- Timeouts must now be an exact two-value tuple of finite, positive connect
+  and read timeouts. `None` and other unbounded or malformed values fail at
+  client construction.
