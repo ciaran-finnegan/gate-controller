@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -335,6 +336,101 @@ class ActivationRecoveryTests(unittest.TestCase):
             self.assertEqual(candidate.resolve(), config.current_link.resolve())
             self.assertFalse(config.pending_activation_path.exists())
 
+    def test_activation_retires_legacy_command_service_before_restarting_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            install_root = Path(temporary_directory)
+            config = replace(UpdateConfig.from_mapping({}), install_root=install_root)
+            previous = config.releases_root / OTHER_SHA
+            candidate = config.releases_root / TARGET_SHA
+            previous.mkdir(parents=True)
+            candidate.mkdir()
+            config.current_link.symlink_to(previous)
+            commands = []
+
+            def record_systemctl(arguments, **_options):
+                commands.append(tuple(str(argument) for argument in arguments))
+                return ""
+
+            def legacy_service_running(arguments, **_options):
+                commands.append(tuple(arguments))
+                return subprocess.CompletedProcess(arguments, 0)
+
+            def restart_candidate(_config):
+                commands.append(("restart-candidate",))
+
+            with patch(
+                "deployment.gate_controller_updater.subprocess.run",
+                side_effect=legacy_service_running,
+            ), patch(
+                "deployment.gate_controller_updater._run_command",
+                side_effect=record_systemctl,
+            ), patch(
+                "deployment.gate_controller_updater._restart_and_confirm",
+                side_effect=restart_candidate,
+            ):
+                activate_release(candidate, previous, config)
+
+            self.assertEqual(
+                [
+                    ("systemctl", "is-enabled", "--quiet", "gate-command-server.service"),
+                    ("systemctl", "is-active", "--quiet", "gate-command-server.service"),
+                    ("systemctl", "disable", "--now", "gate-command-server.service"),
+                    ("restart-candidate",),
+                ],
+                commands,
+            )
+
+    def test_activation_rollback_restores_enabled_and_active_legacy_command_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            install_root = Path(temporary_directory)
+            config = replace(UpdateConfig.from_mapping({}), install_root=install_root)
+            previous = config.releases_root / OTHER_SHA
+            candidate = config.releases_root / TARGET_SHA
+            (previous / "deployment/systemd").mkdir(parents=True)
+            (previous / "deployment/systemd/gate-command-server.service").touch()
+            candidate.mkdir()
+            config.current_link.symlink_to(previous)
+            commands = []
+            health_attempts = 0
+
+            def record_systemctl(arguments, **_options):
+                commands.append(tuple(str(argument) for argument in arguments))
+                return ""
+
+            def legacy_service_running(_arguments, **_options):
+                return subprocess.CompletedProcess([], 0)
+
+            def fail_candidate_then_confirm_rollback(_config):
+                nonlocal health_attempts
+                health_attempts += 1
+                if health_attempts == 1:
+                    commands.append(("candidate-health",))
+                    raise UpdateError("candidate unhealthy")
+                commands.append(("rollback-health",))
+
+            with patch(
+                "deployment.gate_controller_updater.subprocess.run",
+                side_effect=legacy_service_running,
+            ), patch(
+                "deployment.gate_controller_updater._run_command",
+                side_effect=record_systemctl,
+            ), patch(
+                "deployment.gate_controller_updater._restart_and_confirm",
+                side_effect=fail_candidate_then_confirm_rollback,
+            ), self.assertRaises(UpdateError):
+                activate_release(candidate, previous, config)
+
+            self.assertEqual(
+                [
+                    ("systemctl", "disable", "--now", "gate-command-server.service"),
+                    ("candidate-health",),
+                    ("rollback-health",),
+                    ("systemctl", "enable", "gate-command-server.service"),
+                    ("systemctl", "restart", "gate-command-server.service"),
+                ],
+                commands,
+            )
+
     def test_activation_failure_clears_marker_only_after_confirmed_rollback(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             install_root = Path(temporary_directory)
@@ -435,8 +531,10 @@ class ActivationRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "candidate": TARGET_SHA,
+                    "legacy_command_active": False,
+                    "legacy_command_enabled": False,
                     "previous": OTHER_SHA,
-                    "version": 1,
+                    "version": 2,
                 },
                 json.loads(config.pending_activation_path.read_text(encoding="utf-8")),
             )
@@ -524,6 +622,58 @@ class ActivationRecoveryTests(unittest.TestCase):
             self.assertEqual(previous.resolve(), config.current_link.resolve())
             self.assertTrue(rollback_confirmation.is_file())
             self.assertFalse(config.pending_activation_path.exists())
+
+    def test_pending_rollback_restores_enabled_and_active_legacy_command_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            install_root = Path(temporary_directory)
+            config = replace(UpdateConfig.from_mapping({}), install_root=install_root)
+            previous = config.releases_root / OTHER_SHA
+            candidate = config.releases_root / TARGET_SHA
+            (previous / "deployment/systemd").mkdir(parents=True)
+            (previous / "deployment/systemd/gate-command-server.service").touch()
+            candidate.mkdir()
+            config.current_link.symlink_to(candidate)
+            config.pending_activation_path.write_text(
+                json.dumps(
+                    {
+                        "candidate": TARGET_SHA,
+                        "previous": OTHER_SHA,
+                        "legacy_command_active": True,
+                        "legacy_command_enabled": True,
+                        "version": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            commands = []
+            health_attempts = 0
+
+            def record_systemctl(arguments, **_options):
+                commands.append(tuple(str(argument) for argument in arguments))
+                return ""
+
+            def fail_candidate_then_confirm_rollback(_config):
+                nonlocal health_attempts
+                health_attempts += 1
+                if health_attempts == 1:
+                    raise UpdateError("candidate unhealthy")
+
+            with patch(
+                "deployment.gate_controller_updater._run_command",
+                side_effect=record_systemctl,
+            ), patch(
+                "deployment.gate_controller_updater._restart_and_confirm",
+                side_effect=fail_candidate_then_confirm_rollback,
+            ), self.assertRaises(UpdateError):
+                reconcile_pending_activation(config)
+
+            self.assertEqual(
+                [
+                    ("systemctl", "enable", "gate-command-server.service"),
+                    ("systemctl", "restart", "gate-command-server.service"),
+                ],
+                commands,
+            )
 
     def test_pending_previous_is_confirmed_as_interrupted_activation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -627,7 +777,7 @@ class ActivationRecoveryTests(unittest.TestCase):
                 reconcile_pending_activation(config)
 
             self.assertFalse(config.pending_activation_path.exists())
-            self.assertEqual(1, fsync.call_count)
+            self.assertEqual(3, fsync.call_count)
 
     def test_pending_release_symlink_outside_managed_root_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
