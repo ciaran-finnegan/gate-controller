@@ -107,6 +107,64 @@ class MainConfigurationTests(unittest.TestCase):
                         store, relay=object(), environment=environment, latest_image={}
                     )
 
+    def test_partial_cloudflare_configuration_fails_closed(self):
+        configurations = (
+            {"GATE_CLOUDFLARE_API_URL": "https://gate.example.com"},
+            {
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            },
+        )
+        for environment in configurations:
+            with self.subTest(environment=environment):
+                store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+                self.addCleanup(
+                    lambda store=store: store.path.parent.exists()
+                    and __import__("shutil").rmtree(store.path.parent)
+                )
+
+                with self.assertRaisesRegex(ValueError, "GATE_CLOUDFLARE"):
+                    build_background_workers(
+                        store, relay=object(), environment=environment, latest_image={}
+                    )
+
+    def test_cloudflare_configuration_builds_authorisation_status_and_outbox_workers(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        plates = store.path.parent / "plates.csv"
+        plates.write_text("plate\n", encoding="utf-8")
+        authorised = AuthorisedPlateCache(plates)
+
+        workers, _, status = build_background_workers(store, relay=object(), environment={
+            "GATE_CLOUDFLARE_API_URL": "https://gate.example.com",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            "GATE_CONTROLLER_ID": "primary",
+        }, authorised=authorised)
+
+        self.assertEqual(
+            [type(worker).__name__ for worker in workers],
+            ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker"],
+        )
+        self.assertEqual(0, status()["queue_depth"])
+
+    def test_simultaneous_supabase_and_cloudflare_configuration_fails_closed(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        with self.assertRaisesRegex(ValueError, "Supabase.*Cloudflare"):
+            build_background_workers(store, relay=object(), environment={
+                "SUPABASE_URL": "https://project.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+                "GATE_CLOUDFLARE_API_URL": "https://gate.example.com",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            })
+
     def test_configured_camera_upload_receiver_is_ready_before_the_first_vehicle(self):
         store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
         self.addCleanup(

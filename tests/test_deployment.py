@@ -341,6 +341,34 @@ migrate_legacy_authorised_plates \
             self.assertNotEqual(0, partial.returncode)
             self.assertIn("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together", partial.stderr)
 
+    def test_environment_file_rejects_partial_cloudflare_and_mixed_cloud_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            env_file = Path(temporary_directory) / "gate-controller.env"
+            common = f"source deployment/install.sh; validate_env_file {shlex.quote(str(env_file))} $(id -u) $(id -g)"
+
+            env_file.write_text("GATE_CLOUDFLARE_API_URL=https://gate.example.com\n")
+            env_file.chmod(0o600)
+            partial = subprocess.run(
+                ["bash", "-c", common], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(0, partial.returncode)
+            self.assertIn("GATE_CLOUDFLARE", partial.stderr)
+
+            env_file.write_text(
+                "SUPABASE_URL=https://example.supabase.co\n"
+                "SUPABASE_SERVICE_ROLE_KEY=service-key\n"
+                "GATE_CLOUDFLARE_API_URL=https://gate.example.com\n"
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_ID=client-id\n"
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET=client-secret\n"
+            )
+            mixed = subprocess.run(
+                ["bash", "-c", common], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(0, mixed.returncode)
+            self.assertIn("Supabase and Cloudflare", mixed.stderr)
+
     def test_upload_preflight_rejects_symlinked_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -59,6 +59,9 @@ validate_env_file() {
   local owner group mode line value
   local has_supabase_url=false
   local has_service_key=false
+  local has_cloudflare_api_url=false
+  local has_cloudflare_access_client_id=false
+  local has_cloudflare_access_client_secret=false
 
   [[ -f $env_file && ! -L $env_file ]] \
     || fail "$env_file must be a regular file"
@@ -89,10 +92,27 @@ PY
         value=${line#*=}
         [[ -n $value && $value != "''" && $value != '""' ]] && has_service_key=true
         ;;
+      GATE_CLOUDFLARE_API_URL=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_api_url=true
+        ;;
+      GATE_CLOUDFLARE_ACCESS_CLIENT_ID=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_access_client_id=true
+        ;;
+      GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_access_client_secret=true
+        ;;
     esac
   done <"$env_file"
   [[ $has_supabase_url == "$has_service_key" ]] \
     || fail "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together"
+  [[ $has_cloudflare_api_url == "$has_cloudflare_access_client_id" \
+    && $has_cloudflare_api_url == "$has_cloudflare_access_client_secret" ]] \
+    || fail "GATE_CLOUDFLARE_API_URL, GATE_CLOUDFLARE_ACCESS_CLIENT_ID, and GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET must be configured together"
+  [[ $has_supabase_url == false || $has_cloudflare_api_url == false ]] \
+    || fail "Supabase and Cloudflare credentials cannot be configured together"
 }
 
 create_fixed_trust_anchor_handoff() {

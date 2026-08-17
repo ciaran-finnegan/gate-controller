@@ -10,12 +10,14 @@ from urllib.parse import urlparse
 from .audio import PromptPlayer
 from .actuation import ActuationCoordinator
 from .authorisation import (
-    AuthorisationRefreshWorker, AuthorisedPlateCache, SupabasePlateFetcher,
+    AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
+    SupabasePlateFetcher,
 )
+from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
 from .control_plane import CommandWorker, HeartbeatWorker, SupabaseControlPlane
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
-from .outbox import HttpOutboxSender, OutboxWorker
+from .outbox import CloudflareOutboxSender, HttpOutboxSender, OutboxWorker
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
 from .store import LocalStore
@@ -62,7 +64,7 @@ def main() -> None:
     )
     authorised = AuthorisedPlateCache(
         arguments.authorised_plates,
-        max_staleness=authorisation_staleness if _supabase_configured(os.environ) else None,
+        max_staleness=authorisation_staleness if _cloud_configured(os.environ) else None,
     )
     latest_image = {"path": None, "received_at": None}
     background_workers, _, _ = build_background_workers(
@@ -152,6 +154,35 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
+    supabase_configured = _supabase_configured(environment)
+    cloudflare_configured = _cloudflare_configured(environment)
+    if supabase_configured and cloudflare_configured:
+        raise ValueError("Supabase and Cloudflare configuration cannot be used together")
+    if cloudflare_configured:
+        cloudflare_client = CloudflareServiceClient(
+            environment["GATE_CLOUDFLARE_API_URL"].strip(),
+            environment["GATE_CLOUDFLARE_ACCESS_CLIENT_ID"].strip(),
+            environment["GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET"].strip(),
+        )
+        workers.append(OutboxWorker(
+            store,
+            CloudflareOutboxSender(cloudflare_client, controller_id),
+            controller_id=controller_id,
+        ))
+        if authorised is not None:
+            workers.append(AuthorisationRefreshWorker(
+                authorised, CloudflarePlateFetcher(cloudflare_client, controller_id),
+                poll_interval=float(environment.get("GATE_AUTHORISATION_REFRESH_SECONDS", "30")),
+            ))
+        status = lambda: _controller_status(
+            store, prompt_player, latest_image, authorised, relay=relay,
+            camera_directory=camera_directory,
+            camera_stale_seconds=camera_stale_seconds,
+        )
+        workers.append(HeartbeatWorker(
+            CloudflareStatusReporter(cloudflare_client, controller_id), status,
+        ))
+        return tuple(workers), prompt_player, status
     outbox_url = (environment.get("GATE_OUTBOX_URL") or "").strip()
     if outbox_url:
         bearer_token = _validated_outbox_token(
@@ -164,7 +195,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             ),
             controller_id=controller_id,
         ))
-    if not _supabase_configured(environment):
+    if not supabase_configured:
         return tuple(workers), prompt_player, lambda: _controller_status(
             store, prompt_player, latest_image, relay=relay,
             camera_directory=camera_directory,
@@ -284,6 +315,22 @@ def _supabase_configured(environment) -> bool:
             "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together"
         )
     return bool(url)
+
+
+def _cloudflare_configured(environment) -> bool:
+    variables = (
+        "GATE_CLOUDFLARE_API_URL",
+        "GATE_CLOUDFLARE_ACCESS_CLIENT_ID",
+        "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET",
+    )
+    configured = [bool((environment.get(variable) or "").strip()) for variable in variables]
+    if any(configured) and not all(configured):
+        raise ValueError("GATE_CLOUDFLARE_API_URL, GATE_CLOUDFLARE_ACCESS_CLIENT_ID, and GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET must be configured together")
+    return all(configured)
+
+
+def _cloud_configured(environment) -> bool:
+    return _supabase_configured(environment) or _cloudflare_configured(environment)
 
 
 def _validated_outbox_token(url: str, token: str | None) -> str:
