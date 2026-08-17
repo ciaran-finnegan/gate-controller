@@ -31,6 +31,8 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         unit = Path("deployment/systemd/gate-command-server.service").read_text()
         self.assertIn("User=gate-controller", unit)
         self.assertNotIn("CAP_SYS_RAWIO", unit)
+        self.assertIn("-m gate_controller.command_server", unit)
+        self.assertIn("-m gate_controller.relay_safe", unit)
 
     def test_fixed_application_service_stays_non_root_and_preserves_upload_traversal(self):
         unit = read_unit("file-monitor.service")

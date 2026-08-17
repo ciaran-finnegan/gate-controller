@@ -171,9 +171,10 @@ sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /
 The command-server unit is a fixed root-owned deployment artifact, installed by
 bootstrap alongside the controller and updater units. It runs as
 `gate-controller`, uses the account's normal GPIO group permissions through the
-application runtime, and receives no direct raw-I/O capability grant. After the
-command-server runtime entry point is enabled in the deployed controller,
-activate it with:
+application runtime, and receives no direct raw-I/O capability grant. It binds
+only `127.0.0.1:8765`, uses `GATE_CONTROLLER_ID` (default `primary`), and opens
+the local store at `GATE_DATABASE` (default
+`/var/lib/gate-controller/gate-controller.db`). Activate it with:
 
 ```sh
 sudo systemctl daemon-reload

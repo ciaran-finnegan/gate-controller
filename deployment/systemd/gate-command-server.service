@@ -14,6 +14,7 @@ WorkingDirectory=/var/lib/gate-controller
 EnvironmentFile=/etc/gate-controller.env
 Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/gate-controller-deploy/current
 ExecStart=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller.command_server
+ExecStopPost=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller.relay_safe
 Restart=always
 RestartSec=5s
 TimeoutStopSec=15s

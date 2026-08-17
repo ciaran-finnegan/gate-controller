@@ -1,14 +1,22 @@
 import json
+import os
 import socket
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
+from pathlib import Path
+from threading import Event, Lock
 
+from .actuation import ActuationCoordinator
+from .audio import PromptPlayer
 from .models import GateEvent
+from .relay import PiRelayAdapter, RelayController
+from .store import LocalStore
 
 
 MAX_REQUEST_BYTES = 4096
 MAX_COMMAND_LIFETIME = timedelta(seconds=10)
+COMMAND_SERVER_HOST = "127.0.0.1"
+COMMAND_SERVER_PORT = 8765
 
 
 class DirectCommandExecutor:
@@ -176,6 +184,35 @@ def run_command_server(host, port, executor, stop_event):
         server.server_close()
 
 
+def main(*, environment=None, relay=None, store=None, stop_event=None, server_runner=None):
+    environment = os.environ if environment is None else environment
+    controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
+    database = Path(environment.get(
+        "GATE_DATABASE", "/var/lib/gate-controller/gate-controller.db"
+    ))
+    store = store or LocalStore(database)
+    relay = relay or RelayController(PiRelayAdapter())
+    coordinator = ActuationCoordinator(store, relay, timedelta(seconds=20))
+    prompt_player = PromptPlayer({
+        key: Path(environment[value])
+        for key, value in {
+            "arrival": "GATE_PROMPT_ARRIVAL",
+            "access_denied": "GATE_PROMPT_ACCESS_DENIED",
+        }.items()
+        if environment.get(value)
+    })
+    executor = DirectCommandExecutor(
+        controller_id, coordinator, store, prompt_player=prompt_player,
+    )
+    runner = server_runner or run_command_server
+    try:
+        runner(COMMAND_SERVER_HOST, COMMAND_SERVER_PORT, executor, stop_event or Event())
+    finally:
+        shutdown = getattr(relay, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+
 def _is_loopback(host) -> bool:
     return host in {"127.0.0.1", "::1"}
 
@@ -190,3 +227,7 @@ def _parse_timestamp(value):
     if parsed.tzinfo is None:
         raise ValueError("expires_at must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+if __name__ == "__main__":
+    main()
