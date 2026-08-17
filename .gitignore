@@ -3,3 +3,4 @@
 *.env
 .DS_Store
 .worktrees/
+__pycache__/
