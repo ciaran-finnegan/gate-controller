@@ -10,12 +10,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import requests
 from PIL import Image
 
 import gate_controller.outbox as outbox_module
 from gate_controller.models import GateEvent
 from gate_controller.outbox import (
-    CloudflareOutboxSender, EvidenceSpoolError, HttpOutboxSender, OutboxWorker,
+    CloudflareOutboxSender, EvidenceSpoolError, HttpOutboxSender, OutboxSyncError,
+    OutboxWorker,
 )
 from gate_controller.store import LocalStore
 from gate_controller.telemetry import EventTelemetry, StageDurations
@@ -368,6 +370,16 @@ class OutboxWorkerTests(unittest.TestCase):
         )
         self.assertEqual(request.payload["image"]["sha256"], sha)
         self.assertEqual(request.payload["image"]["data_base64"], base64.b64encode(image).decode("ascii"))
+
+    def test_cloudflare_outbox_sender_translates_worker_http_failures(self):
+        class FailingClient:
+            def post_json(self, path, payload, *, headers=None):
+                raise requests.HTTPError("502 Server Error")
+
+        sender = CloudflareOutboxSender(FailingClient(), "primary")
+
+        with self.assertRaisesRegex(OutboxSyncError, "outbox endpoint"):
+            sender({"event_id": 7})
 
     def test_pending_delivery_keeps_its_first_persisted_controller_identity(self):
         class Response:

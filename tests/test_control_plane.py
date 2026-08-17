@@ -162,6 +162,7 @@ class ControlPlaneTests(unittest.TestCase):
     def test_cloudflare_status_reporter_forwards_existing_heartbeat_contract(self):
         reporter = CloudflareStatusReporter(FakeClient(), "primary")
         status = {
+            "controller_id": "secondary",
             "queue_depth": 2,
             "media": {"video": {
                 "configured": False, "ready": False, "verified": False,
@@ -173,7 +174,7 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(reporter.client.requests[0].path, "/api/controller/status")
         self.assertEqual(reporter.client.requests[0].payload, {
-            "controller_id": "primary", **status,
+            **status, "controller_id": "primary",
         })
 
     def test_control_plane_rejects_http_before_creating_a_credentialed_session(self):

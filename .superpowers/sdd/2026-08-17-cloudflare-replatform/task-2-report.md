@@ -65,3 +65,38 @@ Result: PASS. Both commands produced no errors or output.
 ## Concerns
 
 - None.
+
+## Fix Round 1 Verification
+
+The original implementer lost approval-service access after writing the fix diff, so the controller session verified the already-written patch under an SDD ledger ruling before commit.
+
+Findings addressed:
+
+- Rejected unbound Cloudflare plate lists so snapshots must include the configured `controller_id`.
+- Preserved the configured controller identity when status payload input already contains `controller_id`.
+- Translated Worker HTTP failures from `CloudflareOutboxSender` into `OutboxSyncError`.
+
+Command:
+
+```sh
+.venv/bin/python -m unittest tests.test_authorisation tests.test_outbox tests.test_control_plane -q
+```
+
+Result: PASS. `Ran 70 tests in 1.025s`, `OK`.
+
+Command:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -q
+```
+
+Result: PASS. `Ran 371 tests in 7.087s`, `OK (skipped=2)`.
+
+Command:
+
+```sh
+.venv/bin/python -m compileall -q gate_controller tests
+git diff --check
+```
+
+Result: PASS. Both commands produced no errors or output.

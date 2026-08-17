@@ -167,9 +167,7 @@ class CloudflarePlateFetcher:
         payload = self.client.get_json(
             "/api/controller/plates?" + urlencode({"controller_id": self._controller_id})
         )
-        if isinstance(payload, list):
-            rows = payload
-        elif isinstance(payload, dict) and payload.get("controller_id") == self._controller_id:
+        if isinstance(payload, dict) and payload.get("controller_id") == self._controller_id:
             rows = payload.get("plates")
         else:
             raise AuthorisationError("Cloudflare plates returned a snapshot for another controller")

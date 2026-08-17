@@ -147,11 +147,16 @@ class CloudflareOutboxSender:
 
     def __call__(self, payload: dict, evidence_bytes: bytes | None = None) -> None:
         transmitted = _prepare_outbox_payload(payload, self._controller_id, evidence_bytes)
-        self.client.post_json(
-            "/api/controller/events",
-            transmitted,
-            headers={"Idempotency-Key": _outbox_idempotency_key(transmitted)},
-        )
+        try:
+            self.client.post_json(
+                "/api/controller/events",
+                transmitted,
+                headers={"Idempotency-Key": _outbox_idempotency_key(transmitted)},
+            )
+        except requests.HTTPError as error:
+            status_code = getattr(getattr(error, "response", None), "status_code", None)
+            detail = status_code if isinstance(status_code, int) else "failure"
+            raise OutboxSyncError(f"outbox endpoint returned HTTP {detail}") from error
 
 
 def _prepare_outbox_payload(payload: dict, controller_id: str,

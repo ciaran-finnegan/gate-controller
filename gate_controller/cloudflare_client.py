@@ -76,5 +76,5 @@ class CloudflareStatusReporter:
 
     def heartbeat(self, status) -> None:
         self.client.post_json(
-            "/api/controller/status", {"controller_id": self._controller_id, **status}
+            "/api/controller/status", {**status, "controller_id": self._controller_id}
         )

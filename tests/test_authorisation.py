@@ -43,6 +43,12 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthorisationError, "controller"):
             CloudflarePlateFetcher(client, "primary")()
 
+    def test_cloudflare_plate_fetcher_rejects_an_unbound_plate_list(self):
+        client = FakeClient(json_response=[{"plate": "241D123"}])
+
+        with self.assertRaisesRegex(AuthorisationError, "controller"):
+            CloudflarePlateFetcher(client, "primary")()
+
     def test_atomic_snapshot_replace_fsyncs_the_containing_directory(self):
         real_fsync = os.fsync
         fsynced_directory = []
