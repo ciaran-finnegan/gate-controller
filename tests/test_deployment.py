@@ -31,6 +31,38 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertNotIn("SUPABASE_URL", readme)
         self.assertNotIn("SUPABASE_SERVICE_ROLE_KEY", readme)
 
+    def test_deployment_docs_cover_the_command_tunnel_and_ingest_contract(self):
+        deployment = (REPOSITORY_ROOT / "docs/deployment.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("POST /commands", deployment)
+        self.assertIn("cloudflared tunnel ingress validate", deployment)
+        self.assertIn("cloudflared tunnel ingress rule", deployment)
+        self.assertIn("POST\n/api/controller/events", deployment)
+        self.assertIn("private R2 bucket", deployment)
+
+    def test_deployment_docs_require_rollback_before_decommission(self):
+        deployment = (REPOSITORY_ROOT / "docs/deployment.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("restore the previous release before removing", deployment)
+        self.assertIn("decommissioning the prior service", deployment)
+
+    def test_camera_docs_defer_pi_validation_to_safe_non_actuating_harness(self):
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "Real Pi SSH,\nrelay, and media load validation remains deferred",
+            camera,
+        )
+        self.assertIn("default non-actuating command", camera)
+        self.assertIn("--skip-network", camera)
+        self.assertIn("--actuate", camera)
+
 
 class SystemdTrustBoundaryTests(unittest.TestCase):
     def test_cloudflared_config_has_command_media_and_catch_all_rules(self):
