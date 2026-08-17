@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from gate_controller.runtime import require_python_version
+from gate_controller.runtime import require_https_or_loopback_service_url, require_python_version
 
 
 class RuntimeTests(unittest.TestCase):
@@ -18,3 +18,20 @@ class RuntimeTests(unittest.TestCase):
 
     def test_accepts_the_declared_minimum_python_version(self):
         require_python_version((3, 10, 0))
+
+    def test_service_url_requires_https_except_for_loopback_development_urls(self):
+        self.assertEqual(
+            require_https_or_loopback_service_url("https://gate.example.com/", "GATE_CLOUDFLARE_API_URL"),
+            "https://gate.example.com",
+        )
+        self.assertEqual(
+            require_https_or_loopback_service_url("http://localhost:8787/", "GATE_CLOUDFLARE_API_URL"),
+            "http://localhost:8787",
+        )
+        self.assertEqual(
+            require_https_or_loopback_service_url("http://[::1]:8787", "GATE_CLOUDFLARE_API_URL"),
+            "http://[::1]:8787",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GATE_CLOUDFLARE_API_URL"):
+            require_https_or_loopback_service_url("http://gate.example.com", "GATE_CLOUDFLARE_API_URL")
