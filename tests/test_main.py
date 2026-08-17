@@ -8,6 +8,7 @@ import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import build_background_workers, default_runtime_paths
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
+from gate_controller.command_server import CommandServerWorker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.store import LocalStore
 
@@ -126,6 +127,33 @@ class MainConfigurationTests(unittest.TestCase):
             ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker"],
         )
         self.assertEqual(0, status()["queue_depth"])
+
+    def test_command_server_worker_uses_the_main_process_coordinator(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        coordinator = object()
+
+        workers, _, _ = build_background_workers(
+            store, relay=object(), environment={}, latest_image={},
+            coordinator=coordinator,
+        )
+
+        command_worker = next(worker for worker in workers if isinstance(worker, CommandServerWorker))
+        self.assertIs(command_worker.executor.coordinator, coordinator)
+
+    def test_active_legacy_supabase_configuration_fails_closed(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        with self.assertRaisesRegex(ValueError, "legacy Supabase"):
+            build_background_workers(store, relay=object(), environment={
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            })
 
     def test_configured_camera_upload_receiver_is_ready_before_the_first_vehicle(self):
         store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")

@@ -389,7 +389,10 @@ def verify_release(release: Path, config: UpdateConfig) -> None:
         run_as_user=BUILD_USER,
     )
     _run_command(
-        [python, "-m", "compileall", "-q", "gate_controller", "deployment"],
+        [
+            python, "-m", "compileall", "-q", "gate_controller", "deployment",
+            "tests", "scripts",
+        ],
         config=config,
         cwd=release,
         run_as_user=BUILD_USER,

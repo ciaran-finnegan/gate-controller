@@ -6,9 +6,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from gate_controller import command_server
 from gate_controller.actuation import ActuationCoordinator
-from gate_controller.command_server import DirectCommandExecutor, build_command_server
+from gate_controller.command_server import (
+    CommandServerWorker, DirectCommandExecutor, build_command_server,
+)
 from gate_controller.models import RelayResult
 from gate_controller.store import LocalStore
 
@@ -131,35 +132,17 @@ class DirectCommandExecutorTests(unittest.TestCase):
 
 
 class CommandServerTests(unittest.TestCase):
-    def test_daemon_main_runs_loopback_server_with_runtime_executor(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = LocalStore(Path(directory) / "gate.db")
-            calls = []
-
-            def record_runner(host, port, executor, stop_event):
-                calls.append((host, port, executor, stop_event))
-
-            stop_event = threading.Event()
-            command_server.main(
-                environment={"GATE_CONTROLLER_ID": "primary"},
-                relay=FakeRelay(),
-                store=store,
-                stop_event=stop_event,
-                server_runner=record_runner,
-            )
-
-        self.assertEqual(calls[0][0:2], ("127.0.0.1", 8765))
-        self.assertIsInstance(calls[0][2], DirectCommandExecutor)
-        self.assertIs(calls[0][3], stop_event)
-        self.assertEqual(
-            calls[0][2].execute({
-                "controller_id": "other-controller",
-                "command": "open_gate",
-                "idempotency_key": "request-1",
-                "expires_at": "2026-08-17T10:00:10Z",
-            }),
-            {"status": "failed", "detail": "wrong_controller"},
+    def test_command_worker_runs_loopback_server_with_supplied_executor(self):
+        calls = []
+        executor = object()
+        stop_event = threading.Event()
+        worker = CommandServerWorker(
+            executor, server_runner=lambda *arguments: calls.append(arguments)
         )
+
+        worker.run_forever(stop_event)
+
+        self.assertEqual(calls, [("127.0.0.1", 8765, executor, stop_event)])
 
     def test_command_server_rejects_non_loopback_bind(self):
         for host in ("0.0.0.0", "127.0.0.2"):

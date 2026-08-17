@@ -68,15 +68,21 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
     def test_cloudflared_config_has_command_media_and_catch_all_rules(self):
         config = Path("deployment/cloudflared/gate-controller-tunnel.yml").read_text()
         self.assertIn("service: http://127.0.0.1:8765", config)
-        self.assertIn("service: http://127.0.0.1:8889", config)
+        self.assertIn("service: http://127.0.0.1:8891", config)
+        self.assertNotIn("service: http://127.0.0.1:8889", config)
         self.assertRegex(config, r"- service: http_status:404\s*$")
 
-    def test_command_server_unit_runs_as_gate_controller_without_gpio_capabilities(self):
-        unit = Path("deployment/systemd/gate-command-server.service").read_text()
-        self.assertIn("User=gate-controller", unit)
-        self.assertNotIn("CAP_SYS_RAWIO", unit)
-        self.assertIn("-m gate_controller.command_server", unit)
-        self.assertIn("-m gate_controller.relay_safe", unit)
+    def test_command_server_is_owned_by_the_time_synchronised_main_service(self):
+        unit = Path("file-monitor.service").read_text()
+        installer = Path("deployment/install.sh").read_text()
+
+        self.assertFalse(Path("deployment/systemd/gate-command-server.service").exists())
+        self.assertIn("After=network-online.target time-sync.target", unit)
+        self.assertIn("-m gate_controller", unit)
+        self.assertNotIn("COMMAND_SERVER_SERVICE", installer)
+        self.assertIn('systemctl disable --now "$LEGACY_COMMAND_UNIT"', installer)
+        self.assertIn('rm -f -- "$SYSTEMD_ROOT/$LEGACY_COMMAND_UNIT"', installer)
+        self.assertIn("restore_legacy_command_activity", installer)
 
     def test_fixed_application_service_stays_non_root_and_preserves_upload_traversal(self):
         unit = read_unit("file-monitor.service")
@@ -214,7 +220,6 @@ install_fixed_trust_anchors \
             self.assertEqual(0o755, helper.stat().st_mode & 0o777)
             for unit_name in (
                 "file-monitor.service",
-                "gate-command-server.service",
                 "gate-controller-updater.service",
                 "gate-controller-updater.timer",
             ):
@@ -239,7 +244,6 @@ install_fixed_trust_anchors \
             systemd_root.mkdir()
             (source / "deployment/gate_controller_updater.py").write_text("trusted helper\n")
             (source / "file-monitor.service").write_text("trusted app\n")
-            (source / "deployment/systemd/gate-command-server.service").write_text("trusted command server\n")
             (source / "deployment/systemd/gate-controller-updater.service").write_text("trusted updater\n")
             (source / "deployment/systemd/gate-controller-updater.timer").write_text("trusted timer\n")
             command = f"""
@@ -327,7 +331,6 @@ with open(sys.argv[1], "w") as lock_file:
             systemd_root.mkdir()
             (handoff / "deployment/gate_controller_updater.py").write_text("refreshed\n")
             (handoff / "file-monitor.service").write_text("app\n")
-            (handoff / "deployment/systemd/gate-command-server.service").write_text("command server\n")
             (handoff / "deployment/systemd/gate-controller-updater.service").write_text("updater\n")
             (handoff / "deployment/systemd/gate-controller-updater.timer").write_text("timer\n")
             command = f"""
@@ -399,7 +402,7 @@ migrate_legacy_authorised_plates \
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, partial.returncode)
-            self.assertIn("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together", partial.stderr)
+            self.assertIn("legacy Supabase", partial.stderr)
 
     def test_environment_file_rejects_partial_cloudflare_and_mixed_cloud_credentials(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -427,7 +430,28 @@ migrate_legacy_authorised_plates \
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, mixed.returncode)
-            self.assertIn("Supabase and Cloudflare", mixed.stderr)
+            self.assertIn("legacy Supabase", mixed.stderr)
+
+    def test_environment_file_rejects_complete_legacy_supabase_only_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            env_file = Path(temporary_directory) / "gate-controller.env"
+            env_file.write_text(
+                "SUPABASE_URL=https://example.supabase.co\n"
+                "SUPABASE_SERVICE_ROLE_KEY=service-key\n"
+            )
+            env_file.chmod(0o600)
+            command = (
+                "source deployment/install.sh; "
+                f"validate_env_file {shlex.quote(str(env_file))} $(id -u) $(id -g)"
+            )
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("legacy Supabase", completed.stderr)
 
     def test_upload_preflight_rejects_symlinked_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

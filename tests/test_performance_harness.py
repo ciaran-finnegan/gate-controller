@@ -30,6 +30,36 @@ class PerformanceHarnessTests(unittest.TestCase):
 
         self.assertEqual(summary["pi_ssh_tests"], "skipped_until_tailscale_or_home_wifi")
 
+    def test_host_metrics_include_bounded_network_interface_counters(self):
+        harness = load_harness()
+        proc_values = {
+            "/proc/loadavg": None,
+            "/proc/meminfo": None,
+            "/proc/net/dev": (
+                "Inter-| Receive | Transmit\n"
+                " face |bytes packets errs drop fifo frame compressed multicast|"
+                "bytes packets errs drop fifo colls carrier compressed\n"
+                "  eth0: 123 4 0 0 0 0 0 0 567 8 0 0 0 0 0 0\n"
+            ),
+        }
+
+        with mock.patch.object(
+            harness, "_read_proc_value",
+            side_effect=lambda path, **kwargs: proc_values[path],
+        ) as read_proc:
+            metrics = harness.collect_host_metrics()
+
+        self.assertEqual(metrics["network"]["eth0"], {
+            "receive_bytes": 123,
+            "receive_packets": 4,
+            "transmit_bytes": 567,
+            "transmit_packets": 8,
+        })
+        self.assertIn(
+            mock.call("/proc/net/dev", max_bytes=harness.MAX_PROC_NET_DEV_BYTES),
+            read_proc.call_args_list,
+        )
+
     def test_default_execution_issues_only_get_probes(self):
         harness = load_harness()
         calls = []

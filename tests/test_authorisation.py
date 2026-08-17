@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from gate_controller.authorisation import (
     AuthorisationError, AuthorisationRefreshWorker, AuthorisedPlateCache,
-    CloudflarePlateFetcher,
+    CloudflarePlateFetcher, MAX_NORMALISED_PLATE_LENGTH, MAX_PLATE_ROWS,
+    MAX_PLATE_SNAPSHOT_BYTES,
 )
 
 
@@ -17,8 +18,10 @@ class FakeClient:
         self.json_response = json_response
         self.requests = []
 
-    def get_json(self, path):
-        self.requests.append(type("Request", (), {"path": path})())
+    def get_json(self, path, *, max_response_bytes=None):
+        self.requests.append(type("Request", (), {
+            "path": path, "max_response_bytes": max_response_bytes,
+        })())
         return self.json_response
 
 
@@ -34,6 +37,7 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
         self.assertEqual(
             client.requests[0].path, "/api/controller/plates?controller_id=primary"
         )
+        self.assertEqual(client.requests[0].max_response_bytes, MAX_PLATE_SNAPSHOT_BYTES)
 
     def test_cloudflare_plate_fetcher_rejects_a_snapshot_for_another_controller(self):
         client = FakeClient(json_response={
@@ -48,6 +52,38 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AuthorisationError, "controller"):
             CloudflarePlateFetcher(client, "primary")()
+
+    def test_oversized_cloudflare_plate_row_set_does_not_replace_snapshot(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": f"{index}"} for index in range(MAX_PLATE_ROWS + 1)],
+            "controller_id": "primary",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plates.csv"
+            path.write_text("plate\n12D3456\n", encoding="utf-8")
+            cache = AuthorisedPlateCache(path)
+            worker = AuthorisationRefreshWorker(
+                cache, CloudflarePlateFetcher(client, "primary")
+            )
+
+            self.assertFalse(worker.run_once())
+            self.assertEqual(cache.get(), ("12D3456",))
+
+    def test_overlong_normalised_cloudflare_plate_does_not_replace_snapshot(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "A" * (MAX_NORMALISED_PLATE_LENGTH + 1)}],
+            "controller_id": "primary",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plates.csv"
+            path.write_text("plate\n12D3456\n", encoding="utf-8")
+            cache = AuthorisedPlateCache(path)
+            worker = AuthorisationRefreshWorker(
+                cache, CloudflarePlateFetcher(client, "primary")
+            )
+
+            self.assertFalse(worker.run_once())
+            self.assertEqual(cache.get(), ("12D3456",))
 
     def test_atomic_snapshot_replace_fsyncs_the_containing_directory(self):
         real_fsync = os.fsync

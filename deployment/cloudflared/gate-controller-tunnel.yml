@@ -4,5 +4,5 @@ ingress:
   - hostname: gate-command.example.com
     service: http://127.0.0.1:8765
   - hostname: gate-media.example.com
-    service: http://127.0.0.1:8889
+    service: http://127.0.0.1:8891
   - service: http_status:404

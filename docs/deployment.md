@@ -148,8 +148,8 @@ sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 
 ## Cloudflare Tunnel
 
-Cloudflare Tunnel exposes only the loopback command endpoint and MediaMTX WHEP
-gateway. Copy `deployment/cloudflared/gate-controller-tunnel.yml` to the Pi,
+Cloudflare Tunnel exposes only the loopback command endpoint and the hardened
+nginx WHEP gateway. Copy `deployment/cloudflared/gate-controller-tunnel.yml` to the Pi,
 replace the example tunnel UUID, credentials path, and hostnames with the values
 created in Cloudflare, then store its credentials JSON at the configured
 root-owned path. Do not add ingress rules for the controller database, GPIO,
@@ -175,18 +175,14 @@ sudo cloudflared tunnel ingress validate --config /etc/cloudflared/gate-controll
 sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /etc/cloudflared/gate-controller-tunnel.yml
 ```
 
-The command-server unit is a fixed root-owned deployment artifact, installed by
-bootstrap alongside the controller and updater units. It runs as
-`gate-controller`, uses the account's normal GPIO group permissions through the
-application runtime, and receives no direct raw-I/O capability grant. It binds
-only `127.0.0.1:8765`, uses `GATE_CONTROLLER_ID` (default `primary`), and opens
-the local store at `GATE_DATABASE` (default
-`/var/lib/gate-controller/gate-controller.db`). Activate it with:
+The loopback command server runs inside `file-monitor.service`, sharing the
+main process's `ActuationCoordinator`, relay, and local store. The service waits
+for `time-sync.target` before image or command handling starts. It binds only
+`127.0.0.1:8765` and uses `GATE_CONTROLLER_ID` (default `primary`). Verify it with:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now gate-command-server.service
-sudo systemctl status gate-command-server.service
+sudo systemctl status file-monitor.service
+curl --fail-with-body http://127.0.0.1:8765/not-found || test $? -eq 22
 ```
 
 Run `cloudflared` with the validated configuration through the operator-managed
@@ -442,13 +438,20 @@ unused inherited listener. API (`127.0.0.1:9997`), metrics
 the configured camera source.
 
 The installer root-renders the exact allowed HTTPS origin into
-`/etc/gate-media/nginx-whep-locations.conf`. Include it only inside the
-dedicated TLS server for the media public origin. It proxies `POST`/`OPTIONS`
+`/etc/gate-media/nginx-whep-locations.conf`. Include that complete server block
+from nginx's `http` context. It listens only on `127.0.0.1:8891`, which is the
+media origin configured for Cloudflare Tunnel. It proxies `POST`/`OPTIONS`
 on exact `/gate/whep` and `DELETE`/`OPTIONS` on bounded teardown resource paths;
 no catch-all route proxies to MediaMTX. nginx carries WHEP HTTP signaling and
 SDP only; it does not carry RTP/RTCP media. Actual media must traverse the exact
 ICE listeners or the configured TURN relay. Do not expose API, metrics, the auth
 sidecar, WHIP, RTSP serving, or camera administration.
+
+Keep rollback-only Supabase credentials outside `/etc/gate-controller.env`, for
+example in root-owned mode-0600 `/etc/gate-controller.rollback.env`. The active
+environment rejects every non-empty `SUPABASE_URL` or
+`SUPABASE_SERVICE_ROLE_KEY`; restore the prior release and its separate rollback
+environment together if rollback is required.
 
 Before setting `GATE_MEDIA_VIDEO_CONFIGURED=true` or
 `GATE_MEDIA_VIDEO_VERIFIED=true`, complete a WHEP session from a separate

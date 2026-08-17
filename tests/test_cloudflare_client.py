@@ -1,13 +1,21 @@
+import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
 
 from gate_controller.cloudflare_client import CloudflareServiceClient
 
 
 class RecordingResponse:
-    def __init__(self, payload=None, status_error=None, json_error=None):
+    def __init__(self, payload=None, status_error=None, json_error=None, status_code=200,
+                 content=None):
         self.payload = payload
         self.status_error = status_error
         self.json_error = json_error
+        self.status_code = status_code
+        self.content = content if content is not None else json.dumps(payload).encode("utf-8")
         self.raise_for_status_called = False
 
     def raise_for_status(self):
@@ -19,6 +27,10 @@ class RecordingResponse:
         if self.json_error:
             raise self.json_error
         return self.payload
+
+    def iter_content(self, chunk_size=1):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset:offset + chunk_size]
 
 
 class RecordingSession:
@@ -42,6 +54,8 @@ class Request:
         self.headers = kwargs["headers"]
         self.timeout = kwargs["timeout"]
         self.json = kwargs.get("json")
+        self.allow_redirects = kwargs["allow_redirects"]
+        self.stream = kwargs.get("stream", False)
 
 
 class CloudflareServiceClientTests(unittest.TestCase):
@@ -58,6 +72,7 @@ class CloudflareServiceClientTests(unittest.TestCase):
         self.assertEqual(session.requests[0].headers["CF-Access-Client-Id"], "client-id")
         self.assertEqual(session.requests[0].headers["CF-Access-Client-Secret"], "client-secret")
         self.assertEqual(session.requests[0].timeout, (1, 2))
+        self.assertFalse(session.requests[0].allow_redirects)
 
     def test_cloudflare_client_joins_absolute_paths_to_the_base_url(self):
         session = RecordingSession(RecordingResponse({"ok": True}))
@@ -71,6 +86,48 @@ class CloudflareServiceClientTests(unittest.TestCase):
         self.assertEqual(request.method, "POST")
         self.assertEqual(request.url, "https://gate.example.com/api/controller/status")
         self.assertEqual(request.json, {"online": True})
+        self.assertFalse(request.allow_redirects)
+
+    def test_cloudflare_client_rejects_every_redirect_status(self):
+        for status_code in range(300, 400):
+            with self.subTest(status_code=status_code):
+                session = RecordingSession(RecordingResponse(status_code=status_code))
+                client = CloudflareServiceClient(
+                    "https://gate.example.com", "id", "secret", session=session,
+                )
+
+                with self.assertRaisesRegex(requests.HTTPError, "redirect"):
+                    client.get_json("/api/controller/plates")
+
+    def test_get_cross_origin_redirect_never_forwards_access_headers(self):
+        self._assert_cross_origin_redirect_is_not_followed("GET")
+
+    def test_post_cross_origin_redirect_never_forwards_access_headers(self):
+        self._assert_cross_origin_redirect_is_not_followed("POST")
+
+    def test_write_only_post_accepts_empty_204_and_empty_200(self):
+        for status_code in (200, 204):
+            with self.subTest(status_code=status_code):
+                response = RecordingResponse(
+                    status_code=status_code, content=b"",
+                    json_error=AssertionError("write response JSON must not be parsed"),
+                )
+                client = CloudflareServiceClient(
+                    "https://gate.example.com", "id", "secret",
+                    session=RecordingSession(response),
+                )
+
+                self.assertIsNone(client.post_json("/api/controller/status", {"ok": True}))
+
+    def test_bounded_get_rejects_response_before_json_decode(self):
+        response = RecordingResponse(content=b'{"plates":[]}' + b" " * 32)
+        client = CloudflareServiceClient(
+            "https://gate.example.com", "id", "secret",
+            session=RecordingSession(response),
+        )
+
+        with self.assertRaisesRegex(ValueError, "response size"):
+            client.get_json("/api/controller/plates", max_response_bytes=16)
 
     def test_cloudflare_client_rejects_relative_request_paths(self):
         client = CloudflareServiceClient("https://gate.example.com", "id", "secret")
@@ -121,3 +178,55 @@ class CloudflareServiceClientTests(unittest.TestCase):
                     CloudflareServiceClient(
                         "https://gate.example.com", "id", "secret", timeout=timeout,
                     )
+
+    def _assert_cross_origin_redirect_is_not_followed(self, method):
+        received = []
+
+        class Receiver(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(dict(self.headers))
+                self.send_response(204)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, format, *args):
+                return
+
+        receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+        receiver_thread = threading.Thread(target=receiver.serve_forever)
+        receiver_thread.start()
+        self.addCleanup(receiver.server_close)
+        self.addCleanup(lambda: receiver_thread.join(timeout=2))
+        self.addCleanup(receiver.shutdown)
+
+        location = f"http://127.0.0.1:{receiver.server_port}/capture"
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(307)
+                self.send_header("Location", location)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, format, *args):
+                return
+
+        redirector = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        redirector_thread = threading.Thread(target=redirector.serve_forever)
+        redirector_thread.start()
+        self.addCleanup(redirector.server_close)
+        self.addCleanup(lambda: redirector_thread.join(timeout=2))
+        self.addCleanup(redirector.shutdown)
+
+        client = CloudflareServiceClient(
+            f"http://127.0.0.1:{redirector.server_port}", "client-id", "client-secret",
+        )
+        with self.assertRaisesRegex(requests.HTTPError, "redirect"):
+            if method == "GET":
+                client.get_json("/redirect")
+            else:
+                client.post_json("/redirect", {"command": "open_gate"})
+
+        self.assertEqual(received, [])

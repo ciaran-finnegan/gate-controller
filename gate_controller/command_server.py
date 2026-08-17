@@ -1,16 +1,10 @@
 import json
-import os
 import socket
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from threading import Event, Lock
+from threading import Lock
 
-from .actuation import ActuationCoordinator
-from .audio import PromptPlayer
 from .models import GateEvent
-from .relay import PiRelayAdapter, RelayController
-from .store import LocalStore
 
 
 MAX_REQUEST_BYTES = 4096
@@ -33,6 +27,10 @@ class DirectCommandExecutor:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_command_lifetime = max_command_lifetime
         self._prompt_lock = Lock()
+
+    @property
+    def coordinator(self):
+        return self._coordinator
 
     def execute(self, payload, *, now=None) -> dict:
         command = self._parse(payload)
@@ -184,33 +182,16 @@ def run_command_server(host, port, executor, stop_event):
         server.server_close()
 
 
-def main(*, environment=None, relay=None, store=None, stop_event=None, server_runner=None):
-    environment = os.environ if environment is None else environment
-    controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
-    database = Path(environment.get(
-        "GATE_DATABASE", "/var/lib/gate-controller/gate-controller.db"
-    ))
-    store = store or LocalStore(database)
-    relay = relay or RelayController(PiRelayAdapter())
-    coordinator = ActuationCoordinator(store, relay, timedelta(seconds=20))
-    prompt_player = PromptPlayer({
-        key: Path(environment[value])
-        for key, value in {
-            "arrival": "GATE_PROMPT_ARRIVAL",
-            "access_denied": "GATE_PROMPT_ACCESS_DENIED",
-        }.items()
-        if environment.get(value)
-    })
-    executor = DirectCommandExecutor(
-        controller_id, coordinator, store, prompt_player=prompt_player,
-    )
-    runner = server_runner or run_command_server
-    try:
-        runner(COMMAND_SERVER_HOST, COMMAND_SERVER_PORT, executor, stop_event or Event())
-    finally:
-        shutdown = getattr(relay, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
+class CommandServerWorker:
+    def __init__(self, executor, *, host=COMMAND_SERVER_HOST, port=COMMAND_SERVER_PORT,
+                 server_runner=run_command_server):
+        self.executor = executor
+        self._host = host
+        self._port = port
+        self._server_runner = server_runner
+
+    def run_forever(self, stop_event):
+        self._server_runner(self._host, self._port, self.executor, stop_event)
 
 
 def _is_loopback(host) -> bool:
@@ -227,7 +208,3 @@ def _parse_timestamp(value):
     if parsed.tzinfo is None:
         raise ValueError("expires_at must include a timezone")
     return parsed.astimezone(timezone.utc)
-
-
-if __name__ == "__main__":
-    main()

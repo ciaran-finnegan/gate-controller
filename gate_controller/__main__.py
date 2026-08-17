@@ -13,6 +13,7 @@ from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
 )
 from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
+from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
@@ -153,6 +154,10 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
+    if coordinator is not None:
+        workers.append(CommandServerWorker(DirectCommandExecutor(
+            controller_id, coordinator, store, prompt_player=prompt_player,
+        )))
     cloudflare_configured = _cloudflare_configured(environment)
     if cloudflare_configured:
         cloudflare_client = CloudflareServiceClient(
@@ -285,6 +290,11 @@ def _camera_is_fresh(timestamp: str | None, now: datetime, stale_seconds: float)
 
 
 def _cloudflare_configured(environment) -> bool:
+    legacy_variables = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
+    if any(bool((environment.get(variable) or "").strip()) for variable in legacy_variables):
+        raise ValueError(
+            "legacy Supabase credentials must not be present in the active controller environment"
+        )
     variables = (
         "GATE_CLOUDFLARE_API_URL",
         "GATE_CLOUDFLARE_ACCESS_CLIENT_ID",

@@ -15,6 +15,8 @@ from uuid import uuid4
 
 
 DEFERRED_PI_STATUS = "skipped_until_tailscale_or_home_wifi"
+MAX_PROC_NET_DEV_BYTES = 64 * 1024
+MAX_NETWORK_INTERFACES = 32
 
 
 def parse_args(arguments=None):
@@ -60,11 +62,36 @@ def _actuation_body(controller_id):
     }).encode("utf-8")
 
 
-def _read_proc_value(path):
+def _read_proc_value(path, *, max_bytes=1024 * 1024):
     try:
-        return Path(path).read_text(encoding="utf-8")
-    except OSError:
+        with Path(path).open("r", encoding="utf-8") as source:
+            content = source.read(max_bytes + 1)
+    except (OSError, UnicodeDecodeError):
         return None
+    return content if len(content) <= max_bytes else None
+
+
+def _network_counters(content):
+    counters = {}
+    for line in content.splitlines()[2:2 + MAX_NETWORK_INTERFACES]:
+        if ":" not in line:
+            continue
+        interface, values_text = line.split(":", 1)
+        interface = interface.strip()
+        values = values_text.split()
+        if not interface or len(interface) > 64 or len(values) != 16:
+            continue
+        try:
+            numbers = [int(value) for value in values]
+        except ValueError:
+            continue
+        counters[interface] = {
+            "receive_bytes": numbers[0],
+            "receive_packets": numbers[1],
+            "transmit_bytes": numbers[8],
+            "transmit_packets": numbers[9],
+        }
+    return counters
 
 
 def collect_host_metrics():
@@ -86,6 +113,9 @@ def collect_host_metrics():
             for key, value in [line.split(":", 1)]
             if value.split() and value.split()[0].isdigit()
         }
+    network = _read_proc_value("/proc/net/dev", max_bytes=MAX_PROC_NET_DEV_BYTES)
+    if network is not None:
+        metrics["network"] = _network_counters(network)
     return metrics
 
 

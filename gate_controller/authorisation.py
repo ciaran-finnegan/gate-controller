@@ -9,6 +9,11 @@ from threading import Event, Lock
 from .matching import normalise_plate
 
 
+MAX_PLATE_SNAPSHOT_BYTES = 256 * 1024
+MAX_PLATE_ROWS = 1000
+MAX_NORMALISED_PLATE_LENGTH = 16
+
+
 class AuthorisationError(RuntimeError):
     pass
 
@@ -137,17 +142,23 @@ class CloudflarePlateFetcher:
 
     def __call__(self) -> list[dict]:
         payload = self.client.get_json(
-            "/api/controller/plates?" + urlencode({"controller_id": self._controller_id})
+            "/api/controller/plates?" + urlencode({"controller_id": self._controller_id}),
+            max_response_bytes=MAX_PLATE_SNAPSHOT_BYTES,
         )
         if isinstance(payload, dict) and payload.get("controller_id") == self._controller_id:
             rows = payload.get("plates")
         else:
             raise AuthorisationError("Cloudflare plates returned a snapshot for another controller")
-        if not isinstance(rows, list) or any(
+        if not isinstance(rows, list) or len(rows) > MAX_PLATE_ROWS or any(
             not isinstance(row, dict) or not isinstance(row.get("plate"), str)
             for row in rows
         ):
             raise AuthorisationError("Cloudflare plates returned invalid JSON")
+        if any(
+            len(normalise_plate(row["plate"])) > MAX_NORMALISED_PLATE_LENGTH
+            for row in rows
+        ):
+            raise AuthorisationError("Cloudflare plates exceeded the normalized plate length limit")
         return rows
 
 

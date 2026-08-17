@@ -59,7 +59,7 @@ The installer does not overwrite `/etc/gate-controller.env`, existing files
 beneath `/var/lib/gate-controller`, or the legacy `/opt/gate-controller`
 checkout. It configures state/upload directory ownership and copies the legacy
 SQLite database only when the persistent destination is absent. The controller
-service waits for `network-online`,
+service waits for `network-online` and `time-sync.target`,
 restarts failed processes after five seconds, limits restart bursts, and can
 write only beneath `/var/lib/gate-controller`. Its local camera upload
 directory must match `GATE_WATCH_DIRECTORY`.
@@ -97,7 +97,8 @@ and fail closed when older than
 `GATE_AUTHORISATION_MAX_STALENESS_SECONDS`; recognition only reads that in-memory
 snapshot and never waits for a network request.
 
-Remote commands are accepted only by the loopback command server at
+Remote commands are accepted only by the loopback command server hosted inside
+the main controller process at
 `POST /commands`, exposed through the authenticated Cloudflare Tunnel. Supported
 commands are `open_gate` and `play_prompt`; fixed `GATE_PROMPT_*` settings map
 prompt keys to local files, and request payloads cannot select arbitrary shell
