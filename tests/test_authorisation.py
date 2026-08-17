@@ -7,11 +7,42 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gate_controller.authorisation import (
-    AuthorisationRefreshWorker, AuthorisedPlateCache, SupabasePlateFetcher,
+    AuthorisationError, AuthorisationRefreshWorker, AuthorisedPlateCache,
+    CloudflarePlateFetcher, SupabasePlateFetcher,
 )
 
 
+class FakeClient:
+    def __init__(self, *, json_response=None):
+        self.json_response = json_response
+        self.requests = []
+
+    def get_json(self, path):
+        self.requests.append(type("Request", (), {"path": path})())
+        return self.json_response
+
+
 class AuthorisedPlateCacheTests(unittest.TestCase):
+    def test_cloudflare_plate_fetcher_reads_worker_snapshot_with_controller_id(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "241D123"}], "controller_id": "primary",
+        })
+
+        rows = CloudflarePlateFetcher(client, "primary")()
+
+        self.assertEqual(rows, [{"plate": "241D123"}])
+        self.assertEqual(
+            client.requests[0].path, "/api/controller/plates?controller_id=primary"
+        )
+
+    def test_cloudflare_plate_fetcher_rejects_a_snapshot_for_another_controller(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "241D123"}], "controller_id": "secondary",
+        })
+
+        with self.assertRaisesRegex(AuthorisationError, "controller"):
+            CloudflarePlateFetcher(client, "primary")()
+
     def test_atomic_snapshot_replace_fsyncs_the_containing_directory(self):
         real_fsync = os.fsync
         fsynced_directory = []

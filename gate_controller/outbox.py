@@ -128,35 +128,61 @@ class HttpOutboxSender:
         self._headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
 
     def __call__(self, payload: dict, evidence_bytes: bytes | None = None) -> None:
-        transmitted = dict(payload)
-        legacy_path = transmitted.pop(LOCAL_IMAGE_PATH_KEY, None)
-        if legacy_path is not None and "image_sha256" not in transmitted:
-            transmitted.setdefault("image_status", "legacy_evidence_unavailable")
-        transmitted.setdefault("controller_id", self._controller_id)
-        image_digest = transmitted.get("image_sha256")
-        if evidence_bytes is not None:
-            actual_digest = hashlib.sha256(evidence_bytes).hexdigest()
-            if image_digest != actual_digest:
-                raise OutboxSyncError("evidence bytes do not match the queued digest")
-            if len(evidence_bytes) > MAX_OUTBOX_IMAGE_BYTES:
-                raise OutboxSyncError("evidence exceeds the upload limit")
-            transmitted["image"] = {
-                "filename": f"{image_digest}.jpg",
-                "content_type": "image/jpeg",
-                "data_base64": base64.b64encode(evidence_bytes).decode("ascii"),
-                "sha256": image_digest,
-            }
-        elif image_digest is not None:
-            raise OutboxSyncError("queued evidence bytes are unavailable")
+        transmitted = _prepare_outbox_payload(
+            payload, self._controller_id, evidence_bytes
+        )
         request = {"json": transmitted, "timeout": self._timeout}
         headers = dict(self._headers)
-        headers["Idempotency-Key"] = hashlib.sha256(
-            f"{transmitted['controller_id']}:{transmitted['event_id']}".encode("utf-8")
-        ).hexdigest()
+        headers["Idempotency-Key"] = _outbox_idempotency_key(transmitted)
         request["headers"] = headers
         response = self._session.post(self._url, **request)
         if not 200 <= response.status_code < 300:
             raise OutboxSyncError(f"outbox endpoint returned HTTP {response.status_code}")
+
+
+class CloudflareOutboxSender:
+    def __init__(self, client, controller_id):
+        self.client = client
+        self._controller_id = controller_id
+
+    def __call__(self, payload: dict, evidence_bytes: bytes | None = None) -> None:
+        transmitted = _prepare_outbox_payload(payload, self._controller_id, evidence_bytes)
+        self.client.post_json(
+            "/api/controller/events",
+            transmitted,
+            headers={"Idempotency-Key": _outbox_idempotency_key(transmitted)},
+        )
+
+
+def _prepare_outbox_payload(payload: dict, controller_id: str,
+                            evidence_bytes: bytes | None) -> dict:
+    transmitted = dict(payload)
+    legacy_path = transmitted.pop(LOCAL_IMAGE_PATH_KEY, None)
+    if legacy_path is not None and "image_sha256" not in transmitted:
+        transmitted.setdefault("image_status", "legacy_evidence_unavailable")
+    transmitted.setdefault("controller_id", controller_id)
+    image_digest = transmitted.get("image_sha256")
+    if evidence_bytes is not None:
+        actual_digest = hashlib.sha256(evidence_bytes).hexdigest()
+        if image_digest != actual_digest:
+            raise OutboxSyncError("evidence bytes do not match the queued digest")
+        if len(evidence_bytes) > MAX_OUTBOX_IMAGE_BYTES:
+            raise OutboxSyncError("evidence exceeds the upload limit")
+        transmitted["image"] = {
+            "filename": f"{image_digest}.jpg",
+            "content_type": "image/jpeg",
+            "data_base64": base64.b64encode(evidence_bytes).decode("ascii"),
+            "sha256": image_digest,
+        }
+    elif image_digest is not None:
+        raise OutboxSyncError("queued evidence bytes are unavailable")
+    return transmitted
+
+
+def _outbox_idempotency_key(payload: dict) -> str:
+    return hashlib.sha256(
+        f"{payload['controller_id']}:{payload['event_id']}".encode("utf-8")
+    ).hexdigest()
 
 
 def _normalise_jpeg(path: Path) -> bytes | None:

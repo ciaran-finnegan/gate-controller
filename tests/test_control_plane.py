@@ -12,6 +12,7 @@ from gate_controller import __main__ as gate_main
 from gate_controller.control_plane import (
     CommandWorker, ControlPlaneError, GateCommand, HeartbeatWorker, SupabaseControlPlane,
 )
+from gate_controller.cloudflare_client import CloudflareStatusReporter
 from gate_controller.models import GateEvent, RelayResult
 from gate_controller.store import LocalStore
 
@@ -56,6 +57,18 @@ class FakeResponse:
 
     def json(self):
         return self._payload
+
+
+class FakeClient:
+    def __init__(self, *, json_response=None):
+        self.json_response = json_response
+        self.requests = []
+
+    def post_json(self, path, payload, *, headers=None):
+        self.requests.append(type("Request", (), {
+            "path": path, "payload": payload, "headers": headers or {},
+        })())
+        return self.json_response
 
 
 class FakeSession:
@@ -146,6 +159,23 @@ class DelayingActuationStore(LocalStore):
 
 
 class ControlPlaneTests(unittest.TestCase):
+    def test_cloudflare_status_reporter_forwards_existing_heartbeat_contract(self):
+        reporter = CloudflareStatusReporter(FakeClient(), "primary")
+        status = {
+            "queue_depth": 2,
+            "media": {"video": {
+                "configured": False, "ready": False, "verified": False,
+                "reason": "not_reported",
+            }},
+        }
+
+        reporter.heartbeat(status)
+
+        self.assertEqual(reporter.client.requests[0].path, "/api/controller/status")
+        self.assertEqual(reporter.client.requests[0].payload, {
+            "controller_id": "primary", **status,
+        })
+
     def test_control_plane_rejects_http_before_creating_a_credentialed_session(self):
         for url in ("http://project.supabase.co", "http://127.0.0.1:54321"):
             with self.subTest(url=url), patch(

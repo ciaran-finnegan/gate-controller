@@ -1,6 +1,7 @@
 import csv
 import os
 import tempfile
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock
@@ -155,6 +156,29 @@ class SupabasePlateFetcher:
         if not isinstance(payload, list):
             raise AuthorisationError("Supabase plates returned invalid JSON")
         return payload
+
+
+class CloudflarePlateFetcher:
+    def __init__(self, client, controller_id):
+        self.client = client
+        self._controller_id = controller_id
+
+    def __call__(self) -> list[dict]:
+        payload = self.client.get_json(
+            "/api/controller/plates?" + urlencode({"controller_id": self._controller_id})
+        )
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict) and payload.get("controller_id") == self._controller_id:
+            rows = payload.get("plates")
+        else:
+            raise AuthorisationError("Cloudflare plates returned a snapshot for another controller")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("plate"), str)
+            for row in rows
+        ):
+            raise AuthorisationError("Cloudflare plates returned invalid JSON")
+        return rows
 
 
 class AuthorisationRefreshWorker:
