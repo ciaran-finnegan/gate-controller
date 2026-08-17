@@ -40,9 +40,9 @@ sudo install -m 0600 -o root -g root .env.example /etc/gate-controller.env
 ```
 
 Edit `/etc/gate-controller.env` with real credentials and paths before running
-the installer. It contains the Plate Recognizer token and, when Cloudflare
-delivery is enabled, the Access service-token credentials. Never commit that
-file or put its values in a systemd unit.
+the installer. It contains the Plate Recognizer token and the Cloudflare Access
+service-token credentials when the Cloudflare control plane is enabled. Never
+commit that file or put its values in a systemd unit.
 
 Configure branch protection on `master` to require the three stable checks listed
 in [the deployment guide](docs/deployment.md). Then bootstrap from a clean
@@ -84,13 +84,16 @@ supported Pi architectures, including Raspberry Pi 5. Do not install it in the
 same virtual environment as the original `RPi.GPIO` package.
 Install the relay board vendor library if a different relay adapter is used.
 
-## Optional Cloudflare Service
+## Cloudflare Control Plane
 
-Set `GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`,
-`GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET`, and `GATE_CONTROLLER_ID` to enable
-Cloudflare-backed plate refresh, status reporting, and event delivery. The
-controller ID defaults to `primary`. Plate snapshots are atomically applied to
-the local cache and fail closed when older than
+Cloudflare is the active remote-control path. Set
+`GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`,
+`GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET`, and `GATE_CONTROLLER_ID` together to
+enable Cloudflare-backed plate refresh, status reporting, and event delivery.
+The API URL is the HTTPS Worker origin; the client ID and secret are the
+Cloudflare Access service token sent only from the controller. The controller ID
+defaults to `primary`. Plate snapshots are atomically applied to the local cache
+and fail closed when older than
 `GATE_AUTHORISATION_MAX_STALENESS_SECONDS`; recognition only reads that in-memory
 snapshot and never waits for a network request.
 
@@ -111,6 +114,12 @@ object. Each request sends an `Idempotency-Key` equal to the SHA-256 digest of
 Events are first stored in SQLite, then retried in a background worker. A
 failed delivery remains queued and does not delay image processing or relay
 activation.
+
+The Worker ingests events at `/api/controller/events` using the event
+idempotency key. It must store any accepted evidence in private R2 under its
+digest and apply the site-approved R2 lifecycle retention policy. The Pi only
+removes its local evidence after the Worker returns a 2xx response; R2 retention
+is owned by the Cloudflare deployment, not by the controller process.
 
 Before an event is queued, its best-ranked JPEG is EXIF-normalised, converted
 to RGB, bounded to 1280 pixels and 512KB, and atomically written as
@@ -138,6 +147,9 @@ bounded set, the newest candidates are retained and then ranked by image quality
 ## Camera Deployment
 
 See [RLC-811A deployment and night calibration](docs/reolink-rlc-811a.md).
+The Pi performance harness is documented in
+[Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
+is intentionally deferred until reliable on-site network access is available.
 
 Make and colour returned by OCR are reserved for telemetry and operator review;
 they are intentionally not gate authorization factors. This service does not

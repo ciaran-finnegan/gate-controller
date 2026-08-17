@@ -20,6 +20,18 @@ def read_unit(relative_path):
     return parser
 
 
+class CloudflareDocumentationTests(unittest.TestCase):
+    def test_readme_describes_the_active_cloudflare_remote_control_path(self):
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Cloudflare is the active remote-control path", readme)
+        self.assertIn("GATE_CLOUDFLARE_API_URL", readme)
+        self.assertIn("GATE_CLOUDFLARE_ACCESS_CLIENT_ID", readme)
+        self.assertIn("GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET", readme)
+        self.assertNotIn("SUPABASE_URL", readme)
+        self.assertNotIn("SUPABASE_SERVICE_ROLE_KEY", readme)
+
+
 class SystemdTrustBoundaryTests(unittest.TestCase):
     def test_cloudflared_config_has_command_media_and_catch_all_rules(self):
         config = Path("deployment/cloudflared/gate-controller-tunnel.yml").read_text()

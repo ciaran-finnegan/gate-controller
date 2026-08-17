@@ -11,9 +11,10 @@ running unchanged.
 - Raspberry Pi OS with systemd, Git, `flock`, `systemd-analyze`, the GPIO group,
   and Python 3.10 or newer including `venv` support.
 - A working `/etc/gate-controller.env`, owned by `root:root` with mode `0600`.
-  The installer refuses to create or replace this file. `SUPABASE_URL` and
-  `SUPABASE_SERVICE_ROLE_KEY` must either both have values or both be absent;
-  a partial remote-control configuration fails bootstrap.
+  The installer refuses to create or replace this file. Configure
+  `GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`, and
+  `GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET` as one Access-authenticated controller
+  API group; a partial remote-control configuration fails bootstrap.
 - A dedicated `ftp-user` already created by the selected FTP server setup. The
   installer deliberately does not create or assign credentials to an FTP
   account.
@@ -160,6 +161,12 @@ accepts only the Worker service token used for direct commands. Apply the
 separate human/media Access policy from the UI deployment to
 `gate-media.example.com`.
 
+The direct command path is `POST /commands` on the command hostname. The
+tunnel forwards it only to `127.0.0.1:8765`; it does not expose a general Pi
+HTTP service. Verify the Access application, service-token policy, and Worker
+request path as a deployment smoke check. Do not run live Cloudflare account or
+policy commands from this repository or installer.
+
 Before installing or starting the tunnel, validate its ingress rules and confirm
 the command hostname chooses the loopback command service:
 
@@ -185,6 +192,35 @@ sudo systemctl status gate-command-server.service
 Run `cloudflared` with the validated configuration through the operator-managed
 Cloudflare package/service workflow. Do not run Cloudflare account commands or
 create tunnel credentials from the controller installer.
+
+## Cloudflare Event Ingest And Retention
+
+The controller posts authorized-plate refreshes, heartbeats, and queued events
+to the HTTPS Worker origin in `GATE_CLOUDFLARE_API_URL`, authenticated with the
+two Access service-token variables. Event ingest is `POST
+/api/controller/events`; it is idempotent by the controller event key and may
+include a bounded JPEG whose SHA-256 digest is in the event payload.
+
+The Worker deployment owns evidence retention. Store accepted JPEGs only in a
+private R2 bucket under the verified digest, keep bucket access limited to the
+Worker and approved operators, and configure the site's approved R2 lifecycle
+retention before accepting production traffic. Confirm that event metadata and
+the R2 object share the digest before considering ingest healthy. The Pi keeps
+its local evidence until it receives a 2xx response and never performs R2
+credentials, deletion, or lifecycle management directly.
+
+## Controller Cutover And Decommission
+
+Before decommissioning the previous remote-control release, deploy the Worker,
+R2 bucket, Access policies, service token, and validated tunnel routes. Install
+the Cloudflare-enabled controller release, verify plate refresh, heartbeat,
+event ingest, and a non-actuating command path, then retain the previous managed
+release and its rollback-ready configuration through acceptance.
+
+If any acceptance check fails, restore the previous release before removing its
+remote-control configuration or decommissioning the prior service. Rollback is
+the managed-release procedure below; do not attempt it by manually changing a
+live tunnel or editing SQLite state.
 
 ## Update And Rollback Behavior
 
