@@ -6,6 +6,7 @@ INSTALL_ROOT=/opt/gate-controller-deploy
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 APP_SERVICE=file-monitor.service
+COMMAND_SERVER_SERVICE=gate-command-server.service
 UPDATER_SERVICE=gate-controller-updater.service
 UPDATER_TIMER=gate-controller-updater.timer
 SYSTEMD_ROOT=/etc/systemd/system
@@ -128,6 +129,9 @@ create_fixed_trust_anchor_handoff() {
   install -o root -g root -m 0444 \
     "$source/file-monitor.service" "$handoff/file-monitor.service"
   install -o root -g root -m 0444 \
+    "$source/deployment/systemd/$COMMAND_SERVER_SERVICE" \
+    "$handoff/deployment/systemd/$COMMAND_SERVER_SERVICE"
+  install -o root -g root -m 0444 \
     "$source/deployment/systemd/$UPDATER_SERVICE" \
     "$handoff/deployment/systemd/$UPDATER_SERVICE"
   install -o root -g root -m 0444 \
@@ -160,6 +164,9 @@ install_fixed_trust_anchors() {
     "$release/deployment/gate_controller_updater.py" "$updater_helper"
   install -o root -g root -m 0644 \
     "$release/file-monitor.service" "$systemd_root/$APP_SERVICE"
+  install -o root -g root -m 0644 \
+    "$release/deployment/systemd/$COMMAND_SERVER_SERVICE" \
+    "$systemd_root/$COMMAND_SERVER_SERVICE"
   install -o root -g root -m 0644 \
     "$release/deployment/systemd/$UPDATER_SERVICE" \
     "$systemd_root/$UPDATER_SERVICE"
@@ -390,6 +397,8 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the deployment updater"
 [[ -f $SOURCE/file-monitor.service ]] \
   || fail "source does not contain the application service"
+[[ -f $SOURCE/deployment/systemd/$COMMAND_SERVER_SERVICE ]] \
+  || fail "source does not contain the command server service"
 [[ -f $SOURCE/deployment/systemd/$UPDATER_SERVICE ]] \
   || fail "source does not contain the updater service"
 [[ -f $SOURCE/deployment/systemd/$UPDATER_TIMER ]] \
@@ -508,11 +517,14 @@ VERIFY_ROOT=$(mktemp -d "$BACKUP_DIR/verify.XXXXXX")
 sed "s|/opt/gate-controller-deploy/current|$STAGING|g" \
   "$STAGING/file-monitor.service" >"$VERIFY_ROOT/$APP_SERVICE"
 sed "s|/opt/gate-controller-deploy/current|$STAGING|g" \
+  "$STAGING/deployment/systemd/$COMMAND_SERVER_SERVICE" >"$VERIFY_ROOT/$COMMAND_SERVER_SERVICE"
+sed "s|/opt/gate-controller-deploy/current|$STAGING|g" \
   "$STAGING/deployment/systemd/$UPDATER_SERVICE" >"$VERIFY_ROOT/$UPDATER_SERVICE"
 install -m 0644 "$STAGING/deployment/systemd/$UPDATER_TIMER" \
   "$VERIFY_ROOT/$UPDATER_TIMER"
 systemd-analyze verify \
   "$VERIFY_ROOT/$APP_SERVICE" \
+  "$VERIFY_ROOT/$COMMAND_SERVER_SERVICE" \
   "$VERIFY_ROOT/$UPDATER_SERVICE" \
   "$VERIFY_ROOT/$UPDATER_TIMER"
 
@@ -521,7 +533,7 @@ chmod 0755 "$STAGING"
 publish_bootstrap_release "$STAGING" "$RELEASE"
 STAGING=
 
-for name in "$APP_SERVICE" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
+for name in "$APP_SERVICE" "$COMMAND_SERVER_SERVICE" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
   if [[ -f $SYSTEMD_ROOT/$name ]]; then
     install -m 0600 "$SYSTEMD_ROOT/$name" "$BACKUP_DIR/$name"
   fi

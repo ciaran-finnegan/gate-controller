@@ -21,6 +21,17 @@ def read_unit(relative_path):
 
 
 class SystemdTrustBoundaryTests(unittest.TestCase):
+    def test_cloudflared_config_has_command_media_and_catch_all_rules(self):
+        config = Path("deployment/cloudflared/gate-controller-tunnel.yml").read_text()
+        self.assertIn("service: http://127.0.0.1:8765", config)
+        self.assertIn("service: http://127.0.0.1:8889", config)
+        self.assertRegex(config, r"- service: http_status:404\s*$")
+
+    def test_command_server_unit_runs_as_gate_controller_without_gpio_capabilities(self):
+        unit = Path("deployment/systemd/gate-command-server.service").read_text()
+        self.assertIn("User=gate-controller", unit)
+        self.assertNotIn("CAP_SYS_RAWIO", unit)
+
     def test_fixed_application_service_stays_non_root_and_preserves_upload_traversal(self):
         unit = read_unit("file-monitor.service")
         service = unit["Service"]
@@ -157,6 +168,7 @@ install_fixed_trust_anchors \
             self.assertEqual(0o755, helper.stat().st_mode & 0o777)
             for unit_name in (
                 "file-monitor.service",
+                "gate-command-server.service",
                 "gate-controller-updater.service",
                 "gate-controller-updater.timer",
             ):
@@ -181,6 +193,7 @@ install_fixed_trust_anchors \
             systemd_root.mkdir()
             (source / "deployment/gate_controller_updater.py").write_text("trusted helper\n")
             (source / "file-monitor.service").write_text("trusted app\n")
+            (source / "deployment/systemd/gate-command-server.service").write_text("trusted command server\n")
             (source / "deployment/systemd/gate-controller-updater.service").write_text("trusted updater\n")
             (source / "deployment/systemd/gate-controller-updater.timer").write_text("trusted timer\n")
             command = f"""
@@ -268,6 +281,7 @@ with open(sys.argv[1], "w") as lock_file:
             systemd_root.mkdir()
             (handoff / "deployment/gate_controller_updater.py").write_text("refreshed\n")
             (handoff / "file-monitor.service").write_text("app\n")
+            (handoff / "deployment/systemd/gate-command-server.service").write_text("command server\n")
             (handoff / "deployment/systemd/gate-controller-updater.service").write_text("updater\n")
             (handoff / "deployment/systemd/gate-controller-updater.timer").write_text("timer\n")
             command = f"""

@@ -145,6 +145,46 @@ sudo systemctl list-timers gate-controller-updater.timer
 sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 ```
 
+## Cloudflare Tunnel
+
+Cloudflare Tunnel exposes only the loopback command endpoint and MediaMTX WHEP
+gateway. Copy `deployment/cloudflared/gate-controller-tunnel.yml` to the Pi,
+replace the example tunnel UUID, credentials path, and hostnames with the values
+created in Cloudflare, then store its credentials JSON at the configured
+root-owned path. Do not add ingress rules for the controller database, GPIO,
+MediaMTX API or metrics, the media authorization sidecar, or SSH. The final
+catch-all `http_status:404` rule is required.
+
+Protect `gate-command.example.com` with a Cloudflare Access application that
+accepts only the Worker service token used for direct commands. Apply the
+separate human/media Access policy from the UI deployment to
+`gate-media.example.com`.
+
+Before installing or starting the tunnel, validate its ingress rules and confirm
+the command hostname chooses the loopback command service:
+
+```sh
+sudo cloudflared tunnel ingress validate --config /etc/cloudflared/gate-controller-tunnel.yml
+sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /etc/cloudflared/gate-controller-tunnel.yml
+```
+
+The command-server unit is a fixed root-owned deployment artifact, installed by
+bootstrap alongside the controller and updater units. It runs as
+`gate-controller`, uses the account's normal GPIO group permissions through the
+application runtime, and receives no direct raw-I/O capability grant. After the
+command-server runtime entry point is enabled in the deployed controller,
+activate it with:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now gate-command-server.service
+sudo systemctl status gate-command-server.service
+```
+
+Run `cloudflared` with the validated configuration through the operator-managed
+Cloudflare package/service workflow. Do not run Cloudflare account commands or
+create tunnel credentials from the controller installer.
+
 ## Update And Rollback Behavior
 
 The timer starts five minutes after boot and no more frequently than once every
