@@ -59,10 +59,10 @@ The installer does not overwrite `/etc/gate-controller.env`, existing files
 beneath `/var/lib/gate-controller`, or the legacy `/opt/gate-controller`
 checkout. It configures state/upload directory ownership and copies the legacy
 SQLite database only when the persistent destination is absent. The controller
-service waits for `network-online` and `time-sync.target`,
-restarts failed processes after five seconds, limits restart bursts, and can
-write only beneath `/var/lib/gate-controller`. Its local camera upload
-directory must match `GATE_WATCH_DIRECTORY`.
+service requires `systemd-time-wait-sync.service` to complete before image or
+command handling starts, restarts failed processes after five seconds, limits
+restart bursts, and can write only beneath `/var/lib/gate-controller`. Its
+local camera upload directory must match `GATE_WATCH_DIRECTORY`.
 
 Automatic deployment is outbound and pull-based. Every five minutes the Pi
 checks the exact commit at the configured release branch (`master` by default) and

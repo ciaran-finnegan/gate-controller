@@ -176,9 +176,10 @@ sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /
 ```
 
 The loopback command server runs inside `file-monitor.service`, sharing the
-main process's `ActuationCoordinator`, relay, and local store. The service waits
-for `time-sync.target` before image or command handling starts. It binds only
-`127.0.0.1:8765` and uses `GATE_CONTROLLER_ID` (default `primary`). Verify it with:
+main process's `ActuationCoordinator`, relay, and local store. The service
+requires `systemd-time-wait-sync.service`, so it does not begin image or command
+handling until the clock reports synchronized. It binds only `127.0.0.1:8765`
+and uses `GATE_CONTROLLER_ID` (default `primary`). Verify it with:
 
 ```sh
 sudo systemctl status file-monitor.service

@@ -38,6 +38,11 @@ class DelayingStore(LocalStore):
         return result
 
 
+class FailingPromptFinalizationStore(LocalStore):
+    def finalize_actuation(self, *args, **kwargs):
+        raise RuntimeError("database failed after prompt playback")
+
+
 class DirectCommandExecutorTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
@@ -128,6 +133,35 @@ class DirectCommandExecutorTests(unittest.TestCase):
 
         self.assertEqual(first, {"status": "completed"})
         self.assertEqual(second, {"status": "completed"})
+        self.assertEqual(played, ["arrival"])
+
+    def test_prompt_finalization_failure_leaves_a_restart_safe_indeterminate_claim(self):
+        played = []
+        database = Path(self.directory.name) / "prompt-finalization-failure.db"
+        payload = {
+            **self.valid_payload,
+            "command": "play_prompt",
+            "prompt_key": "arrival",
+        }
+        prompt_player = type("PromptPlayer", (), {
+            "play": lambda self, key: played.append(key) or True,
+        })()
+        failing_store = FailingPromptFinalizationStore(database)
+        failing_executor = DirectCommandExecutor(
+            "primary", ActuationCoordinator(failing_store, self.relay, clock=lambda: self.now),
+            failing_store, prompt_player=prompt_player, clock=lambda: self.now,
+        )
+
+        first = failing_executor.execute(payload)
+        restarted_store = LocalStore(database)
+        restarted_executor = DirectCommandExecutor(
+            "primary", ActuationCoordinator(restarted_store, self.relay, clock=lambda: self.now),
+            restarted_store, prompt_player=prompt_player, clock=lambda: self.now,
+        )
+        second = restarted_executor.execute(payload)
+
+        self.assertEqual(first, {"status": "failed", "detail": "indeterminate_claim"})
+        self.assertEqual(second, {"status": "failed", "detail": "indeterminate_claim"})
         self.assertEqual(played, ["arrival"])
 
 

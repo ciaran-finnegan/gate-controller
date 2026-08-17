@@ -100,6 +100,12 @@ class DirectCommandExecutor:
                 if terminal.detail is not None:
                     response["detail"] = terminal.detail
                 return response
+            try:
+                claim = self._store.claim_actuation(idempotency_key, self._clock())
+            except Exception:
+                return {"status": "failed", "detail": "actuation_inhibit_error"}
+            if claim.status != "claimed":
+                return {"status": "failed", "detail": claim.status}
             inhibition = self._expiry_inhibition(command["expires_at"])
             if inhibition is not None:
                 status, detail = inhibition
@@ -107,11 +113,18 @@ class DirectCommandExecutor:
                 status, detail = "failed", "invalid_prompt"
             else:
                 status, detail = "completed", None
-            self._store.record_terminal_outcome(GateEvent(
+            event = GateEvent(
                 source="remote_command", reason="remote_command" if status == "completed" else detail,
                 opened=False, idempotency_key=idempotency_key,
                 received_at=self._clock(), decision_at=self._clock(),
-            ), status=status, detail=detail)
+            )
+            try:
+                self._store.finalize_actuation(
+                    claim, event, terminal_status=status, terminal_detail=detail,
+                    retain_activation_attempt=False,
+                )
+            except Exception:
+                return {"status": "failed", "detail": "indeterminate_claim"}
             response = {"status": status}
             if detail is not None:
                 response["detail"] = detail

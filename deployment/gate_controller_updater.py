@@ -545,15 +545,29 @@ def _managed_release_path(sha: str, config: UpdateConfig) -> Path:
 def _systemctl_is(state: str, service_name: str) -> bool:
     try:
         completed = subprocess.run(
-            ["systemctl", state, "--quiet", service_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["systemctl", state, service_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(
+            f"could not determine whether {service_name} is {state}"
+        ) from error
+    if completed.returncode == 0:
+        return True
+    result = (completed.stdout or "").strip().lower()
+    confirmed_not_present = {
+        "is-enabled": {"disabled", "indirect", "masked", "not-found", "static"},
+        "is-active": {"failed", "inactive", "not-found"},
+    }
+    if result in confirmed_not_present.get(state, set()):
         return False
-    return completed.returncode == 0
+    raise UpdateError(
+        f"could not determine whether {service_name} is {state}: {result or 'unknown'}"
+    )
 
 
 def _legacy_command_state() -> LegacyCommandState:
@@ -748,9 +762,11 @@ def _restart_and_confirm(config: UpdateConfig) -> None:
 
 
 def activate_release(release: Path, previous: Path, config: UpdateConfig) -> None:
+    legacy_command_state = _legacy_command_state()
+    pending: PendingActivation | None = None
     try:
         pending = _write_pending_activation(
-            release, previous, _legacy_command_state(), config
+            release, previous, legacy_command_state, config
         )
         _retire_legacy_command_service(
             config,
@@ -763,6 +779,10 @@ def activate_release(release: Path, previous: Path, config: UpdateConfig) -> Non
         _restart_and_confirm(config)
         _clear_pending_activation(config)
     except Exception as activation_error:
+        if pending is None:
+            raise ActivationError(
+                "candidate activation failed before recording rollback state"
+            ) from activation_error
         LOGGER.error("Activation failed; restoring %s", previous.name)
         rollback_errors: list[str] = []
         try:

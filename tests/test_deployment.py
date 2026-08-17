@@ -77,7 +77,11 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         installer = Path("deployment/install.sh").read_text()
 
         self.assertFalse(Path("deployment/systemd/gate-command-server.service").exists())
-        self.assertIn("After=network-online.target time-sync.target", unit)
+        self.assertIn("Requires=systemd-time-wait-sync.service", unit)
+        self.assertIn(
+            "After=network-online.target systemd-time-wait-sync.service",
+            unit,
+        )
         self.assertIn("-m gate_controller", unit)
         self.assertNotIn("COMMAND_SERVER_SERVICE", installer)
         self.assertIn('systemctl disable --now "$LEGACY_COMMAND_UNIT"', installer)
