@@ -305,6 +305,35 @@ install_fixed_trust_anchors {shlex.quote(str(handoff))} {shlex.quote(str(systemd
             self.assertEqual("trusted helper\n", helper.read_text())
             self.assertEqual(0o555, handoff.stat().st_mode & 0o777)
 
+    def test_fixed_media_bootstrap_includes_turn_refresh_helper_and_units(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bootstrap = Path(temporary_directory) / "gate-media-bootstrap"
+            command = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -o|-g) shift 2 ;; *) forwarded+=("$1"); shift ;; esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+MEDIA_BOOTSTRAP_ROOT={shlex.quote(str(bootstrap))}
+install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                (REPOSITORY_ROOT / "deployment/gate_media_turn_refresh.py").read_bytes(),
+                (bootstrap / "gate_media_turn_refresh.py").read_bytes(),
+            )
+            self.assertEqual(0o700, (bootstrap / "gate_media_turn_refresh.py").stat().st_mode & 0o777)
+            for name in ("gate-media-turn-refresh.service", "gate-media-turn-refresh.timer"):
+                self.assertTrue((bootstrap / name).is_file(), name)
+
     @unittest.skipUnless(shutil.which("flock"), "requires the Linux flock command")
     def test_bootstrap_uses_same_nonblocking_lock_as_updater(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

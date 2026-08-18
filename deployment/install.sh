@@ -359,6 +359,15 @@ install_fixed_media_bootstrap() {
     "$source/deployment/systemd/gate-media-gateway.service" \
     "$MEDIA_BOOTSTRAP_ROOT/gate-media-gateway.service"
   install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-turn-refresh.service" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate-media-turn-refresh.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-turn-refresh.timer" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate-media-turn-refresh.timer"
+  install -o root -g root -m 0700 \
+    "$source/deployment/gate_media_turn_refresh.py" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate_media_turn_refresh.py"
+  install -o root -g root -m 0644 \
     "$source/gate_media_config.py" "$MEDIA_BOOTSTRAP_ROOT/gate_media_config.py"
   for name in __init__.py __main__.py token.py capabilities.py; do
     install -o root -g root -m 0644 \
@@ -596,6 +605,12 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the media auth service"
 [[ -f $SOURCE/deployment/systemd/gate-media-gateway.service ]] \
   || fail "source does not contain the media gateway service"
+[[ -f $SOURCE/deployment/systemd/gate-media-turn-refresh.service ]] \
+  || fail "source does not contain the media TURN refresh service"
+[[ -f $SOURCE/deployment/systemd/gate-media-turn-refresh.timer ]] \
+  || fail "source does not contain the media TURN refresh timer"
+[[ -f $SOURCE/deployment/gate_media_turn_refresh.py ]] \
+  || fail "source does not contain the media TURN refresh helper"
 [[ -f $SOURCE/gate_media_config.py ]] \
   || fail "source does not contain the media config validator"
 [[ -f $SOURCE/gate_media_gateway/__init__.py \

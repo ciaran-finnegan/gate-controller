@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 MEDIA_AUTH_ENV=/etc/gate-media-auth.env
 MEDIA_GATEWAY_ENV=/etc/gate-media-gateway.env
+MEDIA_TURN_ENV=/etc/gate-media-turn.env
 MEDIA_CONFIG_ROOT=/etc/gate-media
 MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml
 MEDIA_PROXY_TEMPLATE=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf.template
@@ -11,11 +12,13 @@ MEDIA_PROXY_CONFIG=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf
 MEDIA_RUNTIME=/run/gate-media
 MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
+MEDIA_TURN_REFRESH_HELPER=$MEDIA_LIBRARY/gate_media_turn_refresh.py
 MEDIA_BINARY=/usr/local/bin/mediamtx
 MEDIA_ARCHIVE_ROOT=/var/lib/gate-media/archives
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
 SYSTEMD_ROOT=/etc/systemd/system
+MEDIA_TURN_REFRESH_TIMER=gate-media-turn-refresh.timer
 PINNED_MEDIAMTX_VERSION=1.19.3
 SOURCE=
 MEDIAMTX_ARCHIVE=
@@ -104,6 +107,26 @@ disable_media_services() {
     >/dev/null 2>&1 || true
 }
 
+disable_turn_refresh_timer() {
+  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 || true
+}
+
+turn_refresh_environment_configured() {
+  local validator=$MEDIA_LIBRARY/gate_media_config.py
+
+  [[ -f $MEDIA_TURN_ENV && ! -L $MEDIA_TURN_ENV ]] || return 1
+  python3 "$validator" turn --env "$MEDIA_TURN_ENV" >/dev/null
+}
+
+configure_turn_refresh_timer() {
+  if turn_refresh_environment_configured; then
+    systemctl enable --now "$MEDIA_TURN_REFRESH_TIMER"
+  else
+    disable_turn_refresh_timer
+    printf 'TURN refresh timer remains disabled until /etc/gate-media-turn.env is valid.\n'
+  fi
+}
+
 cleanup_media_install() {
   if [[ -n $EXTRACTED_MEDIA_DIR \
       && $EXTRACTED_MEDIA_DIR == "$MEDIA_ARCHIVE_ROOT"/.extract.* ]]; then
@@ -128,6 +151,7 @@ on_media_install_failure() {
   [[ $status -ne 0 ]] || status=1
   trap - ERR INT TERM
   disable_media_services
+  disable_turn_refresh_timer
   cleanup_media_install
   exit "$status"
 }
@@ -279,6 +303,12 @@ install_fixed_media_files() {
     || fail "WHEP proxy template is missing"
   [[ -f $source/deployment/systemd/gate-media-auth.service ]] || fail "media auth unit is missing"
   [[ -f $source/deployment/systemd/gate-media-gateway.service ]] || fail "media gateway unit is missing"
+  [[ -f $source/deployment/systemd/gate-media-turn-refresh.service ]] \
+    || fail "media TURN refresh service is missing"
+  [[ -f $source/deployment/systemd/gate-media-turn-refresh.timer ]] \
+    || fail "media TURN refresh timer is missing"
+  [[ -f $source/deployment/gate_media_turn_refresh.py ]] \
+    || fail "media TURN refresh helper is missing"
   [[ -d $source_auth ]] || fail "media auth package is missing"
   [[ -f $source_gateway/__init__.py && -f $source_gateway/__main__.py ]] \
     || fail "media gateway launcher is missing"
@@ -294,6 +324,14 @@ install_fixed_media_files() {
     "$source/deployment/systemd/gate-media-auth.service" "$SYSTEMD_ROOT/gate-media-auth.service"
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-gateway.service" "$SYSTEMD_ROOT/gate-media-gateway.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-turn-refresh.service" \
+    "$SYSTEMD_ROOT/gate-media-turn-refresh.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-turn-refresh.timer" \
+    "$SYSTEMD_ROOT/gate-media-turn-refresh.timer"
+  install -o root -g root -m 0700 \
+    "$source/deployment/gate_media_turn_refresh.py" "$MEDIA_TURN_REFRESH_HELPER"
   install -o root -g root -m 0644 "$source_auth/__init__.py" "$MEDIA_LIBRARY/gate_media_auth/__init__.py"
   install -o root -g root -m 0644 "$source_auth/__main__.py" "$MEDIA_LIBRARY/gate_media_auth/__main__.py"
   install -o root -g root -m 0644 "$source_auth/token.py" "$MEDIA_LIBRARY/gate_media_auth/token.py"
@@ -331,7 +369,7 @@ main() {
   SOURCE=$(readlink -f "$SOURCE")
   [[ -d $SOURCE ]] || fail "source checkout does not exist"
 
-  for command in id install ln mktemp mv python3 readlink rm sha256sum \
+  for command in flock id install ln mktemp mv python3 readlink rm sha256sum \
     systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
@@ -361,6 +399,7 @@ main() {
     disable_media_services
     printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
   fi
+  configure_turn_refresh_timer
   trap - ERR INT TERM
   cleanup_media_install
   trap - EXIT

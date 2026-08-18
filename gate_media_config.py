@@ -18,6 +18,7 @@ _TURN_URL = re.compile(
     r"^(turn|turns):(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})"
     r"(?:\?transport=(udp|tcp))?$"
 )
+_TURN_KEY_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _AUTH_KEYS = frozenset({
     "GATE_MEDIA_HMAC_SECRET",
     "GATE_MEDIA_VIDEO_CONFIGURED",
@@ -36,6 +37,7 @@ _GATEWAY_KEYS = frozenset({
     "MTX_WEBRTCICESERVERS2_0_PASSWORD",
     "MTX_WEBRTCICESERVERS2_0_CLIENTONLY",
 })
+_TURN_KEYS = frozenset({"TURN_KEY_ID", "TURN_KEY_API_TOKEN"})
 _BOOLEAN_AUTH_KEYS = _AUTH_KEYS - {"GATE_MEDIA_HMAC_SECRET"}
 
 
@@ -167,6 +169,19 @@ def validate_gateway_environment(values: Mapping[str, str]) -> dict[str, str]:
             raise MediaConfigError("TURN credentials must be 1 to 256 bytes")
     if selected["MTX_WEBRTCICESERVERS2_0_CLIENTONLY"] != "false":
         raise MediaConfigError("TURN must be available to MediaMTX and clients")
+    return selected
+
+
+def validate_turn_environment(values: Mapping[str, str]) -> dict[str, str]:
+    """Validate the root-only Cloudflare TURN credential source."""
+    selected = dict(values)
+    _validate_effective_values(selected)
+    if set(selected) != _TURN_KEYS:
+        raise MediaConfigError("TURN environment has missing or forbidden keys")
+    if not _TURN_KEY_ID.fullmatch(selected["TURN_KEY_ID"]):
+        raise MediaConfigError("TURN key ID has an invalid format")
+    if any(len(selected[key].encode("utf-8")) > 256 for key in _TURN_KEYS):
+        raise MediaConfigError("TURN credential values must be at most 256 bytes")
     return selected
 
 
@@ -324,15 +339,19 @@ def main(argv=None) -> int:
     environment = subparsers.add_parser("environment")
     environment.add_argument("--auth", required=True)
     environment.add_argument("--gateway", required=True)
+    turn = subparsers.add_parser("turn")
+    turn.add_argument("--env", required=True)
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "checksum":
             print(lookup_trusted_checksum(
                 arguments.map, arguments.version, arguments.architecture
             ))
-        else:
+        elif arguments.command == "environment":
             validate_auth_environment(parse_trusted_environment(arguments.auth))
             validate_gateway_environment(parse_trusted_environment(arguments.gateway))
+        else:
+            validate_turn_environment(parse_trusted_environment(arguments.env))
     except (MediaConfigError, OSError, TypeError, ValueError) as error:
         print(f"gate media configuration: {error}", file=sys.stderr)
         return 1

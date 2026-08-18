@@ -415,10 +415,63 @@ MTX_WEBRTCICESERVERS2_0_PASSWORD=REPLACE_TURN_PASSWORD
 MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false
 ```
 
-Camera and TURN credentials remain only in `/etc/gate-media-gateway.env`. The
-verifier never receives that file, and MediaMTX never receives the HMAC file.
-The non-root gateway launcher validates the effective `MTX_` values on every
-start and refuses to execute MediaMTX if source, ICE, or TURN validation fails.
+Camera and short-lived TURN credentials remain only in
+`/etc/gate-media-gateway.env`. The verifier never receives that file, and
+MediaMTX never receives the HMAC file or the Cloudflare long-term TURN key. The
+non-root gateway launcher validates the effective `MTX_` values on every start
+and refuses to execute MediaMTX if source, ICE, or TURN validation fails.
+
+### Automatic Cloudflare TURN Credential Rotation
+
+Cloudflare TURN credentials are deliberately short-lived. To enable automatic
+rotation, create a separate root-only environment containing exactly the TURN
+key ID and long-term API token. It must be a regular, non-symlink `root:root`
+mode `0600` file with no comments, blank lines, quoting, or whitespace. Do not
+put this token in the gateway environment, a systemd unit, shell history, or
+the repository.
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/gate-media-turn.env
+sudoedit /etc/gate-media-turn.env
+```
+
+```text
+TURN_KEY_ID=REPLACE_WITH_CLOUDFLARE_TURN_KEY_ID
+TURN_KEY_API_TOKEN=REPLACE_WITH_CLOUDFLARE_TURN_KEY_API_TOKEN
+```
+
+The media installer installs the root-only stdlib helper and the
+`gate-media-turn-refresh.service` / `gate-media-turn-refresh.timer` pair. It
+enables the timer only when this separate secret file passes validation, so a
+media installation using manually managed static TURN credentials remains
+supported. The timer runs once shortly after boot and every 12 hours with up to
+15 minutes of randomized delay. Each successful run requests a 24-hour
+credential from Cloudflare with the `gate-mate-pi` custom identifier.
+
+The helper accepts only Cloudflare's documented top-level `iceServers` response,
+rejects port 53 and unauthenticated relays, and deterministically prefers
+`turns:...:5349?transport=tcp`, then `turn:...:3478` UDP/TCP. It stages the
+three MediaMTX TURN values, validates the complete auth and gateway environments
+with the canonical validator, atomically replaces only those values, then
+restarts and verifies the gateway. Generation, parsing, staging, validation, or
+restart failures leave the old environment untouched or restore it and restart
+the old configuration. No invalid persistent gateway environment is left behind.
+
+After installing the secret and rerunning the media installer, verify rotation
+without exposing either credential:
+
+```sh
+sudo /usr/local/lib/gate-media/gate_media_turn_refresh.py --validate-turn-environment
+sudo systemctl start gate-media-turn-refresh.service
+sudo systemctl is-active --quiet gate-media-gateway.service
+sudo systemctl list-timers gate-media-turn-refresh.timer
+sudo journalctl -u gate-media-turn-refresh.service -n 20 --no-pager
+```
+
+The helper and systemd status output never print the long-term token. If a
+refresh fails, inspect the unit status and journal, correct the root secret or
+network condition, and rerun the service; the previously working short-lived
+gateway credentials remain in place until a validated replacement activates.
 
 MediaMTX is pinned to `1.19.3` and is deliberately not fetched by either
 bootstrap or the ordinary updater. Obtain that exact release archive and its
