@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deployment.gate_media_turn_refresh import (
+    SystemdGatewayService,
     TurnRefreshError,
     fetch_ice_servers,
     refresh_turn_credentials,
@@ -17,9 +18,15 @@ from deployment.gate_media_turn_refresh import (
 from gate_media_config import MediaConfigError, validate_turn_environment
 
 
+EXPECTED_HEALTH_CHECK_ATTEMPTS = 3
+EXPECTED_HEALTH_CHECK_INTERVAL_SECONDS = 2
+EXPECTED_REQUEST_TIMEOUT_SECONDS = 15
+EXPECTED_SYSTEMCTL_TIMEOUT_SECONDS = 10
+
+
 class FakeGatewayService:
-    def __init__(self, restart_results=(True,)):
-        self.active = True
+    def __init__(self, restart_results=(True,), *, active=True):
+        self.active = active
         self.restart_results = iter(restart_results)
         self.calls = []
 
@@ -86,17 +93,55 @@ class MediaTurnRefreshTests(unittest.TestCase):
                                         "deployment/systemd/gate-media-turn-refresh.service").read_text())
         self.assertIn("/usr/bin/flock --nonblock", service["Service"].get("ExecStart"))
         self.assertEqual(
-            {"/etc", "/run/gate-media-turn-refresh"},
+            {"/var/lib/gate-media", "/run/gate-media-turn-refresh"},
             set(service["Service"].get("ReadWritePaths").split()),
         )
+        self.assertNotIn("/etc", service["Service"].get("ReadWritePaths").split())
         self.assertEqual("", service["Service"].get("CapabilityBoundingSet"))
         self.assertIn("ProtectSystem=strict", (Path(__file__).parents[1] /
                                                   "deployment/systemd/gate-media-turn-refresh.service").read_text())
         self.assertEqual("2min", timer["Timer"].get("OnBootSec"))
-        self.assertEqual("12h", timer["Timer"].get("OnUnitInactiveSec"))
-        self.assertEqual("15min", timer["Timer"].get("RandomizedDelaySec"))
+        self.assertEqual("4h", timer["Timer"].get("OnUnitInactiveSec"))
+        self.assertEqual("5min", timer["Timer"].get("RandomizedDelaySec"))
         self.assertEqual("true", timer["Timer"].get("Persistent"))
         self.assertEqual("gate-media-turn-refresh.service", timer["Timer"].get("Unit"))
+
+    def test_service_timeout_covers_generation_activation_health_and_rollback(self):
+        service = self._read_unit("deployment/systemd/gate-media-turn-refresh.service")
+        timeout_text = service["Service"].get("TimeoutStartSec")
+        self.assertRegex(timeout_text, r"^[0-9]+s$")
+        timeout_seconds = int(timeout_text[:-1])
+        one_health_check = (
+            EXPECTED_HEALTH_CHECK_ATTEMPTS * EXPECTED_SYSTEMCTL_TIMEOUT_SECONDS
+            + (EXPECTED_HEALTH_CHECK_ATTEMPTS - 1)
+            * EXPECTED_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+        full_failure_budget = (
+            EXPECTED_REQUEST_TIMEOUT_SECONDS
+            + EXPECTED_SYSTEMCTL_TIMEOUT_SECONDS
+            + 2 * (EXPECTED_SYSTEMCTL_TIMEOUT_SECONDS + one_health_check)
+        )
+
+        self.assertGreaterEqual(timeout_seconds, full_failure_budget + 15)
+
+    def test_systemctl_calls_are_bounded_to_leave_rollback_budget(self):
+        with patch("deployment.gate_media_turn_refresh.subprocess.run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(SystemdGatewayService().restart())
+
+        self.assertEqual(
+            EXPECTED_SYSTEMCTL_TIMEOUT_SECONDS,
+            run.call_args.kwargs["timeout"],
+        )
+
+    def test_systemctl_state_probe_distinguishes_inactive_from_failure(self):
+        service = SystemdGatewayService()
+        with patch("deployment.gate_media_turn_refresh.subprocess.run") as run:
+            run.return_value.returncode = 3
+            self.assertFalse(service.is_active())
+            run.return_value.returncode = 1
+            with self.assertRaises(TurnRefreshError):
+                service.is_active()
 
     def test_installer_enables_timer_only_for_a_valid_root_turn_secret(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -208,14 +253,17 @@ configure_turn_refresh_timer
     def test_refresh_replaces_only_short_lived_values_after_full_validation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway, turn = self._write_environments(root)
-            before = gateway.read_bytes()
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            static_before = gateway.read_bytes()
+            before = runtime_turn.read_bytes()
             service = FakeGatewayService()
+            sleeps = []
 
             refresh_turn_credentials(
                 turn_environment=turn,
                 auth_environment=auth,
                 gateway_environment=gateway,
+                runtime_turn_environment=runtime_turn,
                 fetch_ice_servers=lambda _key_id, _api_token: {
                     "iceServers": [{
                         "urls": ["turns:turn.cloudflare.com:5349?transport=tcp"],
@@ -224,26 +272,64 @@ configure_turn_refresh_timer
                     }],
                 },
                 service=service,
+                sleep=sleeps.append,
             )
 
-            after = gateway.read_bytes()
+            after = runtime_turn.read_bytes()
             self.assertNotEqual(before, after)
+            self.assertEqual(static_before, gateway.read_bytes())
             self.assertIn(
                 b"MTX_WEBRTCICESERVERS2_0_URL=turns:turn.cloudflare.com:5349?transport=tcp\n",
                 after,
             )
             self.assertIn(b"MTX_WEBRTCICESERVERS2_0_USERNAME=new-short-lived-user\n", after)
             self.assertIn(b"MTX_WEBRTCICESERVERS2_0_PASSWORD=new-short-lived-password\n", after)
-            self.assertIn(b"MTX_PATHS_GATE_SOURCE=rtsp://camera:password@10.0.0.10:554/live\n", after)
+            self.assertNotIn(b"MTX_PATHS_GATE_SOURCE", after)
             self.assertNotIn(b"long-term-api-token", after)
-            self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
-            self.assertEqual(["is-active", "restart", "is-active"], service.calls)
+            self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
+            self.assertEqual(
+                ["is-active", "restart"]
+                + ["is-active"] * EXPECTED_HEALTH_CHECK_ATTEMPTS,
+                service.calls,
+            )
+            self.assertEqual(
+                [EXPECTED_HEALTH_CHECK_INTERVAL_SECONDS]
+                * (EXPECTED_HEALTH_CHECK_ATTEMPTS - 1),
+                sleeps,
+            )
+
+    def test_successful_refresh_preserves_an_inactive_gateway(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            before = runtime_turn.read_bytes()
+            service = FakeGatewayService(active=False)
+
+            refresh_turn_credentials(
+                turn_environment=turn,
+                auth_environment=auth,
+                gateway_environment=gateway,
+                runtime_turn_environment=runtime_turn,
+                fetch_ice_servers=lambda _key_id, _api_token: {
+                    "iceServers": [{
+                        "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                        "username": "replacement-user",
+                        "credential": "replacement-password",
+                    }],
+                },
+                service=service,
+                sleep=lambda _seconds: None,
+            )
+
+            self.assertNotEqual(before, runtime_turn.read_bytes())
+            self.assertFalse(service.active)
+            self.assertEqual(["is-active"], service.calls)
 
     def test_parse_failure_leaves_gateway_and_running_service_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway, turn = self._write_environments(root)
-            before = gateway.read_bytes()
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            before = runtime_turn.read_bytes()
             service = FakeGatewayService()
 
             with self.assertRaises(TurnRefreshError):
@@ -251,18 +337,19 @@ configure_turn_refresh_timer
                     turn_environment=turn,
                     auth_environment=auth,
                     gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
                     fetch_ice_servers=lambda _key_id, _api_token: {"iceServers": []},
                     service=service,
                 )
 
-            self.assertEqual(before, gateway.read_bytes())
+            self.assertEqual(before, runtime_turn.read_bytes())
             self.assertEqual([], service.calls)
 
     def test_failed_new_restart_restores_old_gateway_environment_and_restarts_it(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway, turn = self._write_environments(root)
-            before = gateway.read_bytes()
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            before = runtime_turn.read_bytes()
             service = FakeGatewayService(restart_results=(False, True))
 
             with self.assertRaises(TurnRefreshError):
@@ -270,6 +357,7 @@ configure_turn_refresh_timer
                     turn_environment=turn,
                     auth_environment=auth,
                     gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
                     fetch_ice_servers=lambda _key_id, _api_token: {
                         "iceServers": [{
                             "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
@@ -278,17 +366,63 @@ configure_turn_refresh_timer
                         }],
                     },
                     service=service,
+                    sleep=lambda _seconds: None,
                 )
 
-            self.assertEqual(before, gateway.read_bytes())
+            self.assertEqual(before, runtime_turn.read_bytes())
             self.assertEqual(
-                ["is-active", "restart", "is-active", "restart", "is-active"],
+                ["is-active", "restart", "restart"]
+                + ["is-active"] * EXPECTED_HEALTH_CHECK_ATTEMPTS,
+                service.calls,
+            )
+
+    def test_indeterminate_new_health_probe_rolls_back_the_runtime_environment(self):
+        class IndeterminateHealthService(FakeGatewayService):
+            def __init__(self):
+                super().__init__(restart_results=(True, True))
+                self.probes = iter((True, TurnRefreshError("state unavailable"), True, True, True))
+
+            def is_active(self):
+                self.calls.append("is-active")
+                result = next(self.probes)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            before = runtime_turn.read_bytes()
+            service = IndeterminateHealthService()
+
+            with self.assertRaises(TurnRefreshError):
+                refresh_turn_credentials(
+                    turn_environment=turn,
+                    auth_environment=auth,
+                    gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
+                    fetch_ice_servers=lambda _key_id, _api_token: {
+                        "iceServers": [{
+                            "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                            "username": "replacement-user",
+                            "credential": "replacement-password",
+                        }],
+                    },
+                    service=service,
+                    sleep=lambda _seconds: None,
+                )
+
+            self.assertEqual(before, runtime_turn.read_bytes())
+            self.assertEqual(
+                ["is-active", "restart", "is-active", "restart"]
+                + ["is-active"] * EXPECTED_HEALTH_CHECK_ATTEMPTS,
                 service.calls,
             )
 
     def _write_environments(self, root):
         auth = root / "gate-media-auth.env"
         gateway = root / "gate-media-gateway.env"
+        runtime_turn = root / "gate-media-runtime-turn.env"
         turn = root / "gate-media-turn.env"
         auth.write_text(
             "GATE_MEDIA_HMAC_SECRET=" + "x" * 32 + "\n"
@@ -303,11 +437,14 @@ configure_turn_refresh_timer
             "MTX_PATHS_GATE_SOURCE=rtsp://camera:password@10.0.0.10:554/live\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
-            "MTX_WEBRTCICESERVERS2_0_URL=turn:old.example:3478?transport=udp\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
-            "MTX_WEBRTCICESERVERS2_0_USERNAME=old-user\n"
-            "MTX_WEBRTCICESERVERS2_0_PASSWORD=old-password\n"
             "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            encoding="utf-8",
+        )
+        runtime_turn.write_text(
+            "MTX_WEBRTCICESERVERS2_0_URL=turn:old.example:3478?transport=udp\n"
+            "MTX_WEBRTCICESERVERS2_0_USERNAME=old-user\n"
+            "MTX_WEBRTCICESERVERS2_0_PASSWORD=old-password\n",
             encoding="utf-8",
         )
         turn.write_text(
@@ -315,9 +452,9 @@ configure_turn_refresh_timer
             "TURN_KEY_API_TOKEN=long-term-api-token\n",
             encoding="utf-8",
         )
-        for path in (auth, gateway, turn):
+        for path in (auth, gateway, runtime_turn, turn):
             path.chmod(0o600)
-        return auth, gateway, turn
+        return auth, gateway, runtime_turn, turn
 
     @staticmethod
     def _read_unit(relative_path):

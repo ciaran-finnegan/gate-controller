@@ -369,10 +369,12 @@ heartbeat. `video`, `listen`, and `talkback` are independent. All default to
 false; talkback remains `hardware_unverified` until a separate physical
 backchannel acceptance test is complete.
 
-Create two disjoint root-owned environments before enabling the services. Both
-must remain regular non-symlink `root:root` mode `0600` files under the
-root-controlled `/etc` directory; never put either file in this repository or a
-systemd unit. The parser allows exactly one unquoted `KEY=value` assignment per
+Create the two operator-managed root-owned environments before enabling the
+services. Both must remain regular non-symlink `root:root` mode `0600` files
+under the root-controlled `/etc` directory; never put either file in this
+repository or a systemd unit. The installer creates a third root-only generated
+environment at `/var/lib/gate-media/turn.env` inside a mode `0700` state
+directory. The parser allows exactly one unquoted `KEY=value` assignment per
 line, requires a final newline, and rejects comments, blank lines, whitespace,
 duplicates, unknown keys, and cross-file secrets.
 
@@ -395,31 +397,34 @@ GATE_MEDIA_LISTEN_VERIFIED=false
 GATE_MEDIA_TALKBACK_CONFIGURED=false
 ```
 
-The gateway environment contains exactly these MediaMTX 1.19.3 overrides.
+The static gateway environment contains exactly these MediaMTX 1.19.3 overrides.
 `MTX_PATHS_GATE_SOURCE` must use `rtsp` or `rtsps`. Both ICE listeners must use
 the same explicit, non-loopback, non-wildcard IP that is reachable on the Pi;
 hostnames are not accepted for binds. `MTX_WEBRTCADDITIONALHOSTS` must be that
 exact IP so MediaMTX can advertise the listeners while interface discovery is
-disabled. It is one IP, not a comma-separated list. A MediaMTX-side TURN entry
-and nonempty credentials are mandatory, and `CLIENTONLY=false` allows both
-MediaMTX and the browser to use that relay.
+disabled. It is one IP, not a comma-separated list. `CLIENTONLY=false` allows
+both MediaMTX and the browser to use the generated relay.
 
 ```text
 MTX_PATHS_GATE_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_PATH
 MTX_WEBRTCLOCALUDPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCLOCALTCPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCADDITIONALHOSTS=REPLACE_PI_IP
-MTX_WEBRTCICESERVERS2_0_URL=turns:REPLACE_TURN_HOST:5349?transport=tcp
-MTX_WEBRTCICESERVERS2_0_USERNAME=REPLACE_TURN_USER
-MTX_WEBRTCICESERVERS2_0_PASSWORD=REPLACE_TURN_PASSWORD
 MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false
 ```
 
-Camera and short-lived TURN credentials remain only in
-`/etc/gate-media-gateway.env`. The verifier never receives that file, and
-MediaMTX never receives the HMAC file or the Cloudflare long-term TURN key. The
-non-root gateway launcher validates the effective `MTX_` values on every start
-and refuses to execute MediaMTX if source, ICE, or TURN validation fails.
+The generated `/var/lib/gate-media/turn.env` contains exactly the TURN URL,
+username, and password. Camera credentials remain only in the static gateway
+file; generated TURN credentials remain only in the mutable state file. The
+verifier receives neither file, and MediaMTX never receives the HMAC file or the
+Cloudflare long-term TURN key. The non-root gateway launcher validates the
+combined effective `MTX_` values on every start and refuses to execute MediaMTX
+if source, ICE, or TURN validation fails.
+
+An installer rerun safely migrates the former eight-key combined gateway file:
+it writes the generated TURN file first, atomically replaces the gateway file
+with the five static keys, and can be rerun after any interruption. If a valid
+generated TURN file already exists, migration preserves it.
 
 ### Automatic Cloudflare TURN Credential Rotation
 
@@ -443,19 +448,23 @@ TURN_KEY_API_TOKEN=REPLACE_WITH_CLOUDFLARE_TURN_KEY_API_TOKEN
 The media installer installs the root-only stdlib helper and the
 `gate-media-turn-refresh.service` / `gate-media-turn-refresh.timer` pair. It
 enables the timer only when this separate secret file passes validation, so a
-media installation using manually managed static TURN credentials remains
-supported. The timer runs once shortly after boot and every 12 hours with up to
-15 minutes of randomized delay. Each successful run requests a 24-hour
-credential from Cloudflare with the `gate-mate-pi` custom identifier.
+media installation using manually managed TURN credentials remains
+supported. The timer runs once shortly after boot and about every 4 hours with
+up to 5 minutes of randomized delay. This leaves several retry opportunities
+after a failed run before a 24-hour credential expires. Each successful run
+requests a 24-hour credential from Cloudflare with the `gate-mate-pi` custom
+identifier.
 
 The helper accepts only Cloudflare's documented top-level `iceServers` response,
 rejects port 53 and unauthenticated relays, and deterministically prefers
 `turns:...:5349?transport=tcp`, then `turn:...:3478` UDP/TCP. It stages the
-three MediaMTX TURN values, validates the complete auth and gateway environments
-with the canonical validator, atomically replaces only those values, then
-restarts and verifies the gateway. Generation, parsing, staging, validation, or
-restart failures leave the old environment untouched or restore it and restart
-the old configuration. No invalid persistent gateway environment is left behind.
+three MediaMTX TURN values, validates the complete auth, static gateway, and
+generated environments with the canonical validator, and atomically replaces
+only `/var/lib/gate-media/turn.env`. A gateway that was inactive remains
+inactive. An active gateway is restarted and checked three times; activation
+failure restores the old generated file and restarts and verifies the old
+configuration. Generation, parsing, staging, or validation failure leaves the
+old file and service state untouched.
 
 After installing the secret and rerunning the media installer, verify rotation
 without exposing either credential:

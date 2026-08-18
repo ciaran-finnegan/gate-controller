@@ -7,6 +7,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -15,7 +16,7 @@ from gate_media_config import (
     MediaConfigError,
     parse_trusted_environment,
     validate_auth_environment,
-    validate_gateway_environment,
+    validate_split_gateway_environment,
     validate_turn_environment,
 )
 
@@ -23,12 +24,16 @@ from gate_media_config import (
 AUTH_ENVIRONMENT = Path("/etc/gate-media-auth.env")
 GATEWAY_ENVIRONMENT = Path("/etc/gate-media-gateway.env")
 TURN_ENVIRONMENT = Path("/etc/gate-media-turn.env")
+RUNTIME_TURN_ENVIRONMENT = Path("/var/lib/gate-media/turn.env")
 GATEWAY_SERVICE = "gate-media-gateway.service"
 CLOUDFLARE_TURN_ENDPOINT = (
     "https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/"
     "generate-ice-servers"
 )
 REQUEST_TIMEOUT_SECONDS = 15
+SYSTEMCTL_TIMEOUT_SECONDS = 10
+GATEWAY_HEALTH_CHECK_ATTEMPTS = 3
+GATEWAY_HEALTH_CHECK_INTERVAL_SECONDS = 2
 MAX_RESPONSE_BYTES = 64 * 1024
 _TURN_URL = re.compile(
     r"^(turn|turns):(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})"
@@ -56,28 +61,33 @@ class SystemdGatewayService:
     """Small systemctl boundary kept outside the credential transaction."""
 
     def is_active(self) -> bool:
-        return self._run("is-active", "--quiet")
+        returncode = self._run("is-active", "--quiet")
+        if returncode == 0:
+            return True
+        if returncode == 3:
+            return False
+        raise TurnRefreshError("gateway service state could not be determined")
 
     def restart(self) -> bool:
-        return self._run("restart")
+        return self._run("restart") == 0
 
     def stop(self) -> bool:
-        return self._run("stop")
+        return self._run("stop") == 0
 
     @staticmethod
-    def _run(*command: str) -> bool:
+    def _run(*command: str):
         try:
             completed = subprocess.run(
                 ["/usr/bin/systemctl", *command, GATEWAY_SERVICE],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=30,
+                timeout=SYSTEMCTL_TIMEOUT_SECONDS,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return False
-        return completed.returncode == 0
+            return None
+        return completed.returncode
 
 
 def fetch_ice_servers(key_id: str, api_token: str):
@@ -146,35 +156,42 @@ def refresh_turn_credentials(
     turn_environment=TURN_ENVIRONMENT,
     auth_environment=AUTH_ENVIRONMENT,
     gateway_environment=GATEWAY_ENVIRONMENT,
+    runtime_turn_environment=RUNTIME_TURN_ENVIRONMENT,
     fetch_ice_servers=fetch_ice_servers,
     service=None,
+    sleep=time.sleep,
 ) -> None:
     """Fetch, validate, atomically activate, and roll back TURN credentials."""
     turn_values = _load_turn_environment(turn_environment)
-    _validate_complete_media_environment(auth_environment, gateway_environment)
-    previous_gateway = _read_environment_bytes(gateway_environment)
+    _validate_complete_media_environment(
+        auth_environment, gateway_environment, runtime_turn_environment
+    )
+    previous_runtime_turn = _read_environment_bytes(runtime_turn_environment)
     payload = fetch_ice_servers(
         turn_values["TURN_KEY_ID"], turn_values["TURN_KEY_API_TOKEN"]
     )
     url, username, password = select_turn_credentials(payload)
-    staged_gateway = _replace_turn_values(previous_gateway, url, username, password)
-    _validate_staged_media_environment(auth_environment, gateway_environment, staged_gateway)
+    staged_runtime_turn = _replace_turn_values(
+        previous_runtime_turn, url, username, password
+    )
+    _validate_staged_media_environment(
+        auth_environment,
+        gateway_environment,
+        runtime_turn_environment,
+        staged_runtime_turn,
+    )
 
     service = service or SystemdGatewayService()
     was_active = service.is_active()
-    _atomic_write_environment(gateway_environment, staged_gateway)
-    new_restart_ok = service.restart()
-    new_active = service.is_active()
-    if new_restart_ok and new_active:
+    _atomic_write_environment(runtime_turn_environment, staged_runtime_turn)
+    if not was_active:
+        return
+    if service.restart() and _gateway_is_healthy(service, sleep):
         return
 
-    _atomic_write_environment(gateway_environment, previous_gateway)
-    old_restart_ok = service.restart()
-    old_active = service.is_active()
-    if not old_restart_ok or not old_active:
+    _atomic_write_environment(runtime_turn_environment, previous_runtime_turn)
+    if not service.restart() or not _gateway_is_healthy(service, sleep):
         raise TurnRefreshError("new TURN configuration failed and gateway rollback did not restart")
-    if not was_active and not service.stop():
-        raise TurnRefreshError("new TURN configuration failed and gateway state was not restored")
     raise TurnRefreshError("new TURN configuration failed; previous configuration was restored")
 
 
@@ -185,22 +202,27 @@ def _load_turn_environment(path) -> dict[str, str]:
         raise TurnRefreshError("TURN secret environment is invalid") from error
 
 
-def _validate_complete_media_environment(auth_path, gateway_path) -> None:
+def _validate_complete_media_environment(auth_path, gateway_path, runtime_turn_path) -> None:
     try:
         validate_auth_environment(parse_trusted_environment(auth_path))
-        validate_gateway_environment(parse_trusted_environment(gateway_path))
+        validate_split_gateway_environment(
+            parse_trusted_environment(gateway_path),
+            parse_trusted_environment(runtime_turn_path),
+        )
     except (MediaConfigError, OSError, TypeError, ValueError) as error:
         raise TurnRefreshError("current media environments are invalid") from error
 
 
-def _validate_staged_media_environment(auth_path, gateway_path, staged_gateway: bytes) -> None:
-    gateway_path = Path(gateway_path)
-    staged_path = gateway_path.with_name(
-        f".{gateway_path.name}.validate.{os.getpid()}.{secrets.token_hex(8)}"
+def _validate_staged_media_environment(
+    auth_path, gateway_path, runtime_turn_path, staged_runtime_turn: bytes
+) -> None:
+    runtime_turn_path = Path(runtime_turn_path)
+    staged_path = runtime_turn_path.with_name(
+        f".{runtime_turn_path.name}.validate.{os.getpid()}.{secrets.token_hex(8)}"
     )
     try:
-        _atomic_write_environment(staged_path, staged_gateway)
-        _validate_complete_media_environment(auth_path, staged_path)
+        _atomic_write_environment(staged_path, staged_runtime_turn)
+        _validate_complete_media_environment(auth_path, gateway_path, staged_path)
     except (OSError, TurnRefreshError) as error:
         raise TurnRefreshError("staged media environments are invalid") from error
     finally:
@@ -216,7 +238,7 @@ def _read_environment_bytes(path) -> bytes:
         body = path.read_bytes()
         body.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        raise TurnRefreshError("gateway environment cannot be read") from error
+        raise TurnRefreshError("runtime TURN environment cannot be read") from error
     return body
 
 
@@ -229,7 +251,7 @@ def _replace_turn_values(previous: bytes, url: str, username: str, password: str
     try:
         lines = previous.decode("utf-8").splitlines(keepends=True)
     except UnicodeDecodeError as error:
-        raise TurnRefreshError("gateway environment is not UTF-8") from error
+        raise TurnRefreshError("runtime TURN environment is not UTF-8") from error
     replaced = set()
     output = []
     for line in lines:
@@ -240,8 +262,21 @@ def _replace_turn_values(previous: bytes, url: str, username: str, password: str
         else:
             output.append(line)
     if replaced != _REPLACED_GATEWAY_KEYS:
-        raise TurnRefreshError("gateway environment has incomplete TURN values")
+        raise TurnRefreshError("runtime TURN environment has incomplete values")
     return "".join(output).encode("utf-8")
+
+
+def _gateway_is_healthy(service, sleep) -> bool:
+    for attempt in range(GATEWAY_HEALTH_CHECK_ATTEMPTS):
+        try:
+            active = service.is_active()
+        except TurnRefreshError:
+            return False
+        if not active:
+            return False
+        if attempt + 1 < GATEWAY_HEALTH_CHECK_ATTEMPTS:
+            sleep(GATEWAY_HEALTH_CHECK_INTERVAL_SECONDS)
+    return True
 
 
 def _atomic_write_environment(path, body: bytes) -> None:
@@ -268,7 +303,7 @@ def _atomic_write_environment(path, body: bytes) -> None:
         os.replace(temporary, path.name, src_dir_fd=directory_descriptor, dst_dir_fd=directory_descriptor)
         os.fsync(directory_descriptor)
     except OSError as error:
-        raise TurnRefreshError("gateway environment could not be atomically updated") from error
+        raise TurnRefreshError("runtime TURN environment could not be atomically updated") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -285,7 +320,7 @@ def _write_all(descriptor: int, body: bytes) -> None:
     while remaining:
         written = os.write(descriptor, remaining)
         if written <= 0:
-            raise OSError("could not write gateway environment")
+            raise OSError("could not write runtime TURN environment")
         remaining = remaining[written:]
 
 

@@ -126,12 +126,13 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertEqual(set(), configured_globals - set(schema["globalKeys"]))
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            _auth, gateway = self._write_valid_media_environments(
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(
                 Path(temporary_directory)
             )
             environment = dict(
                 line.split("=", 1)
-                for line in gateway.read_text(encoding="utf-8").splitlines()
+                for path in (gateway, runtime_turn)
+                for line in path.read_text(encoding="utf-8").splitlines()
             )
         udp_host = environment["MTX_WEBRTCLOCALUDPADDRESS"].rsplit(":", 1)[0]
         tcp_host = environment["MTX_WEBRTCLOCALTCPADDRESS"].rsplit(":", 1)[0]
@@ -183,7 +184,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
     def test_gateway_launcher_executes_only_with_complete_reachable_ice_and_turn(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             del auth
             fake_binary = root / "mediamtx"
             marker = root / "executed"
@@ -196,7 +197,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             fake_binary.chmod(0o755)
             valid_values = dict(
                 line.split("=", 1)
-                for line in gateway.read_text(encoding="utf-8").splitlines()
+                for path in (gateway, runtime_turn)
+                for line in path.read_text(encoding="utf-8").splitlines()
             )
             environment = dict(os.environ)
             environment.update(valid_values)
@@ -288,10 +290,20 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
     def test_services_receive_disjoint_root_owned_environment_files(self):
         auth = read_unit("deployment/systemd/gate-media-auth.service")
         gateway = read_unit("deployment/systemd/gate-media-gateway.service")
+        gateway_unit = (
+            REPOSITORY_ROOT / "deployment/systemd/gate-media-gateway.service"
+        ).read_text(encoding="utf-8")
 
         self.assertEqual("/etc/gate-media-auth.env", auth.get("EnvironmentFile"))
-        self.assertEqual("/etc/gate-media-gateway.env", gateway.get("EnvironmentFile"))
-        self.assertNotEqual(auth.get("EnvironmentFile"), gateway.get("EnvironmentFile"))
+        self.assertEqual(
+            [
+                "EnvironmentFile=/etc/gate-media-gateway.env",
+                "EnvironmentFile=/var/lib/gate-media/turn.env",
+            ],
+            [line for line in gateway_unit.splitlines()
+             if line.startswith("EnvironmentFile=")],
+        )
+        self.assertNotIn("EnvironmentFile=/etc/gate-media-auth.env", gateway_unit)
         self.assertEqual(
             "/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx "
             "/etc/gate-media/mediamtx.yml",
@@ -613,8 +625,8 @@ finally:
     def test_environment_parser_accepts_only_unique_exact_assignments(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
-            accepted = self._validate_media_environments(auth, gateway)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            accepted = self._validate_media_environments(auth, gateway, runtime_turn)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
 
             malformed_values = (
@@ -628,25 +640,32 @@ finally:
                 with self.subTest(malformed=malformed):
                     auth.write_text(original + malformed, encoding="utf-8")
                     auth.chmod(0o600)
-                    rejected = self._validate_media_environments(auth, gateway)
+                    rejected = self._validate_media_environments(
+                        auth, gateway, runtime_turn
+                    )
                     self.assertNotEqual(0, rejected.returncode)
 
             auth.write_bytes(original.replace("\n", "\r\n").encode("utf-8"))
             auth.chmod(0o600)
-            rejected_crlf = self._validate_media_environments(auth, gateway)
+            rejected_crlf = self._validate_media_environments(
+                auth, gateway, runtime_turn
+            )
             self.assertNotEqual(0, rejected_crlf.returncode)
 
     def test_environment_parser_rejects_cross_secrets_and_validates_hmac_bytes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             auth_text = auth.read_text(encoding="utf-8")
             gateway_text = gateway.read_text(encoding="utf-8")
+            runtime_turn_text = runtime_turn.read_text(encoding="utf-8")
 
             auth.write_text(auth_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n")
             auth.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             auth.write_text(auth_text, encoding="utf-8")
@@ -654,55 +673,81 @@ finally:
             gateway.write_text(gateway_text + "GATE_MEDIA_HMAC_SECRET=forbidden\n")
             gateway.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             gateway.write_text(gateway_text, encoding="utf-8")
             gateway.chmod(0o600)
+            runtime_turn.write_text(
+                runtime_turn_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n",
+                encoding="utf-8",
+            )
+            runtime_turn.chmod(0o600)
+            self.assertNotEqual(
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
+            )
+
+            runtime_turn.write_text(runtime_turn_text, encoding="utf-8")
+            runtime_turn.chmod(0o600)
             auth.write_text(auth_text.replace("x" * 32, "x" * 31), encoding="utf-8")
             auth.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             auth.write_text(auth_text.replace("x" * 32, "é" * 16), encoding="utf-8")
             auth.chmod(0o600)
-            accepted_multibyte = self._validate_media_environments(auth, gateway)
+            accepted_multibyte = self._validate_media_environments(
+                auth, gateway, runtime_turn
+            )
             self.assertEqual(0, accepted_multibyte.returncode, accepted_multibyte.stderr)
 
     def test_environment_parser_validates_rtsp_ice_and_mediamtx_turn_values(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             valid_gateway = gateway.read_text(encoding="utf-8")
-            accepted = self._validate_media_environments(auth, gateway)
+            valid_runtime_turn = runtime_turn.read_text(encoding="utf-8")
+            accepted = self._validate_media_environments(auth, gateway, runtime_turn)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
             additional_host = "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5"
             replacements = (
-                ("rtsp://", "https://"),
-                ("10.0.0.5:8189", "0.0.0.0:8189"),
-                ("10.0.0.5:8189", "127.0.0.1:8189"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.6"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5,10.0.0.6"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=0.0.0.0"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=127.0.0.1"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS="),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5 "),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS" + "_0=10.0.0.5"),
-                ("turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
-                ("MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
-                ("MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
+                (gateway, valid_gateway, "rtsp://", "https://"),
+                (gateway, valid_gateway, "10.0.0.5:8189", "0.0.0.0:8189"),
+                (gateway, valid_gateway, "10.0.0.5:8189", "127.0.0.1:8189"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.6"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5,10.0.0.6"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=0.0.0.0"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=127.0.0.1"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS="),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5 "),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS" + "_0=10.0.0.5"),
+                (runtime_turn, valid_runtime_turn, "turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
+                (runtime_turn, valid_runtime_turn, "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
+                (gateway, valid_gateway, "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
             )
-            for old, new in replacements:
+            for target, original, old, new in replacements:
                 with self.subTest(replacement=(old, new)):
-                    gateway.write_text(valid_gateway.replace(old, new, 1), encoding="utf-8")
+                    gateway.write_text(valid_gateway, encoding="utf-8")
+                    runtime_turn.write_text(valid_runtime_turn, encoding="utf-8")
+                    target.write_text(original.replace(old, new, 1), encoding="utf-8")
                     gateway.chmod(0o600)
-                    rejected = self._validate_media_environments(auth, gateway)
+                    runtime_turn.chmod(0o600)
+                    rejected = self._validate_media_environments(
+                        auth, gateway, runtime_turn
+                    )
                     self.assertNotEqual(0, rejected.returncode)
 
     def _write_valid_media_environments(self, root):
         auth = root / "gate-media-auth.env"
         gateway = root / "gate-media-gateway.env"
+        runtime_turn = root / "turn.env"
         auth.write_text(
             "GATE_MEDIA_HMAC_SECRET=" + "x" * 32 + "\n"
             "GATE_MEDIA_VIDEO_CONFIGURED=true\n"
@@ -717,20 +762,25 @@ finally:
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
+            "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            encoding="utf-8",
+        )
+        runtime_turn.write_text(
             "MTX_WEBRTCICESERVERS2_0_URL=turns:turn.example.com:5349?transport=tcp\n"
             "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n"
-            "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n"
-            "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n",
             encoding="utf-8",
         )
         auth.chmod(0o600)
         gateway.chmod(0o600)
-        return auth, gateway
+        runtime_turn.chmod(0o600)
+        return auth, gateway, runtime_turn
 
-    def _validate_media_environments(self, auth, gateway):
+    def _validate_media_environments(self, auth, gateway, runtime_turn):
         return subprocess.run(
             [sys.executable, "-m", "gate_media_config", "environment",
-             "--auth", str(auth), "--gateway", str(gateway)],
+             "--auth", str(auth), "--gateway", str(gateway),
+             "--runtime-turn", str(runtime_turn)],
             cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, check=False,
         )
@@ -738,11 +788,12 @@ finally:
     def test_media_environment_files_reject_cross_contaminated_secrets(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             base = (
                 "source deployment/install-media.sh; "
                 f"MEDIA_AUTH_ENV={shlex.quote(str(auth))}; "
                 f"MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}; "
+                f"MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}; "
             )
 
             complete = subprocess.run(
@@ -757,6 +808,54 @@ finally:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, contaminated.returncode)
+
+    def test_installer_migrates_legacy_combined_gateway_environment_idempotently(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            legacy = gateway.read_text(encoding="utf-8") + runtime_turn.read_text(
+                encoding="utf-8"
+            )
+            gateway.write_text(legacy, encoding="utf-8")
+            gateway.chmod(0o600)
+            runtime_turn.unlink()
+            command = f"""
+source deployment/install-media.sh
+SOURCE={shlex.quote(str(REPOSITORY_ROOT))}
+MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}
+validate_root_file() {{ :; }}
+prepare_gateway_environments
+prepare_gateway_environments
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                {
+                    "MTX_PATHS_GATE_SOURCE",
+                    "MTX_WEBRTCLOCALUDPADDRESS",
+                    "MTX_WEBRTCLOCALTCPADDRESS",
+                    "MTX_WEBRTCADDITIONALHOSTS",
+                    "MTX_WEBRTCICESERVERS2_0_CLIENTONLY",
+                },
+                {line.split("=", 1)[0] for line in gateway.read_text().splitlines()},
+            )
+            self.assertEqual(
+                {
+                    "MTX_WEBRTCICESERVERS2_0_URL",
+                    "MTX_WEBRTCICESERVERS2_0_USERNAME",
+                    "MTX_WEBRTCICESERVERS2_0_PASSWORD",
+                },
+                {line.split("=", 1)[0]
+                 for line in runtime_turn.read_text().splitlines()},
+            )
+            self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
+            self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
 
     def test_installer_rejects_a_media_user_in_the_gpio_group(self):
         command = """

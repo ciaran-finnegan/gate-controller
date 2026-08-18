@@ -5,6 +5,8 @@ set -Eeuo pipefail
 MEDIA_AUTH_ENV=/etc/gate-media-auth.env
 MEDIA_GATEWAY_ENV=/etc/gate-media-gateway.env
 MEDIA_TURN_ENV=/etc/gate-media-turn.env
+MEDIA_STATE_ROOT=/var/lib/gate-media
+MEDIA_RUNTIME_TURN_ENV=$MEDIA_STATE_ROOT/turn.env
 MEDIA_CONFIG_ROOT=/etc/gate-media
 MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml
 MEDIA_PROXY_TEMPLATE=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf.template
@@ -14,7 +16,7 @@ MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_TURN_REFRESH_HELPER=$MEDIA_LIBRARY/gate_media_turn_refresh.py
 MEDIA_BINARY=/usr/local/bin/mediamtx
-MEDIA_ARCHIVE_ROOT=/var/lib/gate-media/archives
+MEDIA_ARCHIVE_ROOT=$MEDIA_STATE_ROOT/archives
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
 SYSTEMD_ROOT=/etc/systemd/system
@@ -91,7 +93,28 @@ media_environment_complete() {
   local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
 
   python3 "$validator" environment --auth "$MEDIA_AUTH_ENV" --gateway "$MEDIA_GATEWAY_ENV" \
+    --runtime-turn "$MEDIA_RUNTIME_TURN_ENV" \
     >/dev/null
+}
+
+prepare_gateway_environments() {
+  local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
+
+  [[ ! -L $MEDIA_GATEWAY_ENV ]] || fail "$MEDIA_GATEWAY_ENV must not be a symlink"
+  if [[ ! -e $MEDIA_GATEWAY_ENV ]]; then
+    install -o root -g root -m 0600 /dev/null "$MEDIA_GATEWAY_ENV"
+  fi
+  validate_root_file "$MEDIA_GATEWAY_ENV" 600
+  if [[ -s $MEDIA_GATEWAY_ENV ]]; then
+    python3 "$validator" split-gateway --gateway "$MEDIA_GATEWAY_ENV" \
+      --runtime-turn "$MEDIA_RUNTIME_TURN_ENV"
+  fi
+  [[ ! -L $MEDIA_RUNTIME_TURN_ENV ]] \
+    || fail "$MEDIA_RUNTIME_TURN_ENV must not be a symlink"
+  if [[ ! -e $MEDIA_RUNTIME_TURN_ENV ]]; then
+    install -o root -g root -m 0600 /dev/null "$MEDIA_RUNTIME_TURN_ENV"
+  fi
+  validate_root_file "$MEDIA_RUNTIME_TURN_ENV" 600
 }
 
 reject_gpio_membership() {
@@ -379,12 +402,15 @@ main() {
     fi
     reject_gpio_membership "$account"
   done
-  for environment_file in "$MEDIA_AUTH_ENV" "$MEDIA_GATEWAY_ENV"; do
-    if [[ ! -e $environment_file ]]; then
-      install -o root -g root -m 0600 /dev/null "$environment_file"
-    fi
-    validate_root_file "$environment_file" 600
-  done
+  [[ ! -e $MEDIA_STATE_ROOT || -d $MEDIA_STATE_ROOT && ! -L $MEDIA_STATE_ROOT ]] \
+    || fail "$MEDIA_STATE_ROOT must be a directory"
+  install -d -o root -g root -m 0700 "$MEDIA_STATE_ROOT"
+  [[ ! -L $MEDIA_AUTH_ENV ]] || fail "$MEDIA_AUTH_ENV must not be a symlink"
+  if [[ ! -e $MEDIA_AUTH_ENV ]]; then
+    install -o root -g root -m 0600 /dev/null "$MEDIA_AUTH_ENV"
+  fi
+  validate_root_file "$MEDIA_AUTH_ENV" 600
+  prepare_gateway_environments
   install_fixed_media_files "$SOURCE"
   STAGED_MEDIA_PROXY_CONFIG=$MEDIA_PROXY_CONFIG.new.$$
   render_proxy_config "$MEDIA_PROXY_TEMPLATE" "$STAGED_MEDIA_PROXY_CONFIG" "$ALLOWED_ORIGIN"

@@ -1,6 +1,6 @@
 # Effective listener and transport schema pinned to MediaMTX 1.19.3.
 # The source, reachable ICE binds, and TURN credentials are supplied only by the
-# strictly validated /etc/gate-media-gateway.env MTX_ overrides.
+# strictly validated static and generated MTX_ environment overrides.
 logLevel: info
 logDestinations: [stdout]
 readTimeout: 10s

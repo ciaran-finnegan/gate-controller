@@ -3,8 +3,8 @@ Description=Schedule Gate MediaMTX Cloudflare TURN credential refresh
 
 [Timer]
 OnBootSec=2min
-OnUnitInactiveSec=12h
-RandomizedDelaySec=15min
+OnUnitInactiveSec=4h
+RandomizedDelaySec=5min
 AccuracySec=1min
 Persistent=true
 Unit=gate-media-turn-refresh.service

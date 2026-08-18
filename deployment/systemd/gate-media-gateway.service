@@ -11,6 +11,7 @@ Type=simple
 User=gate-media
 Group=gate-media
 EnvironmentFile=/etc/gate-media-gateway.env
+EnvironmentFile=/var/lib/gate-media/turn.env
 Environment=PYTHONPATH=/usr/local/lib/gate-media
 ExecStart=/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml
 Restart=always
