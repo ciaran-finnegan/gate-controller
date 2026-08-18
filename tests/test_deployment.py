@@ -572,6 +572,14 @@ install() {{
       -o|-g)
         shift 2
         ;;
+      -m)
+        if [[ $2 == 2770 ]]; then
+          forwarded+=("-m" "0770")
+        else
+          forwarded+=("$1" "$2")
+        fi
+        shift 2
+        ;;
       *)
         forwarded+=("$1")
         shift
