@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import build_background_workers, default_runtime_paths
-from gate_controller.actuation import ActuationCoordinator
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
-from gate_controller.control_plane import CommandWorker, HeartbeatWorker
+from gate_controller.control_plane import HeartbeatWorker
+from gate_controller.command_server import CommandServerWorker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.store import LocalStore
 
@@ -85,13 +85,12 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertLess(calls.index("relay"), calls.index("store"))
         self.assertLess(calls.index("store"), calls.index("recover"))
 
-    def test_partial_supabase_configuration_fails_closed(self):
+    def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (
-            {"SUPABASE_URL": "https://project.supabase.co"},
-            {"SUPABASE_SERVICE_ROLE_KEY": "service-key"},
+            {"GATE_CLOUDFLARE_API_URL": "https://gate.example.com"},
             {
-                "SUPABASE_URL": "https://project.supabase.co",
-                "SUPABASE_SERVICE_ROLE_KEY": "   ",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
             },
         )
         for environment in configurations:
@@ -102,10 +101,59 @@ class MainConfigurationTests(unittest.TestCase):
                     and __import__("shutil").rmtree(store.path.parent)
                 )
 
-                with self.assertRaisesRegex(ValueError, "SUPABASE_URL.*SUPABASE_SERVICE_ROLE_KEY"):
+                with self.assertRaisesRegex(ValueError, "GATE_CLOUDFLARE"):
                     build_background_workers(
                         store, relay=object(), environment=environment, latest_image={}
                     )
+
+    def test_cloudflare_configuration_builds_authorisation_status_and_outbox_workers(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        plates = store.path.parent / "plates.csv"
+        plates.write_text("plate\n", encoding="utf-8")
+        authorised = AuthorisedPlateCache(plates)
+
+        workers, _, status = build_background_workers(store, relay=object(), environment={
+            "GATE_CLOUDFLARE_API_URL": "https://gate.example.com",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            "GATE_CONTROLLER_ID": "primary",
+        }, authorised=authorised)
+
+        self.assertEqual(
+            [type(worker).__name__ for worker in workers],
+            ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker"],
+        )
+        self.assertEqual(0, status()["queue_depth"])
+
+    def test_command_server_worker_uses_the_main_process_coordinator(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+        coordinator = object()
+
+        workers, _, _ = build_background_workers(
+            store, relay=object(), environment={}, latest_image={},
+            coordinator=coordinator,
+        )
+
+        command_worker = next(worker for worker in workers if isinstance(worker, CommandServerWorker))
+        self.assertIs(command_worker.executor.coordinator, coordinator)
+
+    def test_active_legacy_supabase_configuration_fails_closed(self):
+        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
+        self.addCleanup(
+            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
+        )
+
+        with self.assertRaisesRegex(ValueError, "legacy Supabase"):
+            build_background_workers(store, relay=object(), environment={
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            })
 
     def test_configured_camera_upload_receiver_is_ready_before_the_first_vehicle(self):
         store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
@@ -290,73 +338,6 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertIn("GATE_MAX_BURST_CANDIDATES=8", example)
         self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
-
-    def test_builds_optional_background_workers_without_changing_the_image_processor(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
-        environment = {
-            "SUPABASE_URL": "https://project.supabase.co",
-            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-            "GATE_CONTROLLER_ID": "pi-front-gate",
-            "GATE_OUTBOX_URL": "https://sync.example/events",
-            "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
-            "GATE_PROMPT_ARRIVAL": "/opt/gate-controller/prompts/arrival.wav",
-        }
-
-        plates = store.path.parent / "plates.csv"
-        plates.write_text("plate\n", encoding="utf-8")
-        workers, prompt_player, status = build_background_workers(
-            store, relay=object(), environment=environment,
-            authorised=AuthorisedPlateCache(plates),
-        )
-
-        self.assertEqual([type(worker) for worker in workers],
-                         [OutboxWorker, AuthorisationRefreshWorker, CommandWorker, HeartbeatWorker])
-        self.assertEqual(workers[0].prepare_payload()["controller_id"], "pi-front-gate")
-        self.assertTrue(prompt_player.available)
-        self.assertEqual(status()["queue_depth"], 0)
-        self.assertTrue(status()["audio_available"])
-        self.assertFalse(status()["camera_configured"])
-
-    def test_injects_the_shared_actuation_coordinator_into_command_workers(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
-        coordinator = ActuationCoordinator(store, relay=object())
-        environment = {
-            "SUPABASE_URL": "https://project.supabase.co",
-            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-            "GATE_CONTROLLER_ID": "pi-front-gate",
-        }
-
-        workers, _, _ = build_background_workers(
-            store, relay=object(), environment=environment, coordinator=coordinator
-        )
-
-        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
-        self.assertIs(command_worker._coordinator, coordinator)
-
-    def test_defaults_the_supabase_controller_identity_to_primary(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
-        workers, _, _ = build_background_workers(store, relay=object(), environment={
-            "SUPABASE_URL": "https://project.supabase.co",
-            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-        })
-
-        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
-        self.assertEqual(command_worker._control_plane._controller_id, "primary")
-
-    def test_empty_supabase_controller_identity_also_defaults_to_primary(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent))
-        workers, _, _ = build_background_workers(store, relay=object(), environment={
-            "SUPABASE_URL": "https://project.supabase.co",
-            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-            "GATE_CONTROLLER_ID": "",
-        })
-
-        command_worker = next(worker for worker in workers if isinstance(worker, CommandWorker))
-        self.assertEqual(command_worker._control_plane._controller_id, "primary")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
-# Include inside the dedicated HTTPS server for the media public origin.
-# Render the placeholder to one exact HTTPS application origin before activation.
+# Dedicated loopback HTTP origin for Cloudflare Tunnel. Render the placeholder
+# to one exact HTTPS application origin before activation.
+server {
+listen 127.0.0.1:8891;
+server_name _;
+
 location = /gate/whep {
     limit_except POST OPTIONS { deny all; }
     if ($request_method = OPTIONS) {
@@ -32,4 +36,9 @@ location ~ ^/gate/whep/[A-Za-z0-9_-]{1,128}$ {
     proxy_set_header Authorization $http_authorization;
     proxy_set_header Host $http_host;
     proxy_pass http://127.0.0.1:8889;
+}
+
+location / {
+    return 404;
+}
 }

@@ -7,11 +7,84 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gate_controller.authorisation import (
-    AuthorisationRefreshWorker, AuthorisedPlateCache, SupabasePlateFetcher,
+    AuthorisationError, AuthorisationRefreshWorker, AuthorisedPlateCache,
+    CloudflarePlateFetcher, MAX_NORMALISED_PLATE_LENGTH, MAX_PLATE_ROWS,
+    MAX_PLATE_SNAPSHOT_BYTES,
 )
 
 
+class FakeClient:
+    def __init__(self, *, json_response=None):
+        self.json_response = json_response
+        self.requests = []
+
+    def get_json(self, path, *, max_response_bytes=None):
+        self.requests.append(type("Request", (), {
+            "path": path, "max_response_bytes": max_response_bytes,
+        })())
+        return self.json_response
+
+
 class AuthorisedPlateCacheTests(unittest.TestCase):
+    def test_cloudflare_plate_fetcher_reads_worker_snapshot_with_controller_id(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "241D123"}], "controller_id": "primary",
+        })
+
+        rows = CloudflarePlateFetcher(client, "primary")()
+
+        self.assertEqual(rows, [{"plate": "241D123"}])
+        self.assertEqual(
+            client.requests[0].path, "/api/controller/plates?controller_id=primary"
+        )
+        self.assertEqual(client.requests[0].max_response_bytes, MAX_PLATE_SNAPSHOT_BYTES)
+
+    def test_cloudflare_plate_fetcher_rejects_a_snapshot_for_another_controller(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "241D123"}], "controller_id": "secondary",
+        })
+
+        with self.assertRaisesRegex(AuthorisationError, "controller"):
+            CloudflarePlateFetcher(client, "primary")()
+
+    def test_cloudflare_plate_fetcher_rejects_an_unbound_plate_list(self):
+        client = FakeClient(json_response=[{"plate": "241D123"}])
+
+        with self.assertRaisesRegex(AuthorisationError, "controller"):
+            CloudflarePlateFetcher(client, "primary")()
+
+    def test_oversized_cloudflare_plate_row_set_does_not_replace_snapshot(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": f"{index}"} for index in range(MAX_PLATE_ROWS + 1)],
+            "controller_id": "primary",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plates.csv"
+            path.write_text("plate\n12D3456\n", encoding="utf-8")
+            cache = AuthorisedPlateCache(path)
+            worker = AuthorisationRefreshWorker(
+                cache, CloudflarePlateFetcher(client, "primary")
+            )
+
+            self.assertFalse(worker.run_once())
+            self.assertEqual(cache.get(), ("12D3456",))
+
+    def test_overlong_normalised_cloudflare_plate_does_not_replace_snapshot(self):
+        client = FakeClient(json_response={
+            "plates": [{"plate": "A" * (MAX_NORMALISED_PLATE_LENGTH + 1)}],
+            "controller_id": "primary",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plates.csv"
+            path.write_text("plate\n12D3456\n", encoding="utf-8")
+            cache = AuthorisedPlateCache(path)
+            worker = AuthorisationRefreshWorker(
+                cache, CloudflarePlateFetcher(client, "primary")
+            )
+
+            self.assertFalse(worker.run_once())
+            self.assertEqual(cache.get(), ("12D3456",))
+
     def test_atomic_snapshot_replace_fsyncs_the_containing_directory(self):
         real_fsync = os.fsync
         fsynced_directory = []
@@ -30,39 +103,6 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
 
         self.assertEqual(fsynced_directory, [False, True])
 
-    def test_plate_fetcher_rejects_http_before_creating_a_credentialed_session(self):
-        for url in ("http://project.supabase.co", "http://localhost:54321"):
-            with self.subTest(url=url), patch(
-                "gate_controller.authorisation.requests.Session"
-            ) as create_session, self.assertRaisesRegex(ValueError, "HTTPS"):
-                SupabasePlateFetcher(url, "service-key")
-            create_session.assert_not_called()
-
-    def test_supabase_fetcher_uses_service_auth_and_bounded_rest_request(self):
-        class Response:
-            status_code = 200
-
-            def json(self):
-                return [{"plate": "12D3456"}]
-
-        class Session:
-            def __init__(self):
-                self.calls = []
-
-            def get(self, url, **kwargs):
-                self.calls.append((url, kwargs))
-                return Response()
-
-        session = Session()
-        fetch = SupabasePlateFetcher(
-            "https://project.supabase.co/", "service-key", session=session
-        )
-
-        self.assertEqual(fetch(), [{"plate": "12D3456"}])
-        self.assertEqual(session.calls[0][0], "https://project.supabase.co/rest/v1/plates")
-        self.assertEqual(session.calls[0][1]["params"], {"select": "plate", "order": "plate.asc"})
-        self.assertEqual(session.calls[0][1]["timeout"], (1, 3))
-        self.assertEqual(session.calls[0][1]["headers"]["Authorization"], "Bearer service-key")
     def test_keeps_last_known_good_plates_until_a_complete_refresh_arrives(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plates.csv"

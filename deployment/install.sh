@@ -6,6 +6,7 @@ INSTALL_ROOT=/opt/gate-controller-deploy
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 APP_SERVICE=file-monitor.service
+LEGACY_COMMAND_UNIT=gate-command-server.service
 UPDATER_SERVICE=gate-controller-updater.service
 UPDATER_TIMER=gate-controller-updater.timer
 SYSTEMD_ROOT=/etc/systemd/system
@@ -26,6 +27,8 @@ ACTIVATION_STARTED=false
 INSTALL_SUCCEEDED=false
 APP_WAS_ENABLED=false
 APP_WAS_ACTIVE=false
+LEGACY_COMMAND_WAS_ENABLED=false
+LEGACY_COMMAND_WAS_ACTIVE=false
 UPDATER_WAS_ENABLED=false
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
@@ -59,6 +62,9 @@ validate_env_file() {
   local owner group mode line value
   local has_supabase_url=false
   local has_service_key=false
+  local has_cloudflare_api_url=false
+  local has_cloudflare_access_client_id=false
+  local has_cloudflare_access_client_secret=false
 
   [[ -f $env_file && ! -L $env_file ]] \
     || fail "$env_file must be a regular file"
@@ -89,10 +95,25 @@ PY
         value=${line#*=}
         [[ -n $value && $value != "''" && $value != '""' ]] && has_service_key=true
         ;;
+      GATE_CLOUDFLARE_API_URL=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_api_url=true
+        ;;
+      GATE_CLOUDFLARE_ACCESS_CLIENT_ID=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_access_client_id=true
+        ;;
+      GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET=*)
+        value=${line#*=}
+        [[ -n $value && $value != "''" && $value != '""' ]] && has_cloudflare_access_client_secret=true
+        ;;
     esac
   done <"$env_file"
-  [[ $has_supabase_url == "$has_service_key" ]] \
-    || fail "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured together"
+  [[ $has_supabase_url == false && $has_service_key == false ]] \
+    || fail "legacy Supabase credentials must not be present in the active controller environment"
+  [[ $has_cloudflare_api_url == "$has_cloudflare_access_client_id" \
+    && $has_cloudflare_api_url == "$has_cloudflare_access_client_secret" ]] \
+    || fail "GATE_CLOUDFLARE_API_URL, GATE_CLOUDFLARE_ACCESS_CLIENT_ID, and GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET must be configured together"
 }
 
 create_fixed_trust_anchor_handoff() {
@@ -259,6 +280,23 @@ restore_application_activity() {
   fi
 }
 
+restore_legacy_command_activity() {
+  local previous_unit=$1
+  local was_enabled=$2
+  local was_active=$3
+
+  if [[ -f $previous_unit && $was_enabled == true ]]; then
+    systemctl enable "$LEGACY_COMMAND_UNIT"
+  else
+    systemctl disable "$LEGACY_COMMAND_UNIT"
+  fi
+  if [[ -f $previous_unit && $was_active == true ]]; then
+    systemctl restart "$LEGACY_COMMAND_UNIT"
+  else
+    systemctl stop "$LEGACY_COMMAND_UNIT"
+  fi
+}
+
 migrate_legacy_authorised_plates() {
   local legacy_file=$1
   local persistent_file=$2
@@ -286,7 +324,7 @@ verify_candidate_release() {
   (
     cd "$release"
     run_candidate_command .venv/bin/python -m unittest discover -s tests -v
-    run_candidate_command .venv/bin/python -m compileall -q gate_controller deployment
+    run_candidate_command .venv/bin/python -m compileall -q gate_controller deployment tests scripts
     run_candidate_command sh -n file_monitor.sh
     run_candidate_command bash -n deployment/install.sh
   )
@@ -455,6 +493,7 @@ rollback() {
       rm -f -- "$CURRENT_LINK"
     fi
     restore_path "$APP_SERVICE"
+    restore_path "$LEGACY_COMMAND_UNIT"
     restore_path "$UPDATER_SERVICE"
     restore_path "$UPDATER_TIMER"
     restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
@@ -467,6 +506,9 @@ rollback() {
     fi
     systemctl daemon-reload
     restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
+    restore_legacy_command_activity \
+      "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
+      "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
   fi
   cleanup
   exit "$original_status"
@@ -501,7 +543,7 @@ chmod 0755 "$STAGING"
 publish_bootstrap_release "$STAGING" "$RELEASE"
 STAGING=
 
-for name in "$APP_SERVICE" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
+for name in "$APP_SERVICE" "$LEGACY_COMMAND_UNIT" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
   if [[ -f $SYSTEMD_ROOT/$name ]]; then
     install -m 0600 "$SYSTEMD_ROOT/$name" "$BACKUP_DIR/$name"
   fi
@@ -518,12 +560,20 @@ fi
 if systemctl is-active --quiet "$APP_SERVICE"; then
   APP_WAS_ACTIVE=true
 fi
+if systemctl is-enabled --quiet "$LEGACY_COMMAND_UNIT"; then
+  LEGACY_COMMAND_WAS_ENABLED=true
+fi
+if systemctl is-active --quiet "$LEGACY_COMMAND_UNIT"; then
+  LEGACY_COMMAND_WAS_ACTIVE=true
+fi
 if systemctl is-enabled --quiet "$UPDATER_TIMER"; then
   UPDATER_WAS_ENABLED=true
 fi
 
 ACTIVATION_STARTED=true
 configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"
+systemctl disable --now "$LEGACY_COMMAND_UNIT" >/dev/null 2>&1 || true
+rm -f -- "$SYSTEMD_ROOT/$LEGACY_COMMAND_UNIT"
 install_fixed_trust_anchors "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT" "$UPDATER_HELPER"
 install_fixed_media_bootstrap "$RELEASE"
 rm -f -- "$CURRENT_LINK.new"

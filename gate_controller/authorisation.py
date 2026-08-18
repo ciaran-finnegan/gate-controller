@@ -1,14 +1,17 @@
 import csv
 import os
 import tempfile
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock
 
-import requests
-
 from .matching import normalise_plate
-from .runtime import require_https_service_url
+
+
+MAX_PLATE_SNAPSHOT_BYTES = 256 * 1024
+MAX_PLATE_ROWS = 1000
+MAX_NORMALISED_PLATE_LENGTH = 16
 
 
 class AuthorisationError(RuntimeError):
@@ -132,29 +135,31 @@ def _snapshot_is_stale(now: datetime, refreshed_at: datetime,
     return age < timedelta(0) or age > max_staleness
 
 
-class SupabasePlateFetcher:
-    def __init__(self, url: str, service_key: str, *, session=None,
-                 timeout: tuple[float, float] = (1, 3)):
-        base_url = require_https_service_url(url, "SUPABASE_URL")
-        self._url = f"{base_url}/rest/v1/plates"
-        self._session = session or requests.Session()
-        self._timeout = timeout
-        self._headers = {
-            "apikey": service_key,
-            "Authorization": f"Bearer {service_key}",
-        }
+class CloudflarePlateFetcher:
+    def __init__(self, client, controller_id):
+        self.client = client
+        self._controller_id = controller_id
 
     def __call__(self) -> list[dict]:
-        response = self._session.get(
-            self._url, params={"select": "plate", "order": "plate.asc"},
-            headers=self._headers, timeout=self._timeout,
+        payload = self.client.get_json(
+            "/api/controller/plates?" + urlencode({"controller_id": self._controller_id}),
+            max_response_bytes=MAX_PLATE_SNAPSHOT_BYTES,
         )
-        if not 200 <= response.status_code < 300:
-            raise AuthorisationError(f"Supabase plates returned HTTP {response.status_code}")
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise AuthorisationError("Supabase plates returned invalid JSON")
-        return payload
+        if isinstance(payload, dict) and payload.get("controller_id") == self._controller_id:
+            rows = payload.get("plates")
+        else:
+            raise AuthorisationError("Cloudflare plates returned a snapshot for another controller")
+        if not isinstance(rows, list) or len(rows) > MAX_PLATE_ROWS or any(
+            not isinstance(row, dict) or not isinstance(row.get("plate"), str)
+            for row in rows
+        ):
+            raise AuthorisationError("Cloudflare plates returned invalid JSON")
+        if any(
+            len(normalise_plate(row["plate"])) > MAX_NORMALISED_PLATE_LENGTH
+            for row in rows
+        ):
+            raise AuthorisationError("Cloudflare plates exceeded the normalized plate length limit")
+        return rows
 
 
 class AuthorisationRefreshWorker:

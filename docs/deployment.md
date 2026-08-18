@@ -11,9 +11,10 @@ running unchanged.
 - Raspberry Pi OS with systemd, Git, `flock`, `systemd-analyze`, the GPIO group,
   and Python 3.10 or newer including `venv` support.
 - A working `/etc/gate-controller.env`, owned by `root:root` with mode `0600`.
-  The installer refuses to create or replace this file. `SUPABASE_URL` and
-  `SUPABASE_SERVICE_ROLE_KEY` must either both have values or both be absent;
-  a partial remote-control configuration fails bootstrap.
+  The installer refuses to create or replace this file. Configure
+  `GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`, and
+  `GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET` as one Access-authenticated controller
+  API group; a partial remote-control configuration fails bootstrap.
 - A dedicated `ftp-user` already created by the selected FTP server setup. The
   installer deliberately does not create or assign credentials to an FTP
   account.
@@ -144,6 +145,79 @@ sudo systemctl status gate-controller-updater.timer
 sudo systemctl list-timers gate-controller-updater.timer
 sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 ```
+
+## Cloudflare Tunnel
+
+Cloudflare Tunnel exposes only the loopback command endpoint and the hardened
+nginx WHEP gateway. Copy `deployment/cloudflared/gate-controller-tunnel.yml` to the Pi,
+replace the example tunnel UUID, credentials path, and hostnames with the values
+created in Cloudflare, then store its credentials JSON at the configured
+root-owned path. Do not add ingress rules for the controller database, GPIO,
+MediaMTX API or metrics, the media authorization sidecar, or SSH. The final
+catch-all `http_status:404` rule is required.
+
+Protect `gate-command.example.com` with a Cloudflare Access application that
+accepts only the Worker service token used for direct commands. Apply the
+separate human/media Access policy from the UI deployment to
+`gate-media.example.com`.
+
+The direct command path is `POST /commands` on the command hostname. The
+tunnel forwards it only to `127.0.0.1:8765`; it does not expose a general Pi
+HTTP service. Verify the Access application, service-token policy, and Worker
+request path as a deployment smoke check. Do not run live Cloudflare account or
+policy commands from this repository or installer.
+
+Before installing or starting the tunnel, validate its ingress rules and confirm
+the command hostname chooses the loopback command service:
+
+```sh
+sudo cloudflared tunnel ingress validate --config /etc/cloudflared/gate-controller-tunnel.yml
+sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /etc/cloudflared/gate-controller-tunnel.yml
+```
+
+The loopback command server runs inside `file-monitor.service`, sharing the
+main process's `ActuationCoordinator`, relay, and local store. The service
+requires `systemd-time-wait-sync.service`, so it does not begin image or command
+handling until the clock reports synchronized. It binds only `127.0.0.1:8765`
+and uses `GATE_CONTROLLER_ID` (default `primary`). Verify it with:
+
+```sh
+sudo systemctl status file-monitor.service
+curl --fail-with-body http://127.0.0.1:8765/not-found || test $? -eq 22
+```
+
+Run `cloudflared` with the validated configuration through the operator-managed
+Cloudflare package/service workflow. Do not run Cloudflare account commands or
+create tunnel credentials from the controller installer.
+
+## Cloudflare Event Ingest And Retention
+
+The controller posts authorized-plate refreshes, heartbeats, and queued events
+to the HTTPS Worker origin in `GATE_CLOUDFLARE_API_URL`, authenticated with the
+two Access service-token variables. Event ingest is `POST
+/api/controller/events`; it is idempotent by the controller event key and may
+include a bounded JPEG whose SHA-256 digest is in the event payload.
+
+The Worker deployment owns evidence retention. Store accepted JPEGs only in a
+private R2 bucket under the verified digest, keep bucket access limited to the
+Worker and approved operators, and configure the site's approved R2 lifecycle
+retention before accepting production traffic. Confirm that event metadata and
+the R2 object share the digest before considering ingest healthy. The Pi keeps
+its local evidence until it receives a 2xx response and never performs R2
+credentials, deletion, or lifecycle management directly.
+
+## Controller Cutover And Decommission
+
+Before decommissioning the previous remote-control release, deploy the Worker,
+R2 bucket, Access policies, service token, and validated tunnel routes. Install
+the Cloudflare-enabled controller release, verify plate refresh, heartbeat,
+event ingest, and a non-actuating command path, then retain the previous managed
+release and its rollback-ready configuration through acceptance.
+
+If any acceptance check fails, restore the previous release before removing its
+remote-control configuration or decommissioning the prior service. Rollback is
+the managed-release procedure below; do not attempt it by manually changing a
+live tunnel or editing SQLite state.
 
 ## Update And Rollback Behavior
 
@@ -365,13 +439,20 @@ unused inherited listener. API (`127.0.0.1:9997`), metrics
 the configured camera source.
 
 The installer root-renders the exact allowed HTTPS origin into
-`/etc/gate-media/nginx-whep-locations.conf`. Include it only inside the
-dedicated TLS server for the media public origin. It proxies `POST`/`OPTIONS`
+`/etc/gate-media/nginx-whep-locations.conf`. Include that complete server block
+from nginx's `http` context. It listens only on `127.0.0.1:8891`, which is the
+media origin configured for Cloudflare Tunnel. It proxies `POST`/`OPTIONS`
 on exact `/gate/whep` and `DELETE`/`OPTIONS` on bounded teardown resource paths;
 no catch-all route proxies to MediaMTX. nginx carries WHEP HTTP signaling and
 SDP only; it does not carry RTP/RTCP media. Actual media must traverse the exact
 ICE listeners or the configured TURN relay. Do not expose API, metrics, the auth
 sidecar, WHIP, RTSP serving, or camera administration.
+
+Keep rollback-only Supabase credentials outside `/etc/gate-controller.env`, for
+example in root-owned mode-0600 `/etc/gate-controller.rollback.env`. The active
+environment rejects every non-empty `SUPABASE_URL` or
+`SUPABASE_SERVICE_ROLE_KEY`; restore the prior release and its separate rollback
+environment together if rollback is required.
 
 Before setting `GATE_MEDIA_VIDEO_CONFIGURED=true` or
 `GATE_MEDIA_VIDEO_VERIFIED=true`, complete a WHEP session from a separate

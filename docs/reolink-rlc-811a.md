@@ -6,8 +6,8 @@ Connect the RLC-811A and Raspberry Pi to the private LAN or a dedicated camera
 VLAN. Give the camera a DHCP reservation and allow it to initiate FTP uploads
 to the Pi only. Do not forward RTSP, ONVIF, the Reolink web interface, FTP, or
 the Pi GPIO interface to the internet. Remote users use the authenticated web
-application, which requests a Supabase command; the Pi makes the outbound RPC
-calls and applies the local safety policy.
+application, which sends an Access-protected request through Cloudflare Tunnel
+to the Pi's loopback command server. The Pi applies the local safety policy.
 
 Use a dedicated `ftp-user` with a home or upload directory at
 `/var/lib/gate-controller/uploads`. Limit the FTP service to the camera VLAN
@@ -104,3 +104,18 @@ Each local event records `received_at`, `decision_at`, and, when opened,
 Control-plane heartbeats include the latest completed image path, SQLite outbox
 queue depth, and whether a fixed local prompt is configured. They are health
 signals, not an authority to bypass local recognition or relay safeguards.
+
+## Deferred Pi Performance Validation
+
+The Cloudflare performance harness is available at
+`scripts/pi-cloudflare-performance-harness.py` and is documented in
+[`pi-cloudflare-performance.md`](pi-cloudflare-performance.md). Real Pi SSH,
+relay, and media load validation remains deferred until Tailscale is reliable or
+the operator is on the home Wi-Fi. This task does not treat that network access
+as a deployment prerequisite.
+
+For a safe opportunistic check on the Pi, run the default non-actuating command
+or use `--skip-network` when services are unavailable. The harness records
+`pi_ssh_tests` as `skipped_until_tailscale_or_home_wifi`; it sends an
+`open_gate` command only when `--actuate` is explicitly supplied while the
+operator is physically present and prepared for the gate to open.

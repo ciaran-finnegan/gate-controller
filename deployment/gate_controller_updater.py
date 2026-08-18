@@ -30,6 +30,7 @@ GITHUB_API_ROOT = "https://api.github.com"
 MAX_API_RESPONSE_BYTES = 5 * 1024 * 1024
 LOGGER = logging.getLogger("gate-controller-updater")
 BUILD_USER = "gate-controller-build"
+LEGACY_COMMAND_SERVICE = "gate-command-server.service"
 
 
 class UpdateError(RuntimeError):
@@ -56,6 +57,14 @@ class ReleaseEntry:
 class PendingActivation:
     candidate_sha: str
     previous_sha: str
+    legacy_command_enabled: bool | None = None
+    legacy_command_active: bool | None = None
+
+
+@dataclass(frozen=True)
+class LegacyCommandState:
+    enabled: bool
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -389,7 +398,10 @@ def verify_release(release: Path, config: UpdateConfig) -> None:
         run_as_user=BUILD_USER,
     )
     _run_command(
-        [python, "-m", "compileall", "-q", "gate_controller", "deployment"],
+        [
+            python, "-m", "compileall", "-q", "gate_controller", "deployment",
+            "tests", "scripts",
+        ],
         config=config,
         cwd=release,
         run_as_user=BUILD_USER,
@@ -530,6 +542,111 @@ def _managed_release_path(sha: str, config: UpdateConfig) -> Path:
     return resolved
 
 
+def _systemctl_is(state: str, service_name: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["systemctl", state, service_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(
+            f"could not determine whether {service_name} is {state}"
+        ) from error
+    if completed.returncode == 0:
+        return True
+    result = (completed.stdout or "").strip().lower()
+    confirmed_not_present = {
+        "is-enabled": {"disabled", "indirect", "masked", "not-found", "static"},
+        "is-active": {"failed", "inactive", "not-found"},
+    }
+    if result in confirmed_not_present.get(state, set()):
+        return False
+    raise UpdateError(
+        f"could not determine whether {service_name} is {state}: {result or 'unknown'}"
+    )
+
+
+def _legacy_command_state() -> LegacyCommandState:
+    return LegacyCommandState(
+        enabled=_systemctl_is("is-enabled", LEGACY_COMMAND_SERVICE),
+        active=_systemctl_is("is-active", LEGACY_COMMAND_SERVICE),
+    )
+
+
+def _retire_legacy_command_service(
+    config: UpdateConfig,
+    state: LegacyCommandState | None = None,
+) -> LegacyCommandState:
+    state = state or _legacy_command_state()
+    if state.enabled or state.active:
+        _run_command(
+            ["systemctl", "disable", "--now", LEGACY_COMMAND_SERVICE],
+            config=config,
+            timeout=60,
+        )
+    return state
+
+
+def _previous_release_expects_legacy_command_service(previous: Path) -> bool:
+    return (previous / "deployment/systemd" / LEGACY_COMMAND_SERVICE).is_file()
+
+
+def _restore_legacy_command_service(
+    pending: PendingActivation,
+    previous: Path,
+    config: UpdateConfig,
+) -> None:
+    if (
+        pending.legacy_command_enabled is None
+        or pending.legacy_command_active is None
+        or not _previous_release_expects_legacy_command_service(previous)
+    ):
+        return
+    if pending.legacy_command_enabled:
+        _run_command(
+            ["systemctl", "enable", LEGACY_COMMAND_SERVICE],
+            config=config,
+            timeout=60,
+        )
+    if pending.legacy_command_active:
+        _run_command(
+            ["systemctl", "restart", LEGACY_COMMAND_SERVICE],
+            config=config,
+            timeout=60,
+        )
+
+
+def _write_pending_activation(
+    release: Path,
+    previous: Path,
+    legacy_command_state: LegacyCommandState,
+    config: UpdateConfig,
+) -> PendingActivation:
+    pending = PendingActivation(
+        release.name,
+        previous.name,
+        legacy_command_state.enabled,
+        legacy_command_state.active,
+    )
+    payload = json.dumps(
+        {
+            "candidate": pending.candidate_sha,
+            "legacy_command_active": pending.legacy_command_active,
+            "legacy_command_enabled": pending.legacy_command_enabled,
+            "previous": pending.previous_sha,
+            "version": 2,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _atomic_write(config.pending_activation_path, payload, 0o600)
+    return pending
+
+
 def _read_pending_activation(config: UpdateConfig) -> PendingActivation | None:
     path = config.pending_activation_path
     if not path.exists() and not path.is_symlink():
@@ -540,10 +657,20 @@ def _read_pending_activation(config: UpdateConfig) -> PendingActivation | None:
         payload = json.loads(path.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ActivationError("pending activation record is malformed") from error
-    expected_fields = {"candidate", "previous", "version"}
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    version = payload.get("version") if isinstance(payload, dict) else None
+    fields_for_version = {
+        1: {"candidate", "previous", "version"},
+        2: {
+            "candidate",
+            "legacy_command_active",
+            "legacy_command_enabled",
+            "previous",
+            "version",
+        },
+    }
+    if not isinstance(payload, dict) or set(payload) != fields_for_version.get(version):
         raise ActivationError("pending activation record has unexpected fields")
-    if payload["version"] != 1:
+    if version not in fields_for_version:
         raise ActivationError("pending activation record version is unsupported")
     candidate_sha = payload["candidate"]
     previous_sha = payload["previous"]
@@ -555,7 +682,21 @@ def _read_pending_activation(config: UpdateConfig) -> PendingActivation | None:
         or candidate_sha == previous_sha
     ):
         raise ActivationError("pending activation release SHAs are invalid")
-    pending = PendingActivation(candidate_sha, previous_sha)
+    legacy_command_enabled = None
+    legacy_command_active = None
+    if version == 2:
+        legacy_command_enabled = payload["legacy_command_enabled"]
+        legacy_command_active = payload["legacy_command_active"]
+        if not isinstance(legacy_command_enabled, bool) or not isinstance(
+            legacy_command_active, bool
+        ):
+            raise ActivationError("pending activation legacy command state is invalid")
+    pending = PendingActivation(
+        candidate_sha,
+        previous_sha,
+        legacy_command_enabled,
+        legacy_command_active,
+    )
     _managed_release_path(pending.candidate_sha, config)
     _managed_release_path(pending.previous_sha, config)
     return pending
@@ -572,18 +713,28 @@ def reconcile_pending_activation(config: UpdateConfig) -> str | None:
     if pending is None:
         return current_sha
     if current_sha == pending.previous_sha:
+        previous = _managed_release_path(pending.previous_sha, config)
         _restart_and_confirm(config)
+        _restore_legacy_command_service(pending, previous, config)
         _clear_pending_activation(config)
         return pending.previous_sha
     if current_sha != pending.candidate_sha:
         raise ActivationError("current release does not match pending candidate")
     try:
+        if pending.legacy_command_enabled is None:
+            candidate = _managed_release_path(pending.candidate_sha, config)
+            previous = _managed_release_path(pending.previous_sha, config)
+            pending = _write_pending_activation(
+                candidate, previous, _legacy_command_state(), config
+            )
+        _retire_legacy_command_service(config)
         _restart_and_confirm(config)
     except Exception as candidate_error:
         previous = _managed_release_path(pending.previous_sha, config)
         try:
             _atomic_symlink(previous, config.current_link)
             _restart_and_confirm(config)
+            _restore_legacy_command_service(pending, previous, config)
         except Exception as rollback_error:
             raise ActivationError(
                 f"pending candidate failed health check; rollback also failed: {rollback_error}"
@@ -597,17 +748,7 @@ def reconcile_pending_activation(config: UpdateConfig) -> str | None:
 
 
 def _service_is_active(config: UpdateConfig) -> bool:
-    try:
-        completed = subprocess.run(
-            ["systemctl", "is-active", "--quiet", config.service_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
+    return _systemctl_is("is-active", config.service_name)
 
 
 def _restart_and_confirm(config: UpdateConfig) -> None:
@@ -621,21 +762,27 @@ def _restart_and_confirm(config: UpdateConfig) -> None:
 
 
 def activate_release(release: Path, previous: Path, config: UpdateConfig) -> None:
+    legacy_command_state = _legacy_command_state()
+    pending: PendingActivation | None = None
     try:
-        pending = json.dumps(
-            {
-                "candidate": release.name,
-                "previous": previous.name,
-                "version": 1,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        _atomic_write(config.pending_activation_path, pending, 0o600)
+        pending = _write_pending_activation(
+            release, previous, legacy_command_state, config
+        )
+        _retire_legacy_command_service(
+            config,
+            LegacyCommandState(
+                pending.legacy_command_enabled or False,
+                pending.legacy_command_active or False,
+            ),
+        )
         _atomic_symlink(release, config.current_link)
         _restart_and_confirm(config)
         _clear_pending_activation(config)
     except Exception as activation_error:
+        if pending is None:
+            raise ActivationError(
+                "candidate activation failed before recording rollback state"
+            ) from activation_error
         LOGGER.error("Activation failed; restoring %s", previous.name)
         rollback_errors: list[str] = []
         try:
@@ -649,6 +796,7 @@ def activate_release(release: Path, previous: Path, config: UpdateConfig) -> Non
                     "activation failure left current at an unrelated release"
                 )
             _restart_and_confirm(config)
+            _restore_legacy_command_service(pending, previous, config)
             _clear_pending_activation(config)
         except Exception as rollback_error:
             rollback_errors.append(str(rollback_error))

@@ -10,13 +10,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import requests
 from PIL import Image
 
 import gate_controller.outbox as outbox_module
 from gate_controller.models import GateEvent
-from gate_controller.outbox import EvidenceSpoolError, HttpOutboxSender, OutboxWorker
+from gate_controller.outbox import (
+    CloudflareOutboxSender, EvidenceSpoolError, HttpOutboxSender, OutboxSyncError,
+    OutboxWorker,
+)
 from gate_controller.store import LocalStore
 from gate_controller.telemetry import EventTelemetry, StageDurations
+
+
+class FakeClient:
+    def __init__(self, *, json_response=None):
+        self.json_response = json_response
+        self.requests = []
+
+    def post_json(self, path, payload, *, headers=None):
+        self.requests.append(type("Request", (), {
+            "path": path, "payload": payload, "headers": headers or {},
+        })())
+        return self.json_response
 
 
 def _telemetry():
@@ -338,6 +354,32 @@ class OutboxWorkerTests(unittest.TestCase):
                 },
             },
         )])
+
+    def test_cloudflare_outbox_sender_preserves_idempotency_key_and_evidence_digest(self):
+        image = b"immutable-jpeg-evidence"
+        sha = hashlib.sha256(image).hexdigest()
+        sender = CloudflareOutboxSender(FakeClient(), "primary")
+
+        sender({"event_id": 7, "controller_id": "primary", "image_sha256": sha}, image)
+
+        request = sender.client.requests[0]
+        self.assertEqual(request.path, "/api/controller/events")
+        self.assertEqual(
+            request.headers["Idempotency-Key"],
+            hashlib.sha256(b"primary:7").hexdigest(),
+        )
+        self.assertEqual(request.payload["image"]["sha256"], sha)
+        self.assertEqual(request.payload["image"]["data_base64"], base64.b64encode(image).decode("ascii"))
+
+    def test_cloudflare_outbox_sender_translates_worker_http_failures(self):
+        class FailingClient:
+            def post_json(self, path, payload, *, headers=None):
+                raise requests.HTTPError("502 Server Error")
+
+        sender = CloudflareOutboxSender(FailingClient(), "primary")
+
+        with self.assertRaisesRegex(OutboxSyncError, "outbox endpoint"):
+            sender({"event_id": 7})
 
     def test_pending_delivery_keeps_its_first_persisted_controller_identity(self):
         class Response:

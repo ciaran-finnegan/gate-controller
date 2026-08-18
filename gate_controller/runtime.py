@@ -16,3 +16,15 @@ def require_https_service_url(url: str, name: str) -> str:
     if parsed is None or parsed.scheme.lower() != "https" or not parsed.hostname:
         raise ValueError(f"{name} must be an absolute HTTPS URL")
     return url.rstrip("/")
+
+
+def require_https_or_loopback_service_url(url: str, name: str) -> str:
+    parsed = urlparse(url) if isinstance(url, str) else None
+    if parsed is None or not parsed.hostname:
+        raise ValueError(f"{name} must be an absolute HTTPS or loopback HTTP URL")
+
+    scheme = parsed.scheme.lower()
+    is_loopback = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+    if scheme != "https" and not (scheme == "http" and is_loopback):
+        raise ValueError(f"{name} must be an absolute HTTPS or loopback HTTP URL")
+    return url.rstrip("/")

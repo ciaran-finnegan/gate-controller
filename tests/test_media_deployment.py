@@ -276,6 +276,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("__GATE_MEDIA_ALLOWED_ORIGIN__", proxy)
         self.assertIn("proxy_pass http://127.0.0.1:8889", proxy)
         self.assertNotRegex(proxy, r"location\s+/\s*\{[^}]*proxy_pass")
+        self.assertIn("listen 127.0.0.1:8891", proxy)
+        self.assertRegex(proxy, r"location\s+/\s*\{\s*return 404;")
         self.assertIn("limit_except POST OPTIONS", proxy)
         self.assertIn("limit_except DELETE OPTIONS", proxy)
         self.assertEqual(2, proxy.count("proxy_set_header Host $http_host;"))
