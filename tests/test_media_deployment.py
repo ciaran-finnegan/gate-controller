@@ -404,8 +404,11 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
     def test_proxy_activation_owns_validates_enables_and_reloads_nginx(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            proxy = root / "gate-media.conf"
-            proxy.write_text("server {}\n", encoding="utf-8")
+            config = root / "gate-media.conf"
+            proxy = root / "gate-media.conf.new"
+            proxy.write_text("server { first; }\n", encoding="utf-8")
+            next_proxy = root / "gate-media.conf.next"
+            next_proxy.write_text("server { second; }\n", encoding="utf-8")
             enabled = root / "nginx-enabled.conf"
             nginx_log = root / "nginx.log"
             nginx = root / "nginx"
@@ -419,8 +422,10 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
 source deployment/install-media.sh
 NGINX_BINARY={shlex.quote(str(nginx))}
 NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
 systemctl() {{ printf '%s\n' "$*" >> {shlex.quote(str(systemctl_log))}; }}
 activate_proxy_config {shlex.quote(str(proxy))}
+activate_proxy_config {shlex.quote(str(next_proxy))}
 """
             environment = dict(os.environ)
             environment["NGINX_LOG"] = str(nginx_log)
@@ -431,12 +436,75 @@ activate_proxy_config {shlex.quote(str(proxy))}
 
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertTrue(enabled.is_symlink())
-            self.assertEqual(proxy.resolve(), enabled.resolve())
-            self.assertEqual("-t\n", nginx_log.read_text(encoding="utf-8"))
+            self.assertEqual(config.resolve(), enabled.resolve())
+            self.assertEqual("server { second; }\n", config.read_text(encoding="utf-8"))
+            self.assertEqual("-t\n-t\n", nginx_log.read_text(encoding="utf-8"))
             self.assertEqual(
-                ["enable nginx.service", "reload-or-restart nginx.service"],
+                [
+                    "enable nginx.service", "reload-or-restart nginx.service",
+                    "enable nginx.service", "reload-or-restart nginx.service",
+                ],
                 systemctl_log.read_text(encoding="utf-8").splitlines(),
             )
+
+    def test_proxy_activation_restores_existing_config_and_link_when_nginx_validation_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "gate-media.conf"
+            config.write_bytes(b"known-good config\n")
+            candidate = root / "gate-media.conf.new"
+            candidate.write_bytes(b"broken candidate config\n")
+            enabled = root / "nginx-enabled.conf"
+            enabled.symlink_to(config)
+            original_link_target = os.readlink(enabled)
+            nginx = root / "nginx"
+            nginx.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            nginx.chmod(0o755)
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
+activate_proxy_config {shlex.quote(str(candidate))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(b"known-good config\n", config.read_bytes())
+            self.assertTrue(enabled.is_symlink())
+            self.assertEqual(original_link_target, os.readlink(enabled))
+
+    def test_proxy_activation_leaves_no_config_or_link_when_nginx_validation_fails_initially(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "gate-media.conf"
+            candidate = root / "gate-media.conf.new"
+            candidate.write_bytes(b"broken candidate config\n")
+            enabled = root / "nginx-enabled.conf"
+            nginx = root / "nginx"
+            nginx.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            nginx.chmod(0o755)
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
+activate_proxy_config {shlex.quote(str(candidate))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertFalse(config.exists())
+            self.assertFalse(enabled.is_symlink())
+            self.assertFalse(candidate.exists())
 
     def test_checksum_lookup_requires_an_exact_approved_version_and_architecture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

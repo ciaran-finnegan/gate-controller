@@ -25,6 +25,7 @@ ALLOWED_ORIGIN=
 EXTRACTED_MEDIA_DIR=
 STAGED_MEDIA_BINARY=
 STAGED_MEDIA_ARCHIVE=
+STAGED_MEDIA_PROXY_CONFIG=
 
 usage() {
   cat <<'EOF'
@@ -116,6 +117,10 @@ cleanup_media_install() {
       && $STAGED_MEDIA_ARCHIVE == "$MEDIA_ARCHIVE_ROOT"/.archive.* ]]; then
     rm -f -- "$STAGED_MEDIA_ARCHIVE"
   fi
+  if [[ -n $STAGED_MEDIA_PROXY_CONFIG \
+      && $STAGED_MEDIA_PROXY_CONFIG == "$MEDIA_PROXY_CONFIG".new.* ]]; then
+    rm -f -- "$STAGED_MEDIA_PROXY_CONFIG"
+  fi
 }
 
 on_media_install_failure() {
@@ -172,17 +177,42 @@ PY
 activate_proxy_config() {
   local config=$1
   local config_root=${NGINX_PROXY_CONFIG%/*}
+  local prior_proxy_target=
+  local had_prior_proxy_link=0
+  local staged_proxy_link=$NGINX_PROXY_CONFIG.new.$$
 
   [[ -f $config && ! -L $config ]] || fail "rendered WHEP proxy config must be regular"
   [[ -x $NGINX_BINARY ]] || fail "nginx is not installed at $NGINX_BINARY"
   [[ -d $config_root && ! -L $config_root ]] || fail "nginx config directory is invalid"
   [[ ! -e $NGINX_PROXY_CONFIG || -L $NGINX_PROXY_CONFIG ]] \
     || fail "$NGINX_PROXY_CONFIG is not a managed symlink"
-  ln -sfn -- "$config" "$NGINX_PROXY_CONFIG"
+  if [[ -L $NGINX_PROXY_CONFIG ]]; then
+    prior_proxy_target=$(readlink -- "$NGINX_PROXY_CONFIG")
+    had_prior_proxy_link=1
+  fi
+  rm -f -- "$staged_proxy_link"
+  ln -s -- "$config" "$staged_proxy_link"
+  mv -f -- "$staged_proxy_link" "$NGINX_PROXY_CONFIG"
   [[ -L $NGINX_PROXY_CONFIG \
       && $(readlink -f "$NGINX_PROXY_CONFIG") == "$(readlink -f "$config")" ]] \
     || fail "nginx WHEP proxy symlink could not be verified"
-  "$NGINX_BINARY" -t
+  if ! "$NGINX_BINARY" -t; then
+    if [[ $had_prior_proxy_link -eq 1 ]]; then
+      ln -s -- "$prior_proxy_target" "$staged_proxy_link"
+      mv -f -- "$staged_proxy_link" "$NGINX_PROXY_CONFIG"
+    else
+      rm -f -- "$NGINX_PROXY_CONFIG"
+    fi
+    rm -f -- "$config"
+    return 1
+  fi
+  ln -s -- "$MEDIA_PROXY_CONFIG" "$staged_proxy_link"
+  mv -f -- "$staged_proxy_link" "$NGINX_PROXY_CONFIG"
+  mv -f -- "$config" "$MEDIA_PROXY_CONFIG"
+  STAGED_MEDIA_PROXY_CONFIG=
+  [[ -L $NGINX_PROXY_CONFIG \
+      && $(readlink -f "$NGINX_PROXY_CONFIG") == "$(readlink -f "$MEDIA_PROXY_CONFIG")" ]] \
+    || fail "nginx WHEP proxy symlink could not be activated"
   systemctl enable nginx.service
   systemctl reload-or-restart nginx.service
 }
@@ -318,11 +348,12 @@ main() {
     validate_root_file "$environment_file" 600
   done
   install_fixed_media_files "$SOURCE"
-  render_proxy_config "$MEDIA_PROXY_TEMPLATE" "$MEDIA_PROXY_CONFIG" "$ALLOWED_ORIGIN"
+  STAGED_MEDIA_PROXY_CONFIG=$MEDIA_PROXY_CONFIG.new.$$
+  render_proxy_config "$MEDIA_PROXY_TEMPLATE" "$STAGED_MEDIA_PROXY_CONFIG" "$ALLOWED_ORIGIN"
   install_mediamtx_binary "$MEDIAMTX_ARCHIVE" "$MEDIAMTX_VERSION" "$CHECKSUM_MAP"
   systemd-tmpfiles --create "$MEDIA_TMPFILES"
   systemctl daemon-reload
-  activate_proxy_config "$MEDIA_PROXY_CONFIG"
+  activate_proxy_config "$STAGED_MEDIA_PROXY_CONFIG"
   if media_environment_complete; then
     systemctl enable gate-media-auth.service gate-media-gateway.service
     systemctl restart gate-media-auth.service gate-media-gateway.service

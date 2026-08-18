@@ -439,9 +439,10 @@ unused inherited listener. API (`127.0.0.1:9997`), metrics
 the configured camera source.
 
 The installer root-renders the exact allowed HTTPS origin into
-`/etc/gate-media/nginx-whep-locations.conf`. Include that complete server block
-from nginx's `http` context. It listens only on `127.0.0.1:8891`, which is the
-media origin configured for Cloudflare Tunnel. It proxies `POST`/`OPTIONS`
+`/etc/gate-media/nginx-whep-locations.conf` and owns the nginx include
+`/etc/nginx/conf.d/gate-media-whep.conf`; no manual nginx include is needed.
+That complete server block listens only on `127.0.0.1:8891`, which is the media
+origin configured for Cloudflare Tunnel. It proxies `POST`/`OPTIONS`
 on exact `/gate/whep` and `DELETE`/`OPTIONS` on bounded teardown resource paths;
 no catch-all route proxies to MediaMTX. nginx carries WHEP HTTP signaling and
 SDP only; it does not carry RTP/RTCP media. Actual media must traverse the exact
