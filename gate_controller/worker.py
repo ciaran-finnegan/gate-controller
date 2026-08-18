@@ -216,7 +216,7 @@ class StartupReconciler:
 
     def __init__(self, directory: Path, handler: CompletedImageHandler, *,
                  max_image_age: float = 8.0, on_skipped=None, clock=None):
-        self._entries = os.scandir(directory)
+        self._entries = [os.scandir(directory)]
         self._handler = handler
         self._max_image_age = max_image_age
         self._on_skipped = on_skipped
@@ -227,13 +227,14 @@ class StartupReconciler:
         if self._closed:
             return False
         for _ in range(max_entries):
-            try:
-                entry = next(self._entries)
-            except StopIteration:
-                self.close()
+            entry = self._next_entry()
+            if entry is None:
                 return False
             path = Path(entry.path)
-            if entry.is_dir(follow_symlinks=False) or path.suffix.lower() not in {".jpg", ".jpeg"}:
+            if entry.is_dir(follow_symlinks=False):
+                self._entries.append(os.scandir(path))
+                continue
+            if path.suffix.lower() not in {".jpg", ".jpeg"}:
                 continue
             try:
                 age = self._clock() - entry.stat(follow_symlinks=False).st_mtime
@@ -250,9 +251,19 @@ class StartupReconciler:
             self._handler.schedule_candidate(path, False)
         return True
 
+    def _next_entry(self):
+        while self._entries:
+            try:
+                return next(self._entries[-1])
+            except StopIteration:
+                self._entries.pop().close()
+        self.close()
+        return None
+
     def close(self) -> None:
         if not self._closed:
-            self._entries.close()
+            while self._entries:
+                self._entries.pop().close()
             self._closed = True
 
 
@@ -306,7 +317,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         max_pending_candidates=max_burst_candidates,
     )
     observer = Observer()
-    observer.schedule(handler, str(directory), recursive=False)
+    observer.schedule(handler, str(directory), recursive=True)
     stop_event = Event()
     failures = Queue()
     processing_thread = Thread(

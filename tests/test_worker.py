@@ -352,6 +352,65 @@ class WorkerTests(unittest.TestCase):
 
             self.assertEqual(len(handler.paths), 257)
 
+    def test_startup_reconciliation_inspects_nested_reolink_directories(self):
+        class RecordingHandler:
+            def __init__(self):
+                self.paths = []
+
+            def schedule_candidate(self, path, is_directory=False):
+                self.paths.append(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "2026" / "08" / "18"
+            nested.mkdir(parents=True)
+            image = nested / "Front Gate_00_20260818211110.jpg"
+            image.write_bytes(b"fresh")
+            handler = RecordingHandler()
+
+            reconcile_completed_images(root, handler, max_image_age=60)
+
+            self.assertEqual(handler.paths, [image])
+
+    def test_run_worker_observes_nested_camera_directories(self):
+        scheduled = []
+
+        class Observer:
+            def schedule(self, handler, path, recursive=False):
+                scheduled.append((path, recursive))
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def join(self):
+                pass
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.Observer", return_value=Observer()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ):
+            run_worker(Path(directory), lambda *_: None)
+
+        self.assertEqual(scheduled, [(directory, True)])
+
     def test_future_dated_startup_upload_is_rejected_after_clock_rollback(self):
         skipped = []
         with tempfile.TemporaryDirectory() as directory:
