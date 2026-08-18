@@ -17,6 +17,7 @@ from deployment.gate_controller_updater import (
     _atomic_write,
     _command_environment,
     _legacy_command_state,
+    _systemctl_is,
     activate_release,
     decide_update,
     discover_current_sha,
@@ -313,6 +314,45 @@ class ActivationRecoveryTests(unittest.TestCase):
             ],
             calls,
         )
+
+    def test_legacy_probe_treats_missing_unit_file_as_not_enabled(self):
+        responses = [
+            subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr=(
+                    "Failed to get unit file state for "
+                    "gate-command-server.service: No such file or directory\n"
+                ),
+            ),
+            subprocess.CompletedProcess([], 3, stdout="inactive\n", stderr=""),
+        ]
+
+        def return_missing_unit(arguments, **_options):
+            return responses.pop(0)
+
+        with patch(
+            "deployment.gate_controller_updater.subprocess.run",
+            side_effect=return_missing_unit,
+        ):
+            state = _legacy_command_state()
+
+        self.assertFalse(state.enabled)
+        self.assertFalse(state.active)
+
+    def test_legacy_probe_rejects_unrelated_missing_file_diagnostics(self):
+        with patch(
+            "deployment.gate_controller_updater.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr="systemctl: /run/dbus/system_bus_socket: No such file or directory\n",
+            ),
+        ):
+            with self.assertRaises(UpdateError):
+                _systemctl_is("is-enabled", "gate-command-server.service")
 
     def test_legacy_probe_timeout_raises_update_error(self):
         with patch(
