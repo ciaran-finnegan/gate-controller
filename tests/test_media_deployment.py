@@ -324,7 +324,11 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 self.assertTrue(any("/opt/gate-controller-deploy" in path for path in inaccessible))
                 self.assertIn("-/opt/gate-controller", inaccessible)
                 self.assertTrue(any("gpio" in path for path in inaccessible))
-                self.assertNotIn("NoExecPaths", service)
+                no_exec_paths = set(shlex.split(service.get("NoExecPaths", "")))
+                self.assertEqual(
+                    {"/run/gate-media", "/tmp", "/var/tmp", "/dev/shm"},
+                    no_exec_paths,
+                )
                 self.assertNotIn("ExecPaths", service)
 
     def test_media_installer_uses_an_operator_approved_version_architecture_checksum_map(self):
@@ -348,6 +352,18 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("gate_media_gateway", installer)
         self.assertNotIn("install_mediamtx_binary", controller_installer)
         self.assertNotIn("/usr/local/bin/mediamtx", controller_installer)
+        self.assertIn(
+            "systemctl enable gate-media-auth.service gate-media-gateway.service",
+            installer,
+        )
+        self.assertIn(
+            "systemctl restart gate-media-auth.service gate-media-gateway.service",
+            installer,
+        )
+        self.assertNotIn(
+            "systemctl enable --now gate-media-auth.service gate-media-gateway.service",
+            installer,
+        )
 
     def test_proxy_renderer_substitutes_one_validated_exact_https_origin(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -377,6 +393,43 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, rejected.returncode)
+
+    def test_proxy_activation_owns_validates_enables_and_reloads_nginx(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            proxy = root / "gate-media.conf"
+            proxy.write_text("server {}\n", encoding="utf-8")
+            enabled = root / "nginx-enabled.conf"
+            nginx_log = root / "nginx.log"
+            nginx = root / "nginx"
+            nginx.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NGINX_LOG\"\n",
+                encoding="utf-8",
+            )
+            nginx.chmod(0o755)
+            systemctl_log = root / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+systemctl() {{ printf '%s\n' "$*" >> {shlex.quote(str(systemctl_log))}; }}
+activate_proxy_config {shlex.quote(str(proxy))}
+"""
+            environment = dict(os.environ)
+            environment["NGINX_LOG"] = str(nginx_log)
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue(enabled.is_symlink())
+            self.assertEqual(proxy.resolve(), enabled.resolve())
+            self.assertEqual("-t\n", nginx_log.read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["enable nginx.service", "reload-or-restart nginx.service"],
+                systemctl_log.read_text(encoding="utf-8").splitlines(),
+            )
 
     def test_checksum_lookup_requires_an_exact_approved_version_and_architecture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

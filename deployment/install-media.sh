@@ -13,6 +13,8 @@ MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_BINARY=/usr/local/bin/mediamtx
 MEDIA_ARCHIVE_ROOT=/var/lib/gate-media/archives
+NGINX_BINARY=/usr/sbin/nginx
+NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
 SYSTEMD_ROOT=/etc/systemd/system
 PINNED_MEDIAMTX_VERSION=1.19.3
 SOURCE=
@@ -167,6 +169,24 @@ finally:
 PY
 }
 
+activate_proxy_config() {
+  local config=$1
+  local config_root=${NGINX_PROXY_CONFIG%/*}
+
+  [[ -f $config && ! -L $config ]] || fail "rendered WHEP proxy config must be regular"
+  [[ -x $NGINX_BINARY ]] || fail "nginx is not installed at $NGINX_BINARY"
+  [[ -d $config_root && ! -L $config_root ]] || fail "nginx config directory is invalid"
+  [[ ! -e $NGINX_PROXY_CONFIG || -L $NGINX_PROXY_CONFIG ]] \
+    || fail "$NGINX_PROXY_CONFIG is not a managed symlink"
+  ln -sfn -- "$config" "$NGINX_PROXY_CONFIG"
+  [[ -L $NGINX_PROXY_CONFIG \
+      && $(readlink -f "$NGINX_PROXY_CONFIG") == "$(readlink -f "$config")" ]] \
+    || fail "nginx WHEP proxy symlink could not be verified"
+  "$NGINX_BINARY" -t
+  systemctl enable nginx.service
+  systemctl reload-or-restart nginx.service
+}
+
 stage_mediamtx_archive() {
   local archive=$1
   local version=$2
@@ -281,7 +301,7 @@ main() {
   SOURCE=$(readlink -f "$SOURCE")
   [[ -d $SOURCE ]] || fail "source checkout does not exist"
 
-  for command in id install mktemp mv python3 readlink rm sha256sum \
+  for command in id install ln mktemp mv python3 readlink rm sha256sum \
     systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
@@ -302,8 +322,10 @@ main() {
   install_mediamtx_binary "$MEDIAMTX_ARCHIVE" "$MEDIAMTX_VERSION" "$CHECKSUM_MAP"
   systemd-tmpfiles --create "$MEDIA_TMPFILES"
   systemctl daemon-reload
+  activate_proxy_config "$MEDIA_PROXY_CONFIG"
   if media_environment_complete; then
-    systemctl enable --now gate-media-auth.service gate-media-gateway.service
+    systemctl enable gate-media-auth.service gate-media-gateway.service
+    systemctl restart gate-media-auth.service gate-media-gateway.service
   else
     disable_media_services
     printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
