@@ -1,5 +1,6 @@
 import unittest
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,11 @@ from gate_controller.store import LocalStore
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def create_store(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return LocalStore(Path(directory.name) / "gate.db")
+
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
             "sys.argv",
@@ -95,11 +101,7 @@ class MainConfigurationTests(unittest.TestCase):
         )
         for environment in configurations:
             with self.subTest(environment=environment):
-                store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-                self.addCleanup(
-                    lambda store=store: store.path.parent.exists()
-                    and __import__("shutil").rmtree(store.path.parent)
-                )
+                store = self.create_store()
 
                 with self.assertRaisesRegex(ValueError, "GATE_CLOUDFLARE"):
                     build_background_workers(
@@ -107,10 +109,7 @@ class MainConfigurationTests(unittest.TestCase):
                     )
 
     def test_cloudflare_configuration_builds_authorisation_status_and_outbox_workers(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         plates = store.path.parent / "plates.csv"
         plates.write_text("plate\n", encoding="utf-8")
         authorised = AuthorisedPlateCache(plates)
@@ -129,10 +128,7 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertEqual(0, status()["queue_depth"])
 
     def test_command_server_worker_uses_the_main_process_coordinator(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         coordinator = object()
 
         workers, _, _ = build_background_workers(
@@ -144,10 +140,7 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertIs(command_worker.executor.coordinator, coordinator)
 
     def test_active_legacy_supabase_configuration_fails_closed(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
 
         with self.assertRaisesRegex(ValueError, "legacy Supabase"):
             build_background_workers(store, relay=object(), environment={
@@ -156,10 +149,7 @@ class MainConfigurationTests(unittest.TestCase):
             })
 
     def test_configured_camera_upload_receiver_is_ready_before_the_first_vehicle(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         camera_directory = store.path.parent / "uploads"
         camera_directory.mkdir()
 
@@ -178,10 +168,7 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertNotIn("camera_available", snapshot)
 
     def test_camera_inactivity_does_not_make_the_upload_receiver_unready(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         now = datetime.now(timezone.utc)
         latest_image = {
             "path": "/var/lib/gate-controller/uploads/latest.jpg",
@@ -200,10 +187,7 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertFalse(snapshot["camera_upload_recent"])
 
     def test_recent_camera_upload_is_reported_as_activity(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         latest_image = {
             "path": "/var/lib/gate-controller/uploads/latest.jpg",
             "received_at": datetime.now(timezone.utc).isoformat(),
@@ -227,10 +211,7 @@ class MainConfigurationTests(unittest.TestCase):
                     "last_outcome_at": "2026-08-14T10:00:00+00:00",
                 }
 
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
 
         _, _, status = build_background_workers(
             store, relay=MeasuredRelay(), environment={}, latest_image={}
@@ -243,10 +224,7 @@ class MainConfigurationTests(unittest.TestCase):
         })
 
     def test_media_capabilities_are_best_effort_and_cannot_break_the_status_heartbeat(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
         malformed = store.path.parent / "capabilities.json"
         malformed.write_text("not-json", encoding="utf-8")
 
@@ -260,10 +238,7 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertEqual(0, status["queue_depth"])
 
     def test_outbox_url_requires_a_nonempty_bearer_token(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
 
         with self.assertRaisesRegex(ValueError, "GATE_OUTBOX_BEARER_TOKEN"):
             build_background_workers(store, relay=object(), environment={
@@ -272,10 +247,7 @@ class MainConfigurationTests(unittest.TestCase):
             })
 
     def test_outbox_rejects_plain_http_for_non_loopback_hosts(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
 
         with self.assertRaisesRegex(ValueError, "HTTPS"):
             build_background_workers(store, relay=object(), environment={
@@ -284,10 +256,7 @@ class MainConfigurationTests(unittest.TestCase):
             })
 
     def test_outbox_allows_authenticated_plain_http_on_loopback_for_local_testing(self):
-        store = LocalStore(Path(self.id().replace(".", "_")) / "gate.db")
-        self.addCleanup(
-            lambda: store.path.parent.exists() and __import__("shutil").rmtree(store.path.parent)
-        )
+        store = self.create_store()
 
         workers, _, _ = build_background_workers(store, relay=object(), environment={
             "GATE_OUTBOX_URL": "http://127.0.0.1:54321/events",
