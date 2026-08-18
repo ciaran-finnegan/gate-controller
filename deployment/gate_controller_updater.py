@@ -559,11 +559,17 @@ def _systemctl_is(state: str, service_name: str) -> bool:
     if completed.returncode == 0:
         return True
     result = (completed.stdout or "").strip().lower()
+    diagnostic = (completed.stderr or "").strip().lower()
     confirmed_not_present = {
         "is-enabled": {"disabled", "indirect", "masked", "not-found", "static"},
         "is-active": {"failed", "inactive", "not-found"},
     }
     if result in confirmed_not_present.get(state, set()):
+        return False
+    missing_unit_diagnostic = (
+        f"failed to get unit file state for {service_name}: no such file or directory"
+    )
+    if state == "is-enabled" and diagnostic == missing_unit_diagnostic:
         return False
     raise UpdateError(
         f"could not determine whether {service_name} is {state}: {result or 'unknown'}"
