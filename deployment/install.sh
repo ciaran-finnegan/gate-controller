@@ -252,6 +252,9 @@ configure_upload_directory() {
   usermod -aG "$app_group" "$ftp_user"
   install -d -o "$app_user" -g "$app_group" -m 0710 "$state_root"
   install -d -o "$ftp_user" -g "$app_group" -m 2770 "$upload_root"
+  chown -R "$ftp_user:$app_group" "$upload_root"
+  find "$upload_root" -type d -exec chmod g+rwx,g+s,o-rwx {} +
+  find "$upload_root" -type f -exec chmod g+rw,o-rwx {} +
   runuser --user "$ftp_user" -- /usr/bin/test -w "$upload_root" \
     || fail "$ftp_user cannot write $upload_root"
   runuser --user "$ftp_user" -- /usr/bin/test -x "$state_root" \
@@ -362,7 +365,7 @@ validate_env_file "$ENV_FILE" 0 0
 validate_upload_paths "$STATE_ROOT" "$UPLOAD_ROOT"
 
 for command in \
-  bash cat chmod chown env flock getent git id install ln mktemp mv python3 readlink \
+  bash cat chmod chown env find flock getent git id install ln mktemp mv python3 readlink \
   rm runuser sed sh sleep systemctl systemd-analyze tar /usr/bin/test useradd usermod; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done

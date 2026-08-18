@@ -23,14 +23,23 @@ from gate_controller.store import LocalStore
 from gate_controller.telemetry import EventTelemetry, StageDurations
 
 
+_DEFAULT_ACK = object()
+
+
 class FakeClient:
-    def __init__(self, *, json_response=None):
-        self.json_response = json_response
+    def __init__(self, *, json_response=_DEFAULT_ACK):
+        self.json_response = (
+            {"eventId": 7, "inserted": True}
+            if json_response is _DEFAULT_ACK
+            else json_response
+        )
         self.requests = []
 
-    def post_json(self, path, payload, *, headers=None):
+    def post_json(self, path, payload, *, headers=None, expect_json=False,
+                  max_response_bytes=None):
         self.requests.append(type("Request", (), {
             "path": path, "payload": payload, "headers": headers or {},
+            "expect_json": expect_json, "max_response_bytes": max_response_bytes,
         })())
         return self.json_response
 
@@ -368,12 +377,32 @@ class OutboxWorkerTests(unittest.TestCase):
             request.headers["Idempotency-Key"],
             hashlib.sha256(b"primary:7").hexdigest(),
         )
+        self.assertTrue(request.expect_json)
+        self.assertEqual(request.max_response_bytes, 4096)
         self.assertEqual(request.payload["image"]["sha256"], sha)
         self.assertEqual(request.payload["image"]["data_base64"], base64.b64encode(image).decode("ascii"))
 
+    def test_cloudflare_outbox_sender_requires_worker_ingest_acknowledgement(self):
+        invalid_acks = (
+            None,
+            {},
+            {"eventId": "7", "inserted": True},
+            {"eventId": 7},
+            {"eventId": 7, "inserted": "true"},
+        )
+        for ack in invalid_acks:
+            with self.subTest(ack=ack):
+                sender = CloudflareOutboxSender(
+                    FakeClient(json_response=ack), "primary",
+                )
+
+                with self.assertRaisesRegex(OutboxSyncError, "did not confirm ingest"):
+                    sender({"event_id": 7})
+
     def test_cloudflare_outbox_sender_translates_worker_http_failures(self):
         class FailingClient:
-            def post_json(self, path, payload, *, headers=None):
+            def post_json(self, path, payload, *, headers=None, expect_json=False,
+                          max_response_bytes=None):
                 raise requests.HTTPError("502 Server Error")
 
         sender = CloudflareOutboxSender(FailingClient(), "primary")

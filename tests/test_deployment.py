@@ -561,6 +561,12 @@ verify_candidate_release {shlex.quote(str(release))}
             root = Path(temporary_directory)
             state_root = root / "state"
             uploads = state_root / "uploads"
+            daily_uploads = uploads / "2026" / "08" / "18"
+            daily_uploads.mkdir(parents=True)
+            daily_uploads.chmod(0o2755)
+            stale_upload = daily_uploads / "old.jpg"
+            stale_upload.write_bytes(b"jpeg")
+            stale_upload.chmod(0o600)
             account_log = root / "accounts.log"
             command = f"""
 source deployment/install.sh
@@ -590,6 +596,9 @@ install() {{
 }}
 usermod() {{
   printf 'usermod %s\n' "$*" >> {shlex.quote(str(account_log))}
+}}
+chown() {{
+  printf 'chown %s\n' "$*" >> {shlex.quote(str(account_log))}
 }}
 runuser() {{
   local user=
@@ -626,9 +635,15 @@ configure_ftp_home ftp-user {shlex.quote(str(uploads))}
             self.assertTrue(uploads.is_dir())
             self.assertEqual(0o710, state_root.stat().st_mode & 0o7777)
             self.assertEqual(0o770, uploads.stat().st_mode & 0o777)
+            self.assertEqual(0o2770, daily_uploads.stat().st_mode & 0o7777)
+            self.assertEqual(0o660, stale_upload.stat().st_mode & 0o777)
             account_actions = account_log.read_text(encoding="utf-8")
             self.assertIn(
                 "install -d -o ftp-user -g gate-controller -m 2770",
+                account_actions,
+            )
+            self.assertIn(
+                f"chown -R ftp-user:gate-controller {uploads}",
                 account_actions,
             )
             self.assertIn("usermod -aG gate-controller ftp-user", account_actions)

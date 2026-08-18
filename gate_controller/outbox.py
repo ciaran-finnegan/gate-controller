@@ -148,15 +148,19 @@ class CloudflareOutboxSender:
     def __call__(self, payload: dict, evidence_bytes: bytes | None = None) -> None:
         transmitted = _prepare_outbox_payload(payload, self._controller_id, evidence_bytes)
         try:
-            self.client.post_json(
+            acknowledgement = self.client.post_json(
                 "/api/controller/events",
                 transmitted,
                 headers={"Idempotency-Key": _outbox_idempotency_key(transmitted)},
+                expect_json=True,
+                max_response_bytes=4096,
             )
         except requests.HTTPError as error:
             status_code = getattr(getattr(error, "response", None), "status_code", None)
             detail = status_code if isinstance(status_code, int) else "failure"
             raise OutboxSyncError(f"outbox endpoint returned HTTP {detail}") from error
+        if not _is_ingest_acknowledgement(acknowledgement):
+            raise OutboxSyncError("outbox endpoint did not confirm ingest")
 
 
 def _prepare_outbox_payload(payload: dict, controller_id: str,
@@ -188,6 +192,15 @@ def _outbox_idempotency_key(payload: dict) -> str:
     return hashlib.sha256(
         f"{payload['controller_id']}:{payload['event_id']}".encode("utf-8")
     ).hexdigest()
+
+
+def _is_ingest_acknowledgement(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("eventId"), int)
+        and not isinstance(value.get("eventId"), bool)
+        and isinstance(value.get("inserted"), bool)
+    )
 
 
 def _normalise_jpeg(path: Path) -> bytes | None:

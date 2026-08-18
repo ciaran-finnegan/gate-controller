@@ -47,16 +47,39 @@ class CloudflareServiceClient:
                 if callable(close):
                     close()
 
-    def post_json(self, path, payload, *, headers=None):
+    def post_json(
+        self,
+        path,
+        payload,
+        *,
+        headers=None,
+        expect_json=False,
+        max_response_bytes=64 * 1024,
+    ):
+        if expect_json and (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("Cloudflare response size limit must be a positive integer")
         response = self.session.post(
             self._service_url(path), headers=self._headers(headers),
             json=payload,
             timeout=self.timeout,
             allow_redirects=False,
+            stream=expect_json,
         )
-        self._raise_for_redirect(response)
-        response.raise_for_status()
-        return None
+        try:
+            self._raise_for_redirect(response)
+            response.raise_for_status()
+            if not expect_json:
+                return None
+            return json.loads(self._read_bounded(response, max_response_bytes))
+        finally:
+            if expect_json:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
 
     @staticmethod
     def _raise_for_redirect(response):

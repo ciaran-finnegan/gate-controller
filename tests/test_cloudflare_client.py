@@ -120,6 +120,34 @@ class CloudflareServiceClientTests(unittest.TestCase):
 
                 self.assertIsNone(client.post_json("/api/controller/status", {"ok": True}))
 
+    def test_post_json_can_require_a_bounded_json_acknowledgement(self):
+        response = RecordingResponse({"eventId": 42, "inserted": True})
+        session = RecordingSession(response)
+        client = CloudflareServiceClient(
+            "https://gate.example.com", "id", "secret", session=session,
+        )
+
+        result = client.post_json(
+            "/api/controller/events", {"event_id": 42},
+            expect_json=True, max_response_bytes=1024,
+        )
+
+        self.assertEqual(result, {"eventId": 42, "inserted": True})
+        self.assertTrue(session.requests[0].stream)
+
+    def test_required_post_json_ack_is_bounded_before_decode(self):
+        response = RecordingResponse(content=b'{"eventId":42,"inserted":true}' + b" " * 32)
+        client = CloudflareServiceClient(
+            "https://gate.example.com", "id", "secret",
+            session=RecordingSession(response),
+        )
+
+        with self.assertRaisesRegex(ValueError, "response size"):
+            client.post_json(
+                "/api/controller/events", {"event_id": 42},
+                expect_json=True, max_response_bytes=16,
+            )
+
     def test_bounded_get_rejects_response_before_json_decode(self):
         response = RecordingResponse(content=b'{"plates":[]}' + b" " * 32)
         client = CloudflareServiceClient(
