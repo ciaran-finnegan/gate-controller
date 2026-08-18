@@ -299,6 +299,13 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         )
         self.assertEqual("PYTHONPATH=/usr/local/lib/gate-media", gateway.get("Environment"))
 
+    def test_gateway_allows_netlink_only_for_interface_discovery(self):
+        auth = read_unit("deployment/systemd/gate-media-auth.service")
+        gateway = read_unit("deployment/systemd/gate-media-gateway.service")
+
+        self.assertIn("AF_NETLINK", shlex.split(gateway.get("RestrictAddressFamilies", "")))
+        self.assertNotIn("AF_NETLINK", shlex.split(auth.get("RestrictAddressFamilies", "")))
+
     def test_media_units_are_restricted_nonroot_and_cannot_access_gpio_or_controller_state(self):
         for relative_path, user in (
             ("deployment/systemd/gate-media-auth.service", "gate-media-auth"),
