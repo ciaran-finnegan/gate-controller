@@ -72,6 +72,19 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertNotIn("service: http://127.0.0.1:8889", config)
         self.assertRegex(config, r"- service: http_status:404\s*$")
 
+    def test_cloudflared_http2_transport_drop_in_is_managed_by_bootstrap(self):
+        drop_in = Path(
+            "deployment/systemd/cloudflared.service.d/20-http2.conf"
+        ).read_text(encoding="utf-8")
+        installer = Path("deployment/install.sh").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=http2\n",
+            drop_in,
+        )
+        self.assertIn("install_cloudflared_transport_drop_in", installer)
+        self.assertIn("cloudflared.service.d/20-http2.conf", installer)
+
     def test_command_server_is_owned_by_the_time_synchronised_main_service(self):
         unit = Path("file-monitor.service").read_text()
         installer = Path("deployment/install.sh").read_text()
@@ -244,12 +257,20 @@ install_fixed_trust_anchors \
             handoff = root / "handoff"
             systemd_root = root / "systemd"
             helper = root / "libexec/gate-controller-updater.py"
-            (source / "deployment/systemd").mkdir(parents=True)
+            (source / "deployment/systemd/cloudflared.service.d").mkdir(
+                parents=True
+            )
             systemd_root.mkdir()
             (source / "deployment/gate_controller_updater.py").write_text("trusted helper\n")
             (source / "file-monitor.service").write_text("trusted app\n")
             (source / "deployment/systemd/gate-controller-updater.service").write_text("trusted updater\n")
             (source / "deployment/systemd/gate-controller-updater.timer").write_text("trusted timer\n")
+            (
+                source
+                / "deployment/systemd/cloudflared.service.d/20-http2.conf"
+            ).write_text(
+                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=http2\n"
+            )
             command = f"""
 source deployment/install.sh
 install() {{

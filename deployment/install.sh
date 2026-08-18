@@ -10,6 +10,7 @@ LEGACY_COMMAND_UNIT=gate-command-server.service
 UPDATER_SERVICE=gate-controller-updater.service
 UPDATER_TIMER=gate-controller-updater.timer
 SYSTEMD_ROOT=/etc/systemd/system
+CLOUDFLARED_DROP_IN=cloudflared.service.d/20-http2.conf
 UPDATER_HELPER=/usr/local/libexec/gate-controller/gate-controller-updater.py
 MEDIA_BOOTSTRAP_ROOT=/usr/local/libexec/gate-media-bootstrap
 STATE_ROOT=/var/lib/gate-controller
@@ -122,7 +123,9 @@ create_fixed_trust_anchor_handoff() {
 
   [[ ! -e $handoff && ! -L $handoff ]] \
     || fail "trust-anchor handoff already exists: $handoff"
-  install -d -o root -g root -m 0700 "$handoff/deployment/systemd"
+  install -d -o root -g root -m 0700 \
+    "$handoff/deployment/systemd" \
+    "$handoff/deployment/systemd/cloudflared.service.d"
   install -o root -g root -m 0444 \
     "$source/deployment/gate_controller_updater.py" \
     "$handoff/deployment/gate_controller_updater.py"
@@ -134,7 +137,12 @@ create_fixed_trust_anchor_handoff() {
   install -o root -g root -m 0444 \
     "$source/deployment/systemd/$UPDATER_TIMER" \
     "$handoff/deployment/systemd/$UPDATER_TIMER"
-  chmod 0555 "$handoff" "$handoff/deployment" "$handoff/deployment/systemd"
+  install -o root -g root -m 0444 \
+    "$source/deployment/systemd/$CLOUDFLARED_DROP_IN" \
+    "$handoff/deployment/systemd/$CLOUDFLARED_DROP_IN"
+  chmod 0555 \
+    "$handoff" "$handoff/deployment" "$handoff/deployment/systemd" \
+    "$handoff/deployment/systemd/cloudflared.service.d"
 }
 
 publish_bootstrap_release() {
@@ -167,6 +175,19 @@ install_fixed_trust_anchors() {
   install -o root -g root -m 0644 \
     "$release/deployment/systemd/$UPDATER_TIMER" \
     "$systemd_root/$UPDATER_TIMER"
+}
+
+install_cloudflared_transport_drop_in() {
+  local source=$1
+  local systemd_root=$2
+  local source_path=$source/deployment/systemd/$CLOUDFLARED_DROP_IN
+  local destination_root=$systemd_root/cloudflared.service.d
+
+  [[ -f $source_path && ! -L $source_path ]] \
+    || fail "trusted cloudflared transport drop-in is missing"
+  install -d -o root -g root -m 0755 "$destination_root"
+  install -o root -g root -m 0644 \
+    "$source_path" "$systemd_root/$CLOUDFLARED_DROP_IN"
 }
 
 install_fixed_media_bootstrap() {
@@ -415,6 +436,8 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the updater service"
 [[ -f $SOURCE/deployment/systemd/$UPDATER_TIMER ]] \
   || fail "source does not contain the updater timer"
+[[ -f $SOURCE/deployment/systemd/$CLOUDFLARED_DROP_IN ]] \
+  || fail "source does not contain the cloudflared transport drop-in"
 [[ -f $SOURCE/deployment/install-media.sh ]] \
   || fail "source does not contain the media installer"
 [[ -f $SOURCE/deployment/media/mediamtx.yml ]] \
@@ -578,6 +601,7 @@ configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"
 systemctl disable --now "$LEGACY_COMMAND_UNIT" >/dev/null 2>&1 || true
 rm -f -- "$SYSTEMD_ROOT/$LEGACY_COMMAND_UNIT"
 install_fixed_trust_anchors "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT" "$UPDATER_HELPER"
+install_cloudflared_transport_drop_in "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT"
 install_fixed_media_bootstrap "$RELEASE"
 rm -f -- "$CURRENT_LINK.new"
 ln -s "$RELEASE" "$CURRENT_LINK.new"

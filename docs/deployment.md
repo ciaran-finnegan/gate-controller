@@ -190,6 +190,16 @@ Run `cloudflared` with the validated configuration through the operator-managed
 Cloudflare package/service workflow. Do not run Cloudflare account commands or
 create tunnel credentials from the controller installer.
 
+The managed systemd drop-in pins the tunnel transport to HTTP/2. This avoids
+the repeated QUIC idle disconnects observed on the gate network while keeping
+all four outbound tunnel connections encrypted. After bootstrap, confirm the
+effective setting and connection protocol:
+
+```sh
+sudo systemctl show cloudflared.service --property=Environment
+sudo journalctl -u cloudflared.service -n 100 --no-pager | grep 'protocol=http2'
+```
+
 ## Cloudflare Event Ingest And Retention
 
 The controller posts authorized-plate refreshes, heartbeats, and queued events
