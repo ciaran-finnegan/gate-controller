@@ -38,8 +38,6 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
-NoExecPaths=/
-ExecPaths=/usr/bin/python3
 
 [Install]
 WantedBy=multi-user.target

@@ -272,7 +272,10 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         proxy = path.read_text(encoding="utf-8")
 
         self.assertIn("location = /gate/whep", proxy)
-        self.assertRegex(proxy, r"location ~ \^/gate/whep/\[A-Za-z0-9_-\]")
+        self.assertIn(
+            'location ~ "^/gate/whep/[A-Za-z0-9_-]{1,128}$" {',
+            proxy,
+        )
         self.assertIn("__GATE_MEDIA_ALLOWED_ORIGIN__", proxy)
         self.assertIn("proxy_pass http://127.0.0.1:8889", proxy)
         self.assertNotRegex(proxy, r"location\s+/\s*\{[^}]*proxy_pass")
@@ -321,8 +324,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 self.assertTrue(any("/opt/gate-controller-deploy" in path for path in inaccessible))
                 self.assertIn("-/opt/gate-controller", inaccessible)
                 self.assertTrue(any("gpio" in path for path in inaccessible))
-                self.assertEqual("/", service.get("NoExecPaths"))
-                self.assertTrue(service.get("ExecPaths"))
+                self.assertNotIn("NoExecPaths", service)
+                self.assertNotIn("ExecPaths", service)
 
     def test_media_installer_uses_an_operator_approved_version_architecture_checksum_map(self):
         installer = (REPOSITORY_ROOT / "deployment/install-media.sh").read_text(encoding="utf-8")
