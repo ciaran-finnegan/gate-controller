@@ -71,6 +71,7 @@ class CloudflareServiceClientTests(unittest.TestCase):
         self.assertEqual(result, {"plates": []})
         self.assertEqual(session.requests[0].headers["CF-Access-Client-Id"], "client-id")
         self.assertEqual(session.requests[0].headers["CF-Access-Client-Secret"], "client-secret")
+        self.assertEqual(session.requests[0].headers["User-Agent"], "gate-controller/1")
         self.assertEqual(session.requests[0].timeout, (1, 2))
         self.assertFalse(session.requests[0].allow_redirects)
 

@@ -102,6 +102,7 @@ class CloudflareServiceClient:
         headers = {
             "CF-Access-Client-Id": self.client_id,
             "CF-Access-Client-Secret": self.client_secret,
+            "User-Agent": "gate-controller/1",
         }
         if additional_headers:
             headers.update(additional_headers)
