@@ -4,6 +4,8 @@ import unittest
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
+from time import monotonic
 from unittest.mock import patch
 from PIL import Image
 
@@ -1029,6 +1031,73 @@ class GateProcessorTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "decision_timeout")
         self.assertEqual(calls, [])
+
+    def test_blocked_ocr_returns_at_the_hard_decision_deadline_without_relay(self):
+        finished = Event()
+
+        class BlockingRecognizer:
+            def recognise(self, path, timeout=None):
+                try:
+                    Event().wait(0.4)
+                    return PlateObservation("12D3456", 0.99)
+                finally:
+                    finished.set()
+
+        relay_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "blocked.jpg")
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay(relay_calls),
+                BlockingRecognizer(),
+                decision_timeout=0.1,
+            )
+
+            started = monotonic()
+            result = processor.process((frame,))
+            elapsed = monotonic() - started
+
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(result.reason, "decision_timeout")
+        self.assertEqual(relay_calls, [])
+        self.assertTrue(finished.wait(0.5))
+
+    def test_timed_out_ocr_keeps_later_requests_out_of_the_shared_session(self):
+        release = Event()
+        finished = Event()
+
+        class BlockingRecognizer:
+            def __init__(self):
+                self.calls = []
+
+            def recognise(self, path, timeout=None):
+                self.calls.append(path)
+                try:
+                    release.wait(0.4)
+                    return PlateObservation(None, 0.0)
+                finally:
+                    finished.set()
+
+        recognizer = BlockingRecognizer()
+        relay_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._jpeg(directory, "first-blocked.jpg", 32)
+            second = self._jpeg(directory, "second-blocked.jpg", 224)
+            processor = self._processor(
+                LocalStore(root / "gate.db"), RecordingRelay(relay_calls), recognizer,
+                decision_timeout=0.1,
+            )
+
+            first_result = processor.process((first,))
+            second_result = processor.process((second,))
+            release.set()
+
+        self.assertEqual(first_result.reason, "decision_timeout")
+        self.assertEqual(second_result.reason, "ocr_error")
+        self.assertEqual(recognizer.calls, [first])
+        self.assertEqual(relay_calls, [])
+        self.assertTrue(finished.wait(0.5))
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)

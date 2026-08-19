@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Thread
 from time import monotonic
 
 from .actuation import ActuationCoordinator
@@ -40,6 +42,7 @@ class GateProcessor:
         )
         self._trace_factory = trace_factory or ProcessingTrace
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
+        self._ocr_slot = BoundedSemaphore(1)
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None) -> ProcessingResult:
@@ -282,15 +285,42 @@ class GateProcessor:
 
     def _recognise(self, path: Path, remaining: float, on_start=None):
         parameters = inspect.signature(self._recognizer.recognise).parameters
+        operation = lambda: self._recognizer.recognise(path)
         if "timeout" not in parameters:
-            if on_start is not None:
-                on_start()
-            return self._recognizer.recognise(path)
+            return self._run_ocr_bounded(operation, remaining, on_start)
         connect = min(1.0, max(0.1, remaining / 3))
         read = min(2.0, max(0.1, remaining - connect))
+        operation = lambda: self._recognizer.recognise(path, timeout=(connect, read))
+        return self._run_ocr_bounded(operation, remaining, on_start)
+
+    def _run_ocr_bounded(self, operation, remaining: float, on_start=None):
+        if not self._ocr_slot.acquire(blocking=False):
+            raise TimeoutError("previous OCR request is still running")
         if on_start is not None:
             on_start()
-        return self._recognizer.recognise(path, timeout=(connect, read))
+        result = Queue(maxsize=1)
+
+        def invoke():
+            try:
+                result.put((True, operation()))
+            except Exception as error:
+                result.put((False, error))
+            finally:
+                self._ocr_slot.release()
+
+        worker = Thread(target=invoke, name="gate-ocr-request", daemon=True)
+        try:
+            worker.start()
+        except BaseException:
+            self._ocr_slot.release()
+            raise
+        try:
+            succeeded, value = result.get(timeout=max(remaining, 0.0))
+        except Empty as error:
+            raise TimeoutError("OCR request exceeded the decision deadline") from error
+        if succeeded:
+            return value
+        raise value
 
 
 class _BestEffortTrace:
