@@ -653,6 +653,12 @@ pin_trusted_directory() {
     return 1
   fi
   case "$descriptor" in
+    17)
+      if ! exec 17<"$directory"; then
+        fail "could not pin trusted directory: $directory" || true
+        return 1
+      fi
+      ;;
     18)
       if ! exec 18<"$directory"; then
         fail "could not pin trusted directory: $directory" || true
@@ -673,6 +679,7 @@ pin_trusted_directory() {
 
   if python3 - "$directory" "$descriptor" <<'PY'
 import os
+import stat
 import sys
 
 directory = os.path.normpath(sys.argv[1])
@@ -694,6 +701,10 @@ try:
     walked = os.fstat(walk_descriptor)
     if (pinned.st_dev, pinned.st_ino) != (walked.st_dev, walked.st_ino):
         raise OSError("directory changed while its trusted chain was validated")
+    if pinned.st_uid != os.geteuid():
+        raise PermissionError("trusted directory is not owned by the executing uid")
+    if pinned.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError("trusted directory is group or world writable")
 finally:
     os.close(walk_descriptor)
 PY
@@ -702,11 +713,88 @@ PY
   fi
 
   case "$descriptor" in
+    17) exec 17<&- ;;
     18) exec 18<&- ;;
     19) exec 19<&- ;;
   esac
   fail "trusted directory chain is unsafe: $directory" || true
   return 1
+}
+
+create_trusted_fixed_media_directory() {
+  local parent_descriptor=$1
+  local name=$2
+
+  python3 - "$parent_descriptor" "$name" <<'PY'
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+name = sys.argv[2]
+if not name or name in (".", "..") or os.sep in name:
+    raise SystemExit("fixed media directory name is unsafe")
+os.mkdir(name, 0o755, dir_fd=parent_descriptor)
+descriptor = os.open(
+    name,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    dir_fd=parent_descriptor,
+)
+try:
+    metadata = os.fstat(descriptor)
+    if metadata.st_uid != os.geteuid():
+        raise PermissionError("created directory has an unexpected owner")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError("created directory is group or world writable")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.fsync(parent_descriptor)
+PY
+}
+
+pin_or_create_trusted_directory() {
+  local directory=$1
+  local descriptor=$2
+  local parent name kind
+
+  if [[ $directory == / ]]; then
+    pin_trusted_directory "$directory" "$descriptor"
+    return
+  fi
+  if [[ $directory != /* ]]; then
+    fail "trusted directory path must be absolute: $directory" || true
+    return 1
+  fi
+  parent=${directory%/*}
+  name=${directory##*/}
+  [[ -n $parent ]] || parent=/
+  if [[ -z $name ]]; then
+    fail "trusted directory path must name a directory: $directory" || true
+    return 1
+  fi
+
+  pin_trusted_directory "$parent" 17 || return 1
+  kind=$(fixed_media_path_kind 17 "$name") || return 1
+  case "$kind" in
+    absent)
+      if ! create_trusted_fixed_media_directory 17 "$name"; then
+        fail "could not securely create trusted directory: $directory" || true
+        return 1
+      fi
+      ;;
+    directory)
+      ;;
+    symlink)
+      fail "$directory must not be a symbolic link" || true
+      return 1
+      ;;
+    *)
+      fail "$directory must be a directory" || true
+      return 1
+      ;;
+  esac
+  pin_trusted_directory "$directory" "$descriptor"
 }
 
 publish_fixed_media_restore() {
@@ -795,6 +883,43 @@ os.fsync(parent_descriptor)
 PY
 }
 
+publish_fixed_media_absence() {
+  local parent_descriptor=$1
+  local live_name=$2
+  local quarantine_name=$3
+
+  python3 - "$parent_descriptor" "$live_name" "$quarantine_name" <<'PY'
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+live_name = sys.argv[2]
+quarantine_name = sys.argv[3]
+for name in (live_name, quarantine_name):
+    if not name or name in (".", "..") or os.sep in name:
+        raise SystemExit("fixed media absence name is unsafe")
+
+live = os.stat(live_name, dir_fd=parent_descriptor, follow_symlinks=False)
+if not stat.S_ISDIR(live.st_mode):
+    raise SystemExit("live fixed media bootstrap must be a directory")
+try:
+    os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    pass
+else:
+    raise SystemExit("fixed media quarantine already exists")
+
+os.rename(
+    live_name,
+    quarantine_name,
+    src_dir_fd=parent_descriptor,
+    dst_dir_fd=parent_descriptor,
+)
+os.fsync(parent_descriptor)
+PY
+}
+
 fixed_media_path_kind() {
   local parent_descriptor=$1
   local name=$2
@@ -842,8 +967,125 @@ descriptor = os.open(
     0o600,
     dir_fd=parent_descriptor,
 )
-os.close(descriptor)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.fsync(parent_descriptor)
 PY
+}
+
+fsync_fixed_media_tree() {
+  local parent_descriptor=$1
+  local name=$2
+
+  python3 - "$parent_descriptor" "$name" <<'PY'
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+name = sys.argv[2]
+if not name or name in (".", "..") or os.sep in name:
+    raise SystemExit("fixed media fsync name is unsafe")
+tree_descriptor = os.open(
+    name,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    dir_fd=parent_descriptor,
+)
+try:
+    for _, _, files, directory_descriptor in os.fwalk(
+        ".",
+        topdown=False,
+        follow_symlinks=False,
+        dir_fd=tree_descriptor,
+    ):
+        for filename in files:
+            metadata = os.stat(
+                filename,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            file_descriptor = os.open(
+                filename,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                opened = os.fstat(file_descriptor)
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise OSError("fixed media file changed while being synced")
+                os.fsync(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+        os.fsync(directory_descriptor)
+finally:
+    os.close(tree_descriptor)
+os.fsync(parent_descriptor)
+PY
+}
+
+list_fixed_media_stale_generations() {
+  local parent_descriptor=$1
+  local bootstrap_name=$2
+
+  python3 - "$parent_descriptor" "$bootstrap_name" <<'PY'
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+bootstrap_name = sys.argv[2]
+if not bootstrap_name or bootstrap_name in (".", "..") or os.sep in bootstrap_name:
+    raise SystemExit("fixed media bootstrap name is unsafe")
+prefixes = (
+    f"{bootstrap_name}.rollback.",
+    f"{bootstrap_name}.quarantine.",
+)
+generations = []
+with os.scandir(parent_descriptor) as entries:
+    for entry in entries:
+        for prefix in prefixes:
+            if entry.name.startswith(prefix):
+                suffix = entry.name[len(prefix):]
+                if suffix and suffix.isascii() and suffix.isdigit():
+                    generations.append(entry.name)
+                break
+for generation in generations:
+    metadata = os.stat(
+        generation,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"unsafe fixed media restore generation: {generation}")
+for generation in sorted(generations):
+    print(generation)
+PY
+}
+
+cleanup_stale_fixed_media_generations() {
+  local parent_descriptor=$1
+  local bootstrap_name=$2
+  local generations generation
+
+  generations=$(
+    list_fixed_media_stale_generations "$parent_descriptor" "$bootstrap_name"
+  ) || return 1
+  [[ -n $generations ]] || return 0
+  while IFS= read -r generation; do
+    if ! remove_fixed_media_tree "$parent_descriptor" "$generation"; then
+      fail "could not remove stale fixed media generation: $generation" || true
+      return 1
+    fi
+  done <<EOF
+$generations
+EOF
 }
 
 copy_fixed_media_tree_real() {
@@ -944,7 +1186,7 @@ copy_fixed_media_tree() {
   copy_fixed_media_tree_real "$@"
 }
 
-remove_fixed_media_tree() {
+remove_fixed_media_tree_real() {
   local parent_descriptor=$1
   local name=$2
 
@@ -971,7 +1213,16 @@ try:
 finally:
     os.fchdir(original_directory)
     os.close(original_directory)
+os.fsync(parent_descriptor)
 PY
+}
+
+remove_fixed_media_tree() {
+  remove_fixed_media_tree_real "$@"
+}
+
+remove_fixed_media_quarantine() {
+  remove_fixed_media_tree "$@"
 }
 
 backup_fixed_media_bootstrap() (
@@ -986,8 +1237,8 @@ backup_fixed_media_bootstrap() (
     return 1
   fi
   [[ -n $bootstrap_parent ]] || bootstrap_parent=/
-  pin_trusted_directory "$bootstrap_parent" 18 || return 1
   pin_trusted_directory "$backup_dir" 19 || return 1
+  pin_or_create_trusted_directory "$bootstrap_parent" 18 || return 1
   backup_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap) || return 1
   absent_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap.absent) \
     || return 1
@@ -1006,7 +1257,11 @@ backup_fixed_media_bootstrap() (
       fi
       ;;
     absent)
-      create_fixed_media_absent_marker 19 fixed-media-bootstrap.absent
+      if ! create_fixed_media_absent_marker \
+        19 fixed-media-bootstrap.absent; then
+        fail "could not record absence of the fixed media bootstrap" || true
+        return 1
+      fi
       ;;
     symlink)
       fail "$bootstrap_root must not be a symbolic link" || true
@@ -1025,6 +1280,7 @@ restore_fixed_media_bootstrap() (
   local bootstrap_parent=${bootstrap_root%/*}
   local bootstrap_name=${bootstrap_root##*/}
   local temporary_name=$bootstrap_name.rollback.$$
+  local quarantine_name=$bootstrap_name.quarantine.$$
   local bootstrap_kind backup_kind absent_kind temporary_kind
 
   if [[ $bootstrap_root != /* || $bootstrap_root == / || -z $bootstrap_name ]]; then
@@ -1032,8 +1288,8 @@ restore_fixed_media_bootstrap() (
     return 1
   fi
   [[ -n $bootstrap_parent ]] || bootstrap_parent=/
-  pin_trusted_directory "$bootstrap_parent" 18 || return 1
   pin_trusted_directory "$backup_dir" 19 || return 1
+  pin_trusted_directory "$bootstrap_parent" 18 || return 1
   bootstrap_kind=$(fixed_media_path_kind 18 "$bootstrap_name") || return 1
   if [[ $bootstrap_kind == symlink ]]; then
     fail "$bootstrap_root must not be a symbolic link" || true
@@ -1041,11 +1297,6 @@ restore_fixed_media_bootstrap() (
   fi
   if [[ $bootstrap_kind != absent && $bootstrap_kind != directory ]]; then
     fail "$bootstrap_root must be a directory" || true
-    return 1
-  fi
-  temporary_kind=$(fixed_media_path_kind 18 "$temporary_name") || return 1
-  if [[ $temporary_kind != absent ]]; then
-    fail "fixed media bootstrap restore path already exists" || true
     return 1
   fi
   backup_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap) || return 1
@@ -1060,10 +1311,33 @@ restore_fixed_media_bootstrap() (
       fail "fixed media bootstrap backup state is ambiguous" || true
       return 1
     fi
+  elif [[ $absent_kind != file ]]; then
+    fail "fixed media bootstrap backup is missing" || true
+    return 1
+  fi
+
+  cleanup_stale_fixed_media_generations 18 "$bootstrap_name" || return 1
+  bootstrap_kind=$(fixed_media_path_kind 18 "$bootstrap_name") || return 1
+  if [[ $bootstrap_kind != absent && $bootstrap_kind != directory ]]; then
+    fail "$bootstrap_root must be a directory" || true
+    return 1
+  fi
+
+  if [[ $backup_kind != absent ]]; then
+    temporary_kind=$(fixed_media_path_kind 18 "$temporary_name") || return 1
+    if [[ $temporary_kind != absent ]]; then
+      fail "fixed media bootstrap restore path already exists" || true
+      return 1
+    fi
     if ! copy_fixed_media_tree \
       19 fixed-media-bootstrap 18 "$temporary_name"; then
       remove_fixed_media_tree 18 "$temporary_name" || true
       fail "could not copy the fixed media bootstrap backup" || true
+      return 1
+    fi
+    if ! fsync_fixed_media_tree 18 "$temporary_name"; then
+      remove_fixed_media_tree 18 "$temporary_name" || true
+      fail "could not durably stage the fixed media bootstrap restore" || true
       return 1
     fi
     if ! publish_fixed_media_restore 18 "$bootstrap_name" "$temporary_name"; then
@@ -1078,15 +1352,17 @@ restore_fixed_media_bootstrap() (
       fail "could not remove the replaced fixed media bootstrap" || true
       return 1
     fi
-  elif [[ $absent_kind == file ]]; then
-    if [[ $bootstrap_kind == directory ]] \
-      && ! remove_fixed_media_tree 18 "$bootstrap_name"; then
-      fail "could not restore absence of the fixed media bootstrap" || true
+  elif [[ $bootstrap_kind == directory ]]; then
+    if ! publish_fixed_media_absence \
+      18 "$bootstrap_name" "$quarantine_name"; then
+      fail "could not atomically publish fixed media bootstrap absence" \
+        || true
       return 1
     fi
-  else
-    fail "fixed media bootstrap backup is missing" || true
-    return 1
+    if ! remove_fixed_media_quarantine 18 "$quarantine_name"; then
+      fail "could not remove the quarantined fixed media bootstrap" || true
+      return 1
+    fi
   fi
 )
 

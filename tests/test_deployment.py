@@ -1,4 +1,5 @@
 import configparser
+import os
 import re
 import shlex
 import shutil
@@ -540,6 +541,34 @@ printf 'status=%s\\n' "$status"
             self.assertEqual("status=1\n", completed.stdout)
             self.assertIn("must be a regular file", completed.stderr)
 
+    def test_fixed_media_backup_records_absence_when_parent_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap_parent = root / "libexec"
+            bootstrap = bootstrap_parent / "gate-media-bootstrap"
+            backup = root / "backup"
+            backup.mkdir()
+
+            command = f"""
+source deployment/install.sh
+backup_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue((backup / "fixed-media-bootstrap.absent").is_file())
+            self.assertTrue(bootstrap_parent.is_dir())
+            self.assertEqual(os.geteuid(), bootstrap_parent.stat().st_uid)
+            self.assertEqual(0, bootstrap_parent.stat().st_mode & 0o022)
+
     def test_fixed_media_bootstrap_restore_reinstates_the_exact_prior_tree(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve()
@@ -619,6 +648,304 @@ printf 'status=%s\\n' "$status"
                 (bootstrap / "live-candidate").read_text(encoding="utf-8"),
             )
             self.assertFalse((bootstrap / "restored").exists())
+
+    def test_fixed_media_absence_interruption_retains_renamed_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            bootstrap.mkdir()
+            backup.mkdir()
+            (bootstrap / "live-candidate").write_text(
+                "candidate retained in quarantine\n", encoding="utf-8"
+            )
+            (backup / "fixed-media-bootstrap.absent").touch()
+            command = f"""
+source deployment/install.sh
+publish_fixed_media_absence() {{
+  python3 - "$@" <<'PY'
+import os
+import sys
+
+parent_descriptor = int(sys.argv[1])
+os.rename(
+    sys.argv[2],
+    sys.argv[3],
+    src_dir_fd=parent_descriptor,
+    dst_dir_fd=parent_descriptor,
+)
+PY
+  return 23
+}}
+set +e
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertFalse(bootstrap.exists())
+            quarantines = list(root.glob("gate-media-bootstrap.quarantine.*"))
+            self.assertEqual(1, len(quarantines))
+            self.assertEqual(
+                "candidate retained in quarantine\n",
+                (quarantines[0] / "live-candidate").read_text(encoding="utf-8"),
+            )
+
+    def test_fixed_media_absence_removal_failure_retains_durable_quarantine(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            bootstrap.mkdir()
+            backup.mkdir()
+            (bootstrap / "live-candidate").write_text(
+                "candidate retained in quarantine\n", encoding="utf-8"
+            )
+            (backup / "fixed-media-bootstrap.absent").touch()
+            command = f"""
+source deployment/install.sh
+remove_fixed_media_quarantine() {{ return 29; }}
+set +e
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertFalse(bootstrap.exists())
+            quarantines = list(root.glob("gate-media-bootstrap.quarantine.*"))
+            self.assertEqual(1, len(quarantines))
+            self.assertEqual(
+                "candidate retained in quarantine\n",
+                (quarantines[0] / "live-candidate").read_text(encoding="utf-8"),
+            )
+
+    def test_fixed_media_restore_requires_staged_tree_fsync_before_publish(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            actions = root / "actions"
+            bootstrap.mkdir()
+            (backup / "fixed-media-bootstrap/nested").mkdir(parents=True)
+            (bootstrap / "live-candidate").write_text(
+                "candidate remains available\n", encoding="utf-8"
+            )
+            (backup / "fixed-media-bootstrap/nested/restored").write_text(
+                "previous bootstrap\n", encoding="utf-8"
+            )
+            command = f"""
+source deployment/install.sh
+fsync_fixed_media_tree() {{
+  printf 'fsync %s\n' "$2" >>{shlex.quote(str(actions))}
+  return 31
+}}
+publish_fixed_media_restore() {{
+  printf 'publish\n' >>{shlex.quote(str(actions))}
+}}
+set +e
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertEqual(
+                ["fsync gate-media-bootstrap.rollback."],
+                [
+                    re.sub(r"\d+$", "", line)
+                    for line in actions.read_text().splitlines()
+                ],
+            )
+            self.assertEqual(
+                "candidate remains available\n",
+                (bootstrap / "live-candidate").read_text(encoding="utf-8"),
+            )
+
+    def test_fixed_media_restore_cleans_stale_generations(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            stale_rollback = root / "gate-media-bootstrap.rollback.111"
+            stale_quarantine = root / "gate-media-bootstrap.quarantine.222"
+            bootstrap.mkdir()
+            (backup / "fixed-media-bootstrap").mkdir(parents=True)
+            stale_rollback.mkdir()
+            stale_quarantine.mkdir()
+            (bootstrap / "candidate").write_text("candidate\n", encoding="utf-8")
+            (backup / "fixed-media-bootstrap/previous").write_text(
+                "previous bootstrap\n", encoding="utf-8"
+            )
+            (stale_rollback / "stale").write_text("stale\n", encoding="utf-8")
+            (stale_quarantine / "stale").write_text("stale\n", encoding="utf-8")
+            command = f"""
+source deployment/install.sh
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertFalse(stale_rollback.exists())
+            self.assertFalse(stale_quarantine.exists())
+            self.assertEqual(
+                "previous bootstrap\n",
+                (bootstrap / "previous").read_text(encoding="utf-8"),
+            )
+
+    def test_fixed_media_restore_rejects_unsafe_stale_generation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            sentinel = root / "sentinel"
+            stale = root / "gate-media-bootstrap.rollback.111"
+            bootstrap.mkdir()
+            (backup / "fixed-media-bootstrap").mkdir(parents=True)
+            sentinel.write_text("sentinel unchanged\n", encoding="utf-8")
+            stale.symlink_to(sentinel)
+            (bootstrap / "candidate").write_text("candidate\n", encoding="utf-8")
+            command = f"""
+source deployment/install.sh
+set +e
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertTrue(stale.is_symlink())
+            self.assertEqual("sentinel unchanged\n", sentinel.read_text())
+            self.assertEqual("candidate\n", (bootstrap / "candidate").read_text())
+
+    def test_fixed_media_backup_rejects_writable_parent_before_child_swap(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap_parent = root / "libexec"
+            bootstrap = bootstrap_parent / "gate-media-bootstrap"
+            original = bootstrap_parent / "trusted-original"
+            attacker = bootstrap_parent / "attacker-bootstrap"
+            backup = root / "backup"
+            hook_called = root / "hook-called"
+            bootstrap.mkdir(parents=True)
+            attacker.mkdir()
+            backup.mkdir()
+            bootstrap_parent.chmod(0o777)
+            (bootstrap / "identity").write_text("trusted tree\n", encoding="utf-8")
+            (attacker / "identity").write_text("attacker tree\n", encoding="utf-8")
+            command = f"""
+source deployment/install.sh
+copy_fixed_media_tree() {{
+  : >{shlex.quote(str(hook_called))}
+  command mv {shlex.quote(str(bootstrap))} {shlex.quote(str(original))}
+  command mv {shlex.quote(str(attacker))} {shlex.quote(str(bootstrap))}
+  copy_fixed_media_tree_real "$@"
+}}
+set +e
+backup_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertFalse(hook_called.exists())
+            self.assertEqual("trusted tree\n", (bootstrap / "identity").read_text())
+            self.assertFalse((backup / "fixed-media-bootstrap").exists())
+
+    def test_fixed_media_backup_rejects_writable_backup_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            bootstrap.mkdir()
+            backup.mkdir()
+            backup.chmod(0o777)
+            (bootstrap / "identity").write_text("trusted tree\n", encoding="utf-8")
+            command = f"""
+source deployment/install.sh
+set +e
+backup_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertFalse((backup / "fixed-media-bootstrap").exists())
 
     def test_fixed_media_backup_and_restore_reject_symlinked_parent(self):
         for operation in ("backup", "restore"):
