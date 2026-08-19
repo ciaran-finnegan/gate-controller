@@ -1736,6 +1736,8 @@ class GateProcessorTests(unittest.TestCase):
 
     def test_timed_out_ocr_cleanup_is_bounded_when_abandon_hangs(self):
         release = Event()
+        abandon_started = Event()
+        processing_completed = Event()
 
         class BlockingCleanupRecognizer:
             def recognise(self, path, timeout=None):
@@ -1743,9 +1745,11 @@ class GateProcessorTests(unittest.TestCase):
                 return PlateObservation(None, 0.0)
 
             def abandon_in_flight(self):
+                abandon_started.set()
                 release.wait(2)
                 return False
 
+        results = []
         try:
             with tempfile.TemporaryDirectory() as directory:
                 processor = self._processor(
@@ -1753,14 +1757,28 @@ class GateProcessorTests(unittest.TestCase):
                     BlockingCleanupRecognizer(), decision_timeout=0.02,
                 )
 
-                started = monotonic()
-                result = processor.process((self._jpeg(directory, "cleanup-hung.jpg"),))
-                elapsed = monotonic() - started
+                def process_timed_out_request():
+                    try:
+                        results.append(processor.process(
+                            (self._jpeg(directory, "cleanup-hung.jpg"),)
+                        ))
+                    finally:
+                        processing_completed.set()
 
-            self.assertEqual(result.reason, "decision_timeout")
-            self.assertLess(elapsed, 0.25)
+                worker = Thread(target=process_timed_out_request, daemon=True)
+                worker.start()
+                self.assertTrue(abandon_started.wait(1.0))
+                self.assertTrue(processing_completed.wait(1.0))
+                self.assertFalse(release.is_set())
+
+            self.assertEqual(results[0].reason, "decision_timeout")
         finally:
             release.set()
+            processing_completed.wait(2.0)
+            if "worker" in locals():
+                worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
