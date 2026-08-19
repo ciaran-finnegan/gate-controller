@@ -207,13 +207,43 @@ disable_turn_refresh_timer() {
   systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 || true
 }
 
-quiesce_turn_refresh() {
-  local inactive_status
+turn_refresh_unit_is_installed() {
+  local unit=$1
+  local status
 
-  if ! systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER"; then
+  if systemctl cat "$unit" >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ $status -eq 5 ]] && return 1
+  fail "TURN refresh unit presence could not be determined: $unit"
+  return 2
+}
+
+quiesce_turn_refresh() {
+  local inactive_status status
+  local timer_installed=0
+  local service_installed=0
+
+  if turn_refresh_unit_is_installed "$MEDIA_TURN_REFRESH_TIMER"; then
+    timer_installed=1
+  else
+    status=$?
+    [[ $status -eq 1 ]] || return "$status"
+  fi
+  if turn_refresh_unit_is_installed "$MEDIA_TURN_REFRESH_SERVICE"; then
+    service_installed=1
+  else
+    status=$?
+    [[ $status -eq 1 ]] || return "$status"
+  fi
+
+  if [[ $timer_installed -eq 1 ]] && ! systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER"; then
     fail "TURN refresh timer could not be disabled"
     return 1
   fi
+  [[ $service_installed -eq 1 ]] || return 0
   if ! systemctl stop "$MEDIA_TURN_REFRESH_SERVICE"; then
     fail "TURN refresh service could not be stopped"
     return 1

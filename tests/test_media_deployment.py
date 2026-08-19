@@ -533,6 +533,8 @@ exit "$failed"
             self.assertTrue(acquired.is_file())
             self.assertEqual(
                 [
+                    "cat gate-media-turn-refresh.timer",
+                    "cat gate-media-turn-refresh.service",
                     "disable --now gate-media-turn-refresh.timer",
                     "stop gate-media-turn-refresh.service",
                     "is-active --quiet gate-media-turn-refresh.service",
@@ -646,7 +648,7 @@ on_media_install_failure
                 log.read_text(encoding="utf-8").splitlines(),
             )
 
-    def test_media_install_aborts_and_cleans_up_when_legacy_turn_refresh_stop_fails(self):
+    def test_media_install_prepares_when_turn_refresh_units_are_not_installed(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             state = root / "state"
@@ -659,9 +661,47 @@ MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
 flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
 systemctl() {{
   printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == cat ]] && return 5
+  return 99
+}}
+prepare_turn_refresh_install
+release_turn_refresh_install_lock
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl cat gate-media-turn-refresh.timer",
+                    "systemctl cat gate-media-turn-refresh.service",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_aborts_and_cleans_up_when_an_installed_turn_refresh_service_stop_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ "$*" == 'cat gate-media-turn-refresh.timer' ]] && return 0
+  [[ "$*" == 'cat gate-media-turn-refresh.service' ]] && return 0
+  [[ "$*" == 'disable --now gate-media-turn-refresh.timer' ]] && return 0
   [[ "$*" == 'stop gate-media-turn-refresh.service' ]] && return 1
-  [[ "$*" == 'is-active --quiet gate-media-turn-refresh.service' ]] && return 3
-  return 0
+  return 99
 }}
 if prepare_turn_refresh_install; then exit 1; fi
 on_media_install_failure
@@ -676,6 +716,8 @@ on_media_install_failure
             self.assertEqual(
                 [
                     "flock 9",
+                    "systemctl cat gate-media-turn-refresh.timer",
+                    "systemctl cat gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-transcoder.service "
@@ -716,6 +758,8 @@ on_media_install_failure
             self.assertEqual(
                 [
                     "flock 9",
+                    "systemctl cat gate-media-turn-refresh.timer",
+                    "systemctl cat gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
                     "systemctl is-active --quiet gate-media-turn-refresh.service",
