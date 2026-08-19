@@ -123,13 +123,57 @@ class OcrClientTests(unittest.TestCase):
         )
         client = PlateRecognizerClient("token", session=original)
 
-        client.abandon_in_flight()
+        cancelled = client.abandon_in_flight()
         with patch.object(client, "_create_session", return_value=replacement):
             client.recognise(self.path)
 
         self.assertEqual(original.calls, [])
         self.assertTrue(original.closed)
+        self.assertFalse(cancelled)
         self.assertEqual(len(replacement.calls), 1)
+
+    def test_close_during_session_creation_never_posts_and_closes_late_session(self):
+        creating = Event()
+        release = Event()
+        late = FakeSession(
+            response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
+        )
+        errors = []
+        client = PlateRecognizerClient("token")
+
+        def create_session():
+            creating.set()
+            release.wait(0.5)
+            return late
+
+        def recognise():
+            try:
+                client.recognise(self.path)
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(client, "_create_session", side_effect=create_session):
+            worker = Thread(target=recognise, daemon=True)
+            worker.start()
+            self.assertTrue(creating.wait(0.5))
+            client.close()
+            release.set()
+            worker.join(0.5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(late.calls, [])
+        self.assertTrue(late.closed)
+        self.assertEqual(len(errors), 1)
+
+    def test_closed_client_never_creates_a_new_session(self):
+        client = PlateRecognizerClient("token", session=FakeSession())
+        client.close()
+
+        with patch.object(client, "_create_session") as create_session:
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                client.recognise(self.path)
+
+        create_session.assert_not_called()
 
     def test_late_session_creation_cannot_replace_the_fresh_generation(self):
         creating_first = Event()
@@ -141,6 +185,7 @@ class OcrClientTests(unittest.TestCase):
             response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
         )
         sessions = iter((obsolete, replacement))
+        errors = []
 
         def create_session():
             session = next(sessions)
@@ -149,9 +194,15 @@ class OcrClientTests(unittest.TestCase):
                 release_first.wait(0.5)
             return session
 
+        def recognise_first():
+            try:
+                client.recognise(self.path)
+            except Exception as error:
+                errors.append(error)
+
         client = PlateRecognizerClient("token")
         with patch.object(client, "_create_session", side_effect=create_session):
-            first = Thread(target=client.recognise, args=(self.path,), daemon=True)
+            first = Thread(target=recognise_first, daemon=True)
             first.start()
             self.assertTrue(creating_first.wait(0.5))
             client.abandon_in_flight()
@@ -161,8 +212,10 @@ class OcrClientTests(unittest.TestCase):
 
         self.assertFalse(first.is_alive())
         self.assertIs(client._session, replacement)
-        self.assertEqual(len(obsolete.calls), 1)
+        self.assertEqual(obsolete.calls, [])
+        self.assertTrue(obsolete.closed)
         self.assertEqual(len(replacement.calls), 1)
+        self.assertEqual(len(errors), 1)
 
     def test_rejects_confidence_outside_the_closed_zero_to_one_range(self):
         for score in (-0.01, 1.01, nan, inf, -inf):

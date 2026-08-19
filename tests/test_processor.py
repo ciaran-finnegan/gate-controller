@@ -1289,16 +1289,19 @@ class GateProcessorTests(unittest.TestCase):
 
     def test_deadline_check_follows_all_final_validation_before_gpio(self):
         decision_clock = MutableClock()
-        normalization_calls = 0
         original_normalise = processor_module.normalise_plate
+        authorisation_checks = 0
+
+        def authorised():
+            nonlocal authorisation_checks
+            authorisation_checks += 1
+            if authorisation_checks == 3:
+                decision_clock.value = 3.999
+            return {"12D 3456"}
 
         def delayed_normalise(value):
-            nonlocal normalization_calls
-            normalization_calls += 1
             result = original_normalise(value)
-            if normalization_calls == 3:
-                decision_clock.value = 3.999
-            elif normalization_calls == 4:
+            if authorisation_checks == 3 and value == "12D3456":
                 decision_clock.value = 4.001
             return result
 
@@ -1325,7 +1328,7 @@ class GateProcessorTests(unittest.TestCase):
                 recognizer=SequenceRecognizer([PlateObservation("12D3456", 0.99)]),
                 store=LocalStore(Path(directory) / "gate.db"),
                 relay=relay,
-                authorised={"12D3456"},
+                authorised=authorised,
                 decision_timeout=4.0,
                 decision_clock=decision_clock,
                 clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
@@ -1418,6 +1421,59 @@ class GateProcessorTests(unittest.TestCase):
 
         self.assertTrue(recognizer.closed)
         self.assertTrue(finished.wait(0.5))
+
+    def test_processor_close_is_bounded_when_recognizer_close_hangs(self):
+        release = Event()
+
+        class BlockingCloseRecognizer:
+            def recognise(self, path, timeout=None):
+                return PlateObservation(None, 0.0)
+
+            def close(self):
+                release.wait(2)
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                processor = self._processor(
+                    LocalStore(Path(directory) / "gate.db"), RecordingRelay([]),
+                    BlockingCloseRecognizer(),
+                )
+
+                started = monotonic()
+                processor.close()
+                elapsed = monotonic() - started
+
+            self.assertLess(elapsed, 0.7)
+        finally:
+            release.set()
+
+    def test_timed_out_ocr_cleanup_is_bounded_when_abandon_hangs(self):
+        release = Event()
+
+        class BlockingCleanupRecognizer:
+            def recognise(self, path, timeout=None):
+                release.wait(2)
+                return PlateObservation(None, 0.0)
+
+            def abandon_in_flight(self):
+                release.wait(2)
+                return False
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                processor = self._processor(
+                    LocalStore(Path(directory) / "gate.db"), RecordingRelay([]),
+                    BlockingCleanupRecognizer(), decision_timeout=0.02,
+                )
+
+                started = monotonic()
+                result = processor.process((self._jpeg(directory, "cleanup-hung.jpg"),))
+                elapsed = monotonic() - started
+
+            self.assertEqual(result.reason, "decision_timeout")
+            self.assertLess(elapsed, 0.25)
+        finally:
+            release.set()
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)

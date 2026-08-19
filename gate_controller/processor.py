@@ -385,11 +385,20 @@ class GateProcessor:
         abandon = getattr(self._recognizer, "abandon_in_flight", None)
         if not callable(abandon):
             return
-        try:
-            cancelled = abandon() is True
-        except Exception:
-            return
-        if cancelled:
+        outcome = []
+
+        def abandon_recognizer():
+            try:
+                outcome.append(abandon() is True)
+            except Exception:
+                outcome.append(False)
+
+        cleanup = Thread(
+            target=abandon_recognizer, name="gate-ocr-abandon", daemon=True,
+        )
+        cleanup.start()
+        cleanup.join(0.05)
+        if not cleanup.is_alive() and outcome and outcome[0]:
             worker.join(0.5)
         with self._ocr_slot_lock:
             if self._ocr_worker is worker and not worker.is_alive():
@@ -397,16 +406,25 @@ class GateProcessor:
 
     def close(self) -> None:
         with self._ocr_slot_lock:
+            if self._closed:
+                return
             self._closed = True
             worker = self._ocr_worker
         close = getattr(self._recognizer, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+            def close_recognizer():
+                try:
+                    close()
+                except Exception:
+                    pass
+
+            cleanup = Thread(
+                target=close_recognizer, name="gate-ocr-close", daemon=True,
+            )
+            cleanup.start()
+            cleanup.join(0.5)
         if worker is not None:
-            worker.join(1.0)
+            worker.join(0.5)
             with self._ocr_slot_lock:
                 if self._ocr_worker is worker and not worker.is_alive():
                     self._ocr_worker = None
