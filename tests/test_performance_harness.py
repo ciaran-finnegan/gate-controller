@@ -154,18 +154,41 @@ class PerformanceHarnessTests(unittest.TestCase):
             proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
             proxy_thread.start()
             proxy_url = f"http://127.0.0.1:{proxy.server_port}"
-            try:
-                with mock.patch.dict(os.environ, {
+            proxy_environments = {
+                "uppercase": {
                     "HTTP_PROXY": proxy_url,
                     "HTTPS_PROXY": proxy_url,
-                }, clear=True):
-                    harness = load_harness()
-                    harness.measure_request(harness.PATHS_URL, timeout_seconds=0.5)
+                },
+                "lowercase": {
+                    "http_proxy": proxy_url,
+                    "https_proxy": proxy_url,
+                },
+                "mixed_case": {
+                    "HtTp_PrOxY": proxy_url,
+                    "hTtPs_PrOxY": proxy_url,
+                },
+                "conflicting_upper_lower": {
+                    "HTTP_PROXY": "http://127.0.0.1:1",
+                    "HTTPS_PROXY": "http://127.0.0.1:1",
+                    "http_proxy": proxy_url,
+                    "https_proxy": proxy_url,
+                },
+            }
+            try:
+                for environment_name, proxy_environment in proxy_environments.items():
+                    with self.subTest(proxy_environment=environment_name):
+                        proxy_requests.clear()
+                        with mock.patch.dict(
+                            os.environ, proxy_environment, clear=True
+                        ):
+                            harness = load_harness()
+                            harness.measure_request(
+                                harness.PATHS_URL, timeout_seconds=0.5
+                            )
+                        self.assertEqual([], proxy_requests)
             finally:
                 proxy.shutdown()
                 proxy_thread.join(timeout=1)
-
-        self.assertEqual([], proxy_requests)
 
     def test_harness_artifacts_do_not_reference_the_command_endpoint(self):
         plan = (
