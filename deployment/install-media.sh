@@ -203,9 +203,31 @@ activate_media_services() {
 }
 
 disable_turn_refresh_timer() {
-  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" "$MEDIA_TURN_REFRESH_SERVICE" \
-    >/dev/null 2>&1 || true
+  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 || true
   systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 || true
+}
+
+quiesce_turn_refresh() {
+  local inactive_status
+
+  if ! systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER"; then
+    fail "TURN refresh timer could not be disabled"
+    return 1
+  fi
+  if ! systemctl stop "$MEDIA_TURN_REFRESH_SERVICE"; then
+    fail "TURN refresh service could not be stopped"
+    return 1
+  fi
+  if systemctl is-active --quiet "$MEDIA_TURN_REFRESH_SERVICE"; then
+    fail "TURN refresh service remains active"
+    return 1
+  else
+    inactive_status=$?
+  fi
+  if [[ $inactive_status -ne 3 ]]; then
+    fail "TURN refresh service inactivity could not be confirmed"
+    return 1
+  fi
 }
 
 acquire_turn_refresh_install_lock() {
@@ -245,7 +267,7 @@ release_turn_refresh_install_lock() {
 
 prepare_turn_refresh_install() {
   acquire_turn_refresh_install_lock
-  disable_turn_refresh_timer
+  quiesce_turn_refresh
 }
 
 turn_refresh_environment_configured() {
@@ -286,8 +308,8 @@ cleanup_media_install() {
 }
 
 finish_media_install() {
+  configure_turn_refresh_timer || return 1
   cleanup_media_install
-  configure_turn_refresh_timer
 }
 
 on_media_install_failure() {

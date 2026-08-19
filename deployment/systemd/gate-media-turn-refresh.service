@@ -8,7 +8,7 @@ Type=oneshot
 User=root
 Group=root
 Environment=PYTHONPATH=/usr/local/lib/gate-media
-ExecStart=/usr/bin/flock --nonblock /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
+ExecStart=/usr/bin/flock --wait 10 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
 TimeoutStartSec=150s
 UMask=0077
 StateDirectory=gate-media
