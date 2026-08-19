@@ -310,6 +310,29 @@ install_fixed_trust_anchors \
             ).write_text(
                 "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n"
             )
+            for relative_path in (
+                "deployment/install-media.sh",
+                "deployment/media/mediamtx.yml",
+                "deployment/media/nginx-whep-locations.conf.template",
+                "deployment/systemd/gate-media-auth.service",
+                "deployment/systemd/gate-media-gateway.service",
+                "deployment/systemd/gate-media-transcoder.service",
+                "deployment/systemd/gate-media-turn-refresh.service",
+                "deployment/systemd/gate-media-turn-refresh.timer",
+                "deployment/gate_media_turn_refresh.py",
+                "gate_media_config.py",
+                "gate_media_auth/__init__.py",
+                "gate_media_auth/__main__.py",
+                "gate_media_auth/token.py",
+                "gate_media_auth/capabilities.py",
+                "gate_media_gateway/__init__.py",
+                "gate_media_gateway/__main__.py",
+                "gate_media_transcoder/__init__.py",
+                "gate_media_transcoder/__main__.py",
+            ):
+                path = source / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("trusted media artifact\n", encoding="utf-8")
             command = f"""
 source deployment/install.sh
 install() {{
@@ -374,6 +397,281 @@ install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
             ).read_text(encoding="utf-8")
             self.assertNotIn("gate-media-transcoder", updater)
             self.assertNotIn("gate_media_transcoder", updater)
+
+    def test_fixed_media_bootstrap_is_installed_from_immutable_handoff(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            handoff = root / "handoff"
+            bootstrap = root / "gate-media-bootstrap"
+            artifacts = {
+                "deployment/gate_controller_updater.py": "updater\n",
+                "file-monitor.service": "application\n",
+                "deployment/systemd/gate-controller-updater.service": "updater service\n",
+                "deployment/systemd/gate-controller-updater.timer": "updater timer\n",
+                "deployment/systemd/cloudflared.service.d/20-http2.conf": "cloudflared\n",
+                "deployment/install-media.sh": "#!/bin/sh\n",
+                "deployment/media/mediamtx.yml": "paths: {}\n",
+                "deployment/media/nginx-whep-locations.conf.template": "location / {}\n",
+                "deployment/systemd/gate-media-auth.service": "auth service\n",
+                "deployment/systemd/gate-media-gateway.service": "gateway service\n",
+                "deployment/systemd/gate-media-transcoder.service": "transcoder service\n",
+                "deployment/systemd/gate-media-turn-refresh.service": "refresh service\n",
+                "deployment/systemd/gate-media-turn-refresh.timer": "refresh timer\n",
+                "deployment/gate_media_turn_refresh.py": "refresh helper\n",
+                "gate_media_config.py": "media config\n",
+                "gate_media_auth/__init__.py": "auth init\n",
+                "gate_media_auth/__main__.py": "auth main\n",
+                "gate_media_auth/token.py": "auth token\n",
+                "gate_media_auth/capabilities.py": "auth capabilities\n",
+                "gate_media_gateway/__init__.py": "gateway init\n",
+                "gate_media_gateway/__main__.py": "gateway main\n",
+                "gate_media_transcoder/__init__.py": "transcoder init\n",
+                "gate_media_transcoder/__main__.py": "transcoder main\n",
+            }
+            for relative_path, contents in artifacts.items():
+                path = source / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+
+            command = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -o|-g) shift 2 ;; *) forwarded+=("$1"); shift ;; esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+create_fixed_trust_anchor_handoff {shlex.quote(str(source))} {shlex.quote(str(handoff))}
+find {shlex.quote(str(source))} -type f -exec sh -c 'printf tampered >"$1"' _ {{}} \\;
+MEDIA_BOOTSTRAP_ROOT={shlex.quote(str(bootstrap))}
+install_fixed_media_bootstrap {shlex.quote(str(handoff))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            for relative_path, contents in artifacts.items():
+                handed_off = handoff / relative_path
+                self.assertEqual(contents, handed_off.read_text(encoding="utf-8"))
+                self.assertEqual(0o444, handed_off.stat().st_mode & 0o777)
+            self.assertEqual(0o555, handoff.stat().st_mode & 0o777)
+            self.assertEqual(0o555, (handoff / "deployment").stat().st_mode & 0o777)
+            self.assertEqual(
+                "#!/bin/sh\n",
+                (bootstrap / "install-media.sh").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "auth capabilities\n",
+                (bootstrap / "gate_media_auth/capabilities.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_fixed_media_handoff_rejects_symbolic_link_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            handoff = root / "handoff"
+            artifact_paths = (
+                "deployment/gate_controller_updater.py",
+                "file-monitor.service",
+                "deployment/systemd/gate-controller-updater.service",
+                "deployment/systemd/gate-controller-updater.timer",
+                "deployment/systemd/cloudflared.service.d/20-http2.conf",
+                "deployment/install-media.sh",
+                "deployment/media/mediamtx.yml",
+                "deployment/media/nginx-whep-locations.conf.template",
+                "deployment/systemd/gate-media-auth.service",
+                "deployment/systemd/gate-media-gateway.service",
+                "deployment/systemd/gate-media-transcoder.service",
+                "deployment/systemd/gate-media-turn-refresh.service",
+                "deployment/systemd/gate-media-turn-refresh.timer",
+                "deployment/gate_media_turn_refresh.py",
+                "gate_media_config.py",
+                "gate_media_auth/__init__.py",
+                "gate_media_auth/__main__.py",
+                "gate_media_auth/token.py",
+                "gate_media_auth/capabilities.py",
+                "gate_media_gateway/__init__.py",
+                "gate_media_gateway/__main__.py",
+                "gate_media_transcoder/__init__.py",
+                "gate_media_transcoder/__main__.py",
+            )
+            for relative_path in artifact_paths:
+                path = source / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("trusted\n", encoding="utf-8")
+            (source / "gate_media_config.py").unlink()
+            (source / "gate_media_config.py").symlink_to(root / "outside")
+
+            command = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -o|-g) shift 2 ;; *) forwarded+=("$1"); shift ;; esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+set +e
+create_fixed_trust_anchor_handoff {shlex.quote(str(source))} {shlex.quote(str(handoff))}
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertIn("must be a regular file", completed.stderr)
+
+    def test_fixed_media_bootstrap_restore_reinstates_the_exact_prior_tree(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            backup.mkdir()
+            (bootstrap / "gate_media_auth").mkdir(parents=True)
+            (bootstrap / "install-media.sh").write_text("previous bootstrap\n")
+            (bootstrap / "gate_media_auth/token.py").write_text("previous token\n")
+            (bootstrap / "gate_media_auth/token.py").chmod(0o600)
+
+            command = f"""
+source deployment/install.sh
+MEDIA_BOOTSTRAP_ROOT={shlex.quote(str(bootstrap))}
+backup_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
+rm -f -- {shlex.quote(str(bootstrap / 'gate_media_auth/token.py'))}
+printf 'candidate only\\n' > {shlex.quote(str(bootstrap / 'candidate-only'))}
+printf 'candidate replacement\\n' > {shlex.quote(str(bootstrap / 'install-media.sh'))}
+restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                "previous bootstrap\n",
+                (bootstrap / "install-media.sh").read_text(encoding="utf-8"),
+            )
+            token = bootstrap / "gate_media_auth/token.py"
+            self.assertEqual("previous token\n", token.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, token.stat().st_mode & 0o777)
+            self.assertFalse((bootstrap / "candidate-only").exists())
+
+    def test_fixed_media_bootstrap_restore_reinstates_prior_absence(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            backup.mkdir()
+
+            command = f"""
+source deployment/install.sh
+MEDIA_BOOTSTRAP_ROOT={shlex.quote(str(bootstrap))}
+backup_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
+mkdir -p {shlex.quote(str(bootstrap))}
+printf 'candidate only\\n' > {shlex.quote(str(bootstrap / 'candidate-only'))}
+restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue((backup / "fixed-media-bootstrap.absent").is_file())
+            self.assertFalse(bootstrap.exists())
+
+    def test_fixed_media_bootstrap_restore_rejects_unsafe_paths(self):
+        for unsafe_state in ("destination-symlink", "destination-file", "backup-symlink", "backup-file", "temporary-symlink"):
+            with self.subTest(unsafe_state=unsafe_state):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    bootstrap = root / "gate-media-bootstrap"
+                    backup = root / "backup"
+                    sentinel = root / "sentinel"
+                    backup.mkdir()
+                    sentinel.write_text("sentinel unchanged\n", encoding="utf-8")
+                    if unsafe_state == "destination-symlink":
+                        bootstrap.symlink_to(sentinel)
+                        (backup / "fixed-media-bootstrap").mkdir()
+                    elif unsafe_state == "destination-file":
+                        bootstrap.write_text("candidate file\n", encoding="utf-8")
+                        (backup / "fixed-media-bootstrap").mkdir()
+                    else:
+                        bootstrap.mkdir()
+                        (bootstrap / "candidate").write_text("candidate\n")
+                        if unsafe_state == "backup-symlink":
+                            (backup / "fixed-media-bootstrap").symlink_to(sentinel)
+                        elif unsafe_state == "backup-file":
+                            (backup / "fixed-media-bootstrap").write_text(
+                                "not a directory\n", encoding="utf-8"
+                            )
+                        else:
+                            (backup / "fixed-media-bootstrap").mkdir()
+
+                    temporary_setup = ""
+                    if unsafe_state == "temporary-symlink":
+                        temporary_setup = (
+                            f"ln -s {shlex.quote(str(sentinel))} "
+                            '"$MEDIA_BOOTSTRAP_ROOT.rollback.$$"'
+                        )
+                    command = f"""
+source deployment/install.sh
+MEDIA_BOOTSTRAP_ROOT={shlex.quote(str(bootstrap))}
+{temporary_setup}
+set +e
+restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+                    completed = subprocess.run(
+                        ["bash", "-c", command],
+                        cwd=REPOSITORY_ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(0, completed.returncode, completed.stderr)
+                    self.assertEqual("status=1\n", completed.stdout)
+                    self.assertEqual("sentinel unchanged\n", sentinel.read_text())
+                    if unsafe_state == "temporary-symlink":
+                        self.assertTrue(
+                            any(
+                                path.is_symlink()
+                                for path in root.glob(
+                                    "gate-media-bootstrap.rollback.*"
+                                )
+                            )
+                        )
 
     @unittest.skipUnless(shutil.which("flock"), "requires the Linux flock command")
     def test_bootstrap_uses_same_nonblocking_lock_as_updater(self):
@@ -843,6 +1141,7 @@ restore_application_activity {shlex.quote(str(previous_unit))} true
 source deployment/install.sh
 restore_current_release() {{ printf 'restore current release\n' >> {shlex.quote(str(action_log))}; }}
 restore_fixed_updater_helper() {{ :; }}
+restore_fixed_media_bootstrap() {{ :; }}
 restore_cloudflared_transport_with_diagnostics() {{ :; }}
 configure_ftp_home() {{ :; }}
 restore_application_activity() {{ :; }}
@@ -894,6 +1193,7 @@ record_action() {{ printf '%s\n' "$1" >> {shlex.quote(str(action_log))}; }}
 restore_current_release() {{ record_action 'restore current release'; }}
 restore_path() {{ record_action "restore $1"; }}
 restore_fixed_updater_helper() {{ record_action 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ record_action 'restore fixed media bootstrap'; }}
 run_systemctl_bounded() {{ record_action "$*"; }}
 restore_cloudflared_transport_with_diagnostics() {{
   record_action 'restore cloudflared transport before its reload'
@@ -941,6 +1241,7 @@ rollback
             "restore gate-controller-updater.service",
             "restore gate-controller-updater.timer",
             "restore fixed updater helper",
+            "restore fixed media bootstrap",
         ]
         independent_restores = [
             *prerequisites,
@@ -975,6 +1276,7 @@ restore_current_release() {{ record_restore 'restore current release'; }}
 restore_path() {{ record_restore "restore $1"; }}
 run_systemctl_bounded() {{ record_restore 'reload restored systemd units'; }}
 restore_fixed_updater_helper() {{ record_restore 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ record_restore 'restore fixed media bootstrap'; }}
 restore_cloudflared_transport_with_diagnostics() {{
   record_restore 'unsafe cloudflared service action'
 }}
@@ -1016,6 +1318,71 @@ rollback
                         (backup / "rollback-error.log").read_text(encoding="utf-8"),
                     )
 
+    def test_media_bootstrap_restore_failure_blocks_service_state_restoration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            backup = root / "backup"
+            action_log = root / "actions.log"
+            backup.mkdir()
+            command = f"""
+source deployment/install.sh
+record_action() {{ printf '%s\\n' "$1" >> {shlex.quote(str(action_log))}; }}
+restore_current_release() {{ record_action 'restore current release'; }}
+restore_path() {{ record_action "restore $1"; }}
+run_systemctl_bounded() {{ record_action 'reload restored systemd units'; }}
+restore_fixed_updater_helper() {{ record_action 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{
+  record_action 'restore fixed media bootstrap'
+  return 1
+}}
+restore_cloudflared_transport_with_diagnostics() {{
+  record_action 'unsafe cloudflared service action'
+}}
+restore_cloudflared_transport_drop_in() {{ record_action 'restore cloudflared files'; }}
+configure_ftp_home() {{ record_action 'restore FTP home'; }}
+restore_unit_enablement() {{ record_action 'unsafe timer enablement action'; }}
+restore_unit_activity() {{ record_action 'unsafe timer activity action'; }}
+systemctl() {{ record_action 'unsafe application enablement action'; }}
+restore_application_activity() {{ record_action 'unsafe application activity'; }}
+restore_legacy_command_activity() {{ record_action 'unsafe legacy activity'; }}
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+BACKUP_DIR={shlex.quote(str(backup))}
+: >"$BACKUP_DIR/$UPDATER_TIMER"
+STAGING=
+APP_WAS_ENABLED=false
+set +e
+false
+rollback
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            actions = action_log.read_text(encoding="utf-8").splitlines()
+            self.assertIn("restore fixed media bootstrap", actions)
+            self.assertIn("restore cloudflared files", actions)
+            self.assertIn("restore FTP home", actions)
+            for unsafe_action in (
+                "unsafe cloudflared service action",
+                "unsafe timer enablement action",
+                "unsafe timer activity action",
+                "unsafe application enablement action",
+                "unsafe application activity",
+                "unsafe legacy activity",
+            ):
+                self.assertNotIn(unsafe_action, actions)
+            self.assertIn(
+                "Rollback step failed: restore fixed media bootstrap",
+                (backup / "rollback-error.log").read_text(encoding="utf-8"),
+            )
+
     def test_restore_path_rejects_preexisting_temporary_symlink(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1043,6 +1410,7 @@ record_action() {{ printf '%s\n' "$1" >> {shlex.quote(str(action_log))}; }}
 restore_current_release() {{ :; }}
 run_systemctl_bounded() {{ record_action 'reload restored systemd units'; }}
 restore_fixed_updater_helper() {{ :; }}
+restore_fixed_media_bootstrap() {{ :; }}
 restore_cloudflared_transport_with_diagnostics() {{
   record_action 'unsafe cloudflared service action'
 }}
@@ -1112,6 +1480,7 @@ run_systemctl_bounded() {{
   return 1
 }}
 restore_fixed_updater_helper() {{ record_action 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ record_action 'restore fixed media bootstrap'; }}
 restore_cloudflared_transport_with_diagnostics() {{
   record_action 'unsafe cloudflared service action'
 }}
@@ -1233,6 +1602,7 @@ run_systemctl_bounded() {{
   printf '%s\n' 'reload restored systemd units' >> {shlex.quote(str(action_log))}
 }}
 restore_fixed_updater_helper() {{ record_failure 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ :; }}
 restore_cloudflared_transport_with_diagnostics() {{ record_failure 'restore cloudflared transport'; }}
 restore_cloudflared_transport_drop_in() {{ record_failure 'restore cloudflared transport files'; }}
 configure_ftp_home() {{ record_failure 'restore FTP home'; }}
@@ -1305,6 +1675,7 @@ rollback
             "restore gate-controller-updater.service",
             "restore gate-controller-updater.timer",
             "restore fixed updater helper",
+            "restore fixed media bootstrap",
         ]
         cloudflared_prerequisite_failure_classes = [
             "restore cloudflared transport",
@@ -1356,6 +1727,7 @@ run_systemctl_bounded() {{
   printf '%s\n' 'reload restored systemd units' >> {shlex.quote(str(action_log))}
 }}
 restore_fixed_updater_helper() {{ record_step 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ record_step 'restore fixed media bootstrap'; }}
 restore_cloudflared_transport_with_diagnostics() {{ record_step 'restore cloudflared transport'; }}
 restore_cloudflared_transport_drop_in() {{ record_step 'restore cloudflared transport files'; }}
 configure_ftp_home() {{ record_step 'restore FTP home'; }}
@@ -1446,6 +1818,7 @@ rollback
                 "restore gate-controller-updater.timer",
                 "reload restored systemd units",
                 "restore fixed updater helper",
+                "restore fixed media bootstrap",
                 "restore cloudflared transport",
                 "restore FTP home",
                 "restore updater timer enablement",
@@ -1464,6 +1837,7 @@ restore_current_release() {{ record_step 'restore current release'; }}
 restore_path() {{ record_step "restore $1"; }}
 run_systemctl_bounded() {{ record_step 'reload restored systemd units'; }}
 restore_fixed_updater_helper() {{ record_step 'restore fixed updater helper'; }}
+restore_fixed_media_bootstrap() {{ record_step 'restore fixed media bootstrap'; }}
 restore_cloudflared_transport_with_diagnostics() {{ record_step 'restore cloudflared transport'; }}
 configure_ftp_home() {{ record_step 'restore FTP home'; }}
 restore_unit_enablement() {{ record_step 'restore updater timer enablement'; }}

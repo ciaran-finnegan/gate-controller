@@ -138,28 +138,80 @@ create_fixed_trust_anchor_handoff() {
   local source=$1
   local handoff=$2
 
-  [[ ! -e $handoff && ! -L $handoff ]] \
-    || fail "trust-anchor handoff already exists: $handoff"
+  if [[ -e $handoff || -L $handoff ]]; then
+    fail "trust-anchor handoff already exists: $handoff" || true
+    return 1
+  fi
   install -d -o root -g root -m 0700 \
-    "$handoff/deployment/systemd" \
-    "$handoff/deployment/systemd/cloudflared.service.d"
-  install -o root -g root -m 0444 \
+    "$handoff/deployment/media" \
+    "$handoff/deployment/systemd/cloudflared.service.d" \
+    "$handoff/gate_media_auth" \
+    "$handoff/gate_media_gateway" \
+    "$handoff/gate_media_transcoder"
+  copy_fixed_trust_anchor_file \
     "$source/deployment/gate_controller_updater.py" \
-    "$handoff/deployment/gate_controller_updater.py"
-  install -o root -g root -m 0444 \
-    "$source/file-monitor.service" "$handoff/file-monitor.service"
-  install -o root -g root -m 0444 \
+    "$handoff/deployment/gate_controller_updater.py" || return 1
+  copy_fixed_trust_anchor_file \
+    "$source/file-monitor.service" "$handoff/file-monitor.service" || return 1
+  copy_fixed_trust_anchor_file \
     "$source/deployment/systemd/$UPDATER_SERVICE" \
-    "$handoff/deployment/systemd/$UPDATER_SERVICE"
-  install -o root -g root -m 0444 \
+    "$handoff/deployment/systemd/$UPDATER_SERVICE" || return 1
+  copy_fixed_trust_anchor_file \
     "$source/deployment/systemd/$UPDATER_TIMER" \
-    "$handoff/deployment/systemd/$UPDATER_TIMER"
-  install -o root -g root -m 0444 \
+    "$handoff/deployment/systemd/$UPDATER_TIMER" || return 1
+  copy_fixed_trust_anchor_file \
     "$source/deployment/systemd/$CLOUDFLARED_DROP_IN" \
-    "$handoff/deployment/systemd/$CLOUDFLARED_DROP_IN"
-  chmod 0555 \
-    "$handoff" "$handoff/deployment" "$handoff/deployment/systemd" \
-    "$handoff/deployment/systemd/cloudflared.service.d"
+    "$handoff/deployment/systemd/$CLOUDFLARED_DROP_IN" || return 1
+  copy_fixed_trust_anchor_file \
+    "$source/deployment/install-media.sh" "$handoff/deployment/install-media.sh" \
+    || return 1
+  copy_fixed_trust_anchor_file \
+    "$source/deployment/media/mediamtx.yml" \
+    "$handoff/deployment/media/mediamtx.yml" || return 1
+  copy_fixed_trust_anchor_file \
+    "$source/deployment/media/nginx-whep-locations.conf.template" \
+    "$handoff/deployment/media/nginx-whep-locations.conf.template" || return 1
+  for name in \
+    gate-media-auth.service \
+    gate-media-gateway.service \
+    gate-media-transcoder.service \
+    gate-media-turn-refresh.service \
+    gate-media-turn-refresh.timer; do
+    copy_fixed_trust_anchor_file \
+      "$source/deployment/systemd/$name" "$handoff/deployment/systemd/$name" \
+      || return 1
+  done
+  copy_fixed_trust_anchor_file \
+    "$source/deployment/gate_media_turn_refresh.py" \
+    "$handoff/deployment/gate_media_turn_refresh.py" || return 1
+  copy_fixed_trust_anchor_file \
+    "$source/gate_media_config.py" "$handoff/gate_media_config.py" || return 1
+  for name in __init__.py __main__.py token.py capabilities.py; do
+    copy_fixed_trust_anchor_file \
+      "$source/gate_media_auth/$name" "$handoff/gate_media_auth/$name" \
+      || return 1
+  done
+  for name in __init__.py __main__.py; do
+    copy_fixed_trust_anchor_file \
+      "$source/gate_media_gateway/$name" "$handoff/gate_media_gateway/$name" \
+      || return 1
+    copy_fixed_trust_anchor_file \
+      "$source/gate_media_transcoder/$name" "$handoff/gate_media_transcoder/$name" \
+      || return 1
+  done
+  find "$handoff" -type f -exec chmod 0444 {} +
+  find "$handoff" -type d -exec chmod 0555 {} +
+}
+
+copy_fixed_trust_anchor_file() {
+  local source=$1
+  local destination=$2
+
+  if [[ ! -f $source || -L $source ]]; then
+    fail "$source must be a regular file" || true
+    return 1
+  fi
+  install -o root -g root -m 0444 "$source" "$destination"
 }
 
 publish_bootstrap_release() {
@@ -592,6 +644,93 @@ install_fixed_media_bootstrap() {
   done
 }
 
+backup_fixed_media_bootstrap() {
+  local bootstrap_root=$1
+  local backup_dir=$2
+  local backup=$backup_dir/fixed-media-bootstrap
+  local absent=$backup_dir/fixed-media-bootstrap.absent
+
+  if [[ ! -d $backup_dir || -L $backup_dir ]]; then
+    fail "$backup_dir must be a directory" || true
+    return 1
+  fi
+  if [[ -e $backup || -L $backup || -e $absent || -L $absent ]]; then
+    fail "fixed media bootstrap backup already exists" || true
+    return 1
+  fi
+  if [[ -L $bootstrap_root ]]; then
+    fail "$bootstrap_root must not be a symbolic link" || true
+    return 1
+  fi
+  if [[ -e $bootstrap_root ]]; then
+    if [[ ! -d $bootstrap_root ]]; then
+      fail "$bootstrap_root must be a directory" || true
+      return 1
+    fi
+    cp -a -- "$bootstrap_root" "$backup"
+  else
+    : >"$absent"
+  fi
+}
+
+restore_fixed_media_bootstrap() {
+  local bootstrap_root=$1
+  local backup_dir=$2
+  local backup=$backup_dir/fixed-media-bootstrap
+  local absent=$backup_dir/fixed-media-bootstrap.absent
+  local temporary=$bootstrap_root.rollback.$$
+
+  if [[ ! -d $backup_dir || -L $backup_dir ]]; then
+    fail "$backup_dir must be a directory" || true
+    return 1
+  fi
+  if [[ -L $bootstrap_root ]]; then
+    fail "$bootstrap_root must not be a symbolic link" || true
+    return 1
+  fi
+  if [[ -e $bootstrap_root && ! -d $bootstrap_root ]]; then
+    fail "$bootstrap_root must be a directory" || true
+    return 1
+  fi
+  if [[ -e $temporary || -L $temporary ]]; then
+    fail "fixed media bootstrap restore path already exists" || true
+    return 1
+  fi
+  if [[ -e $backup || -L $backup ]]; then
+    if [[ ! -d $backup || -L $backup ]]; then
+      fail "fixed media bootstrap backup must be a directory" || true
+      return 1
+    fi
+    if [[ -e $absent || -L $absent ]]; then
+      fail "fixed media bootstrap backup state is ambiguous" || true
+      return 1
+    fi
+    if ! cp -a -- "$backup" "$temporary"; then
+      rm -rf -- "$temporary"
+      fail "could not copy the fixed media bootstrap backup" || true
+      return 1
+    fi
+    if [[ -e $bootstrap_root ]] && ! rm -rf -- "$bootstrap_root"; then
+      rm -rf -- "$temporary"
+      fail "could not remove the candidate fixed media bootstrap" || true
+      return 1
+    fi
+    if ! mv -f -- "$temporary" "$bootstrap_root"; then
+      rm -rf -- "$temporary"
+      fail "could not restore the fixed media bootstrap" || true
+      return 1
+    fi
+  elif [[ -f $absent && ! -L $absent ]]; then
+    if [[ -e $bootstrap_root ]] && ! rm -rf -- "$bootstrap_root"; then
+      fail "could not restore absence of the fixed media bootstrap" || true
+      return 1
+    fi
+  else
+    fail "fixed media bootstrap backup is missing" || true
+    return 1
+  fi
+}
+
 backup_fixed_updater_helper() {
   local updater_helper=$1
   local backup_dir=$2
@@ -923,6 +1062,9 @@ rollback() {
     run_rollback_prerequisite \
       "restore fixed updater helper" \
       restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+    run_rollback_prerequisite \
+      "restore fixed media bootstrap" \
+      restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" "$BACKUP_DIR"
     if [[ $ROLLBACK_PREREQUISITES_SUCCEEDED == true ]]; then
       run_rollback_prerequisite \
         "restore cloudflared transport" \
@@ -1189,6 +1331,7 @@ for name in "$APP_SERVICE" "$LEGACY_COMMAND_UNIT" "$UPDATER_SERVICE" "$UPDATER_T
   backup_path "$name"
 done
 backup_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+backup_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" "$BACKUP_DIR"
 backup_cloudflared_transport_drop_in "$SYSTEMD_ROOT" "$BACKUP_DIR"
 if [[ -L $CURRENT_LINK ]]; then
   PREVIOUS_CURRENT=$(readlink -f "$CURRENT_LINK")
@@ -1216,7 +1359,7 @@ systemctl disable --now "$LEGACY_COMMAND_UNIT" >/dev/null 2>&1 || true
 rm -f -- "$SYSTEMD_ROOT/$LEGACY_COMMAND_UNIT"
 install_fixed_trust_anchors "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT" "$UPDATER_HELPER"
 install_cloudflared_transport_drop_in "$TRUST_ANCHOR_HANDOFF" "$SYSTEMD_ROOT"
-install_fixed_media_bootstrap "$RELEASE"
+install_fixed_media_bootstrap "$TRUST_ANCHOR_HANDOFF"
 rm -f -- "$CURRENT_LINK.new"
 ln -s "$RELEASE" "$CURRENT_LINK.new"
 mv -Tf "$CURRENT_LINK.new" "$CURRENT_LINK"
