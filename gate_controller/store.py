@@ -23,6 +23,7 @@ _SNAPSHOT_BUSY_TIMEOUT_SECONDS = 0.25
 _SNAPSHOT_BUSY_SLICE_MS = 10
 _OUTBOX_READY = "ready"
 _OUTBOX_AWAITING_TELEMETRY = "awaiting_telemetry"
+_OUTBOX_TELEMETRY_READY = "telemetry_ready"
 _OUTBOX_LOCAL_ONLY = "local_only"
 _LOGGER = logging.getLogger(__name__)
 
@@ -298,20 +299,22 @@ class LocalStore:
                 rows = connection.execute(
                     """
                     SELECT id, payload FROM outbox
-                    WHERE completed_at IS NULL AND send_state = ?
+                    WHERE completed_at IS NULL AND send_state IN (?, ?)
                     ORDER BY id LIMIT ?
                     """,
-                    (_OUTBOX_READY, limit),
+                    (_OUTBOX_READY, _OUTBOX_TELEMETRY_READY, limit),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     """
                     SELECT id, payload FROM outbox
-                    WHERE completed_at IS NULL AND send_state = ?
+                    WHERE completed_at IS NULL AND send_state IN (?, ?)
                     ORDER BY CASE WHEN id > ? THEN 0 ELSE 1 END, id
                     LIMIT ?
                     """,
-                    (_OUTBOX_READY, after_id, limit),
+                    (
+                        _OUTBOX_READY, _OUTBOX_TELEMETRY_READY, after_id, limit,
+                    ),
                 ).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
 
@@ -480,9 +483,10 @@ class LocalStore:
             row = connection.execute(
                 """
                 SELECT event_id, payload, created_at FROM outbox
-                WHERE id = ? AND completed_at IS NULL AND send_state = ?
+                WHERE id = ? AND completed_at IS NULL
+                  AND send_state IN (?, ?)
                 """,
-                (item_id, _OUTBOX_READY),
+                (item_id, _OUTBOX_READY, _OUTBOX_TELEMETRY_READY),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -778,7 +782,7 @@ class LocalStore:
         payload["telemetry"] = telemetry
         connection.execute(
             "UPDATE outbox SET payload = ?, send_state = ? WHERE id = ?",
-            (_encode_json(payload), _OUTBOX_READY, outbox_id),
+            (_encode_json(payload), _OUTBOX_TELEMETRY_READY, outbox_id),
         )
 
     def _event_id(self, idempotency_key: str) -> int | None:
@@ -1034,22 +1038,23 @@ class LocalStore:
             incompatible_followup = connection.execute(
                 """
                 SELECT 1 FROM schema_migrations
-                WHERE name = 'outbox_incompatible_followup_v1'
+                WHERE name = 'outbox_incompatible_followup_v2'
                 """
             ).fetchone()
             if not incompatible_followup:
-                for outbox_id, payload_text in connection.execute(
+                for outbox_id, payload_text, send_state in connection.execute(
                     """
-                    SELECT id, payload FROM outbox
-                    WHERE completed_at IS NULL AND send_state = ?
+                    SELECT id, payload, send_state FROM outbox
+                    WHERE completed_at IS NULL
+                      AND send_state IN (?, ?)
                     """,
-                    (_OUTBOX_READY,),
+                    (_OUTBOX_READY, _OUTBOX_TELEMETRY_READY),
                 ).fetchall():
                     try:
                         payload = json.loads(payload_text)
                     except (TypeError, ValueError):
                         continue
-                    if not _is_incompatible_v3_followup(payload):
+                    if not _is_incompatible_v3_followup(payload, send_state):
                         continue
                     connection.execute(
                         "UPDATE outbox SET send_state = ? WHERE id = ?",
@@ -1058,7 +1063,7 @@ class LocalStore:
                 connection.execute(
                     """
                     INSERT INTO schema_migrations (name)
-                    VALUES ('outbox_incompatible_followup_v1')
+                    VALUES ('outbox_incompatible_followup_v2')
                     """
                 )
     def _recover_interrupted_actuations(self, connection: sqlite3.Connection) -> int:
@@ -1278,12 +1283,19 @@ def _v2_outbox_payload(payload: object) -> dict:
     return fallback
 
 
-def _is_incompatible_v3_followup(payload: object) -> bool:
+def _is_incompatible_v3_followup(payload: object, send_state: str) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 3
+        or not isinstance(payload.get("telemetry"), dict)
+    ):
+        return False
+    if payload.get("image_status") == "delivered_before_telemetry":
+        return True
     return (
-        isinstance(payload, dict)
-        and payload.get("schema_version") == 3
-        and payload.get("image_status") == "delivered_before_telemetry"
-        and isinstance(payload.get("telemetry"), dict)
+        send_state == _OUTBOX_READY
+        and "image_sha256" not in payload
+        and "image_status" not in payload
     )
 
 

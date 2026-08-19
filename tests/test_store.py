@@ -287,7 +287,10 @@ class LocalStoreTests(unittest.TestCase):
                 connection.execute(
                     """
                     DELETE FROM schema_migrations
-                    WHERE name = 'outbox_incompatible_followup_v1'
+                    WHERE name IN (
+                        'outbox_incompatible_followup_v1',
+                        'outbox_incompatible_followup_v2'
+                    )
                     """
                 )
 
@@ -306,6 +309,140 @@ class LocalStoreTests(unittest.TestCase):
             self.assertEqual(json.loads(payload_text), invalid_follow_up)
             self.assertIsNone(completed_at)
             self.assertEqual(send_state, "local_only")
+
+    def test_migration_quarantines_image_free_legacy_v3_follow_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.db"
+            store = LocalStore(path)
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="legacy-image-free-follow-up",
+                received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+            ))
+            item_id = store.queue_outbox(
+                event_id, {"controller_id": "pi-front-gate"}
+            )
+            prepared = store.prepare_outbox_attempt(item_id)
+            store.complete_outbox_item(item_id, prepared_payload=prepared)
+            store.attach_event_telemetry(event_id, _telemetry(reason="no_match"))
+            telemetry = store.event_telemetry(event_id)
+            legacy_follow_up = {
+                **prepared,
+                "schema_version": 3,
+                "telemetry": telemetry,
+            }
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE outbox SET payload = ?, completed_at = NULL,
+                        send_state = 'ready'
+                    WHERE id = ?
+                    """,
+                    (json.dumps(legacy_follow_up, sort_keys=True), item_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name IN (
+                        'outbox_incompatible_followup_v1',
+                        'outbox_incompatible_followup_v2'
+                    )
+                    """
+                )
+
+            migrated = LocalStore(path)
+
+            self.assertEqual(migrated.pending_outbox_count(), 0)
+            self.assertEqual(migrated.pending_outbox_items(), [])
+            self.assertEqual(
+                migrated.event_telemetry(event_id)["trace_id"], telemetry["trace_id"]
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                payload_text, completed_at, send_state = connection.execute(
+                    "SELECT payload, completed_at, send_state FROM outbox WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+            self.assertEqual(json.loads(payload_text), legacy_follow_up)
+            self.assertIsNone(completed_at)
+            self.assertEqual(send_state, "local_only")
+
+    def test_migration_keeps_current_image_free_v3_event_sendable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.db"
+            store = LocalStore(path)
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="queue_coalesced", opened=False,
+                    idempotency_key="current-image-free-v3",
+                    received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+                ),
+                {
+                    "controller_id": "pi-front-gate",
+                    "_awaiting_telemetry": True,
+                },
+            )
+            store.attach_event_telemetry(
+                event_id, _telemetry(reason="queue_coalesced")
+            )
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name IN (
+                        'outbox_incompatible_followup_v1',
+                        'outbox_incompatible_followup_v2'
+                    )
+                    """
+                )
+
+            migrated = LocalStore(path)
+
+            queued = migrated.pending_outbox_items()
+            self.assertEqual(migrated.pending_outbox_count(), 1)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0][1]["schema_version"], 3)
+            self.assertNotIn("image_sha256", queued[0][1])
+            self.assertNotIn("image_status", queued[0][1])
+
+    def test_migration_keeps_current_image_bearing_v3_event_sendable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.db"
+            store = LocalStore(path)
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key="current-image-bearing-v3",
+                    received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+                ),
+                {
+                    "controller_id": "pi-front-gate",
+                    "image_sha256": "b" * 64,
+                    "_awaiting_telemetry": True,
+                },
+            )
+            store.attach_event_telemetry(event_id, _telemetry(reason="no_match"))
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    "UPDATE outbox SET send_state = 'ready' WHERE event_id = ?",
+                    (event_id,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name IN (
+                        'outbox_incompatible_followup_v1',
+                        'outbox_incompatible_followup_v2'
+                    )
+                    """
+                )
+
+            migrated = LocalStore(path)
+
+            queued = migrated.pending_outbox_items()
+            self.assertEqual(migrated.pending_outbox_count(), 1)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0][1]["schema_version"], 3)
+            self.assertEqual(queued[0][1]["image_sha256"], "b" * 64)
 
     def test_retention_removes_only_old_telemetry_with_completed_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
