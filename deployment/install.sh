@@ -1341,7 +1341,7 @@ restore_fixed_media_bootstrap() (
       return 1
     fi
     if ! publish_fixed_media_restore 18 "$bootstrap_name" "$temporary_name"; then
-      remove_fixed_media_tree 18 "$temporary_name" || true
+      # The exchange may have succeeded before a durability error was reported.
       fail "could not atomically publish the fixed media bootstrap restore" \
         || true
       return 1

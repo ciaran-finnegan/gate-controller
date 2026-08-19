@@ -14,6 +14,13 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
+def create_trusted_test_root(temporary_directory):
+    trusted_root = Path(temporary_directory).resolve() / "trusted"
+    trusted_root.mkdir(mode=0o700)
+    trusted_root.chmod(0o700)
+    return trusted_root
+
+
 def read_unit(relative_path):
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     parser.optionxform = str
@@ -210,6 +217,15 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
 
 
 class BootstrapInstallerTests(unittest.TestCase):
+    def test_fixed_media_test_root_is_owner_only_intermediate_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory).resolve()
+            trusted_root = create_trusted_test_root(temporary_directory)
+
+            self.assertEqual(temporary_root, trusted_root.parent)
+            self.assertEqual(os.geteuid(), trusted_root.stat().st_uid)
+            self.assertEqual(0o700, trusted_root.stat().st_mode & 0o777)
+
     def test_installer_can_be_sourced_without_executing_bootstrap(self):
         completed = subprocess.run(
             [
@@ -543,7 +559,7 @@ printf 'status=%s\\n' "$status"
 
     def test_fixed_media_backup_records_absence_when_parent_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap_parent = root / "libexec"
             bootstrap = bootstrap_parent / "gate-media-bootstrap"
             backup = root / "backup"
@@ -571,7 +587,7 @@ backup_fixed_media_bootstrap \
 
     def test_fixed_media_bootstrap_restore_reinstates_the_exact_prior_tree(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             backup.mkdir()
@@ -610,7 +626,7 @@ restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
 
     def test_fixed_media_restore_publication_failure_preserves_live_candidate(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             backup.mkdir()
@@ -648,10 +664,112 @@ printf 'status=%s\\n' "$status"
                 (bootstrap / "live-candidate").read_text(encoding="utf-8"),
             )
             self.assertFalse((bootstrap / "restored").exists())
+            generations = list(root.glob("gate-media-bootstrap.rollback.*"))
+            self.assertEqual(1, len(generations))
+            self.assertEqual(
+                "previous bootstrap\n",
+                (generations[0] / "restored").read_text(encoding="utf-8"),
+            )
+
+    def test_fixed_media_post_exchange_failure_preserves_both_generations(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = create_trusted_test_root(temporary_directory)
+            bootstrap = root / "gate-media-bootstrap"
+            backup = root / "backup"
+            backup.mkdir()
+            bootstrap.mkdir()
+            (bootstrap / "live-candidate").write_text(
+                "old candidate survives\n", encoding="utf-8"
+            )
+            (backup / "fixed-media-bootstrap").mkdir()
+            (backup / "fixed-media-bootstrap/restored").write_text(
+                "new live restore\n", encoding="utf-8"
+            )
+            command = f"""
+source deployment/install.sh
+publish_fixed_media_restore() {{
+  python3 - "$@" <<'PY'
+import os
+import errno
+import sys
+
+parent_descriptor = int(sys.argv[1])
+live_name = sys.argv[2]
+staged_name = sys.argv[3]
+holder_name = f"{{live_name}}.test-exchange-holder"
+os.rename(
+    live_name,
+    holder_name,
+    src_dir_fd=parent_descriptor,
+    dst_dir_fd=parent_descriptor,
+)
+os.rename(
+    staged_name,
+    live_name,
+    src_dir_fd=parent_descriptor,
+    dst_dir_fd=parent_descriptor,
+)
+os.rename(
+    holder_name,
+    staged_name,
+    src_dir_fd=parent_descriptor,
+    dst_dir_fd=parent_descriptor,
+)
+raise OSError(errno.EIO, "simulated parent fsync failure after exchange")
+PY
+  return 37
+}}
+set +e
+restore_fixed_media_bootstrap \
+  {shlex.quote(str(bootstrap))} {shlex.quote(str(backup))}
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertEqual(
+                "new live restore\n",
+                (bootstrap / "restored").read_text(encoding="utf-8"),
+            )
+            generations = list(root.glob("gate-media-bootstrap.rollback.*"))
+            self.assertEqual(1, len(generations))
+            self.assertEqual(
+                "old candidate survives\n",
+                (generations[0] / "live-candidate").read_text(encoding="utf-8"),
+            )
+
+            discovery = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f"""
+source deployment/install.sh
+pin_trusted_directory {shlex.quote(str(root))} 18
+list_fixed_media_stale_generations 18 gate-media-bootstrap
+""",
+                ],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(0, discovery.returncode, discovery.stderr)
+            self.assertEqual(f"{generations[0].name}\n", discovery.stdout)
 
     def test_fixed_media_absence_interruption_retains_renamed_candidate(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             bootstrap.mkdir()
@@ -705,7 +823,7 @@ printf 'status=%s\n' "$status"
 
     def test_fixed_media_absence_removal_failure_retains_durable_quarantine(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             bootstrap.mkdir()
@@ -745,7 +863,7 @@ printf 'status=%s\n' "$status"
 
     def test_fixed_media_restore_requires_staged_tree_fsync_before_publish(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             actions = root / "actions"
@@ -798,7 +916,7 @@ printf 'status=%s\n' "$status"
 
     def test_fixed_media_restore_cleans_stale_generations(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             stale_rollback = root / "gate-media-bootstrap.rollback.111"
@@ -837,7 +955,7 @@ restore_fixed_media_bootstrap \
 
     def test_fixed_media_restore_rejects_unsafe_stale_generation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             sentinel = root / "sentinel"
@@ -873,7 +991,7 @@ printf 'status=%s\n' "$status"
 
     def test_fixed_media_backup_rejects_writable_parent_before_child_swap(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap_parent = root / "libexec"
             bootstrap = bootstrap_parent / "gate-media-bootstrap"
             original = bootstrap_parent / "trusted-original"
@@ -918,7 +1036,7 @@ printf 'status=%s\n' "$status"
 
     def test_fixed_media_backup_rejects_writable_backup_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             bootstrap.mkdir()
@@ -951,7 +1069,7 @@ printf 'status=%s\n' "$status"
         for operation in ("backup", "restore"):
             with self.subTest(operation=operation):
                 with tempfile.TemporaryDirectory() as temporary_directory:
-                    root = Path(temporary_directory).resolve()
+                    root = create_trusted_test_root(temporary_directory)
                     actual_parent = root / "actual-parent"
                     linked_parent = root / "linked-parent"
                     bootstrap = linked_parent / "gate-media-bootstrap"
@@ -1003,7 +1121,7 @@ printf 'status=%s\\n' "$status"
 
     def test_fixed_media_backup_pins_parent_across_path_replacement(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap_parent = root / "bootstrap-parent"
             relocated_parent = root / "relocated-parent"
             attacker_parent = root / "attacker-parent"
@@ -1049,7 +1167,7 @@ backup_fixed_media_bootstrap \
 
     def test_fixed_media_restore_pins_parent_across_path_replacement(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap_parent = root / "bootstrap-parent"
             relocated_parent = root / "relocated-parent"
             attacker_parent = root / "attacker-parent"
@@ -1101,7 +1219,7 @@ restore_fixed_media_bootstrap \
 
     def test_fixed_media_bootstrap_restore_reinstates_prior_absence(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve()
+            root = create_trusted_test_root(temporary_directory)
             bootstrap = root / "gate-media-bootstrap"
             backup = root / "backup"
             backup.mkdir()
@@ -1131,7 +1249,7 @@ restore_fixed_media_bootstrap "$MEDIA_BOOTSTRAP_ROOT" {shlex.quote(str(backup))}
         for unsafe_state in ("destination-symlink", "destination-file", "backup-symlink", "backup-file", "temporary-symlink"):
             with self.subTest(unsafe_state=unsafe_state):
                 with tempfile.TemporaryDirectory() as temporary_directory:
-                    root = Path(temporary_directory).resolve()
+                    root = create_trusted_test_root(temporary_directory)
                     bootstrap = root / "gate-media-bootstrap"
                     backup = root / "backup"
                     sentinel = root / "sentinel"
