@@ -42,6 +42,18 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("POST\n/api/controller/events", deployment)
         self.assertIn("private R2 bucket", deployment)
 
+    def test_deployment_docs_cover_safe_cloudflared_transport_activation(self):
+        deployment = (REPOSITORY_ROOT / "docs/deployment.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("30-second bound", deployment)
+        self.assertRegex(
+            deployment,
+            r"An inactive or absent service\s+is never started",
+        )
+        self.assertIn("exact previous drop-in, including its absence", deployment)
+
     def test_deployment_docs_require_rollback_before_decommission(self):
         deployment = (REPOSITORY_ROOT / "docs/deployment.md").read_text(
             encoding="utf-8"
@@ -717,6 +729,323 @@ restore_application_activity {shlex.quote(str(previous_unit))} true
             self.assertIn(
                 'configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"',
                 installer,
+            )
+
+
+class CloudflaredTransportLifecycleTests(unittest.TestCase):
+    def run_shell(self, script):
+        return subprocess.run(
+            ["bash", "-c", script],
+            cwd=REPOSITORY_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+    def test_active_service_restarts_with_timeout_and_post_restart_check(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            systemd_root = root / "systemd"
+            action_log = root / "actions.log"
+            (source / "deployment/systemd/cloudflared.service.d").mkdir(
+                parents=True
+            )
+            systemd_root.mkdir()
+            (
+                source
+                / "deployment/systemd/cloudflared.service.d/20-http2.conf"
+            ).write_text(
+                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n"
+            )
+            script = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) forwarded+=("$1"); shift ;;
+    esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+timeout() {{
+  printf 'timeout %s\n' "$*" >> {shlex.quote(str(action_log))}
+  shift 3
+  "$@"
+}}
+systemctl() {{
+  case "$*" in
+    'show cloudflared.service --property=LoadState --value') printf 'loaded\n' ;;
+    'is-enabled --quiet cloudflared.service') return 1 ;;
+    'is-active --quiet cloudflared.service') return 0 ;;
+    'daemon-reload'|'restart cloudflared.service') return 0 ;;
+    *) return 99 ;;
+  esac
+}}
+capture_cloudflared_service_state
+install_cloudflared_transport_drop_in \
+  {shlex.quote(str(source))} {shlex.quote(str(systemd_root))}
+run_systemctl_bounded daemon-reload
+apply_cloudflared_transport_if_active
+printf '%s %s %s\n' \
+  "$CLOUDFLARED_WAS_PRESENT" \
+  "$CLOUDFLARED_WAS_ACTIVE" \
+  "$CLOUDFLARED_WAS_ENABLED"
+"""
+
+            completed = self.run_shell(script)
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("true true false\n", completed.stdout)
+            self.assertEqual(
+                [
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl show cloudflared.service --property=LoadState --value",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-enabled --quiet cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-active --quiet cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl daemon-reload",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl restart cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-active --quiet cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-enabled --quiet cloudflared.service",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_inactive_service_keeps_enabled_state_without_starting(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            action_log = Path(temporary_directory) / "actions.log"
+            script = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) forwarded+=("$1"); shift ;;
+    esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+timeout() {{
+  printf 'timeout %s\n' "$*" >> {shlex.quote(str(action_log))}
+  shift 3
+  "$@"
+}}
+systemctl() {{
+  case "$*" in
+    'show cloudflared.service --property=LoadState --value') printf 'loaded\n' ;;
+    'is-enabled --quiet cloudflared.service') return 0 ;;
+    'is-active --quiet cloudflared.service') return 3 ;;
+    *) return 99 ;;
+  esac
+}}
+capture_cloudflared_service_state
+CLOUDFLARED_DROP_IN_CHANGED=true
+apply_cloudflared_transport_if_active
+printf '%s %s %s\n' \
+  "$CLOUDFLARED_WAS_PRESENT" \
+  "$CLOUDFLARED_WAS_ACTIVE" \
+  "$CLOUDFLARED_WAS_ENABLED"
+"""
+
+            completed = self.run_shell(script)
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("true false true\n", completed.stdout)
+            self.assertEqual(
+                [
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl show cloudflared.service --property=LoadState --value",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-enabled --quiet cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-active --quiet cloudflared.service",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_absent_service_is_not_started(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            action_log = Path(temporary_directory) / "actions.log"
+            script = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) forwarded+=("$1"); shift ;;
+    esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+timeout() {{
+  printf 'timeout %s\n' "$*" >> {shlex.quote(str(action_log))}
+  shift 3
+  "$@"
+}}
+systemctl() {{
+  case "$*" in
+    'show cloudflared.service --property=LoadState --value') printf 'not-found\n' ;;
+    *) return 99 ;;
+  esac
+}}
+capture_cloudflared_service_state
+CLOUDFLARED_DROP_IN_CHANGED=true
+apply_cloudflared_transport_if_active
+printf '%s %s %s\n' \
+  "$CLOUDFLARED_WAS_PRESENT" \
+  "$CLOUDFLARED_WAS_ACTIVE" \
+  "$CLOUDFLARED_WAS_ENABLED"
+"""
+
+            completed = self.run_shell(script)
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("false false false\n", completed.stdout)
+            self.assertEqual(
+                [
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl show cloudflared.service --property=LoadState --value",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_rollback_restores_exact_existing_drop_in_and_active_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            systemd_root = root / "systemd"
+            backup = root / "backup"
+            action_log = root / "actions.log"
+            destination = (
+                systemd_root / "cloudflared.service.d/20-http2.conf"
+            )
+            (source / "deployment/systemd/cloudflared.service.d").mkdir(
+                parents=True
+            )
+            destination.parent.mkdir(parents=True)
+            backup.mkdir()
+            destination.write_text("previous transport\n", encoding="utf-8")
+            destination.chmod(0o600)
+            (
+                source
+                / "deployment/systemd/cloudflared.service.d/20-http2.conf"
+            ).write_text(
+                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n"
+            )
+            script = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) forwarded+=("$1"); shift ;;
+    esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+timeout() {{
+  printf 'timeout %s\n' "$*" >> {shlex.quote(str(action_log))}
+  shift 3
+  "$@"
+}}
+systemctl() {{
+  case "$*" in
+    'daemon-reload'|'restart cloudflared.service'|'is-active --quiet cloudflared.service') return 0 ;;
+    'is-enabled --quiet cloudflared.service') return 1 ;;
+    *) return 99 ;;
+  esac
+}}
+CLOUDFLARED_WAS_PRESENT=true
+CLOUDFLARED_WAS_ACTIVE=true
+CLOUDFLARED_WAS_ENABLED=false
+backup_cloudflared_transport_drop_in \
+  {shlex.quote(str(systemd_root))} {shlex.quote(str(backup))}
+install_cloudflared_transport_drop_in \
+  {shlex.quote(str(source))} {shlex.quote(str(systemd_root))}
+restore_cloudflared_transport_after_rollback \
+  {shlex.quote(str(systemd_root))} {shlex.quote(str(backup))}
+"""
+
+            completed = self.run_shell(script)
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("previous transport\n", destination.read_text())
+            self.assertEqual(0o600, destination.stat().st_mode & 0o777)
+            self.assertEqual(
+                [
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl daemon-reload",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl restart cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-active --quiet cloudflared.service",
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl is-enabled --quiet cloudflared.service",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_rollback_restores_drop_in_absence_without_starting_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            systemd_root = root / "systemd"
+            backup = root / "backup"
+            action_log = root / "actions.log"
+            destination = (
+                systemd_root / "cloudflared.service.d/20-http2.conf"
+            )
+            (source / "deployment/systemd/cloudflared.service.d").mkdir(
+                parents=True
+            )
+            systemd_root.mkdir()
+            backup.mkdir()
+            (
+                source
+                / "deployment/systemd/cloudflared.service.d/20-http2.conf"
+            ).write_text(
+                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n"
+            )
+            script = f"""
+source deployment/install.sh
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) forwarded+=("$1"); shift ;;
+    esac
+  done
+  command install "${{forwarded[@]}}"
+}}
+timeout() {{
+  printf 'timeout %s\n' "$*" >> {shlex.quote(str(action_log))}
+  shift 3
+  "$@"
+}}
+systemctl() {{
+  case "$*" in
+    'daemon-reload') return 0 ;;
+    *) return 99 ;;
+  esac
+}}
+CLOUDFLARED_WAS_PRESENT=true
+CLOUDFLARED_WAS_ACTIVE=false
+CLOUDFLARED_WAS_ENABLED=true
+backup_cloudflared_transport_drop_in \
+  {shlex.quote(str(systemd_root))} {shlex.quote(str(backup))}
+install_cloudflared_transport_drop_in \
+  {shlex.quote(str(source))} {shlex.quote(str(systemd_root))}
+restore_cloudflared_transport_after_rollback \
+  {shlex.quote(str(systemd_root))} {shlex.quote(str(backup))}
+"""
+
+            completed = self.run_shell(script)
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                [
+                    "timeout --signal=TERM --kill-after=5s 30s systemctl daemon-reload",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
             )
 
 

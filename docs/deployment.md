@@ -190,11 +190,19 @@ Run `cloudflared` with the validated configuration through the operator-managed
 Cloudflare package/service workflow. Do not run Cloudflare account commands or
 create tunnel credentials from the controller installer.
 
-The managed systemd drop-in keeps transport selection on `auto`. Cloudflare's
-startup connectivity checks can then choose QUIC when UDP reaches both tunnel
-regions but TCP/HTTP2 does not. All four outbound tunnel connections remain
-encrypted. After bootstrap, confirm the effective setting and selected
-connection protocol:
+The managed systemd drop-in keeps transport selection on `auto`, which first
+tries QUIC and falls back to HTTP/2 when UDP cannot connect. All four outbound
+tunnel connections remain encrypted. Bootstrap records the existing service
+state and drop-in before activation. When the effective drop-in changes and
+`cloudflared.service` was active, bootstrap restarts it with a 30-second bound
+and explicitly confirms it is active afterward. An inactive or absent service
+is never started, and the previous enabled state is left unchanged. If later
+bootstrap activation fails, the exact previous drop-in, including its absence,
+is restored before an originally active service is restarted and checked
+against the prior setting.
+
+After bootstrap, confirm the effective setting and selected connection
+protocol:
 
 ```sh
 sudo systemctl show cloudflared.service --property=Environment

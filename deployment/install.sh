@@ -10,6 +10,7 @@ LEGACY_COMMAND_UNIT=gate-command-server.service
 UPDATER_SERVICE=gate-controller-updater.service
 UPDATER_TIMER=gate-controller-updater.timer
 SYSTEMD_ROOT=/etc/systemd/system
+CLOUDFLARED_SERVICE=cloudflared.service
 CLOUDFLARED_DROP_IN=cloudflared.service.d/20-http2.conf
 UPDATER_HELPER=/usr/local/libexec/gate-controller/gate-controller-updater.py
 MEDIA_BOOTSTRAP_ROOT=/usr/local/libexec/gate-media-bootstrap
@@ -31,6 +32,10 @@ APP_WAS_ACTIVE=false
 LEGACY_COMMAND_WAS_ENABLED=false
 LEGACY_COMMAND_WAS_ACTIVE=false
 UPDATER_WAS_ENABLED=false
+CLOUDFLARED_WAS_PRESENT=false
+CLOUDFLARED_WAS_ENABLED=false
+CLOUDFLARED_WAS_ACTIVE=false
+CLOUDFLARED_DROP_IN_CHANGED=false
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
 
@@ -177,17 +182,160 @@ install_fixed_trust_anchors() {
     "$systemd_root/$UPDATER_TIMER"
 }
 
+run_systemctl_bounded() {
+  timeout --signal=TERM --kill-after=5s 30s systemctl "$@"
+}
+
+capture_cloudflared_service_state() {
+  local load_state status
+
+  CLOUDFLARED_WAS_PRESENT=false
+  CLOUDFLARED_WAS_ENABLED=false
+  CLOUDFLARED_WAS_ACTIVE=false
+  load_state=$(
+    run_systemctl_bounded show "$CLOUDFLARED_SERVICE" \
+      --property=LoadState --value
+  ) || fail "could not inspect $CLOUDFLARED_SERVICE"
+  if [[ $load_state == not-found ]]; then
+    return
+  fi
+  [[ $load_state == loaded ]] \
+    || fail "$CLOUDFLARED_SERVICE has unexpected load state: $load_state"
+  CLOUDFLARED_WAS_PRESENT=true
+
+  if run_systemctl_bounded is-enabled --quiet "$CLOUDFLARED_SERVICE"; then
+    CLOUDFLARED_WAS_ENABLED=true
+  else
+    status=$?
+    [[ $status -eq 1 ]] \
+      || fail "could not inspect whether $CLOUDFLARED_SERVICE is enabled"
+  fi
+  if run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE"; then
+    CLOUDFLARED_WAS_ACTIVE=true
+  else
+    status=$?
+    [[ $status -eq 3 ]] \
+      || fail "could not inspect whether $CLOUDFLARED_SERVICE is active"
+  fi
+}
+
+backup_cloudflared_transport_drop_in() {
+  local systemd_root=$1
+  local backup_dir=$2
+  local destination=$systemd_root/$CLOUDFLARED_DROP_IN
+  local backup=$backup_dir/cloudflared-transport-drop-in
+  local absent=$backup_dir/cloudflared-transport-drop-in.absent
+
+  [[ ! -e $backup && ! -L $backup && ! -e $absent ]] \
+    || fail "cloudflared transport backup already exists"
+  if [[ -e $destination || -L $destination ]]; then
+    cp -a -- "$destination" "$backup"
+  else
+    : >"$absent"
+  fi
+}
+
 install_cloudflared_transport_drop_in() {
   local source=$1
   local systemd_root=$2
   local source_path=$source/deployment/systemd/$CLOUDFLARED_DROP_IN
   local destination_root=$systemd_root/cloudflared.service.d
+  local destination=$systemd_root/$CLOUDFLARED_DROP_IN
+  local temporary
 
   [[ -f $source_path && ! -L $source_path ]] \
     || fail "trusted cloudflared transport drop-in is missing"
+  [[ ! -L $destination_root ]] \
+    || fail "$destination_root must not be a symbolic link"
+  [[ ! -d $destination ]] \
+    || fail "$destination must not be a directory"
+  if [[ ! -f $destination || -L $destination ]] \
+    || ! cmp -s -- "$source_path" "$destination"; then
+    CLOUDFLARED_DROP_IN_CHANGED=true
+  else
+    CLOUDFLARED_DROP_IN_CHANGED=false
+  fi
   install -d -o root -g root -m 0755 "$destination_root"
-  install -o root -g root -m 0644 \
-    "$source_path" "$systemd_root/$CLOUDFLARED_DROP_IN"
+  temporary=$(mktemp "$destination_root/.20-http2.conf.XXXXXX")
+  if ! install -o root -g root -m 0644 "$source_path" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  mv -f -- "$temporary" "$destination"
+}
+
+apply_cloudflared_transport_if_active() {
+  [[ $CLOUDFLARED_DROP_IN_CHANGED == true ]] || return 0
+  [[ $CLOUDFLARED_WAS_PRESENT == true ]] || return 0
+  [[ $CLOUDFLARED_WAS_ACTIVE == true ]] || return 0
+
+  run_systemctl_bounded restart "$CLOUDFLARED_SERVICE" \
+    || fail "could not restart $CLOUDFLARED_SERVICE"
+  run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE" \
+    || fail "$CLOUDFLARED_SERVICE is not active after transport restart"
+  verify_cloudflared_enabled_state
+}
+
+verify_cloudflared_enabled_state() {
+  local currently_enabled=false
+  local status
+
+  if run_systemctl_bounded is-enabled --quiet "$CLOUDFLARED_SERVICE"; then
+    currently_enabled=true
+  else
+    status=$?
+    [[ $status -eq 1 ]] \
+      || fail "could not verify whether $CLOUDFLARED_SERVICE is enabled"
+  fi
+  [[ $currently_enabled == "$CLOUDFLARED_WAS_ENABLED" ]] \
+    || fail "$CLOUDFLARED_SERVICE enabled state changed during bootstrap"
+}
+
+restore_cloudflared_transport_drop_in() {
+  local systemd_root=$1
+  local backup_dir=$2
+  local destination_root=$systemd_root/cloudflared.service.d
+  local destination=$systemd_root/$CLOUDFLARED_DROP_IN
+  local backup=$backup_dir/cloudflared-transport-drop-in
+  local absent=$backup_dir/cloudflared-transport-drop-in.absent
+  local temporary
+
+  if [[ -e $backup || -L $backup ]]; then
+    [[ ! -L $destination_root ]] \
+      || fail "$destination_root must not be a symbolic link"
+    [[ ! -d $destination ]] \
+      || fail "$destination must not be a directory"
+    install -d -o root -g root -m 0755 "$destination_root"
+    temporary=$destination_root/.20-http2.conf.restore.$$
+    [[ ! -e $temporary && ! -L $temporary ]] \
+      || fail "cloudflared transport restore path already exists"
+    if ! cp -a -- "$backup" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    mv -f -- "$temporary" "$destination"
+  elif [[ -f $absent && ! -L $absent ]]; then
+    rm -f -- "$destination"
+  else
+    fail "cloudflared transport backup is missing"
+  fi
+}
+
+restore_cloudflared_transport_after_rollback() {
+  local systemd_root=$1
+  local backup_dir=$2
+
+  restore_cloudflared_transport_drop_in "$systemd_root" "$backup_dir"
+  run_systemctl_bounded daemon-reload \
+    || fail "could not reload systemd after cloudflared transport rollback"
+  if [[ $CLOUDFLARED_WAS_PRESENT == true \
+        && $CLOUDFLARED_WAS_ACTIVE == true ]]; then
+    run_systemctl_bounded restart "$CLOUDFLARED_SERVICE" \
+      || fail "could not restart $CLOUDFLARED_SERVICE during rollback"
+    run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE" \
+      || fail "$CLOUDFLARED_SERVICE is not active after rollback"
+    verify_cloudflared_enabled_state
+  fi
 }
 
 install_fixed_media_bootstrap() {
@@ -386,8 +534,8 @@ validate_env_file "$ENV_FILE" 0 0
 validate_upload_paths "$STATE_ROOT" "$UPLOAD_ROOT"
 
 for command in \
-  bash cat chmod chown env find flock getent git id install ln mktemp mv python3 readlink \
-  rm runuser sed sh sleep systemctl systemd-analyze tar /usr/bin/test useradd usermod; do
+  bash cat chmod chown cmp cp env find flock getent git id install ln mktemp mv python3 readlink \
+  rm runuser sed sh sleep systemctl systemd-analyze tar timeout /usr/bin/test useradd usermod; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
 install -d -o root -g root -m 0755 "${UPDATE_LOCK%/*}"
@@ -523,6 +671,7 @@ rollback() {
     restore_path "$UPDATER_SERVICE"
     restore_path "$UPDATER_TIMER"
     restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+    restore_cloudflared_transport_after_rollback "$SYSTEMD_ROOT" "$BACKUP_DIR"
     configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
     if [[ $UPDATER_WAS_ENABLED == false ]]; then
       systemctl disable --now "$UPDATER_TIMER"
@@ -530,7 +679,6 @@ rollback() {
     if [[ $APP_WAS_ENABLED == false ]]; then
       systemctl disable "$APP_SERVICE"
     fi
-    systemctl daemon-reload
     restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
     restore_legacy_command_activity \
       "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
@@ -575,6 +723,7 @@ for name in "$APP_SERVICE" "$LEGACY_COMMAND_UNIT" "$UPDATER_SERVICE" "$UPDATER_T
   fi
 done
 backup_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+backup_cloudflared_transport_drop_in "$SYSTEMD_ROOT" "$BACKUP_DIR"
 if [[ -L $CURRENT_LINK ]]; then
   PREVIOUS_CURRENT=$(readlink -f "$CURRENT_LINK")
 elif [[ -e $CURRENT_LINK ]]; then
@@ -595,6 +744,7 @@ fi
 if systemctl is-enabled --quiet "$UPDATER_TIMER"; then
   UPDATER_WAS_ENABLED=true
 fi
+capture_cloudflared_service_state
 
 ACTIVATION_STARTED=true
 configure_ftp_home "$FTP_USER" "$UPLOAD_ROOT"
@@ -606,7 +756,9 @@ install_fixed_media_bootstrap "$RELEASE"
 rm -f -- "$CURRENT_LINK.new"
 ln -s "$RELEASE" "$CURRENT_LINK.new"
 mv -Tf "$CURRENT_LINK.new" "$CURRENT_LINK"
-systemctl daemon-reload
+run_systemctl_bounded daemon-reload \
+  || fail "could not reload systemd during bootstrap"
+apply_cloudflared_transport_if_active
 systemctl enable "$APP_SERVICE"
 systemctl restart "$APP_SERVICE"
 
