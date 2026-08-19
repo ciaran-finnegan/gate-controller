@@ -4,7 +4,7 @@ import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread, current_thread
 from unittest.mock import patch
 
 from gate_controller.relay import PiRelayAdapter, RelayController
@@ -51,6 +51,101 @@ class RecordingBackend:
 
 
 class RelayControllerTests(unittest.TestCase):
+    def test_pi_gpio_high_cannot_follow_shutdown_latch_establishment(self):
+        shutdown_progress = Event()
+        high_edge_reached = Event()
+        release_high_edge = Event()
+
+        class ObservedBoundary:
+            def __init__(self):
+                self._lock = RLock()
+
+            def acquire(self):
+                if current_thread().name == "relay-shutdown":
+                    shutdown_progress.set()
+                return self._lock.acquire()
+
+            def release(self):
+                self._lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, _type, _value, _traceback):
+                self.release()
+
+        class ObservedShutdownEvent:
+            def __init__(self):
+                self._event = Event()
+
+            def set(self):
+                self._event.set()
+                shutdown_progress.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                return self._event.wait(timeout)
+
+        gpio_calls = []
+        shutdown_event = ObservedShutdownEvent()
+        gpio = types.ModuleType("RPi.GPIO")
+        gpio.BOARD, gpio.OUT, gpio.LOW, gpio.HIGH = 1, 2, 0, 1
+        gpio.setmode = lambda mode: None
+        gpio.setwarnings = lambda enabled: None
+        gpio.setup = lambda pin, mode: None
+
+        def output(_pin, value):
+            if value == gpio.HIGH:
+                high_edge_reached.set()
+                release_high_edge.wait(1)
+            gpio_calls.append((value, shutdown_event.is_set()))
+
+        gpio.output = output
+        rpi = types.ModuleType("RPi")
+        rpi.GPIO = gpio
+        spec = importlib.util.spec_from_file_location(
+            "PiRelay_test_atomic_boundary", Path("PiRelay.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"RPi": rpi, "RPi.GPIO": gpio}):
+            spec.loader.exec_module(module)
+
+        boundary = ObservedBoundary()
+        pi_relay = module.Relay("RELAY1")
+        pi_relay.activation_boundary = boundary
+        adapter = object.__new__(PiRelayAdapter)
+        adapter._relay = pi_relay
+        controller = RelayController(adapter, pulse_seconds=0, sleeper=lambda _: None)
+        controller._shutdown_requested = shutdown_event
+        gpio_calls.clear()
+
+        trigger = Thread(
+            target=lambda: controller.trigger("remote_command", "command:atomic-boundary")
+        )
+        shutdown = Thread(target=controller.begin_shutdown, name="relay-shutdown")
+        trigger.start()
+        self.assertTrue(high_edge_reached.wait(1))
+        shutdown.start()
+        try:
+            self.assertTrue(shutdown_progress.wait(1))
+            self.assertFalse(
+                shutdown_event.is_set(),
+                "shutdown latch was established while the GPIO HIGH edge was pending",
+            )
+        finally:
+            release_high_edge.set()
+            trigger.join(1)
+            shutdown.join(1)
+
+        self.assertFalse(trigger.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        high_states = [latched for value, latched in gpio_calls if value == gpio.HIGH]
+        self.assertEqual([False], high_states)
+        self.assertEqual(gpio.LOW, gpio_calls[-1][0])
+
     def test_shutdown_request_at_gpio_boundary_prevents_activation(self):
         boundary_reached = Event()
         release_boundary = Event()
@@ -85,7 +180,7 @@ class RelayControllerTests(unittest.TestCase):
         worker.join(1)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(backend.calls, ["off", "off"])
         self.assertEqual(results[0].reason, "relay_latched")
         self.assertTrue(results[0].latched)
 
@@ -106,7 +201,7 @@ class RelayControllerTests(unittest.TestCase):
         self.assertEqual(checks, ["expiry"])
         self.assertFalse(result.activated)
         self.assertEqual(result.reason, "expired_before_activation")
-        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(backend.calls, ["off", "off"])
 
     def test_pi_library_checks_inhibition_at_the_gpio_boundary(self):
         calls = []

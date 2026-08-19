@@ -34,6 +34,17 @@ EXTRACTED_MEDIA_DIR=
 STAGED_MEDIA_BINARY=
 STAGED_MEDIA_ARCHIVE=
 STAGED_MEDIA_PROXY_CONFIG=
+MEDIA_INSTALL_BACKUP_DIR=
+MEDIA_TRANSACTION_PREPARING=0
+MEDIA_TRANSACTION_STARTED=0
+MEDIA_ROLLBACK_STARTED=0
+MEDIA_ROLLBACK_OWNER_SUBSHELL=0
+MEDIA_ARTIFACT_PATHS=()
+MEDIA_UNIT_NAMES=()
+MEDIA_UNIT_WAS_PRESENT=()
+MEDIA_UNIT_WAS_ENABLED=()
+MEDIA_UNIT_WAS_ACTIVE=()
+MEDIA_UNIT_RESTORE_ENABLEMENT=()
 
 usage() {
   cat <<'EOF'
@@ -320,6 +331,316 @@ configure_turn_refresh_timer() {
   fi
 }
 
+bootstrap_turn_credentials_if_needed() {
+  [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]] \
+    || fail "TURN bootstrap requires the install lock"
+  if [[ ! -s $MEDIA_RUNTIME_TURN_ENV ]] && turn_refresh_environment_configured; then
+    python3 "$MEDIA_TURN_REFRESH_HELPER"
+  fi
+}
+
+configure_media_transaction_targets() {
+  MEDIA_ARTIFACT_PATHS=(
+    "$MEDIA_AUTH_ENV"
+    "$MEDIA_GATEWAY_ENV"
+    "$MEDIA_RUNTIME_TURN_ENV"
+    "$MEDIA_CONFIG_ROOT"
+    "$MEDIA_TMPFILES"
+    "$MEDIA_LIBRARY"
+    "$MEDIA_BINARY"
+    "$MEDIA_ARCHIVE_ROOT"
+    "$SYSTEMD_ROOT/gate-media-auth.service"
+    "$SYSTEMD_ROOT/gate-media-gateway.service"
+    "$SYSTEMD_ROOT/gate-media-transcoder.service"
+    "$SYSTEMD_ROOT/$MEDIA_TURN_REFRESH_SERVICE"
+    "$SYSTEMD_ROOT/$MEDIA_TURN_REFRESH_TIMER"
+    "$NGINX_PROXY_CONFIG"
+  )
+  MEDIA_UNIT_NAMES=(
+    nginx.service
+    gate-media-auth.service
+    gate-media-gateway.service
+    gate-media-transcoder.service
+    "$MEDIA_TURN_REFRESH_TIMER"
+    "$MEDIA_TURN_REFRESH_SERVICE"
+  )
+  MEDIA_UNIT_RESTORE_ENABLEMENT=(1 1 1 1 1 0)
+}
+
+capture_media_unit_states() {
+  local index load_state status unit
+
+  MEDIA_UNIT_WAS_PRESENT=()
+  MEDIA_UNIT_WAS_ENABLED=()
+  MEDIA_UNIT_WAS_ACTIVE=()
+  for ((index = 0; index < ${#MEDIA_UNIT_NAMES[@]}; index += 1)); do
+    unit=${MEDIA_UNIT_NAMES[$index]}
+    if ! load_state=$(systemctl show --property=LoadState --value "$unit"); then
+      fail "service state could not be captured: $unit"
+      return 1
+    fi
+    case "$load_state" in
+      not-found)
+        MEDIA_UNIT_WAS_PRESENT[index]=0
+        MEDIA_UNIT_WAS_ENABLED[index]=0
+        MEDIA_UNIT_WAS_ACTIVE[index]=0
+        continue
+        ;;
+      loaded|masked|bad-setting|error|merged)
+        MEDIA_UNIT_WAS_PRESENT[index]=1
+        ;;
+      *)
+        fail "service has unexpected load state: $unit: $load_state"
+        return 1
+        ;;
+    esac
+
+    if systemctl is-enabled --quiet "$unit"; then
+      MEDIA_UNIT_WAS_ENABLED[index]=1
+    else
+      status=$?
+      if [[ $status -ne 1 ]]; then
+        fail "service enablement could not be captured: $unit"
+        return 1
+      fi
+      MEDIA_UNIT_WAS_ENABLED[index]=0
+    fi
+    if systemctl is-active --quiet "$unit"; then
+      MEDIA_UNIT_WAS_ACTIVE[index]=1
+    else
+      status=$?
+      if [[ $status -ne 3 && $status -ne 4 ]]; then
+        fail "service activity could not be captured: $unit"
+        return 1
+      fi
+      MEDIA_UNIT_WAS_ACTIVE[index]=0
+    fi
+  done
+}
+
+backup_media_artifacts() {
+  local absent backup index path
+
+  MEDIA_INSTALL_BACKUP_DIR=$(mktemp -d "$MEDIA_STATE_ROOT/.install-backup.XXXXXX")
+  [[ -d $MEDIA_INSTALL_BACKUP_DIR && ! -L $MEDIA_INSTALL_BACKUP_DIR ]] \
+    || fail "media transaction backup directory is invalid"
+  for ((index = 0; index < ${#MEDIA_ARTIFACT_PATHS[@]}; index += 1)); do
+    path=${MEDIA_ARTIFACT_PATHS[$index]}
+    backup=$MEDIA_INSTALL_BACKUP_DIR/artifact-$index
+    absent=$MEDIA_INSTALL_BACKUP_DIR/artifact-$index.absent
+    if [[ -e $path || -L $path ]]; then
+      cp -a -- "$path" "$backup" \
+        || fail "stable media artifact could not be backed up"
+    else
+      : > "$absent" || fail "media artifact absence could not be recorded"
+    fi
+  done
+}
+
+begin_media_install_transaction() {
+  [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]] \
+    || fail "media transaction requires the install lock"
+  [[ $MEDIA_TRANSACTION_STARTED -eq 0 ]] \
+    || fail "media transaction is already active"
+  MEDIA_ROLLBACK_STARTED=0
+  MEDIA_TRANSACTION_PREPARING=1
+  MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+  configure_media_transaction_targets
+  capture_media_unit_states
+  backup_media_artifacts
+  MEDIA_TRANSACTION_STARTED=1
+  MEDIA_TRANSACTION_PREPARING=0
+}
+
+prepare_media_install_transaction() {
+  [[ ! -e $MEDIA_STATE_ROOT || -d $MEDIA_STATE_ROOT && ! -L $MEDIA_STATE_ROOT ]] \
+    || fail "$MEDIA_STATE_ROOT must be a directory"
+  install -d -o root -g root -m 0700 "$MEDIA_STATE_ROOT"
+  acquire_turn_refresh_install_lock
+  begin_media_install_transaction
+  quiesce_turn_refresh
+}
+
+discard_media_install_backup() {
+  [[ -n $MEDIA_INSTALL_BACKUP_DIR ]] || return 0
+  [[ $MEDIA_INSTALL_BACKUP_DIR == "$MEDIA_STATE_ROOT"/.install-backup.* \
+      && -d $MEDIA_INSTALL_BACKUP_DIR && ! -L $MEDIA_INSTALL_BACKUP_DIR ]] \
+    || fail "media transaction backup directory cannot be removed"
+  rm -rf -- "$MEDIA_INSTALL_BACKUP_DIR" \
+    || fail "media transaction backup directory could not be removed"
+  MEDIA_INSTALL_BACKUP_DIR=
+}
+
+restore_media_artifact() {
+  local index=$1
+  local path=$2
+  local absent=$MEDIA_INSTALL_BACKUP_DIR/artifact-$index.absent
+  local backup=$MEDIA_INSTALL_BACKUP_DIR/artifact-$index
+  local parent=${path%/*}
+  local name=${path##*/}
+  local staged=$parent/.$name.media-restore.$$
+  local quarantine=$parent/.$name.media-candidate.$$
+  local had_candidate=0
+
+  [[ -d $parent && ! -L $parent ]] \
+    || { fail "media artifact restore parent is invalid"; return 1; }
+  [[ ! -e $staged && ! -L $staged && ! -e $quarantine && ! -L $quarantine ]] \
+    || { fail "media artifact restore path already exists"; return 1; }
+  if [[ -e $backup || -L $backup ]]; then
+    [[ ! -e $absent ]] \
+      || { fail "media artifact backup state is ambiguous"; return 1; }
+    if ! cp -a -- "$backup" "$staged"; then
+      rm -rf -- "$staged"
+      fail "media artifact backup could not be staged" || true
+      return 1
+    fi
+    if [[ -e $path || -L $path ]]; then
+      if ! mv -f -- "$path" "$quarantine"; then
+        rm -rf -- "$staged"
+        fail "candidate media artifact could not be quarantined" || true
+        return 1
+      fi
+      had_candidate=1
+    fi
+    if ! mv -f -- "$staged" "$path"; then
+      rm -rf -- "$staged"
+      if [[ $had_candidate -eq 1 ]]; then
+        mv -f -- "$quarantine" "$path" || true
+      fi
+      fail "prior media artifact could not be published" || true
+      return 1
+    fi
+    if [[ $had_candidate -eq 1 ]] && ! rm -rf -- "$quarantine"; then
+      fail "candidate media artifact quarantine could not be removed" || true
+      return 1
+    fi
+    return 0
+  fi
+
+  [[ -f $absent && ! -L $absent ]] \
+    || { fail "media artifact backup state is missing"; return 1; }
+  if [[ -e $path || -L $path ]]; then
+    mv -f -- "$path" "$quarantine" \
+      || { fail "candidate media artifact could not be quarantined"; return 1; }
+    if ! rm -rf -- "$quarantine"; then
+      fail "candidate media artifact could not be removed" || true
+      return 1
+    fi
+  fi
+}
+
+restore_media_artifacts() {
+  local failed=0
+  local index path
+
+  for ((index = 0; index < ${#MEDIA_ARTIFACT_PATHS[@]}; index += 1)); do
+    path=${MEDIA_ARTIFACT_PATHS[$index]}
+    if ! restore_media_artifact "$index" "$path"; then
+      failed=1
+    fi
+  done
+  [[ $failed -eq 0 ]]
+}
+
+quiesce_published_media() {
+  local failed=0
+
+  systemctl disable --now gate-media-transcoder.service \
+    gate-media-gateway.service gate-media-auth.service >/dev/null 2>&1 \
+    || failed=1
+  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 \
+    || failed=1
+  systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 \
+    || failed=1
+  [[ $failed -eq 0 ]]
+}
+
+validate_restored_nginx() {
+  [[ -x $NGINX_BINARY ]] || return 1
+  "$NGINX_BINARY" -t
+}
+
+restore_media_unit_states() {
+  local failed=0
+  local index unit
+
+  for ((index = 0; index < ${#MEDIA_UNIT_NAMES[@]}; index += 1)); do
+    [[ ${MEDIA_UNIT_WAS_PRESENT[$index]} -eq 1 ]] || continue
+    unit=${MEDIA_UNIT_NAMES[$index]}
+    if [[ ${MEDIA_UNIT_RESTORE_ENABLEMENT[$index]} -eq 1 ]]; then
+      if [[ ${MEDIA_UNIT_WAS_ENABLED[$index]} -eq 1 ]]; then
+        systemctl enable "$unit" || failed=1
+      else
+        systemctl disable "$unit" || failed=1
+      fi
+    fi
+    if [[ ${MEDIA_UNIT_WAS_ACTIVE[$index]} -eq 1 ]]; then
+      if [[ $unit == nginx.service ]]; then
+        systemctl reload-or-restart "$unit" || failed=1
+      else
+        systemctl restart "$unit" || failed=1
+      fi
+    else
+      systemctl stop "$unit" || failed=1
+    fi
+  done
+  [[ $failed -eq 0 ]]
+}
+
+rollback_media_install_transaction() {
+  local failed=0
+  local prerequisites_failed=0
+
+  [[ $MEDIA_TRANSACTION_STARTED -eq 1 ]] || return 0
+  if [[ $MEDIA_ROLLBACK_STARTED -eq 1 ]]; then
+    return 1
+  fi
+  MEDIA_ROLLBACK_STARTED=1
+  printf 'Media activation failed; restoring the previous installation.\n' >&2
+  if ! quiesce_published_media; then
+    failed=1
+    prerequisites_failed=1
+  fi
+  if ! restore_media_artifacts; then
+    failed=1
+    prerequisites_failed=1
+  fi
+  if ! systemctl daemon-reload; then
+    failed=1
+    prerequisites_failed=1
+  fi
+  if ! validate_restored_nginx; then
+    failed=1
+    prerequisites_failed=1
+  fi
+  if [[ $prerequisites_failed -eq 0 ]]; then
+    if ! restore_media_unit_states; then
+      failed=1
+      quiesce_published_media || true
+    fi
+  else
+    printf 'Service-state restoration skipped because media rollback prerequisites failed.\n' \
+      >&2
+  fi
+  if [[ $failed -eq 0 ]]; then
+    if ! discard_media_install_backup; then
+      failed=1
+    fi
+  fi
+  if [[ $failed -ne 0 ]]; then
+    printf 'Media rollback failed; the transaction backup was retained.\n' >&2
+    return 1
+  fi
+  MEDIA_TRANSACTION_STARTED=0
+  return 0
+}
+
+commit_media_install_transaction() {
+  [[ $MEDIA_TRANSACTION_STARTED -eq 1 ]] || return 0
+  discard_media_install_backup
+  MEDIA_TRANSACTION_STARTED=0
+}
+
 cleanup_media_install() {
   [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]] || return 0
   if [[ -n $EXTRACTED_MEDIA_DIR \
@@ -343,17 +664,40 @@ cleanup_media_install() {
 
 finish_media_install() {
   configure_turn_refresh_timer || return 1
+  commit_media_install_transaction || return 1
   cleanup_media_install
+}
+
+activate_media_runtime() {
+  bootstrap_turn_credentials_if_needed
+  if media_environment_complete; then
+    activate_media_services
+  else
+    disable_media_services
+    printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
+  fi
+  finish_media_install
 }
 
 on_media_install_failure() {
   local status=$?
   [[ $status -ne 0 ]] || status=1
   trap - ERR INT TERM
+  if [[ $MEDIA_TRANSACTION_STARTED -eq 1 || $MEDIA_TRANSACTION_PREPARING -eq 1 ]] \
+      && [[ $BASH_SUBSHELL -ne $MEDIA_ROLLBACK_OWNER_SUBSHELL ]]; then
+    return "$status"
+  fi
   if [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]]; then
-    disable_media_services
-    disable_turn_refresh_timer
-    cleanup_media_install
+    if [[ $MEDIA_TRANSACTION_STARTED -eq 1 ]]; then
+      rollback_media_install_transaction || status=1
+    elif [[ $MEDIA_TRANSACTION_PREPARING -eq 1 ]]; then
+      discard_media_install_backup || status=1
+      MEDIA_TRANSACTION_PREPARING=0
+    else
+      disable_media_services
+      disable_turn_refresh_timer
+    fi
+    cleanup_media_install || status=1
   fi
   exit "$status"
 }
@@ -584,21 +928,18 @@ main() {
   SOURCE=$(readlink -f "$SOURCE")
   [[ -d $SOURCE ]] || fail "source checkout does not exist"
 
-  for command in flock id install ln mktemp mv python3 readlink rm sha256sum \
+  for command in cp flock id install ln mktemp mv python3 readlink rm sha256sum \
     systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
   preflight_ffmpeg
-  prepare_turn_refresh_install
+  prepare_media_install_transaction
   for account in gate-media gate-media-auth; do
     if ! id "$account" >/dev/null 2>&1; then
       useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin "$account"
     fi
     reject_gpio_membership "$account"
   done
-  [[ ! -e $MEDIA_STATE_ROOT || -d $MEDIA_STATE_ROOT && ! -L $MEDIA_STATE_ROOT ]] \
-    || fail "$MEDIA_STATE_ROOT must be a directory"
-  install -d -o root -g root -m 0700 "$MEDIA_STATE_ROOT"
   [[ ! -L $MEDIA_AUTH_ENV ]] || fail "$MEDIA_AUTH_ENV must not be a symlink"
   if [[ ! -e $MEDIA_AUTH_ENV ]]; then
     install -o root -g root -m 0600 /dev/null "$MEDIA_AUTH_ENV"
@@ -612,13 +953,7 @@ main() {
   systemd-tmpfiles --create "$MEDIA_TMPFILES"
   systemctl daemon-reload
   activate_proxy_config "$STAGED_MEDIA_PROXY_CONFIG"
-  if media_environment_complete; then
-    activate_media_services
-  else
-    disable_media_services
-    printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
-  fi
-  finish_media_install
+  activate_media_runtime
   trap - ERR INT TERM
   trap - EXIT
 }

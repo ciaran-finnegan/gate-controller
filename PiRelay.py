@@ -9,6 +9,7 @@
 
 import RPi.GPIO as GPIO
 import time
+from threading import RLock
 
 GPIO.setmode(GPIO.BOARD)
 GPIO.setwarnings(False)
@@ -25,16 +26,19 @@ class Relay:
     def __init__(self, relay):
         self.pin = self.relaypins[relay]
         self.relay = relay
+        self.activation_boundary = RLock()
         GPIO.setup(self.pin,GPIO.OUT)
         GPIO.output(self.pin, GPIO.LOW)
 
     def on(self, pre_activation_inhibit=None):
-        if pre_activation_inhibit is not None:
-            inhibition = pre_activation_inhibit()
-            if inhibition is not None:
-                return inhibition
-        GPIO.output(self.pin,GPIO.HIGH)
-        return None
+        with self.activation_boundary:
+            if pre_activation_inhibit is not None:
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+            GPIO.output(self.pin,GPIO.HIGH)
+            return None
 
     def off(self):
-        GPIO.output(self.pin,GPIO.LOW)
+        with self.activation_boundary:
+            GPIO.output(self.pin,GPIO.LOW)

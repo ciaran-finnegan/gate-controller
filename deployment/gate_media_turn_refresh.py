@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ from gate_media_config import (
     MediaConfigError,
     parse_trusted_environment,
     validate_auth_environment,
+    validate_gateway_static_environment,
     validate_split_gateway_environment,
     validate_turn_environment,
 )
@@ -165,17 +167,25 @@ def refresh_turn_credentials(
 ) -> None:
     """Fetch, validate, atomically activate, and roll back TURN credentials."""
     turn_values = _load_turn_environment(turn_environment)
-    _validate_complete_media_environment(
-        auth_environment, gateway_environment, runtime_turn_environment
-    )
-    previous_runtime_turn = _read_environment_bytes(runtime_turn_environment)
+    bootstrap = _empty_runtime_environment_is_trusted(runtime_turn_environment)
+    if bootstrap:
+        _validate_bootstrap_media_environment(auth_environment, gateway_environment)
+        previous_runtime_turn = b""
+    else:
+        _validate_complete_media_environment(
+            auth_environment, gateway_environment, runtime_turn_environment
+        )
+        previous_runtime_turn = _read_environment_bytes(runtime_turn_environment)
     payload = fetch_ice_servers(
         turn_values["TURN_KEY_ID"], turn_values["TURN_KEY_API_TOKEN"]
     )
     url, username, password = select_turn_credentials(payload)
-    staged_runtime_turn = _replace_turn_values(
-        previous_runtime_turn, url, username, password
-    )
+    if bootstrap:
+        staged_runtime_turn = _initial_turn_values(url, username, password)
+    else:
+        staged_runtime_turn = _replace_turn_values(
+            previous_runtime_turn, url, username, password
+        )
     _validate_staged_media_environment(
         auth_environment,
         gateway_environment,
@@ -215,6 +225,14 @@ def _validate_complete_media_environment(auth_path, gateway_path, runtime_turn_p
         raise TurnRefreshError("current media environments are invalid") from error
 
 
+def _validate_bootstrap_media_environment(auth_path, gateway_path) -> None:
+    try:
+        validate_auth_environment(parse_trusted_environment(auth_path))
+        validate_gateway_static_environment(parse_trusted_environment(gateway_path))
+    except (MediaConfigError, OSError, TypeError, ValueError) as error:
+        raise TurnRefreshError("current media environments are invalid") from error
+
+
 def _validate_staged_media_environment(
     auth_path, gateway_path, runtime_turn_path, staged_runtime_turn: bytes
 ) -> None:
@@ -244,6 +262,48 @@ def _read_environment_bytes(path) -> bytes:
     return body
 
 
+def _empty_runtime_environment_is_trusted(path) -> bool:
+    path = Path(path)
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0:
+        return False
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = None
+    descriptor = None
+    try:
+        directory_descriptor = os.open(path.parent, directory_flags)
+        parent_metadata = os.fstat(directory_descriptor)
+        if (not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_metadata.st_mode) & 0o022):
+            raise TurnRefreshError("empty runtime TURN environment is not trusted")
+        descriptor = os.open(path.name, file_flags, dir_fd=directory_descriptor)
+        opened_metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened_metadata.st_mode)
+                or opened_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_metadata.st_mode) != 0o600
+                or opened_metadata.st_size != 0
+                or os.read(descriptor, 1)):
+            raise TurnRefreshError("empty runtime TURN environment is not trusted")
+    except TurnRefreshError:
+        raise
+    except OSError as error:
+        raise TurnRefreshError("empty runtime TURN environment is not trusted") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+    return True
+
+
 def _replace_turn_values(previous: bytes, url: str, username: str, password: str) -> bytes:
     values = {
         "MTX_WEBRTCICESERVERS2_0_URL": url,
@@ -266,6 +326,14 @@ def _replace_turn_values(previous: bytes, url: str, username: str, password: str
     if replaced != _REPLACED_GATEWAY_KEYS:
         raise TurnRefreshError("runtime TURN environment has incomplete values")
     return "".join(output).encode("utf-8")
+
+
+def _initial_turn_values(url: str, username: str, password: str) -> bytes:
+    return (
+        f"MTX_WEBRTCICESERVERS2_0_URL={url}\n"
+        f"MTX_WEBRTCICESERVERS2_0_USERNAME={username}\n"
+        f"MTX_WEBRTCICESERVERS2_0_PASSWORD={password}\n"
+    ).encode("utf-8")
 
 
 def _gateway_is_healthy(service, sleep) -> bool:

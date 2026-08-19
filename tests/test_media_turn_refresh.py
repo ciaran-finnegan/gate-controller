@@ -320,6 +320,75 @@ configure_turn_refresh_timer
                 sleeps,
             )
 
+    def test_refresh_bootstraps_an_empty_trusted_runtime_environment(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            runtime_turn.write_bytes(b"")
+            runtime_turn.chmod(0o600)
+            previous_inode = runtime_turn.stat().st_ino
+            fetches = []
+            service = FakeGatewayService(active=False)
+
+            def fetch(key_id, api_token):
+                fetches.append((key_id, api_token))
+                return {
+                    "iceServers": [{
+                        "urls": ["turns:turn.cloudflare.com:5349?transport=tcp"],
+                        "username": "initial-short-lived-user",
+                        "credential": "initial-short-lived-password",
+                    }],
+                }
+
+            try:
+                refresh_turn_credentials(
+                    turn_environment=turn,
+                    auth_environment=auth,
+                    gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
+                    fetch_ice_servers=fetch,
+                    service=service,
+                    sleep=lambda _seconds: None,
+                )
+            except TurnRefreshError as error:
+                self.fail(f"empty trusted runtime was not bootstrapped: {error}")
+
+            self.assertEqual([("turn-key-id", "long-term-api-token")], fetches)
+            self.assertEqual(
+                b"MTX_WEBRTCICESERVERS2_0_URL="
+                b"turns:turn.cloudflare.com:5349?transport=tcp\n"
+                b"MTX_WEBRTCICESERVERS2_0_USERNAME=initial-short-lived-user\n"
+                b"MTX_WEBRTCICESERVERS2_0_PASSWORD=initial-short-lived-password\n",
+                runtime_turn.read_bytes(),
+            )
+            self.assertNotEqual(previous_inode, runtime_turn.stat().st_ino)
+            self.assertEqual(os.geteuid(), runtime_turn.stat().st_uid)
+            self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
+            self.assertNotIn(b"long-term-api-token", runtime_turn.read_bytes())
+            self.assertEqual(["is-active"], service.calls)
+            self.assertEqual([], list(root.glob(f".{runtime_turn.name}.*")))
+
+    def test_refresh_rejects_an_insecure_empty_runtime_without_fetching(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            runtime_turn.write_bytes(b"")
+            runtime_turn.chmod(0o644)
+            fetches = []
+
+            with self.assertRaises(TurnRefreshError):
+                refresh_turn_credentials(
+                    turn_environment=turn,
+                    auth_environment=auth,
+                    gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
+                    fetch_ice_servers=lambda *_arguments: fetches.append(True),
+                    service=FakeGatewayService(active=False),
+                )
+
+            self.assertEqual([], fetches)
+            self.assertEqual(b"", runtime_turn.read_bytes())
+
     def test_successful_refresh_preserves_an_inactive_gateway(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

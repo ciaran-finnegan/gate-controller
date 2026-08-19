@@ -1314,7 +1314,7 @@ class GateProcessorTests(unittest.TestCase):
 
         self.assertFalse(result.opened)
         self.assertEqual(result.reason, "relay_latched")
-        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(backend.calls, ["off", "off"])
         self.assertEqual(result.telemetry.to_wire()["actuation"], {
             "claim": "claimed",
             "attempted": False,

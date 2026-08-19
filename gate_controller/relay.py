@@ -1,6 +1,6 @@
 import inspect
 from datetime import datetime, timezone
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from time import sleep
 
 from .models import RelayResult
@@ -17,6 +17,7 @@ class RelayController:
         self._max_off_attempts = max_off_attempts
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
+        self._activation_boundary = getattr(relay, "activation_boundary", None) or RLock()
         self._shutdown_requested = Event()
         safe = self._deenergize()
         self._latched = not safe
@@ -59,15 +60,16 @@ class RelayController:
                             latched=detail == "relay_latched",
                         )
                 else:
-                    last_moment_inhibition = activation_inhibition()
-                    if last_moment_inhibition is not None:
-                        _, detail = last_moment_inhibition
-                        self._record_outcome(detail)
-                        return RelayResult(
-                            False, detail, idempotency_key,
-                            latched=detail == "relay_latched",
-                        )
-                    self._relay.on()
+                    with self._activation_boundary:
+                        last_moment_inhibition = activation_inhibition()
+                        if last_moment_inhibition is not None:
+                            _, detail = last_moment_inhibition
+                            self._record_outcome(detail)
+                            return RelayResult(
+                                False, detail, idempotency_key,
+                                latched=detail == "relay_latched",
+                            )
+                        self._relay.on()
                 activated_at = self._clock()
                 if on_activation is not None:
                     try:
@@ -100,19 +102,16 @@ class RelayController:
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
     def begin_shutdown(self) -> bool:
-        self._shutdown_requested.set()
-        with self._lock:
-            return True
-
-    def shutdown(self) -> bool:
-        self.begin_shutdown()
-        with self._lock:
-            safe = self._deenergize()
-            # Service shutdown is terminal for this controller instance. Keep it
-            # latched even after a successful off so late worker calls cannot pulse.
+        with self._activation_boundary:
+            self._shutdown_requested.set()
             self._latched = True
+            safe = self._deenergize_at_boundary()
+        with self._lock:
             self._record_outcome("shutdown_safe" if safe else "relay_deenergize_error")
             return safe
+
+    def shutdown(self) -> bool:
+        return self.begin_shutdown()
 
     def status(self) -> dict:
         with self._lock:
@@ -127,6 +126,10 @@ class RelayController:
         self._last_outcome_at = observed_at or self._clock()
 
     def _deenergize(self) -> bool:
+        with self._activation_boundary:
+            return self._deenergize_at_boundary()
+
+    def _deenergize_at_boundary(self) -> bool:
         for _ in range(self._max_off_attempts):
             try:
                 self._relay.off()
@@ -145,6 +148,10 @@ class PiRelayAdapter:
 
     def on(self, *, pre_activation_inhibit=None):
         return self._relay.on(pre_activation_inhibit=pre_activation_inhibit)
+
+    @property
+    def activation_boundary(self):
+        return self._relay.activation_boundary
 
     def off(self) -> None:
         self._relay.off()
