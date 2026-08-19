@@ -609,6 +609,9 @@ restore_fixed_updater_helper() {
       "$backup_dir/updater-helper" "$updater_helper"
   elif [[ -f $backup_dir/updater-helper.absent ]]; then
     rm -f -- "$updater_helper"
+  else
+    fail "updater helper backup is missing" || true
+    return 1
   fi
 }
 
@@ -913,7 +916,7 @@ rollback() {
       "restore fixed updater helper" \
       restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
     if [[ $ROLLBACK_PREREQUISITES_SUCCEEDED == true ]]; then
-      run_rollback_step \
+      run_rollback_prerequisite \
         "restore cloudflared transport" \
         restore_cloudflared_transport_with_diagnostics "$SYSTEMD_ROOT" "$BACKUP_DIR"
     else

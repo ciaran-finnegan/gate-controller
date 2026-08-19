@@ -619,6 +619,32 @@ restore_fixed_updater_helper \
             self.assertEqual("previous helper\n", helper.read_text(encoding="utf-8"))
             self.assertEqual(0o755, helper.stat().st_mode & 0o777)
 
+    def test_fixed_helper_restore_fails_when_backup_state_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            helper = root / "gate-controller-updater.py"
+            helper.write_text("candidate helper\n", encoding="utf-8")
+            backup = root / "backup"
+            backup.mkdir()
+            command = f"""
+source deployment/install.sh
+restore_fixed_updater_helper \
+  {shlex.quote(str(helper))} {shlex.quote(str(backup))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual("candidate helper\n", helper.read_text(encoding="utf-8"))
+            self.assertIn("updater helper backup is missing", completed.stderr)
+
     def test_bootstrap_candidate_verification_uses_build_account_for_shells(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             release = Path(temporary_directory)
@@ -890,8 +916,8 @@ rollback
                 reload_index,
                 actions.index("restore cloudflared transport before its reload"),
             )
-            self.assertLess(reload_index, actions.index("restart application"))
-            self.assertLess(reload_index, actions.index("restart legacy command"))
+            self.assertNotIn("restart application", actions)
+            self.assertNotIn("restart legacy command", actions)
 
     def test_critical_restore_failure_blocks_all_later_service_actions(self):
         prerequisites = [
@@ -1266,8 +1292,10 @@ rollback
             "restore gate-controller-updater.timer",
             "restore fixed updater helper",
         ]
-        service_failure_classes = [
+        cloudflared_prerequisite_failure_classes = [
             "restore cloudflared transport",
+        ]
+        service_failure_classes = [
             "restore FTP home",
             "restore updater timer enablement",
             "restore updater timer activity",
@@ -1281,7 +1309,6 @@ rollback
         ]
         service_actions = [*service_failure_classes]
         blocked_service_actions = [
-            "restore cloudflared transport",
             "restore updater timer enablement",
             "restore updater timer activity",
             "restore application enablement",
@@ -1289,7 +1316,12 @@ rollback
             "restore legacy command activity",
         ]
 
-        for failure_class in prerequisite_failure_classes + service_failure_classes:
+        all_failure_classes = (
+            prerequisite_failure_classes
+            + cloudflared_prerequisite_failure_classes
+            + service_failure_classes
+        )
+        for failure_class in all_failure_classes:
             with self.subTest(failure_class=failure_class):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     root = Path(temporary_directory)
@@ -1370,6 +1402,13 @@ rollback
                     if failure_class in prerequisite_failure_classes:
                         self.assertIn("restore cloudflared transport files", actions)
                         self.assertIn("restore FTP home", actions)
+                        self.assertNotIn("restore cloudflared transport", actions)
+                        for unsafe_action in blocked_service_actions:
+                            self.assertNotIn(unsafe_action, actions)
+                    elif failure_class in cloudflared_prerequisite_failure_classes:
+                        self.assertIn("restore cloudflared transport", actions)
+                        self.assertIn("restore FTP home", actions)
+                        self.assertNotIn("restore cloudflared transport files", actions)
                         for unsafe_action in blocked_service_actions:
                             self.assertNotIn(unsafe_action, actions)
                     else:
