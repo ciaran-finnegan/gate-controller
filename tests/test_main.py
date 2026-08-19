@@ -4,11 +4,14 @@ import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
+from time import monotonic
 from unittest.mock import patch
 
 import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import (
-    _quiet_window, build_background_workers, default_runtime_paths,
+    _quiet_window, _shutdown_controller, build_background_workers,
+    default_runtime_paths,
 )
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
@@ -134,7 +137,32 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertLess(calls.index("relay"), calls.index("store"))
         self.assertLess(calls.index("store"), calls.index("recover"))
-        self.assertLess(calls.index("relay_shutdown"), calls.index("processor_close"))
+        self.assertLess(calls.index("processor_close"), calls.index("relay_shutdown"))
+
+    def test_shutdown_reaches_processor_close_when_relay_shutdown_hangs(self):
+        release = Event()
+        calls = []
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                release.wait(2)
+                return True
+
+        try:
+            started = monotonic()
+            safe = _shutdown_controller(Processor(), Relay(), relay_timeout=0.05)
+            elapsed = monotonic() - started
+
+            self.assertFalse(safe)
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(calls, ["processor_close", "relay_shutdown"])
+        finally:
+            release.set()
 
     def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (

@@ -307,6 +307,13 @@ class ProcessingTrace:
             self._decision_outcome = outcome
             self._decision_reason = reason
 
+    def revise_decision(self, outcome: str, reason: str) -> None:
+        if self._decision is None:
+            self.mark_decision(outcome, reason)
+            return
+        self._decision_outcome = outcome
+        self._decision_reason = reason
+
     def mark_actuation(self, claim: str, attempted: bool, relay_outcome: str) -> None:
         """Backward-compatible combined activation and outcome marker."""
         self.mark_relay_activation()

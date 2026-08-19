@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
 from urllib.parse import urlparse
 
 from .audio import PromptPlayer
@@ -115,9 +116,7 @@ def main() -> None:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
     def shutdown():
-        safe = relay.shutdown()
-        processor.close()
-        return safe
+        return _shutdown_controller(processor, relay)
 
     run_worker(
         arguments.directory, process, quiet_window=arguments.quiet_window,
@@ -129,6 +128,28 @@ def main() -> None:
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
     )
+
+
+def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
+                         processor_timeout: float = 1.0) -> bool:
+    processor_completed, _ = _bounded_shutdown_call(processor.close, processor_timeout)
+    relay_completed, relay_safe = _bounded_shutdown_call(relay.shutdown, relay_timeout)
+    return processor_completed and relay_completed and relay_safe is True
+
+
+def _bounded_shutdown_call(operation, timeout: float) -> tuple[bool, object | None]:
+    result = []
+
+    def invoke():
+        try:
+            result.append(operation())
+        except BaseException:
+            result.append(False)
+
+    worker = Thread(target=invoke, name="gate-controller-shutdown", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return not worker.is_alive(), result[0] if result else None
 
 
 def _run_telemetry_export(arguments: list[str]) -> None:

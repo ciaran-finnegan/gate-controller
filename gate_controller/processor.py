@@ -20,6 +20,11 @@ from .telemetry import OcrAttemptTelemetry, ProcessingTrace
 
 
 MAX_OCR_FRAMES = 3
+DEFAULT_ACTIVATION_GUARD_SECONDS = 0.1
+FINAL_INHIBITION_REASONS = frozenset({
+    "stale_burst", "authorisation_error", "authorisation_revoked",
+    "decision_timeout", "processor_closed",
+})
 
 
 class _OcrBusy(TimeoutError):
@@ -34,10 +39,21 @@ class GateProcessor:
     def __init__(self, recognizer, store, relay, authorised: Iterable[str],
                  cooldown: timedelta = timedelta(seconds=20), outbox=None, clock=None,
                  coordinator=None, max_image_age: timedelta = timedelta(seconds=8),
-                 decision_timeout: float = 4.0, decision_clock=None,
+                 decision_timeout: float = 4.0,
+                 activation_guard_seconds: float | None = None,
+                 decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
+        if activation_guard_seconds is None:
+            activation_guard_seconds = min(
+                DEFAULT_ACTIVATION_GUARD_SECONDS, decision_timeout / 10,
+            )
+        if (not math.isfinite(activation_guard_seconds)
+                or not 0 <= activation_guard_seconds < decision_timeout):
+            raise ValueError(
+                "activation guard must be finite, non-negative, and below the decision timeout"
+            )
         self._recognizer = recognizer
         self._store = store
         self._authorised = authorised if callable(authorised) else lambda: tuple(authorised)
@@ -46,6 +62,7 @@ class GateProcessor:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_image_age = max_image_age
         self._decision_timeout = decision_timeout
+        self._activation_guard_seconds = activation_guard_seconds
         self._decision_clock = decision_clock or monotonic
         self._telemetry_clock = telemetry_clock or monotonic
         self._telemetry_wall_clock = telemetry_wall_clock or (
@@ -55,6 +72,7 @@ class GateProcessor:
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
         self._ocr_slot = BoundedSemaphore(1)
         self._ocr_slot_lock = Lock()
+        self._actuation_lock = Lock()
         self._ocr_worker = None
         self._closed = False
         self._recognise_call = self._recognizer.recognise
@@ -64,6 +82,7 @@ class GateProcessor:
                 decision_started_at: float | None = None) -> ProcessingResult:
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
+        activation_deadline = deadline - self._activation_guard_seconds
         candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
@@ -222,6 +241,9 @@ class GateProcessor:
                 trace, ProcessingResult(False, "stale_burst", event_id, decision)
             )
         def activation_inhibition():
+            with self._ocr_slot_lock:
+                if self._closed:
+                    return "failed", "processor_closed"
             if not _is_fresh(self._clock(), received_at, self._max_image_age):
                 return "failed", "stale_burst"
             try:
@@ -232,7 +254,7 @@ class GateProcessor:
                 return "failed", "authorisation_error"
             if normalise_plate(decision.authorised_plate) not in current_authorised:
                 return "failed", "authorisation_revoked"
-            if self._decision_clock() >= deadline:
+            if self._decision_clock() >= activation_deadline:
                 return "failed", "decision_timeout"
             return None
 
@@ -242,7 +264,10 @@ class GateProcessor:
         }
         if _accepts_keyword(self._coordinator.actuate, "on_activation"):
             actuation_kwargs["on_activation"] = trace.mark_relay_activation
-        execution = self._coordinator.actuate(event, **actuation_kwargs)
+        with self._actuation_lock:
+            execution = self._coordinator.actuate(event, **actuation_kwargs)
+        if execution.reason in FINAL_INHIBITION_REASONS:
+            trace.revise_decision("denied", execution.reason)
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._finish_result(
             trace,
@@ -410,6 +435,8 @@ class GateProcessor:
                 return
             self._closed = True
             worker = self._ocr_worker
+        with self._actuation_lock:
+            pass
         close = getattr(self._recognizer, "close", None)
         if callable(close):
             def close_recognizer():
@@ -482,6 +509,17 @@ class _BestEffortTrace:
 
     def mark_decision(self, outcome: str, reason: str) -> None:
         self._call("mark_decision", outcome, reason)
+
+    def revise_decision(self, outcome: str, reason: str) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "revise_decision", None)
+        if not callable(operation):
+            return
+        try:
+            operation(outcome, reason)
+        except Exception:
+            self.disable()
 
     def mark_relay_activation(self) -> None:
         self._call("mark_relay_activation")
@@ -557,9 +595,7 @@ def _actuation_telemetry(execution) -> tuple[str, bool, str]:
         return "cooldown", False, "not_attempted"
     if execution.reason == "actuation_inhibit_error":
         return "claim_error", False, "not_attempted"
-    if execution.reason in {
-        "stale_burst", "authorisation_error", "authorisation_revoked", "decision_timeout",
-    }:
+    if execution.reason in FINAL_INHIBITION_REASONS:
         return "claimed", False, "inhibited"
     if execution.reason == "indeterminate_claim":
         return "claimed", True, "indeterminate"
