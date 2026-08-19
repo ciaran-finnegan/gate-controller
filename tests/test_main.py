@@ -93,8 +93,13 @@ class MainConfigurationTests(unittest.TestCase):
             def get(self):
                 return ()
 
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
         relay = Relay()
         store = Store()
+        processor = Processor()
 
         def create_relay(_adapter):
             calls.append("relay")
@@ -121,12 +126,15 @@ class MainConfigurationTests(unittest.TestCase):
         ), patch.object(
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
-            gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker"):
+            gate_main, "GateProcessor", return_value=processor
+        ), patch.object(
+            gate_main, "run_worker", side_effect=lambda *args, **kwargs: kwargs["shutdown"]()
+        ):
             gate_main.main()
 
         self.assertLess(calls.index("relay"), calls.index("store"))
         self.assertLess(calls.index("store"), calls.index("recover"))
+        self.assertLess(calls.index("relay_shutdown"), calls.index("processor_close"))
 
     def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (

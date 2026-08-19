@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Queue as ThreadQueue
-from threading import Event
+from threading import Event, Lock
 from time import monotonic
 from unittest.mock import patch
 from PIL import Image
@@ -1166,6 +1166,8 @@ class GateProcessorTests(unittest.TestCase):
 
             def abandon_in_flight(self):
                 self.abandoned += 1
+                release_first.set()
+                return True
 
         recognizer = ResettableRecognizer()
         with tempfile.TemporaryDirectory() as directory:
@@ -1284,6 +1286,138 @@ class GateProcessorTests(unittest.TestCase):
             "attempted": False,
             "relay_outcome": "inhibited",
         })
+
+    def test_deadline_check_follows_all_final_validation_before_gpio(self):
+        decision_clock = MutableClock()
+        normalization_calls = 0
+        original_normalise = processor_module.normalise_plate
+
+        def delayed_normalise(value):
+            nonlocal normalization_calls
+            normalization_calls += 1
+            result = original_normalise(value)
+            if normalization_calls == 3:
+                decision_clock.value = 3.999
+            elif normalization_calls == 4:
+                decision_clock.value = 4.001
+            return result
+
+        class ObservedGpioBackend:
+            def __init__(self):
+                self.calls = []
+
+            def off(self):
+                self.calls.append("off")
+
+            def on(self, *, pre_activation_inhibit=None):
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+                self.calls.append(("gpio", decision_clock.value))
+                return None
+
+        backend = ObservedGpioBackend()
+        relay = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            processor_module, "normalise_plate", side_effect=delayed_normalise
+        ):
+            result = GateProcessor(
+                recognizer=SequenceRecognizer([PlateObservation("12D3456", 0.99)]),
+                store=LocalStore(Path(directory) / "gate.db"),
+                relay=relay,
+                authorised={"12D3456"},
+                decision_timeout=4.0,
+                decision_clock=decision_clock,
+                clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+            ).process((Path("deadline-after-validation.jpg"),))
+
+        self.assertEqual(result.reason, "decision_timeout")
+        self.assertEqual(backend.calls, ["off"])
+
+    def test_repeated_permanent_ocr_hangs_keep_one_bounded_worker(self):
+        release = Event()
+        state_lock = Lock()
+
+        class UncancellableRecognizer:
+            def __init__(self):
+                self.calls = []
+                self.active = 0
+                self.max_active = 0
+                self.abandoned = 0
+
+            def recognise(self, path, timeout=None):
+                with state_lock:
+                    self.calls.append(path)
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    release.wait(2)
+                    return PlateObservation(None, 0.0)
+                finally:
+                    with state_lock:
+                        self.active -= 1
+
+            def abandon_in_flight(self):
+                self.abandoned += 1
+                return False
+
+        recognizer = UncancellableRecognizer()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                processor = self._processor(
+                    LocalStore(root / "gate.db"), RecordingRelay([]), recognizer,
+                    decision_timeout=0.02,
+                )
+                results = [
+                    processor.process((self._jpeg(directory, f"hung-{index}.jpg", index * 31),))
+                    for index in range(5)
+                ]
+
+            self.assertEqual(results[0].reason, "decision_timeout")
+            self.assertEqual([result.reason for result in results[1:]], ["ocr_busy"] * 4)
+            self.assertEqual(len(recognizer.calls), 1)
+            self.assertEqual(recognizer.max_active, 1)
+            self.assertEqual(recognizer.abandoned, 1)
+        finally:
+            release.set()
+
+    def test_processor_close_closes_recognizer_and_reaps_timed_out_worker(self):
+        release = Event()
+        finished = Event()
+
+        class ClosableRecognizer:
+            def __init__(self):
+                self.closed = False
+
+            def recognise(self, path, timeout=None):
+                try:
+                    release.wait(2)
+                    return PlateObservation(None, 0.0)
+                finally:
+                    finished.set()
+
+            def abandon_in_flight(self):
+                return False
+
+            def close(self):
+                self.closed = True
+                release.set()
+
+        recognizer = ClosableRecognizer()
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"), RecordingRelay([]), recognizer,
+                decision_timeout=0.02,
+            )
+            processor.process((self._jpeg(directory, "close-hung.jpg"),))
+            try:
+                processor.close()
+            finally:
+                release.set()
+
+        self.assertTrue(recognizer.closed)
+        self.assertTrue(finished.wait(0.5))
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)

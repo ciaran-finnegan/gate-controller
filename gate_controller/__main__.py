@@ -114,13 +114,18 @@ def main() -> None:
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
+    def shutdown():
+        safe = relay.shutdown()
+        processor.close()
+        return safe
+
     run_worker(
         arguments.directory, process, quiet_window=arguments.quiet_window,
         background_workers=background_workers,
         max_image_age=max_image_age,
         on_skipped=record_skipped,
         on_error=record_error,
-        shutdown=relay.shutdown,
+        shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
     )

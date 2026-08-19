@@ -76,11 +76,19 @@ class PlateRecognizerClient:
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
 
-    def abandon_in_flight(self) -> None:
+    def abandon_in_flight(self) -> bool:
         """Detach a timed-out request so later work receives a fresh session."""
         with self._session_lock:
+            session = self._session
             self._session_generation += 1
             self._session = None
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+        return session is not None
+
+    def close(self) -> None:
+        self.abandon_in_flight()
 
     @staticmethod
     def _create_session():

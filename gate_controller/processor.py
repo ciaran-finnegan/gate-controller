@@ -55,6 +55,8 @@ class GateProcessor:
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
         self._ocr_slot = BoundedSemaphore(1)
         self._ocr_slot_lock = Lock()
+        self._ocr_worker = None
+        self._closed = False
         self._recognise_call = self._recognizer.recognise
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
@@ -228,10 +230,10 @@ class GateProcessor:
                 }
             except Exception:
                 return "failed", "authorisation_error"
-            if self._decision_clock() >= deadline:
-                return "failed", "decision_timeout"
             if normalise_plate(decision.authorised_plate) not in current_authorised:
                 return "failed", "authorisation_revoked"
+            if self._decision_clock() >= deadline:
+                return "failed", "decision_timeout"
             return None
 
         actuation_kwargs = {
@@ -329,6 +331,8 @@ class GateProcessor:
 
     def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
         with self._ocr_slot_lock:
+            if self._closed:
+                raise _OcrBusy("OCR processor is closed")
             slot = self._ocr_slot
             if not slot.acquire(blocking=False):
                 raise _OcrBusy("previous OCR request is still running")
@@ -346,38 +350,66 @@ class GateProcessor:
             result.put(outcome)
 
         worker = Thread(target=invoke, name="gate-ocr-request", daemon=True)
-        try:
-            worker.start()
-        except BaseException:
-            self._ocr_slot.release()
-            raise
+        with self._ocr_slot_lock:
+            if self._closed:
+                slot.release()
+                raise _OcrBusy("OCR processor is closed")
+            self._ocr_worker = worker
+            try:
+                worker.start()
+            except BaseException:
+                if self._ocr_worker is worker:
+                    self._ocr_worker = None
+                slot.release()
+                raise
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
-            self._abandon_ocr_generation(slot)
+            self._cancel_and_reap_ocr_worker(worker)
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         try:
             succeeded, value = result.get(timeout=max(remaining, 0.0))
         except Empty as error:
-            self._abandon_ocr_generation(slot)
+            self._cancel_and_reap_ocr_worker(worker)
             raise _OcrDeadlineExceeded(
                 "OCR request exceeded the decision deadline"
             ) from error
+        worker.join(0.5)
+        with self._ocr_slot_lock:
+            if self._ocr_worker is worker and not worker.is_alive():
+                self._ocr_worker = None
         if succeeded:
             return value
         raise value
 
-    def _abandon_ocr_generation(self, slot) -> None:
+    def _cancel_and_reap_ocr_worker(self, worker) -> None:
         abandon = getattr(self._recognizer, "abandon_in_flight", None)
         if not callable(abandon):
             return
+        try:
+            cancelled = abandon() is True
+        except Exception:
+            return
+        if cancelled:
+            worker.join(0.5)
         with self._ocr_slot_lock:
-            if self._ocr_slot is not slot:
-                return
+            if self._ocr_worker is worker and not worker.is_alive():
+                self._ocr_worker = None
+
+    def close(self) -> None:
+        with self._ocr_slot_lock:
+            self._closed = True
+            worker = self._ocr_worker
+        close = getattr(self._recognizer, "close", None)
+        if callable(close):
             try:
-                abandon()
+                close()
             except Exception:
-                return
-            self._ocr_slot = BoundedSemaphore(1)
+                pass
+        if worker is not None:
+            worker.join(1.0)
+            with self._ocr_slot_lock:
+                if self._ocr_worker is worker and not worker.is_alive():
+                    self._ocr_worker = None
 
 
 class _BestEffortTrace:

@@ -25,12 +25,16 @@ class FakeSession:
         self.response = response
         self.error = error
         self.calls = []
+        self.closed = False
 
     def post(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         if self.error:
             raise self.error
         return self.response
+
+    def close(self):
+        self.closed = True
 
 
 class OcrClientTests(unittest.TestCase):
@@ -124,6 +128,7 @@ class OcrClientTests(unittest.TestCase):
             client.recognise(self.path)
 
         self.assertEqual(original.calls, [])
+        self.assertTrue(original.closed)
         self.assertEqual(len(replacement.calls), 1)
 
     def test_late_session_creation_cannot_replace_the_fresh_generation(self):
