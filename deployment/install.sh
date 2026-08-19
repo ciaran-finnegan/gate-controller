@@ -32,6 +32,7 @@ APP_WAS_ACTIVE=false
 LEGACY_COMMAND_WAS_ENABLED=false
 LEGACY_COMMAND_WAS_ACTIVE=false
 UPDATER_WAS_ENABLED=false
+UPDATER_WAS_ACTIVE=false
 CLOUDFLARED_WAS_PRESENT=false
 CLOUDFLARED_WAS_ENABLED=false
 CLOUDFLARED_WAS_ACTIVE=false
@@ -43,6 +44,9 @@ CLOUDFLARED_QUIESCE_TIMEOUT_SECONDS=10
 CLOUDFLARED_POLL_SECONDS=1
 ROLLBACK_FAILED=false
 ROLLBACK_DIAGNOSTICS=
+ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+ROLLBACK_STARTED=false
+ROLLBACK_STEP_SUCCEEDED=true
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
 
@@ -654,7 +658,7 @@ restore_application_activity() {
   local previous_unit=$1
   local was_active=$2
 
-  if [[ -f $previous_unit && $was_active == true ]]; then
+  if [[ (-e $previous_unit || -L $previous_unit) && $was_active == true ]]; then
     systemctl restart "$APP_SERVICE"
   else
     systemctl stop "$APP_SERVICE"
@@ -667,7 +671,7 @@ restore_legacy_command_activity() {
   local was_active=$3
   local restoration_failed=false
 
-  if [[ -f $previous_unit && $was_enabled == true ]]; then
+  if [[ (-e $previous_unit || -L $previous_unit) && $was_enabled == true ]]; then
     if ! systemctl enable "$LEGACY_COMMAND_UNIT"; then
       restoration_failed=true
     fi
@@ -676,7 +680,7 @@ restore_legacy_command_activity() {
       restoration_failed=true
     fi
   fi
-  if [[ -f $previous_unit && $was_active == true ]]; then
+  if [[ (-e $previous_unit || -L $previous_unit) && $was_active == true ]]; then
     if ! systemctl restart "$LEGACY_COMMAND_UNIT"; then
       restoration_failed=true
     fi
@@ -698,13 +702,88 @@ cleanup() {
   fi
 }
 
+backup_path() {
+  local name=$1
+  local destination=$SYSTEMD_ROOT/$name
+  local backup=$BACKUP_DIR/$name
+  local absent=$BACKUP_DIR/$name.absent
+
+  [[ ! -e $backup && ! -L $backup && ! -e $absent ]] \
+    || fail "backup already exists for $name"
+  if [[ -e $destination || -L $destination ]]; then
+    cp -a -- "$destination" "$backup"
+  else
+    : >"$absent"
+  fi
+}
+
 restore_path() {
   local name=$1
   local destination=$SYSTEMD_ROOT/$name
-  if [[ -f $BACKUP_DIR/$name ]]; then
-    install -m 0644 "$BACKUP_DIR/$name" "$destination"
-  else
+  local backup=$BACKUP_DIR/$name
+  local absent=$BACKUP_DIR/$name.absent
+  local temporary=$SYSTEMD_ROOT/.$name.rollback.$$
+
+  if [[ -e $backup || -L $backup ]]; then
+    [[ ! -d $destination ]] || fail "$destination must not be a directory"
+    [[ ! -e $temporary && ! -L $temporary ]] \
+      || fail "unit restore path already exists: $temporary"
+    if ! cp -a -- "$backup" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    if ! rm -f -- "$destination"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    mv -f -- "$temporary" "$destination"
+  elif [[ -f $absent && ! -L $absent ]]; then
     rm -f -- "$destination"
+  else
+    fail "unit backup is missing for $name"
+  fi
+}
+
+capture_updater_timer_state() {
+  local status
+
+  UPDATER_WAS_ENABLED=false
+  UPDATER_WAS_ACTIVE=false
+  if systemctl is-enabled --quiet "$UPDATER_TIMER"; then
+    UPDATER_WAS_ENABLED=true
+  else
+    status=$?
+    [[ $status -eq 1 ]] \
+      || fail "could not inspect whether $UPDATER_TIMER is enabled"
+  fi
+  if systemctl is-active --quiet "$UPDATER_TIMER"; then
+    UPDATER_WAS_ACTIVE=true
+  else
+    status=$?
+    [[ $status -eq 3 || $status -eq 4 ]] \
+      || fail "could not inspect whether $UPDATER_TIMER is active"
+  fi
+}
+
+restore_unit_enablement() {
+  local unit=$1
+  local was_enabled=$2
+
+  if [[ $was_enabled == true ]]; then
+    systemctl enable "$unit"
+  else
+    systemctl disable "$unit"
+  fi
+}
+
+restore_unit_activity() {
+  local unit=$1
+  local was_active=$2
+
+  if [[ $was_active == true ]]; then
+    systemctl restart "$unit"
+  else
+    systemctl stop "$unit"
   fi
 }
 
@@ -734,7 +813,9 @@ run_rollback_step() {
   local status
   local message
   local step_diagnostics=
+  local diagnostics_appended=true
   shift
+  ROLLBACK_STEP_SUCCEEDED=true
 
   if [[ -n $ROLLBACK_DIAGNOSTICS ]]; then
     step_diagnostics=$(mktemp "$BACKUP_DIR/.rollback-step.XXXXXX") || true
@@ -759,19 +840,26 @@ run_rollback_step() {
   fi
 
   ROLLBACK_FAILED=true
+  ROLLBACK_STEP_SUCCEEDED=false
   message="Rollback step failed: $description (status $status)."
   printf '%s\n' "$message" >&2
-  if [[ -n $step_diagnostics ]] \
-      && ! cat -- "$step_diagnostics" >>"$ROLLBACK_DIAGNOSTICS"; then
-    printf '%s\n' \
-      "Rollback diagnostics could not be updated; backup retained at $BACKUP_DIR." \
-      >&2
+  if [[ -n $step_diagnostics ]]; then
+    if ! cat -- "$step_diagnostics" >>"$ROLLBACK_DIAGNOSTICS"; then
+      diagnostics_appended=false
+    fi
+  else
+    diagnostics_appended=false
   fi
   if [[ -n $ROLLBACK_DIAGNOSTICS ]] \
       && ! printf '%s\n' "$message" >>"$ROLLBACK_DIAGNOSTICS"; then
+    diagnostics_appended=false
+  fi
+  if [[ $diagnostics_appended == false && -n $step_diagnostics ]]; then
+    printf '%s\n' "$message" >>"$step_diagnostics" || true
     printf '%s\n' \
-      "Rollback diagnostics could not be updated; backup retained at $BACKUP_DIR." \
+      "Rollback diagnostics could not be updated; detailed fallback retained at $step_diagnostics." \
       >&2
+    step_diagnostics=
   fi
   [[ -z $step_diagnostics ]] || rm -f -- "$step_diagnostics"
   return 0
@@ -779,6 +867,19 @@ run_rollback_step() {
 
 rollback() {
   local original_status=$?
+  local systemd_units_reloaded=false
+  if [[ $# -gt 0 ]]; then
+    original_status=$1
+  fi
+  if [[ $BASH_SUBSHELL -ne $ROLLBACK_OWNER_SUBSHELL ]]; then
+    return "$original_status"
+  fi
+  if [[ $ROLLBACK_STARTED == true ]]; then
+    [[ $original_status -ne 0 ]] || original_status=1
+    exit "$original_status"
+  fi
+  ROLLBACK_STARTED=true
+  trap - ERR INT TERM
   set +e
   if [[ $ACTIVATION_STARTED == true && $INSTALL_SUCCEEDED == false ]]; then
     printf 'Managed startup failed; restoring the previous installation.\n' >&2
@@ -789,32 +890,52 @@ rollback() {
     run_rollback_step "restore $UPDATER_SERVICE" restore_path "$UPDATER_SERVICE"
     run_rollback_step "restore $UPDATER_TIMER" restore_path "$UPDATER_TIMER"
     run_rollback_step \
+      "reload restored systemd units" \
+      run_systemctl_bounded daemon-reload
+    systemd_units_reloaded=$ROLLBACK_STEP_SUCCEEDED
+    run_rollback_step \
       "restore fixed updater helper" \
       restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
-    run_rollback_step \
-      "restore cloudflared transport" \
-      restore_cloudflared_transport_with_diagnostics "$SYSTEMD_ROOT" "$BACKUP_DIR"
+    if [[ $systemd_units_reloaded == true ]]; then
+      run_rollback_step \
+        "restore cloudflared transport" \
+        restore_cloudflared_transport_with_diagnostics "$SYSTEMD_ROOT" "$BACKUP_DIR"
+    else
+      run_rollback_step \
+        "restore cloudflared transport files" \
+        restore_cloudflared_transport_drop_in "$SYSTEMD_ROOT" "$BACKUP_DIR"
+    fi
     run_rollback_step \
       "restore FTP home" \
       configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
-    if [[ $UPDATER_WAS_ENABLED == false ]]; then
+    if [[ $systemd_units_reloaded == true ]]; then
       run_rollback_step \
         "restore updater timer enablement" \
-        systemctl disable --now "$UPDATER_TIMER"
-    fi
-    if [[ $APP_WAS_ENABLED == false ]]; then
+        restore_unit_enablement "$UPDATER_TIMER" "$UPDATER_WAS_ENABLED"
+      if [[ -e $BACKUP_DIR/$UPDATER_TIMER \
+            || -L $BACKUP_DIR/$UPDATER_TIMER ]]; then
+        run_rollback_step \
+          "restore updater timer activity" \
+          restore_unit_activity "$UPDATER_TIMER" "$UPDATER_WAS_ACTIVE"
+      fi
+      if [[ $APP_WAS_ENABLED == false ]]; then
+        run_rollback_step \
+          "restore application enablement" \
+          systemctl disable "$APP_SERVICE"
+      fi
       run_rollback_step \
-        "restore application enablement" \
-        systemctl disable "$APP_SERVICE"
+        "restore application activity" \
+        restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
+      run_rollback_step \
+        "restore legacy command activity" \
+        restore_legacy_command_activity \
+          "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
+          "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
+    else
+      printf '%s\n' \
+        "Service-state restoration skipped because restored systemd units could not be reloaded." \
+        >&2
     fi
-    run_rollback_step \
-      "restore application activity" \
-      restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
-    run_rollback_step \
-      "restore legacy command activity" \
-      restore_legacy_command_activity \
-        "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
-        "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
   fi
   if [[ $ROLLBACK_FAILED == true ]]; then
     printf '%s\n' \
@@ -999,7 +1120,11 @@ RELEASE=$RELEASES_ROOT/$SHA
 STAGING=$(mktemp -d "$RELEASES_ROOT/.bootstrap-$SHA.XXXXXX")
 BACKUP_DIR=$(mktemp -d /run/gate-controller-install.XXXXXX)
 
-trap rollback ERR INT TERM
+ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+ROLLBACK_STARTED=false
+trap rollback ERR
+trap 'rollback 130' INT
+trap 'rollback 143' TERM
 trap cleanup EXIT
 
 git -C "$SOURCE" archive --format=tar "$SHA" | tar -xf - -C "$STAGING"
@@ -1029,9 +1154,7 @@ publish_bootstrap_release "$STAGING" "$RELEASE"
 STAGING=
 
 for name in "$APP_SERVICE" "$LEGACY_COMMAND_UNIT" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
-  if [[ -f $SYSTEMD_ROOT/$name ]]; then
-    install -m 0600 "$SYSTEMD_ROOT/$name" "$BACKUP_DIR/$name"
-  fi
+  backup_path "$name"
 done
 backup_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
 backup_cloudflared_transport_drop_in "$SYSTEMD_ROOT" "$BACKUP_DIR"
@@ -1052,9 +1175,7 @@ fi
 if systemctl is-active --quiet "$LEGACY_COMMAND_UNIT"; then
   LEGACY_COMMAND_WAS_ACTIVE=true
 fi
-if systemctl is-enabled --quiet "$UPDATER_TIMER"; then
-  UPDATER_WAS_ENABLED=true
-fi
+capture_updater_timer_state
 capture_cloudflared_service_state
 
 ACTIVATION_STARTED=true
