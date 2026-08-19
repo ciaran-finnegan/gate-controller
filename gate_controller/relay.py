@@ -1,6 +1,6 @@
 import inspect
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Event, Lock
 from time import sleep
 
 from .models import RelayResult
@@ -17,6 +17,7 @@ class RelayController:
         self._max_off_attempts = max_off_attempts
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
+        self._shutdown_requested = Event()
         safe = self._deenergize()
         self._latched = not safe
         self._last_outcome = "initialized_safe" if safe else "relay_deenergize_error"
@@ -25,29 +26,46 @@ class RelayController:
     def trigger(self, source: str, idempotency_key: str | None = None, *,
                 pre_activation_inhibit=None, on_activation=None) -> RelayResult:
         with self._lock:
-            if self._latched:
+            if self._latched or self._shutdown_requested.is_set():
                 self._record_outcome("relay_latched")
                 return RelayResult(False, "relay_latched", idempotency_key, latched=True)
-            inhibition = (
-                pre_activation_inhibit() if pre_activation_inhibit is not None else None
-            )
+
+            def activation_inhibition():
+                if self._shutdown_requested.is_set():
+                    return "failed", "relay_latched"
+                if pre_activation_inhibit is not None:
+                    return pre_activation_inhibit()
+                return None
+
+            inhibition = activation_inhibition()
             if inhibition is not None:
                 _, detail = inhibition
                 self._record_outcome(detail)
-                return RelayResult(False, detail, idempotency_key)
+                return RelayResult(
+                    False, detail, idempotency_key, latched=detail == "relay_latched"
+                )
             activated_at = None
             try:
-                if pre_activation_inhibit is not None and _accepts_keyword(
-                    self._relay.on, "pre_activation_inhibit"
-                ):
+                if _accepts_keyword(self._relay.on, "pre_activation_inhibit"):
                     last_moment_inhibition = self._relay.on(
-                        pre_activation_inhibit=pre_activation_inhibit
+                        pre_activation_inhibit=activation_inhibition
                     )
                     if last_moment_inhibition is not None:
                         _, detail = last_moment_inhibition
                         self._record_outcome(detail)
-                        return RelayResult(False, detail, idempotency_key)
+                        return RelayResult(
+                            False, detail, idempotency_key,
+                            latched=detail == "relay_latched",
+                        )
                 else:
+                    last_moment_inhibition = activation_inhibition()
+                    if last_moment_inhibition is not None:
+                        _, detail = last_moment_inhibition
+                        self._record_outcome(detail)
+                        return RelayResult(
+                            False, detail, idempotency_key,
+                            latched=detail == "relay_latched",
+                        )
                     self._relay.on()
                 activated_at = self._clock()
                 if on_activation is not None:
@@ -77,7 +95,11 @@ class RelayController:
             self._record_outcome("activated", activated_at)
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
+    def begin_shutdown(self) -> None:
+        self._shutdown_requested.set()
+
     def shutdown(self) -> bool:
+        self.begin_shutdown()
         with self._lock:
             safe = self._deenergize()
             # Service shutdown is terminal for this controller instance. Keep it
@@ -89,7 +111,7 @@ class RelayController:
     def status(self) -> dict:
         with self._lock:
             return {
-                "ready": not self._latched,
+                "ready": not self._latched and not self._shutdown_requested.is_set(),
                 "last_outcome": self._last_outcome,
                 "last_outcome_at": self._last_outcome_at.isoformat(),
             }

@@ -164,6 +164,29 @@ class MainConfigurationTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_shutdown_requests_the_relay_latch_before_processor_cleanup(self):
+        calls = []
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                return True
+
+        safe = _shutdown_controller(Processor(), Relay())
+
+        self.assertTrue(safe)
+        self.assertEqual(
+            calls,
+            ["relay_begin_shutdown", "processor_close", "relay_shutdown"],
+        )
+
     def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (
             {"GATE_CLOUDFLARE_API_URL": "https://gate.example.com"},

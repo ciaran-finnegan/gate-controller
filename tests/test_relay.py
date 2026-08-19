@@ -4,6 +4,7 @@ import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Thread
 from unittest.mock import patch
 
 from gate_controller.relay import PiRelayAdapter, RelayController
@@ -50,6 +51,44 @@ class RecordingBackend:
 
 
 class RelayControllerTests(unittest.TestCase):
+    def test_shutdown_request_at_gpio_boundary_prevents_activation(self):
+        boundary_reached = Event()
+        release_boundary = Event()
+
+        class BoundaryBackend:
+            def __init__(self):
+                self.calls = []
+
+            def on(self, *, pre_activation_inhibit=None):
+                boundary_reached.set()
+                release_boundary.wait(1)
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+                self.calls.append("on")
+                return None
+
+            def off(self):
+                self.calls.append("off")
+
+        backend = BoundaryBackend()
+        controller = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        results = []
+        worker = Thread(target=lambda: results.append(controller.trigger(
+            "remote_command", "command:shutdown-race"
+        )))
+        worker.start()
+        self.assertTrue(boundary_reached.wait(1))
+
+        controller.begin_shutdown()
+        release_boundary.set()
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(results[0].reason, "relay_latched")
+        self.assertTrue(results[0].latched)
+
     def test_pi_library_checks_inhibition_at_the_gpio_boundary(self):
         calls = []
         gpio = types.ModuleType("RPi.GPIO")
