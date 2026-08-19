@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import subprocess
@@ -16,6 +17,8 @@ from deployment.gate_controller_updater import (
     _atomic_symlink,
     _atomic_write,
     _command_environment,
+    _github_json,
+    _main_commit_payload,
     _legacy_command_state,
     _systemctl_is,
     activate_release,
@@ -59,6 +62,60 @@ def workflow_run(
 
 
 class MainCommitTests(unittest.TestCase):
+    def test_fetches_encoded_branch_ref_and_normalizes_commit_sha(self):
+        config = UpdateConfig.from_mapping(
+            {"GATE_UPDATE_BRANCH": "release/2026.08"}
+        )
+        payload = {
+            "ref": "refs/heads/release/2026.08",
+            "object": {
+                "sha": TARGET_SHA,
+                "type": "commit",
+                "url": "https://api.github.test/commits/candidate",
+            },
+            "url": "https://api.github.test/refs/heads/release/2026.08",
+        }
+
+        with patch(
+            "deployment.gate_controller_updater._github_json",
+            return_value=payload,
+        ) as github_json:
+            result = _main_commit_payload(config)
+
+        self.assertEqual({"sha": TARGET_SHA}, result)
+        github_json.assert_called_once_with(
+            config, "git/ref/heads/release%2F2026.08"
+        )
+
+    def test_rejects_malformed_or_mismatched_branch_ref_payload(self):
+        config = UpdateConfig.from_mapping({})
+        valid_object = {"sha": TARGET_SHA, "type": "commit"}
+        invalid_payloads = (
+            [],
+            {},
+            {"ref": "refs/heads/other", "object": valid_object},
+            {"ref": "refs/heads/master", "object": []},
+            {
+                "ref": "refs/heads/master",
+                "object": {"sha": TARGET_SHA, "type": "tag"},
+            },
+            {
+                "ref": "refs/heads/master",
+                "object": {"sha": "abc", "type": "commit"},
+            },
+            {
+                "ref": "refs/heads/master",
+                "object": {"sha": "A" * 40, "type": "commit"},
+            },
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), patch(
+                "deployment.gate_controller_updater._github_json",
+                return_value=payload,
+            ), self.assertRaises(UpdateError):
+                _main_commit_payload(config)
+
     def test_reads_exact_lowercase_commit_sha(self):
         self.assertEqual(TARGET_SHA, read_main_sha({"sha": TARGET_SHA}))
 
@@ -67,6 +124,28 @@ class MainCommitTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValueError):
                     read_main_sha(payload)
+
+    def test_incomplete_github_response_is_deferred_as_update_error(self):
+        class IncompleteResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exception_type, _exception, _traceback):
+                return False
+
+            def read(self, _limit):
+                raise http.client.IncompleteRead(b'{"ref":', 128)
+
+        config = UpdateConfig.from_mapping({})
+        with patch(
+            "deployment.gate_controller_updater.urllib.request.urlopen",
+            return_value=IncompleteResponse(),
+        ), self.assertRaisesRegex(
+            UpdateError, "GitHub API request deferred"
+        ) as raised:
+            _github_json(config, "git/ref/heads/master")
+
+        self.assertIsInstance(raised.exception.__cause__, http.client.IncompleteRead)
 
 
 class WorkflowDecisionTests(unittest.TestCase):
