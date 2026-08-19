@@ -60,6 +60,10 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main.main()
 
         self.assertEqual(0.2, run_worker.call_args.kwargs["quiet_window"])
+        self.assertIs(
+            run_worker.call_args.kwargs["on_timed_skipped"],
+            run_worker.call_args.kwargs["on_skipped"],
+        )
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -276,13 +280,39 @@ class MainConfigurationTests(unittest.TestCase):
             "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
             "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
             "GATE_CONTROLLER_ID": "primary",
+            "GATE_TELEMETRY_RETENTION_DAYS": "14",
         }, authorised=authorised)
 
         self.assertEqual(
             [type(worker).__name__ for worker in workers],
             ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker"],
         )
+        self.assertEqual(workers[0]._telemetry_retention_days, 14)
         self.assertEqual(0, status()["queue_depth"])
+
+    def test_telemetry_retention_days_must_be_a_positive_integer(self):
+        for configured in ("0", "not-a-number"):
+            with self.subTest(configured=configured):
+                with self.assertRaisesRegex(ValueError, "GATE_TELEMETRY_RETENTION_DAYS"):
+                    build_background_workers(
+                        self.create_store(), relay=object(), environment={
+                            "GATE_TELEMETRY_RETENTION_DAYS": configured,
+                        }, latest_image={},
+                    )
+
+    def test_local_only_configuration_still_builds_a_telemetry_retention_worker(self):
+        workers, _, _ = build_background_workers(
+            self.create_store(), relay=object(), environment={
+                "GATE_TELEMETRY_RETENTION_DAYS": "9",
+            },
+        )
+
+        retention_workers = [
+            worker for worker in workers
+            if type(worker).__name__ == "TelemetryRetentionWorker"
+        ]
+        self.assertEqual(len(retention_workers), 1)
+        self.assertEqual(retention_workers[0].retention_days, 9)
 
     def test_command_server_worker_uses_the_main_process_coordinator(self):
         store = self.create_store()
@@ -437,6 +467,7 @@ class MainConfigurationTests(unittest.TestCase):
             "GATE_AUTHORISED_PLATES=/var/lib/gate-controller/authorised_licence_plates.csv",
             example,
         )
+        self.assertIn("GATE_TELEMETRY_RETENTION_DAYS=30", example)
 
     def test_image_runtime_limits_are_configurable(self):
         self.assertEqual(gate_main.image_runtime_limits({

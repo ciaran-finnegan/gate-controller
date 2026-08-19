@@ -468,23 +468,21 @@ git commit -m "refactor: remove Supabase and S3 controller runtime"
 
 **Interfaces:**
 - Produces: local harness command that can run on the Pi when reachable
-- Consumes: command server local endpoint and media gateway health endpoint
+- Consumes: media gateway read-only API and metrics endpoints
 
 - [ ] **Step 1: Write failing harness tests**
 
 ```python
-def test_performance_harness_refuses_to_actuate_without_explicit_flag(self):
-    result = parse_args(["--command-url", "http://127.0.0.1:8765/commands"])
-    self.assertFalse(result.actuate)
+def test_performance_harness_rejects_actuation_flag(self):
+    with self.assertRaises(SystemExit):
+        parse_args(["--actuate"])
 
 def test_performance_harness_outputs_json_summary(self):
     summary = build_summary(
         samples=[{"latency_ms": 12.5}],
         run_mode="host_metrics_only",
-        actuation_requested=False,
     )
     self.assertEqual(summary["run_mode"], "host_metrics_only")
-    self.assertFalse(summary["actuation_requested"])
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -495,7 +493,7 @@ Expected: FAIL because harness is absent.
 
 - [ ] **Step 3: Implement harness**
 
-Harness records local command endpoint latency with a non-actuating health request by default, media gateway health URL latency, CPU load from `/proc/loadavg` when present, memory from `/proc/meminfo` when present, disk usage via `shutil.disk_usage("/")`, and JSON output. Real relay actuation requires `--actuate` and is not run in this environment.
+Harness records MediaMTX paths API and Prometheus metrics latency with passive GET requests, CPU load from `/proc/loadavg` when present, memory from `/proc/meminfo` when present, disk usage via `shutil.disk_usage("/")`, and JSON output. The diagnostic harness has no relay-actuation mode.
 
 - [ ] **Step 4: Verify**
 
@@ -507,7 +505,7 @@ Run:
 ```
 
 Expected: unit tests pass and the local command writes JSON with
-`"run_mode": "host_metrics_only"` and `"actuation_requested": false`.
+`"run_mode": "host_metrics_only"`.
 
 - [ ] **Step 5: Commit**
 

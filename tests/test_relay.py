@@ -51,6 +51,132 @@ class RecordingBackend:
 
 
 class RelayControllerTests(unittest.TestCase):
+    def test_reports_relay_start_and_finish_at_the_physical_boundaries(self):
+        backend = RecordingBackend()
+        calls = []
+        controller = RelayController(
+            backend,
+            pulse_seconds=0,
+            sleeper=lambda _: calls.append("pulse"),
+        )
+        backend.calls.clear()
+
+        try:
+            result = controller.trigger(
+                "ocr",
+                "image:one",
+                on_activation=lambda: calls.append("started"),
+                on_deactivation=lambda: calls.append("finished"),
+            )
+        except TypeError as error:
+            self.fail(f"relay completion observability is unavailable: {error}")
+
+        self.assertTrue(result.activated)
+        self.assertEqual(backend.calls, ["on", "off"])
+        self.assertEqual(calls, ["started", "pulse", "finished"])
+
+    def test_shutdown_reports_the_first_physical_deactivation_exactly_once(self):
+        backend = RecordingBackend()
+        activated = Event()
+        callback_boundaries = []
+        results = []
+        controller = RelayController(backend, pulse_seconds=60)
+        backend.calls.clear()
+
+        worker = Thread(target=lambda: results.append(controller.trigger(
+            "ocr",
+            "image:shutdown-race",
+            on_activation=activated.set,
+            on_deactivation=lambda: callback_boundaries.append(tuple(backend.calls)),
+        )))
+        worker.start()
+        try:
+            self.assertTrue(activated.wait(1))
+            self.assertTrue(controller.begin_shutdown())
+            worker.join(1)
+        finally:
+            controller.begin_shutdown()
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(results[0].activated)
+        self.assertEqual(backend.calls, ["on", "off", "off", "off"])
+        self.assertEqual(callback_boundaries, [("on", "off")])
+
+    def test_shutdown_reports_deactivation_only_after_activation_callback_completes(self):
+        activation_started = Event()
+        release_activation = Event()
+        physical_off = Event()
+        deactivation_started = Event()
+        release_deactivation = Event()
+        deactivation_reported = Event()
+        trigger_returned = Event()
+        callbacks = []
+        results = []
+        shutdown_results = []
+
+        class ObservedBackend(RecordingBackend):
+            def off(self):
+                super().off()
+                physical_off.set()
+
+        backend = ObservedBackend()
+        controller = RelayController(backend, pulse_seconds=60)
+        backend.calls.clear()
+        physical_off.clear()
+
+        def record_activation():
+            activation_started.set()
+            release_activation.wait(2)
+            callbacks.append("activation")
+
+        def record_deactivation():
+            deactivation_started.set()
+            release_deactivation.wait(2)
+            try:
+                callbacks.append("deactivation")
+            finally:
+                deactivation_reported.set()
+
+        def run_trigger():
+            try:
+                results.append(controller.trigger(
+                    "ocr",
+                    "image:activation-order",
+                    on_activation=record_activation,
+                    on_deactivation=record_deactivation,
+                ))
+            finally:
+                trigger_returned.set()
+
+        trigger = Thread(target=run_trigger)
+        shutdown = Thread(target=lambda: shutdown_results.append(
+            controller.begin_shutdown()
+        ))
+        trigger.start()
+        try:
+            self.assertTrue(activation_started.wait(1))
+            shutdown.start()
+            self.assertTrue(physical_off.wait(1))
+            self.assertEqual(callbacks, [])
+            shutdown.join(0.5)
+            self.assertFalse(shutdown.is_alive())
+            release_activation.set()
+            self.assertTrue(deactivation_started.wait(1))
+            self.assertFalse(trigger_returned.wait(0.2))
+        finally:
+            release_activation.set()
+            release_deactivation.set()
+            trigger.join(1)
+            shutdown.join(1)
+
+        self.assertFalse(trigger.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        self.assertTrue(deactivation_reported.wait(1))
+        self.assertTrue(results[0].activated)
+        self.assertEqual(shutdown_results, [True])
+        self.assertEqual(callbacks, ["activation", "deactivation"])
+
     def test_pi_gpio_high_cannot_follow_shutdown_latch_establishment(self):
         shutdown_progress = Event()
         high_edge_reached = Event()

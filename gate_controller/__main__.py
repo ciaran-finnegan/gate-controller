@@ -19,7 +19,10 @@ from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
-from .outbox import CloudflareOutboxSender, HttpOutboxSender, OutboxWorker
+from .outbox import (
+    CloudflareOutboxSender, HttpOutboxSender, OutboxWorker,
+    TelemetryRetentionWorker,
+)
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
 from .store import LocalStore
@@ -93,17 +96,28 @@ def main() -> None:
         decision_timeout=decision_timeout,
     )
 
-    def process(paths, received_at=None, decision_started_at=None):
+    def process(paths, received_at=None, decision_started_at=None,
+                processing_started_at=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
-            paths, received_at=received_at, decision_started_at=decision_started_at
+            paths,
+            received_at=received_at,
+            decision_started_at=decision_started_at,
+            processing_started_at=processing_started_at,
         )
 
-    def record_skipped(paths, reason, received_at):
+    def record_skipped(paths, reason, received_at, decision_started_at=None,
+                       processing_started_at=None):
         logging.getLogger(__name__).warning("image_burst_skipped reason=%s count=%d", reason,
                                             len(paths))
-        return processor.record_skipped(paths, reason, received_at)
+        return processor.record_skipped(
+            paths,
+            reason,
+            received_at,
+            decision_started_at=decision_started_at,
+            processing_started_at=processing_started_at,
+        )
 
     def record_error(paths, error, received_at):
         logging.getLogger(__name__).exception(
@@ -123,6 +137,7 @@ def main() -> None:
         background_workers=background_workers,
         max_image_age=max_image_age,
         on_skipped=record_skipped,
+        on_timed_skipped=record_skipped,
         on_error=record_error,
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
@@ -211,6 +226,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     camera_stale_seconds = float(environment.get("GATE_CAMERA_STALE_SECONDS", "60"))
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
+    telemetry_retention_days = _telemetry_retention_days(environment)
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
     if coordinator is not None:
@@ -228,6 +244,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             store,
             CloudflareOutboxSender(cloudflare_client, controller_id),
             controller_id=controller_id,
+            telemetry_retention_days=telemetry_retention_days,
         ))
         if authorised is not None:
             workers.append(AuthorisationRefreshWorker(
@@ -254,12 +271,32 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                 outbox_url, bearer_token=bearer_token, controller_id=controller_id,
             ),
             controller_id=controller_id,
+            telemetry_retention_days=telemetry_retention_days,
+        ))
+    else:
+        workers.append(TelemetryRetentionWorker(
+            store, retention_days=telemetry_retention_days,
         ))
     return tuple(workers), prompt_player, lambda: _controller_status(
         store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
     )
+
+
+def _telemetry_retention_days(environment) -> int:
+    configured = environment.get("GATE_TELEMETRY_RETENTION_DAYS", "30")
+    try:
+        days = int(configured)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "GATE_TELEMETRY_RETENTION_DAYS must be an integer between 1 and 3650"
+        ) from error
+    if not 1 <= days <= 3650:
+        raise ValueError(
+            "GATE_TELEMETRY_RETENTION_DAYS must be an integer between 1 and 3650"
+        )
+    return days
 
 
 def _configured_prompts(environment) -> dict[str, Path]:

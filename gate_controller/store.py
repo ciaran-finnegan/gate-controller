@@ -21,6 +21,10 @@ _MAX_TELEMETRY_PAGE_SIZE = 100
 _SNAPSHOT_PAGES_PER_STEP = 16
 _SNAPSHOT_BUSY_TIMEOUT_SECONDS = 0.25
 _SNAPSHOT_BUSY_SLICE_MS = 10
+_OUTBOX_READY = "ready"
+_OUTBOX_AWAITING_TELEMETRY = "awaiting_telemetry"
+_OUTBOX_TELEMETRY_READY = "telemetry_ready"
+_OUTBOX_LOCAL_ONLY = "local_only"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -279,19 +283,55 @@ class LocalStore:
 
     def pending_outbox_count(self) -> int:
         with closing(self._connect()) as connection:
-            return connection.execute("SELECT COUNT(*) FROM outbox WHERE completed_at IS NULL").fetchone()[0]
+            return connection.execute(
+                """
+                SELECT COUNT(*) FROM outbox
+                WHERE completed_at IS NULL AND send_state != ?
+                """,
+                (_OUTBOX_LOCAL_ONLY,),
+            ).fetchone()[0]
 
-    def pending_outbox_items(self, limit: int = 20) -> list[tuple[int, dict]]:
+    def pending_outbox_items(
+        self, limit: int = 20, *, after_id: int | None = None,
+    ) -> list[tuple[int, dict]]:
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT id, payload FROM outbox WHERE completed_at IS NULL ORDER BY id LIMIT ?", (limit,)
-            ).fetchall()
+            if after_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT id, payload FROM outbox
+                    WHERE completed_at IS NULL AND send_state IN (?, ?)
+                    ORDER BY id LIMIT ?
+                    """,
+                    (_OUTBOX_READY, _OUTBOX_TELEMETRY_READY, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, payload FROM outbox
+                    WHERE completed_at IS NULL AND send_state IN (?, ?)
+                    ORDER BY CASE WHEN id > ? THEN 0 ELSE 1 END, id
+                    LIMIT ?
+                    """,
+                    (
+                        _OUTBOX_READY, _OUTBOX_TELEMETRY_READY, after_id, limit,
+                    ),
+                ).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
+
+    def release_outbox_without_telemetry(self, event_id: int) -> None:
+        """Make a processor outbox sendable when no trace could be attached."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE outbox SET send_state = ?
+                WHERE event_id = ? AND completed_at IS NULL AND send_state = ?
+                """,
+                (_OUTBOX_READY, event_id, _OUTBOX_AWAITING_TELEMETRY),
+            )
 
     def attach_event_telemetry(self, event_id: int, telemetry: EventTelemetry) -> bool:
         """Attach one trace after the terminal event transaction has committed."""
         payload = _telemetry_payload(telemetry)
-        encoded = _encode_json(payload)
         created_at = _timestamp(datetime.now(timezone.utc))
         connection = self._connect()
         try:
@@ -300,6 +340,8 @@ class LocalStore:
                 "SELECT 1 FROM events WHERE id = ?", (event_id,)
             ).fetchone() is None:
                 raise KeyError(f"unknown event {event_id}")
+            _enrich_outbox_delivery(connection, event_id, payload)
+            encoded = _encode_json(payload)
             existing = connection.execute(
                 "SELECT trace_id, payload FROM event_telemetry WHERE event_id = ?",
                 (event_id,),
@@ -327,8 +369,17 @@ class LocalStore:
                     """,
                     (event_id, payload["trace_id"], encoded, created_at),
                 )
-            self._promote_pending_outbox(connection, event_id, payload)
+            self._promote_outbox(connection, event_id, payload)
             connection.commit()
+            cloud_enqueued_at = payload.get("stage_timestamps", {}).get(
+                "cloud_enqueued_at"
+            )
+            if cloud_enqueued_at is not None:
+                _LOGGER.info(
+                    "gate_pipeline stage=cloud_enqueued trace_id=%s event_id=%d "
+                    "observed_at=%s",
+                    payload["trace_id"], event_id, cloud_enqueued_at,
+                )
             return inserted
         except Exception:
             connection.rollback()
@@ -433,8 +484,9 @@ class LocalStore:
                 """
                 SELECT event_id, payload, created_at FROM outbox
                 WHERE id = ? AND completed_at IS NULL
+                  AND send_state IN (?, ?)
                 """,
-                (item_id,),
+                (item_id, _OUTBOX_READY, _OUTBOX_TELEMETRY_READY),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -455,6 +507,11 @@ class LocalStore:
                 )
                 telemetry["delivery"] = {"outbox_attempt": attempt, "state": "sending"}
                 queued_at = _parse_timestamp(created_at)
+                stage_timestamps = dict(telemetry.get("stage_timestamps", {}))
+                stage_timestamps.setdefault("cloud_enqueued_at", _timestamp(queued_at))
+                stage_timestamps["cloud_send_started_at"] = _timestamp(attempted_at)
+                stage_timestamps.pop("cloud_acknowledged_at", None)
+                telemetry["stage_timestamps"] = stage_timestamps
                 lag_ms = max(
                     0,
                     int((_as_utc(attempted_at) - queued_at).total_seconds() * 1000),
@@ -521,6 +578,29 @@ class LocalStore:
                 removed += connection.execute(
                     "DELETE FROM event_telemetry WHERE event_id = ?", (event_id,)
                 ).rowcount
+            connection.commit()
+            return removed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def purge_unqueued_telemetry(self, cutoff: datetime) -> int:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            removed = connection.execute(
+                """
+                DELETE FROM event_telemetry
+                WHERE created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outbox
+                      WHERE outbox.event_id = event_telemetry.event_id
+                  )
+                """,
+                (_timestamp(cutoff),),
+            ).rowcount
             connection.commit()
             return removed
         except Exception:
@@ -602,13 +682,20 @@ class LocalStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM command_ack_outbox WHERE command_id = ?", (command_id,))
 
-    def complete_outbox_item(self, item_id: int, completed_at: datetime | None = None) -> None:
+    def complete_outbox_item(
+        self, item_id: int, completed_at: datetime | None = None, *,
+        prepared_payload: dict | None = None,
+    ) -> None:
         self._set_outbox_delivery_state(
-            item_id, "delivered", completed_at or datetime.now(timezone.utc)
+            item_id,
+            "delivered",
+            completed_at or datetime.now(timezone.utc),
+            prepared_payload=prepared_payload,
         )
 
     def _set_outbox_delivery_state(self, item_id: int, state: str,
-                                   completed_at: datetime | None = None) -> None:
+                                   completed_at: datetime | None = None, *,
+                                   prepared_payload: dict | None = None) -> None:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -620,24 +707,53 @@ class LocalStore:
                 connection.commit()
                 return
             event_id, payload_text = row
-            payload = json.loads(payload_text)
+            payload = (
+                json.loads(payload_text)
+                if prepared_payload is None else dict(prepared_payload)
+            )
             fallback = _v2_outbox_payload(payload)
-            payload = fallback
+            if prepared_payload is None:
+                payload = fallback
             telemetry_row = connection.execute(
                 "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
             ).fetchone()
-            if telemetry_row is not None:
+            prepared_telemetry = payload.get("telemetry")
+            if telemetry_row is not None and (
+                prepared_payload is None or prepared_telemetry is not None
+            ):
                 connection.execute("SAVEPOINT telemetry_delivery_state")
                 try:
-                    telemetry = _decode_telemetry_payload(telemetry_row[0])
+                    telemetry_source = (
+                        _encode_json(prepared_telemetry)
+                        if prepared_telemetry is not None else telemetry_row[0]
+                    )
+                    telemetry = _decode_telemetry_payload(telemetry_source)
                     telemetry["delivery"] = {
                         "outbox_attempt": _telemetry_attempt(telemetry),
                         "state": state,
                     }
+                    if state == "delivered" and completed_at is not None:
+                        stage_timestamps = dict(
+                            telemetry.get("stage_timestamps", {})
+                        )
+                        acknowledged_at = _timestamp(completed_at)
+                        stage_timestamps["cloud_acknowledged_at"] = acknowledged_at
+                        telemetry["stage_timestamps"] = stage_timestamps
+                        send_started_at = stage_timestamps.get(
+                            "cloud_send_started_at"
+                        )
+                        send_to_ack_ms = _bounded_interval_ms(
+                            send_started_at, acknowledged_at
+                        )
+                        if send_to_ack_ms is not None:
+                            telemetry["stage_durations"][
+                                "cloud_send_to_ack_ms"
+                            ] = send_to_ack_ms
                     self._write_telemetry_payload(connection, event_id, telemetry)
-                    payload = dict(fallback)
-                    payload["schema_version"] = 3
-                    payload["telemetry"] = telemetry
+                    if prepared_payload is None:
+                        payload = dict(fallback)
+                        payload["schema_version"] = 3
+                        payload["telemetry"] = telemetry
                 except _MalformedTelemetry:
                     connection.execute("ROLLBACK TO telemetry_delivery_state")
                     _log_telemetry_fallback("malformed")
@@ -673,21 +789,23 @@ class LocalStore:
         )
 
     @staticmethod
-    def _promote_pending_outbox(connection: sqlite3.Connection, event_id: int,
-                                telemetry: dict) -> None:
+    def _promote_outbox(connection: sqlite3.Connection, event_id: int,
+                        telemetry: dict) -> None:
         row = connection.execute(
-            "SELECT id, payload FROM outbox WHERE event_id = ? AND completed_at IS NULL",
+            "SELECT id, payload, completed_at FROM outbox WHERE event_id = ?",
             (event_id,),
         ).fetchone()
         if row is None:
             return
-        outbox_id, payload_text = row
+        outbox_id, payload_text, completed_at = row
         payload = json.loads(payload_text)
+        if completed_at is not None:
+            return
         payload["schema_version"] = 3
         payload["telemetry"] = telemetry
         connection.execute(
-            "UPDATE outbox SET payload = ? WHERE id = ? AND completed_at IS NULL",
-            (_encode_json(payload), outbox_id),
+            "UPDATE outbox SET payload = ?, send_state = ? WHERE id = ?",
+            (_encode_json(payload), _OUTBOX_TELEMETRY_READY, outbox_id),
         )
 
     def _event_id(self, idempotency_key: str) -> int | None:
@@ -721,13 +839,25 @@ class LocalStore:
                        payload: dict | None) -> int | None:
         if payload is None:
             return None
+        payload = dict(payload)
+        send_state = (
+            _OUTBOX_AWAITING_TELEMETRY
+            if payload.pop("_awaiting_telemetry", False) is True
+            else _OUTBOX_READY
+        )
         encoded = LocalStore._event_payload(connection, event_id) or {}
         encoded.update(payload)
         if encoded.get("event_id") is None:
             encoded["event_id"] = event_id
         cursor = connection.execute(
-            "INSERT OR IGNORE INTO outbox (event_id, payload, created_at) VALUES (?, ?, ?)",
-            (event_id, json.dumps(encoded, sort_keys=True), _timestamp(datetime.now(timezone.utc))),
+            """
+            INSERT OR IGNORE INTO outbox (event_id, payload, created_at, send_state)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                event_id, json.dumps(encoded, sort_keys=True),
+                _timestamp(datetime.now(timezone.utc)), send_state,
+            ),
         )
         return cursor.lastrowid or None
 
@@ -837,7 +967,8 @@ class LocalStore:
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
                     id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events(id),
-                    payload TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT,
+                    send_state TEXT NOT NULL DEFAULT 'ready'
                 );
                 CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS command_ack_outbox (
@@ -865,6 +996,19 @@ class LocalStore:
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE actuation_claims ADD COLUMN {name} TEXT")
+            outbox_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(outbox)")
+            }
+            if "send_state" not in outbox_columns:
+                connection.execute(
+                    "ALTER TABLE outbox ADD COLUMN send_state TEXT NOT NULL DEFAULT 'ready'"
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS outbox_pending_send
+                ON outbox (send_state, completed_at, id)
+                """
+            )
             applied = connection.execute("SELECT 1 FROM schema_migrations WHERE name = 'legacy_log_import'").fetchone()
             if not applied and self._legacy_log_exists(connection):
                 self._import_legacy_log(connection)
@@ -913,6 +1057,48 @@ class LocalStore:
                     )
                 connection.execute(
                     "INSERT INTO schema_migrations (name) VALUES ('outbox_evidence_v2')"
+                )
+            incompatible_followup = connection.execute(
+                """
+                SELECT 1 FROM schema_migrations
+                WHERE name = 'outbox_incompatible_followup_v3'
+                """
+            ).fetchone()
+            if not incompatible_followup:
+                for outbox_id, payload_text, send_state in connection.execute(
+                    """
+                    SELECT id, payload, send_state FROM outbox
+                    WHERE completed_at IS NULL
+                      AND send_state IN (?, ?, ?)
+                    """,
+                    (
+                        _OUTBOX_READY,
+                        _OUTBOX_TELEMETRY_READY,
+                        _OUTBOX_LOCAL_ONLY,
+                    ),
+                ).fetchall():
+                    try:
+                        payload = json.loads(payload_text)
+                    except (TypeError, ValueError):
+                        continue
+                    if _is_incompatible_v3_followup(payload, send_state):
+                        next_state = _OUTBOX_LOCAL_ONLY
+                    elif (
+                        send_state == _OUTBOX_LOCAL_ONLY
+                        and _is_image_free_v3_telemetry_payload(payload)
+                    ):
+                        next_state = _OUTBOX_READY
+                    else:
+                        continue
+                    connection.execute(
+                        "UPDATE outbox SET send_state = ? WHERE id = ?",
+                        (next_state, outbox_id),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO schema_migrations (name)
+                    VALUES ('outbox_incompatible_followup_v3')
+                    """
                 )
     def _recover_interrupted_actuations(self, connection: sqlite3.Connection) -> int:
         rows = connection.execute(
@@ -973,6 +1159,13 @@ class LocalStore:
                 (event_id, recovery_reason, claim_id),
             )
             recovered_count += 1
+        connection.execute(
+            """
+            UPDATE outbox SET send_state = ?
+            WHERE completed_at IS NULL AND send_state = ?
+            """,
+            (_OUTBOX_READY, _OUTBOX_AWAITING_TELEMETRY),
+        )
         return recovered_count
 
     @staticmethod
@@ -1053,7 +1246,7 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
     raw = telemetry.to_wire()
     if raw.get("schema_version") != 3:
         raise ValueError("telemetry must use schema version 3")
-    return {
+    payload = {
         "trace_id": raw["trace_id"],
         "taxonomy_version": raw["taxonomy_version"],
         "stage_durations": dict(raw["stage_durations"]),
@@ -1069,6 +1262,9 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
         "actuation": dict(raw["actuation"]),
         "delivery": dict(raw["delivery"]),
     }
+    if "stage_timestamps" in raw:
+        payload["stage_timestamps"] = dict(raw["stage_timestamps"])
+    return payload
 
 
 def _same_trace(left: dict, right: dict) -> bool:
@@ -1080,8 +1276,19 @@ def _same_trace(left: dict, right: dict) -> bool:
     right_durations = dict(right_immutable.get("stage_durations", {}))
     left_durations.pop("delivery_lag_ms", None)
     right_durations.pop("delivery_lag_ms", None)
+    left_durations.pop("cloud_send_to_ack_ms", None)
+    right_durations.pop("cloud_send_to_ack_ms", None)
     left_immutable["stage_durations"] = left_durations
     right_immutable["stage_durations"] = right_durations
+    for candidate in (left_immutable, right_immutable):
+        stage_timestamps = dict(candidate.get("stage_timestamps", {}))
+        for key in tuple(stage_timestamps):
+            if key.startswith("cloud_"):
+                stage_timestamps.pop(key)
+        if stage_timestamps:
+            candidate["stage_timestamps"] = stage_timestamps
+        else:
+            candidate.pop("stage_timestamps", None)
     return left_immutable == right_immutable
 
 
@@ -1110,6 +1317,35 @@ def _v2_outbox_payload(payload: object) -> dict:
     return fallback
 
 
+def _is_incompatible_v3_followup(payload: object, send_state: str) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 3
+        or not isinstance(payload.get("telemetry"), dict)
+    ):
+        return False
+    if payload.get("image_status") == "delivered_before_telemetry":
+        return True
+    if not _is_image_free_v3_telemetry_payload(payload):
+        return False
+    delivery = payload["telemetry"].get("delivery")
+    return (
+        send_state in (_OUTBOX_READY, _OUTBOX_LOCAL_ONLY)
+        and isinstance(delivery, dict)
+        and delivery.get("state") == "pending"
+    )
+
+
+def _is_image_free_v3_telemetry_payload(payload: object) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 3
+        and isinstance(payload.get("telemetry"), dict)
+        and "image_sha256" not in payload
+        and "image_status" not in payload
+    )
+
+
 def _decode_telemetry_payload(encoded: object) -> dict:
     try:
         telemetry = json.loads(encoded)
@@ -1130,7 +1366,46 @@ def _decode_telemetry_payload(encoded: object) -> dict:
     if any(not isinstance(telemetry.get(key), value_type)
            for key, value_type in expected.items()):
         raise _MalformedTelemetry("telemetry has an invalid bounded contract")
+    stage_timestamps = telemetry.get("stage_timestamps")
+    if stage_timestamps is not None and (
+        not isinstance(stage_timestamps, dict)
+        or any(not isinstance(value, str) for value in stage_timestamps.values())
+    ):
+        raise _MalformedTelemetry("telemetry stage timestamps are invalid")
     return telemetry
+
+
+def _enrich_outbox_delivery(
+    connection: sqlite3.Connection, event_id: int, telemetry: dict
+) -> None:
+    row = connection.execute(
+        "SELECT created_at FROM outbox WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return
+    stage_timestamps = dict(telemetry.get("stage_timestamps", {}))
+    stage_timestamps.setdefault("cloud_enqueued_at", row[0])
+    telemetry["stage_timestamps"] = stage_timestamps
+
+
+def _bounded_interval_ms(start: object, end: object) -> int | None:
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        parsed_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        parsed_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        if parsed_start.tzinfo is None or parsed_end.tzinfo is None:
+            return None
+        interval = (
+            parsed_end.astimezone(timezone.utc)
+            - parsed_start.astimezone(timezone.utc)
+        ).total_seconds()
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return None
+    if interval < 0:
+        return None
+    return min(round(interval * 1_000), MAX_DURATION_MS)
 
 
 def _telemetry_attempt(telemetry: dict) -> int:

@@ -122,8 +122,10 @@ class FailingTelemetryTrace:
     def mark_burst(self):
         return self._call("mark_burst")
 
-    def seed_upstream(self, received_at, decision_started_at):
-        return self._call("seed_upstream", received_at, decision_started_at)
+    def seed_upstream(self, received_at, decision_started_at, processing_started_at=None):
+        return self._call(
+            "seed_upstream", received_at, decision_started_at, processing_started_at
+        )
 
     def add_frame(self, frame):
         return self._call("add_frame", frame)
@@ -170,6 +172,29 @@ class GateProcessorTests(unittest.TestCase):
         path = Path(directory) / name
         Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
         return path
+
+    def test_completed_trace_log_correlates_sanitized_stage_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "private-owner-registration.jpg")
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+            )
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,))
+
+        combined = "\n".join(logs.output)
+        self.assertIn(
+            f"gate_pipeline stage=processing_finished "
+            f"trace_id={result.telemetry.trace_id}",
+            combined,
+        )
+        self.assertIn("outcome=allowed reason=exact_match", combined)
+        self.assertIn('ocr_attempts=[{"duration_ms":', combined)
+        self.assertNotIn(str(frame), combined)
+        self.assertNotIn("12D3456", combined)
 
     def test_rejects_nonfinite_or_nonpositive_decision_budgets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -295,7 +320,74 @@ class GateProcessorTests(unittest.TestCase):
             "decision_ms": 0,
             "decision_to_relay_ms": 0,
             "end_to_end_ms": 1_150,
+            "filesystem_ingress_to_decision_ms": 1_150,
+            "filesystem_ingress_to_relay_ms": 1_150,
         })
+
+    def test_pre_ranking_wall_boundary_survives_clock_step_in_persisted_telemetry(self):
+        processing_started_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        stepped_wall = processing_started_at - timedelta(minutes=5)
+        monotonic_clock = MutableClock()
+        monotonic_clock.value = 104.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "wall-step.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("NOPE", 0.95)),
+                outbox=object(),
+                clock=lambda: processing_started_at + timedelta(seconds=4),
+                decision_clock=monotonic_clock,
+                telemetry_clock=monotonic_clock,
+                telemetry_wall_clock=lambda: stepped_wall,
+            ).process(
+                (frame,),
+                received_at=processing_started_at - timedelta(seconds=1),
+                decision_started_at=100.0,
+                processing_started_at=processing_started_at,
+            )
+
+            persisted = store.event_telemetry(result.event_id)
+
+        self.assertEqual(
+            persisted["stage_timestamps"]["burst_processing_started_at"],
+            processing_started_at.isoformat(),
+        )
+
+    def test_queue_coalesced_skip_persists_the_exact_pre_ranking_wall_boundary(self):
+        processing_started_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        stepped_wall = processing_started_at - timedelta(minutes=5)
+        monotonic_clock = MutableClock()
+        monotonic_clock.value = 104.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "coalesced-wall-step.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                SequenceRecognizer([]),
+                outbox=object(),
+                clock=lambda: processing_started_at + timedelta(seconds=4),
+                decision_clock=monotonic_clock,
+                telemetry_clock=monotonic_clock,
+                telemetry_wall_clock=lambda: stepped_wall,
+            ).record_skipped(
+                (frame,),
+                "queue_coalesced",
+                processing_started_at - timedelta(seconds=1),
+                decision_started_at=100.0,
+                processing_started_at=processing_started_at,
+            )
+
+            persisted = store.event_telemetry(result.event_id)
+
+        self.assertEqual(
+            persisted["stage_timestamps"]["burst_processing_started_at"],
+            processing_started_at.isoformat(),
+        )
 
     def test_upstream_seed_failure_is_best_effort(self):
         captured_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
@@ -644,6 +736,7 @@ class GateProcessorTests(unittest.TestCase):
             "capture_to_burst_ms": 500,
             "ocr_ms": 0,
             "end_to_end_ms": 4_600,
+            "filesystem_ingress_to_decision_ms": 4_600,
         })
 
     def test_preprocessing_stale_path_retains_upstream_terminal_durations(self):
@@ -696,6 +789,7 @@ class GateProcessorTests(unittest.TestCase):
             "capture_to_burst_ms": 500,
             "ocr_ms": 0,
             "end_to_end_ms": 6_200,
+            "filesystem_ingress_to_decision_ms": 6_200,
         })
 
     def test_stale_burst_has_zero_ocr_work_and_no_recognizer_or_relay_calls(self):
@@ -813,6 +907,9 @@ class GateProcessorTests(unittest.TestCase):
             self.assertIsNotNone(result.event_id)
             self.assertIsNone(result.telemetry)
             self.assertEqual(store.pending_outbox_count(), 1)
+            queued = store.pending_outbox_items()
+            self.assertEqual(len(queued), 1)
+            self.assertNotIn("_awaiting_telemetry", queued[0][1])
 
     def test_duplicate_direct_skip_does_not_create_a_second_trace(self):
         created_traces = []
@@ -1046,36 +1143,71 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_blocked_ocr_wait_is_bounded_without_waiting_for_the_request(self):
+        recognising = Event()
+        release = Event()
         finished = Event()
 
         class BlockingRecognizer:
             def recognise(self, path, timeout=None):
                 try:
-                    Event().wait(0.4)
+                    recognising.set()
+                    release.wait()
                     return PlateObservation("12D3456", 0.99)
                 finally:
                     finished.set()
+
+        class FastStore:
+            def event_exists(self, idempotency_key):
+                return False
+
+            def record_event_with_outbox(self, event, outbox_payload=None):
+                return 1
+
+            def attach_event_telemetry(self, event_id, telemetry):
+                return True
 
         relay_calls = []
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "blocked.jpg")
             processor = self._processor(
-                LocalStore(Path(directory) / "gate.db"),
+                FastStore(),
                 RecordingRelay(relay_calls),
                 BlockingRecognizer(),
                 decision_timeout=0.1,
             )
 
-            started = monotonic()
-            result = processor.process((frame,))
-            elapsed = monotonic() - started
+            results = []
+            processing = Thread(target=lambda: results.append(processor.process((frame,))))
+            processing.start()
+            try:
+                self.assertTrue(recognising.wait(1.0))
+                processing.join(0.5)
+                returned_while_ocr_blocked = not processing.is_alive()
+                ocr_finished_before_release = finished.is_set()
+            finally:
+                release.set()
+                processing.join(1.0)
 
-        self.assertLess(elapsed, 0.25)
-        self.assertEqual(result.reason, "decision_timeout")
+        processing_stopped = not processing.is_alive()
+
+        self.assertTrue(returned_while_ocr_blocked)
+        self.assertFalse(ocr_finished_before_release)
+        self.assertTrue(processing_stopped)
+        self.assertEqual(results[0].reason, "decision_timeout")
         self.assertEqual(relay_calls, [])
         self.assertTrue(finished.wait(0.5))
 
     def test_ocr_setup_time_consumes_the_same_absolute_decision_deadline(self):
+        class FastStore:
+            def event_exists(self, idempotency_key):
+                return False
+
+            def record_event_with_outbox(self, event, outbox_payload=None):
+                return 1
+
+            def attach_event_telemetry(self, event_id, telemetry):
+                return True
+
         class DelayedRecognizer:
             def __init__(self):
                 self.lookups = 0
@@ -1095,7 +1227,7 @@ class GateProcessorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "delayed-setup.jpg")
             processor = self._processor(
-                LocalStore(Path(directory) / "gate.db"),
+                FastStore(),
                 RecordingRelay(relay_calls),
                 DelayedRecognizer(),
                 decision_timeout=0.1,
@@ -1604,16 +1736,28 @@ class GateProcessorTests(unittest.TestCase):
 
     def test_timed_out_ocr_cleanup_is_bounded_when_abandon_hangs(self):
         release = Event()
+        abandon_started = Event()
+        abandon_finished = Event()
+        recognition_finished = Event()
+        processing_completed = Event()
 
         class BlockingCleanupRecognizer:
             def recognise(self, path, timeout=None):
-                release.wait(2)
-                return PlateObservation(None, 0.0)
+                try:
+                    release.wait(2)
+                    return PlateObservation(None, 0.0)
+                finally:
+                    recognition_finished.set()
 
             def abandon_in_flight(self):
-                release.wait(2)
-                return False
+                abandon_started.set()
+                try:
+                    release.wait(2)
+                    return False
+                finally:
+                    abandon_finished.set()
 
+        results = []
         try:
             with tempfile.TemporaryDirectory() as directory:
                 processor = self._processor(
@@ -1621,14 +1765,32 @@ class GateProcessorTests(unittest.TestCase):
                     BlockingCleanupRecognizer(), decision_timeout=0.02,
                 )
 
-                started = monotonic()
-                result = processor.process((self._jpeg(directory, "cleanup-hung.jpg"),))
-                elapsed = monotonic() - started
+                def process_timed_out_request():
+                    try:
+                        results.append(processor.process(
+                            (self._jpeg(directory, "cleanup-hung.jpg"),)
+                        ))
+                    finally:
+                        processing_completed.set()
 
-            self.assertEqual(result.reason, "decision_timeout")
-            self.assertLess(elapsed, 0.25)
+                worker = Thread(target=process_timed_out_request, daemon=True)
+                worker.start()
+                self.assertTrue(abandon_started.wait(1.0))
+                self.assertTrue(processing_completed.wait(1.0))
+                self.assertFalse(release.is_set())
+
+            self.assertEqual(results[0].reason, "decision_timeout")
         finally:
             release.set()
+            processing_completed.wait(2.0)
+            recognition_finished.wait(2.0)
+            abandon_finished.wait(2.0)
+            if "worker" in locals():
+                worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(recognition_finished.is_set())
+        self.assertTrue(abandon_finished.is_set())
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
@@ -1909,6 +2071,55 @@ class GateProcessorTests(unittest.TestCase):
 
             self.assertFalse(result.opened)
             self.assertEqual(store.pending_outbox_count(), 1)
+
+    def test_processor_outbox_cannot_send_until_telemetry_attachment_finishes(self):
+        attach_started = Event()
+        allow_attach = Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = self._jpeg(directory, "telemetry-race.jpg")
+
+            class PausingStore(LocalStore):
+                def attach_event_telemetry(self, event_id, telemetry):
+                    attach_started.set()
+                    if not allow_attach.wait(timeout=1):
+                        raise TimeoutError("test did not release telemetry attachment")
+                    return super().attach_event_telemetry(event_id, telemetry)
+
+            store = PausingStore(root / "gate.db")
+            spool = EvidenceSpool(root / "event-evidence")
+            sent = []
+            outbox = OutboxWorker(
+                store,
+                send=lambda payload, evidence: sent.append((dict(payload), evidence)),
+                evidence_spool=spool,
+            )
+            processor = self._processor(
+                store,
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("NOPE", 0.95)),
+                outbox=outbox,
+            )
+            result = []
+            processing = Thread(target=lambda: result.append(processor.process((frame,))))
+            processing.start()
+            try:
+                self.assertTrue(attach_started.wait(timeout=1))
+                self.assertEqual(outbox.run_once(), 0)
+                self.assertEqual(sent, [])
+            finally:
+                allow_attach.set()
+                processing.join(timeout=1)
+            self.assertFalse(processing.is_alive())
+            self.assertEqual(outbox.run_once(), 1)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0]["schema_version"], 3)
+        self.assertEqual(
+            sent[0][0]["telemetry"]["trace_id"], result[0].telemetry.trace_id
+        )
 
     def test_outbox_binds_an_immutable_best_image_before_queuing(self):
         with tempfile.TemporaryDirectory() as directory:

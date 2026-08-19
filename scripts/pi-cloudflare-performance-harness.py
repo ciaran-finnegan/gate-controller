@@ -7,40 +7,45 @@ import os
 import shutil
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-from uuid import uuid4
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 MAX_PROC_NET_DEV_BYTES = 64 * 1024
 MAX_NETWORK_INTERFACES = 32
+PATHS_URL = "http://127.0.0.1:9997/v3/paths/list"
+METRICS_URL = "http://127.0.0.1:9998/metrics"
+_READ_ONLY_ENDPOINTS = frozenset((PATHS_URL, METRICS_URL))
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        raise HTTPError(
+            request.full_url, code, "redirect response rejected", headers, file_pointer
+        )
+
+
+_URL_OPENER = build_opener(ProxyHandler({}), _RejectRedirects())
 
 
 def parse_args(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--command-url", default="http://127.0.0.1:8765/commands")
-    parser.add_argument("--media-health-url", default="http://127.0.0.1:9997/v3/paths/list")
     parser.add_argument("--output", type=Path, default=Path("gate-pi-performance.json"))
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
-    collection_mode = parser.add_mutually_exclusive_group()
-    collection_mode.add_argument("--skip-network", action="store_true")
-    collection_mode.add_argument(
-        "--actuate",
-        action="store_true",
-        help="send one real open_gate command; omitted by default",
-    )
-    parser.add_argument("--controller-id", default="primary")
+    parser.add_argument("--skip-network", action="store_true")
     return parser.parse_args(arguments)
 
 
-def measure_request(url, *, method="GET", body=None, timeout_seconds=5.0):
-    request = Request(url, data=body, method=method)
+def measure_request(url, *, timeout_seconds=5.0):
+    if url not in _READ_ONLY_ENDPOINTS:
+        raise ValueError("performance harness endpoint is not allowlisted")
+    request = Request(url, method="GET")
     started = time.perf_counter()
-    sample = {"url": url, "method": method}
+    sample = {"url": url, "method": "GET"}
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
+        with _URL_OPENER.open(request, timeout=timeout_seconds) as response:
             response.read()
             sample["status_code"] = response.status
     except HTTPError as error:
@@ -50,16 +55,6 @@ def measure_request(url, *, method="GET", body=None, timeout_seconds=5.0):
         sample["error"] = str(error)
     sample["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
     return sample
-
-
-def _actuation_body(controller_id):
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)
-    return json.dumps({
-        "controller_id": controller_id,
-        "command": "open_gate",
-        "idempotency_key": f"performance-harness-{uuid4()}",
-        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
-    }).encode("utf-8")
 
 
 def _read_proc_value(path, *, max_bytes=1024 * 1024):
@@ -119,19 +114,14 @@ def collect_host_metrics():
     return metrics
 
 
-def build_summary(*, samples, run_mode, actuation_requested, host_metrics=None):
-    if run_mode not in {
-        "host_metrics_only",
-        "passive_endpoint_probe",
-        "actuating_endpoint_probe",
-    }:
+def build_summary(*, samples, run_mode, host_metrics=None):
+    if run_mode not in {"host_metrics_only", "passive_endpoint_probe"}:
         raise ValueError("invalid performance harness run mode")
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "samples": samples,
         "host_metrics": host_metrics if host_metrics is not None else collect_host_metrics(),
         "run_mode": run_mode,
-        "actuation_requested": bool(actuation_requested),
     }
 
 
@@ -151,25 +141,15 @@ def main(arguments=None):
     samples = []
     if not args.skip_network:
         samples.append(measure_request(
-            args.command_url, timeout_seconds=args.timeout_seconds,
+            PATHS_URL, timeout_seconds=args.timeout_seconds,
         ))
         samples.append(measure_request(
-            args.media_health_url, timeout_seconds=args.timeout_seconds,
+            METRICS_URL, timeout_seconds=args.timeout_seconds,
         ))
-        if args.actuate:
-            samples.append(measure_request(
-                args.command_url,
-                method="POST",
-                body=_actuation_body(args.controller_id),
-                timeout_seconds=args.timeout_seconds,
-            ))
-    run_mode = "host_metrics_only" if args.skip_network else (
-        "actuating_endpoint_probe" if args.actuate else "passive_endpoint_probe"
-    )
+    run_mode = "host_metrics_only" if args.skip_network else "passive_endpoint_probe"
     summary = build_summary(
         samples=samples,
         run_mode=run_mode,
-        actuation_requested=args.actuate,
         host_metrics=collect_host_metrics(),
     )
     write_json(args.output, summary)

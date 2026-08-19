@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import os
 import tempfile
 import warnings
@@ -19,6 +20,7 @@ Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMA
 LOCAL_IMAGE_PATH_KEY = "_local_image_path"
 MAX_OUTBOX_IMAGE_BYTES = 512 * 1024
 MAX_OUTBOX_IMAGE_DIMENSION = 1280
+LOGGER = logging.getLogger(__name__)
 
 
 class OutboxSyncError(RuntimeError):
@@ -242,13 +244,60 @@ def _has_jpeg_signature(path: Path) -> bool:
         return False
 
 
+class TelemetryRetentionWorker:
+    """Bound local-only telemetry without touching rows queued for delivery."""
+
+    def __init__(self, store, *, retention_days: int = 30,
+                 poll_interval: float = 3600,
+                 clock: Callable[[], datetime] | None = None):
+        if (
+            isinstance(retention_days, bool)
+            or not isinstance(retention_days, int)
+            or not 1 <= retention_days <= 3650
+        ):
+            raise ValueError("retention_days must be between 1 and 3650")
+        self._store = store
+        self._retention_days = retention_days
+        self._poll_interval = poll_interval
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @property
+    def retention_days(self) -> int:
+        return self._retention_days
+
+    def run_once(self) -> int:
+        cutoff = self._clock() - timedelta(days=self._retention_days)
+        removed = 0
+        for purge in (
+            self._store.purge_delivered_telemetry,
+            self._store.purge_unqueued_telemetry,
+        ):
+            try:
+                removed += purge(cutoff)
+            except Exception:
+                pass
+        return removed
+
+    def run_forever(self, stop_event: Event) -> None:
+        while not stop_event.is_set():
+            self.run_once()
+            stop_event.wait(self._poll_interval)
+
+
 class OutboxWorker:
     """Persist remote work first, then retry it without affecting gate decisions."""
 
     def __init__(self, store, send: Callable[..., None], poll_interval: float = 5.0, *,
                  evidence_spool: EvidenceSpool | None = None,
                  controller_id: str = "primary",
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None,
+                 telemetry_retention_days: int = 30):
+        if (
+            isinstance(telemetry_retention_days, bool)
+            or not isinstance(telemetry_retention_days, int)
+            or not 1 <= telemetry_retention_days <= 3650
+        ):
+            raise ValueError("telemetry_retention_days must be between 1 and 3650")
         self._store = store
         self._send = send
         self._poll_interval = poll_interval
@@ -257,7 +306,9 @@ class OutboxWorker:
         )
         self._controller_id = controller_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._telemetry_retention_days = telemetry_retention_days
         self._last_retention_at: datetime | None = None
+        self._last_item_id: int | None = None
         try:
             self._store.bind_pending_outbox_controller(self._controller_id)
             self._evidence_spool.cleanup(self._store.pending_evidence_digests())
@@ -280,26 +331,61 @@ class OutboxWorker:
         now = self._clock()
         self._run_retention(now)
         completed = 0
-        for item_id, _queued_payload in self._store.pending_outbox_items():
+        for item_id, _queued_payload in self._store.pending_outbox_items(
+            after_id=self._last_item_id
+        ):
+            self._last_item_id = item_id
+            trace_id = "unavailable"
             try:
                 payload = self._store.prepare_outbox_attempt(item_id, self._clock())
                 if payload is None:
                     continue
+                telemetry = payload.get("telemetry", {})
+                trace_id = telemetry.get("trace_id", "unavailable")
+                send_started_at = telemetry.get("stage_timestamps", {}).get(
+                    "cloud_send_started_at", "unavailable"
+                )
+                LOGGER.info(
+                    "gate_pipeline stage=cloud_send_started trace_id=%s item_id=%d "
+                    "observed_at=%s attempt=%s",
+                    trace_id,
+                    item_id,
+                    send_started_at,
+                    telemetry.get("delivery", {}).get("outbox_attempt", "unavailable"),
+                )
                 image_digest = payload.get("image_sha256")
                 if image_digest is None:
                     self._send(payload)
                 else:
                     self._send(payload, self._evidence_spool.load(image_digest))
-            except Exception:
+            except Exception as error:
+                LOGGER.warning(
+                    "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d "
+                    "error_type=%s",
+                    trace_id, item_id, type(error).__name__,
+                )
                 try:
                     self._store.mark_outbox_retry(item_id)
                 except Exception:
                     pass
                 continue
             try:
-                self._store.complete_outbox_item(item_id, self._clock())
-            except Exception:
+                acknowledged_at = self._clock()
+                self._store.complete_outbox_item(
+                    item_id, acknowledged_at, prepared_payload=payload
+                )
+            except Exception as error:
+                LOGGER.warning(
+                    "gate_pipeline stage=cloud_ack_persist_failed trace_id=%s "
+                    "item_id=%d error_type=%s",
+                    trace_id, item_id, type(error).__name__,
+                )
                 continue
+            LOGGER.info(
+                "gate_pipeline stage=cloud_acknowledged trace_id=%s item_id=%d "
+                "observed_at=%s",
+                trace_id, item_id, acknowledged_at.astimezone(timezone.utc).isoformat(),
+            )
             if (
                 image_digest is not None
                 and image_digest not in self._store.pending_evidence_digests()
@@ -319,7 +405,9 @@ class OutboxWorker:
             return
         self._last_retention_at = now
         try:
-            self._store.purge_delivered_telemetry(now - timedelta(days=30))
+            self._store.purge_delivered_telemetry(
+                now - timedelta(days=self._telemetry_retention_days)
+            )
         except Exception:
             pass
 

@@ -288,6 +288,66 @@ class TelemetryWireTests(unittest.TestCase):
 
 
 class ProcessingTraceTests(unittest.TestCase):
+    def test_trace_emits_truthful_stage_timestamps_and_direct_latency_measurements(self):
+        ingress_at = datetime(2026, 8, 15, 9, 59, 59, 500000, tzinfo=timezone.utc)
+        wall_anchor = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        monotonic = iter((100.0, 100.1, 100.3, 100.4, 100.45, 100.65, 100.7))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: wall_anchor,
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.seed_upstream(ingress_at, 99.75)
+        trace.mark_ocr_start()
+        trace.add_ocr_attempt(OcrAttemptTelemetry(frame_sequence=0, status="matched"))
+        trace.mark_decision("allowed", "exact_match")
+        trace.mark_relay_activation()
+        mark_relay_finished = getattr(trace, "mark_relay_finished", None)
+        self.assertIsNotNone(mark_relay_finished)
+        mark_relay_finished()
+        wire = trace.finish().to_wire()
+
+        self.assertEqual(wire["stage_timestamps"], {
+            "filesystem_ingress_at": "2026-08-15T09:59:59.500000+00:00",
+            "burst_processing_started_at": "2026-08-15T09:59:59.750000+00:00",
+            "ocr_started_at": "2026-08-15T10:00:00.100000+00:00",
+            "ocr_finished_at": "2026-08-15T10:00:00.300000+00:00",
+            "decision_at": "2026-08-15T10:00:00.400000+00:00",
+            "relay_started_at": "2026-08-15T10:00:00.450000+00:00",
+            "relay_finished_at": "2026-08-15T10:00:00.650000+00:00",
+            "processing_finished_at": "2026-08-15T10:00:00.700000+00:00",
+        })
+        self.assertEqual(wire["stage_durations"], {
+            "capture_to_burst_ms": 250,
+            "burst_to_ocr_ms": 350,
+            "ocr_ms": 200,
+            "decision_ms": 100,
+            "decision_to_relay_ms": 50,
+            "end_to_end_ms": 1_200,
+            "filesystem_ingress_to_decision_ms": 900,
+            "filesystem_ingress_to_relay_ms": 950,
+            "relay_ms": 200,
+        })
+
+    def test_unobserved_filesystem_and_relay_stages_are_omitted(self):
+        monotonic = iter((10.0, 10.1, 10.2, 10.3))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        trace.mark_burst()
+        trace.mark_decision("denied", "no_match")
+        wire = trace.finish().to_wire()
+
+        self.assertIn("stage_timestamps", wire)
+        self.assertNotIn("filesystem_ingress_at", wire["stage_timestamps"])
+        self.assertNotIn("relay_started_at", wire["stage_timestamps"])
+        self.assertNotIn("relay_finished_at", wire["stage_timestamps"])
+        self.assertNotIn("filesystem_ingress_to_decision_ms", wire["stage_durations"])
+        self.assertNotIn("relay_ms", wire["stage_durations"])
+
     def test_upstream_boundaries_anchor_wall_capture_to_monotonic_burst(self):
         captured_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
         monotonic = iter((101.0, 101.1, 101.2))

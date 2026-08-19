@@ -57,6 +57,20 @@ class PassiveObserver:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_filesystem_ingress_is_logged_without_exposing_the_image_path(self):
+        collector = RecordingCollector()
+        observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        handler = CompletedImageHandler(collector, arrival_clock=lambda: observed_at)
+        private_path = Path("/private/camera/customer-plate.jpg")
+
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            handler.schedule_candidate(private_path)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_pipeline stage=filesystem_ingress", combined)
+        self.assertIn("observed_at=2026-08-14T10:00:00+00:00", combined)
+        self.assertNotIn(str(private_path), combined)
+
     def test_coalesces_completed_files_until_the_quiet_window_expires(self):
         clock = MutableClock()
         emitted = []
@@ -186,6 +200,38 @@ class WorkerTests(unittest.TestCase):
         collector.flush_due()
 
         self.assertEqual(emitted, [((path,), received_at, 1.0)])
+
+    def test_burst_log_pairs_pre_ranking_wall_and_monotonic_boundaries(self):
+        clock = MutableClock()
+        wall_clock = [datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)]
+        processing_started_at = wall_clock[0]
+        emitted = []
+
+        def delayed_ranker(paths):
+            clock.value += 4.0
+            wall_clock[0] += timedelta(seconds=4)
+            return paths
+
+        collector = BurstCollector(
+            emitted.append,
+            quiet_window=0.5,
+            ranker=delayed_ranker,
+            clock=clock,
+            wall_clock=lambda: wall_clock[0],
+            include_processing_started_at=True,
+        )
+        path = Path("frame.jpg")
+        collector.add(path)
+        clock.value = 1.0
+
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            collector.flush_due()
+
+        combined = "\n".join(logs.output)
+        self.assertIn("observed_at=2026-08-14T10:00:00+00:00", combined)
+        self.assertIn("ingress_wait_ms=1000", combined)
+        self.assertNotIn("observed_at=2026-08-14T10:00:04+00:00", combined)
+        self.assertEqual(emitted, [((path,), processing_started_at)])
 
     def test_created_file_fallback_adds_only_a_readable_completed_upload(self):
         collector = RecordingCollector()
@@ -585,8 +631,75 @@ class WorkerTests(unittest.TestCase):
 
         self.assertEqual(configured["collector"]["max_candidates"], 5)
         self.assertTrue(configured["collector"]["include_decision_started_at"])
+        self.assertTrue(configured["collector"]["include_processing_started_at"])
         self.assertEqual(configured["handler"]["max_candidate_bytes"], 1024)
         self.assertEqual(configured["handler"]["max_pending_candidates"], 5)
+
+    def test_queue_coalesced_callback_receives_exact_collector_boundaries(self):
+        configured = {}
+        received_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        processing_started_at = received_at + timedelta(milliseconds=250)
+        timed_skips = []
+        legacy_skips = []
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                configured["emit"] = emit
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                pass
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def enqueue_then_stop(_):
+            configured["emit"](((Path("first.jpg"),), received_at, 12.5,
+                                 processing_started_at))
+            configured["emit"](((Path("second.jpg"),), received_at, 13.0,
+                                 processing_started_at + timedelta(seconds=1)))
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=enqueue_then_stop
+        ):
+            run_worker(
+                Path(directory), lambda *_: None, max_pending_bursts=1,
+                on_skipped=lambda *args: legacy_skips.append(args),
+                on_timed_skipped=lambda *args: timed_skips.append(args),
+            )
+
+        self.assertEqual(timed_skips[0], (
+            (Path("first.jpg"),), "queue_coalesced", received_at, 12.5,
+            processing_started_at,
+        ))
+        self.assertEqual(legacy_skips, [])
 
     def test_fatal_image_worker_exception_fails_the_service(self):
         started = ThreadEvent()

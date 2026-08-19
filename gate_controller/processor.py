@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import math
 from collections.abc import Iterable
@@ -79,7 +80,8 @@ class GateProcessor:
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
-                decision_started_at: float | None = None) -> ProcessingResult:
+                decision_started_at: float | None = None,
+                processing_started_at: datetime | None = None) -> ProcessingResult:
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
         activation_deadline = deadline - self._activation_guard_seconds
@@ -95,8 +97,14 @@ class GateProcessor:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
             return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
         trace = self._new_trace()
-        if received_at is not None or decision_started_at is not None:
-            trace.seed_upstream(received_at, decision_started_at)
+        if (
+            received_at is not None
+            or decision_started_at is not None
+            or processing_started_at is not None
+        ):
+            trace.seed_upstream(
+                received_at, decision_started_at, processing_started_at
+            )
         if decision_started_at is None:
             trace.mark_burst()
         received_at = received_at or self._clock()
@@ -225,7 +233,7 @@ class GateProcessor:
             trace.mark_decision("denied", event.reason)
         else:
             trace.mark_decision("allowed", decision.reason)
-        outbox_payload = self._outbox_payload(paths)
+        outbox_payload = self._outbox_payload(paths, await_telemetry=True)
         if not decision.allowed:
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
@@ -264,6 +272,8 @@ class GateProcessor:
         }
         if _accepts_keyword(self._coordinator.actuate, "on_activation"):
             actuation_kwargs["on_activation"] = trace.mark_relay_activation
+        if _accepts_keyword(self._coordinator.actuate, "on_deactivation"):
+            actuation_kwargs["on_deactivation"] = trace.mark_relay_finished
         with self._actuation_lock:
             execution = self._coordinator.actuate(event, **actuation_kwargs)
         if execution.reason in FINAL_INHIBITION_REASONS:
@@ -277,7 +287,9 @@ class GateProcessor:
     def record_skipped(self, paths: Iterable[Path], reason: str,
                        received_at: datetime | None = None,
                        trace: ProcessingTrace | _BestEffortTrace | None = None,
-                       idempotency_key: str | None = None) -> ProcessingResult:
+                       idempotency_key: str | None = None, *,
+                       decision_started_at: float | None = None,
+                       processing_started_at: datetime | None = None) -> ProcessingResult:
         paths = tuple(Path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
@@ -291,9 +303,16 @@ class GateProcessor:
             )
         if trace is None:
             trace = self._new_trace()
-            if received_at is not None:
-                trace.seed_upstream(received_at, None)
-            trace.mark_burst()
+            if (
+                received_at is not None
+                or decision_started_at is not None
+                or processing_started_at is not None
+            ):
+                trace.seed_upstream(
+                    received_at, decision_started_at, processing_started_at
+                )
+            if decision_started_at is None:
+                trace.mark_burst()
         else:
             trace = _BestEffortTrace.wrap(trace)
         trace.mark_decision("denied", reason)
@@ -311,8 +330,10 @@ class GateProcessor:
     ) -> ProcessingResult:
         telemetry = trace.finish()
         if telemetry is None:
+            self._release_outbox_without_telemetry(result.event_id)
             return result
         completed = replace(result, telemetry=telemetry)
+        _log_completed_trace(telemetry)
         if result.event_id is not None:
             try:
                 self._store.attach_event_telemetry(result.event_id, telemetry)
@@ -320,7 +341,18 @@ class GateProcessor:
                 logging.getLogger(__name__).warning(
                     "event_telemetry_attach status=persistence_failed"
                 )
+                self._release_outbox_without_telemetry(result.event_id)
         return completed
+
+    def _release_outbox_without_telemetry(self, event_id: int | None) -> None:
+        if not self._outbox_enabled or event_id is None:
+            return
+        try:
+            self._store.release_outbox_without_telemetry(event_id)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "outbox_telemetry_wait status=release_failed"
+            )
 
     def _new_trace(self) -> _BestEffortTrace:
         return _BestEffortTrace.create(
@@ -330,17 +362,23 @@ class GateProcessor:
         )
 
     def _record(self, event: GateEvent, paths: Iterable[Path] = ()) -> int:
-        payload = self._outbox_payload(paths)
+        payload = self._outbox_payload(paths, await_telemetry=True)
         return self._store.record_event_with_outbox(event, payload)
 
-    def _outbox_payload(self, paths: Iterable[Path]) -> dict | None:
+    def _outbox_payload(
+        self, paths: Iterable[Path], *, await_telemetry: bool = False,
+    ) -> dict | None:
         if not self._outbox_enabled:
             return None
         paths = tuple(Path(path) for path in paths)
         prepare_payload = getattr(self._outbox, "prepare_payload", None)
         if not callable(prepare_payload):
-            return {"event_id": None}
-        return prepare_payload(paths[0] if paths else None)
+            payload = {"event_id": None}
+        else:
+            payload = prepare_payload(paths[0] if paths else None)
+        if await_telemetry:
+            payload["_awaiting_telemetry"] = True
+        return payload
 
     def _recognise(self, path: Path, deadline: float, on_start=None):
         remaining = deadline - self._decision_clock()
@@ -491,9 +529,12 @@ class _BestEffortTrace:
         self._call("mark_burst")
 
     def seed_upstream(
-        self, received_at: datetime | None, decision_started_at: float | None
+        self, received_at: datetime | None, decision_started_at: float | None,
+        processing_started_at: datetime | None = None,
     ) -> None:
-        self._call("seed_upstream", received_at, decision_started_at)
+        self._call(
+            "seed_upstream", received_at, decision_started_at, processing_started_at
+        )
 
     def add_frame(self, frame) -> None:
         self._call("add_frame", frame)
@@ -523,6 +564,9 @@ class _BestEffortTrace:
 
     def mark_relay_activation(self) -> None:
         self._call("mark_relay_activation")
+
+    def mark_relay_finished(self) -> None:
+        self._call("mark_relay_finished")
 
     def set_actuation_outcome(
         self, claim: str, attempted: bool, relay_outcome: str
@@ -613,3 +657,35 @@ def _accepts_keyword(callable_object, keyword: str) -> bool:
         parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+
+
+def _log_completed_trace(telemetry) -> None:
+    try:
+        wire = telemetry.to_wire()
+        attempts = [
+            {
+                "frame_sequence": attempt.get("frame_sequence"),
+                "duration_ms": attempt.get("duration_ms"),
+                "status": attempt.get("status"),
+            }
+            for attempt in wire.get("ocr_attempts", ())
+        ]
+        logging.getLogger(__name__).info(
+            "gate_pipeline stage=processing_finished trace_id=%s outcome=%s reason=%s "
+            "relay_outcome=%s durations=%s timestamps=%s ocr_attempts=%s",
+            wire["trace_id"],
+            wire["decision"]["outcome"],
+            wire["decision"]["reason"],
+            wire["actuation"]["relay_outcome"],
+            json.dumps(
+                wire["stage_durations"], sort_keys=True, separators=(",", ":")
+            ),
+            json.dumps(
+                wire.get("stage_timestamps", {}),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            json.dumps(attempts, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        return

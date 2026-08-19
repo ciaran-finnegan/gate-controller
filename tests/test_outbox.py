@@ -162,6 +162,171 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
+    def test_local_telemetry_retention_removes_expired_unqueued_rows(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        retention_worker = getattr(outbox_module, "TelemetryRetentionWorker", None)
+        self.assertIsNotNone(retention_worker)
+        worker = retention_worker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertIsNone(store.event_telemetry(event_id))
+
+    def test_local_telemetry_retention_preserves_rows_queued_for_delivery(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        retention_worker = getattr(outbox_module, "TelemetryRetentionWorker", None)
+        self.assertIsNotNone(retention_worker)
+        worker = retention_worker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertIsNotNone(store.event_telemetry(event_id))
+
+    def test_local_telemetry_retention_removes_expired_delivered_rows(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.complete_outbox_item(
+            item_id, datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        )
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        worker = outbox_module.TelemetryRetentionWorker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertIsNone(store.event_telemetry(event_id))
+
+    def test_legacy_v2_mid_send_attachment_remains_truthfully_pending(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        sent = []
+
+        def send(payload):
+            sent.append(dict(payload))
+            store.attach_event_telemetry(event_id, _telemetry())
+
+        completed = OutboxWorker(store, send=send).run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(sent[0]["schema_version"], 2)
+        self.assertNotIn("telemetry", sent[0])
+        with closing(sqlite3.connect(store.path)) as connection:
+            saved, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved), sent[0])
+        self.assertIsNotNone(completed_at)
+        self.assertEqual(
+            store.event_telemetry(event_id)["delivery"],
+            {"outbox_attempt": 0, "state": "pending"},
+        )
+
+    def test_telemetry_wait_prevents_v2_send_and_preserves_v3_evidence(self):
+        store, event_id = self._queued_store()
+        source = store.path.parent / "camera.jpg"
+        Image.new("RGB", (32, 32), color="red").save(source, format="JPEG")
+        spool = outbox_module.EvidenceSpool(store.path.parent / "event-evidence")
+        digest = spool.stage(source)
+        evidence_path = spool.root / f"{digest}.jpg"
+        expected_evidence = evidence_path.read_bytes()
+        item_id = store.queue_outbox(event_id, {
+            "controller_id": "pi-front-gate",
+            "image_sha256": digest,
+            "_awaiting_telemetry": True,
+        })
+        sent = []
+        worker = OutboxWorker(
+            store,
+            send=lambda payload, evidence: sent.append((dict(payload), evidence)),
+            evidence_spool=spool,
+        )
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(sent, [])
+        self.assertTrue(evidence_path.exists())
+
+        store.attach_event_telemetry(event_id, _telemetry())
+        completed = worker.run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(len(sent), 1)
+        sent_payload, sent_evidence = sent[0]
+        self.assertEqual(sent_payload["schema_version"], 3)
+        self.assertEqual(sent_payload["image_sha256"], digest)
+        self.assertEqual(sent_payload["telemetry"]["trace_id"], _telemetry().trace_id)
+        self.assertEqual(sent_evidence, expected_evidence)
+        with closing(sqlite3.connect(store.path)) as connection:
+            saved, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved), sent_payload)
+        self.assertIsNotNone(completed_at)
+        self.assertFalse(evidence_path.exists())
+        self.assertEqual(
+            store.event_telemetry(event_id)["delivery"],
+            {"outbox_attempt": 1, "state": "delivered"},
+        )
+
+    def test_poison_batch_does_not_starve_a_newer_delivery(self):
+        store, _ = self._queued_store()
+        poison_keys = set()
+        for index in range(20):
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key=f"poison-{index}",
+                received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+            ))
+            store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+            poison_keys.add(f"poison-{index}")
+        fresh_event_id = store.record_event(GateEvent(
+            source="ocr", reason="no_match", opened=False,
+            idempotency_key="fresh-delivery",
+            received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+        ))
+        store.queue_outbox(fresh_event_id, {"controller_id": "pi-front-gate"})
+        sent = []
+
+        def send(payload):
+            if payload["idempotency_key"] in poison_keys:
+                raise OutboxSyncError("permanent receiver rejection")
+            sent.append(payload["idempotency_key"])
+
+        worker = OutboxWorker(store, send=send)
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(sent, ["fresh-delivery"])
+        self.assertEqual(store.pending_outbox_count(), 20)
+
     def test_malformed_telemetry_falls_back_to_the_original_v2_delivery(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {
@@ -265,7 +430,11 @@ class OutboxWorkerTests(unittest.TestCase):
 
         worker = OutboxWorker(store, send=send)
 
-        self.assertEqual(worker.run_once(), 0)
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        combined = "\n".join(logs.output)
+        self.assertIn("error_type=RuntimeError", combined)
+        self.assertNotIn("offline", combined)
         self.assertEqual(sent[0]["telemetry"]["delivery"], {
             "outbox_attempt": 1,
             "state": "sending",
@@ -285,10 +454,87 @@ class OutboxWorkerTests(unittest.TestCase):
             "state": "delivered",
         })
         with closing(sqlite3.connect(store.path)) as connection:
-            completed_at = connection.execute(
-                "SELECT completed_at FROM outbox WHERE id = ?", (item_id,)
-            ).fetchone()[0]
+            saved_payload, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved_payload), sent[1])
         self.assertIsNotNone(completed_at)
+
+    def test_cloud_queue_send_and_ack_boundaries_are_persisted_and_logged(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        queued_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        send_at = queued_at + timedelta(milliseconds=250)
+        ack_at = send_at + timedelta(milliseconds=125)
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE outbox SET created_at = ? WHERE id = ?",
+                (queued_at.isoformat(), item_id),
+            )
+        store.attach_event_telemetry(event_id, _telemetry())
+        clock = iter((send_at, send_at, ack_at))
+        worker = OutboxWorker(store, send=lambda payload: None, clock=lambda: next(clock))
+
+        with self.assertLogs("gate_controller.outbox", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 1)
+
+        telemetry = store.event_telemetry(event_id)
+        self.assertEqual(telemetry["stage_timestamps"], {
+            "cloud_enqueued_at": queued_at.isoformat(),
+            "cloud_send_started_at": send_at.isoformat(),
+            "cloud_acknowledged_at": ack_at.isoformat(),
+        })
+        self.assertEqual(telemetry["stage_durations"]["delivery_lag_ms"], 250)
+        self.assertEqual(telemetry["stage_durations"]["cloud_send_to_ack_ms"], 125)
+        combined = "\n".join(logs.output)
+        self.assertIn(
+            "gate_pipeline stage=cloud_send_started "
+            "trace_id=ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            combined,
+        )
+        self.assertIn(
+            "gate_pipeline stage=cloud_acknowledged "
+            "trace_id=ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            combined,
+        )
+
+    def test_ack_persistence_failure_logs_only_the_exception_type(self):
+        store, event_id = self._queued_store()
+        store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.attach_event_telemetry(event_id, _telemetry())
+        worker = OutboxWorker(store, send=lambda payload: None)
+
+        with mock.patch.object(
+            store, "complete_outbox_item", side_effect=OSError("private path")
+        ), self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_pipeline stage=cloud_ack_persist_failed", combined)
+        self.assertIn("error_type=OSError", combined)
+        self.assertNotIn("private path", combined)
+
+    def test_invalid_send_timestamp_does_not_fabricate_cloud_ack_duration(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.attach_event_telemetry(event_id, _telemetry())
+        store.prepare_outbox_attempt(
+            item_id, datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        )
+        telemetry = store.event_telemetry(event_id)
+        telemetry["stage_timestamps"]["cloud_send_started_at"] = "not-a-timestamp"
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET payload = ? WHERE event_id = ?",
+                (json.dumps(telemetry), event_id),
+            )
+
+        store.complete_outbox_item(
+            item_id, datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+        )
+
+        persisted = store.event_telemetry(event_id)
+        self.assertNotIn("cloud_send_to_ack_ms", persisted["stage_durations"])
 
     def test_retention_runs_at_startup_then_no_more_than_hourly(self):
         store, _ = self._queued_store()
@@ -312,6 +558,28 @@ class OutboxWorkerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc))
         self.assertEqual(calls[1], datetime(2026, 7, 17, 13, 1, tzinfo=timezone.utc))
+
+    def test_retention_uses_the_configured_number_of_days(self):
+        store, _ = self._queued_store()
+        cutoffs = []
+        store.purge_delivered_telemetry = cutoffs.append
+        now = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+        worker = OutboxWorker(
+            store,
+            send=lambda payload: None,
+            clock=lambda: now,
+            telemetry_retention_days=7,
+        )
+
+        worker.run_once()
+
+        self.assertEqual(cutoffs, [datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)])
+
+    def test_retention_days_must_be_positive(self):
+        store, _ = self._queued_store()
+
+        with self.assertRaisesRegex(ValueError, "telemetry_retention_days"):
+            OutboxWorker(store, send=lambda payload: None, telemetry_retention_days=0)
 
     def test_prepares_an_immutable_evidence_reference_without_a_local_path(self):
         with tempfile.TemporaryDirectory() as directory:

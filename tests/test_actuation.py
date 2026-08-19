@@ -103,6 +103,49 @@ class ActuationCoordinatorTests(unittest.TestCase):
         self.assertTrue(result.opened)
         self.assertEqual(calls, ["relay", "activation", "finalize"])
 
+    def test_forwards_relay_completion_hook_before_finalization(self):
+        now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        calls = []
+
+        class CallbackRelay:
+            def trigger(self, source, idempotency_key=None, *, on_activation=None,
+                        on_deactivation=None):
+                calls.append("relay")
+                on_activation()
+                on_deactivation()
+                return RelayResult(True, "activated", idempotency_key, now)
+
+        class FinalizationStore(LocalStore):
+            def finalize_actuation(self, *args, **kwargs):
+                calls.append("finalize")
+                return super().finalize_actuation(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = ActuationCoordinator(
+                FinalizationStore(Path(directory) / "gate.db"),
+                CallbackRelay(),
+                clock=lambda: now,
+            )
+            try:
+                result = coordinator.actuate(
+                    GateEvent(
+                        source="ocr", reason="exact_match", opened=False,
+                        idempotency_key="ocr-relay-complete", received_at=now,
+                        decision_at=now,
+                    ),
+                    on_activation=lambda: calls.append("activation"),
+                    on_deactivation=lambda: calls.append("deactivation"),
+                )
+            except TypeError as error:
+                self.fail(f"coordinator relay completion hook is unavailable: {error}")
+
+        self.assertTrue(result.opened)
+        self.assertEqual(
+            calls,
+            ["relay", "activation", "deactivation", "finalize"],
+        )
+
+
     def test_successful_finalization_durably_queues_the_command_ack_before_restart(self):
         now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
