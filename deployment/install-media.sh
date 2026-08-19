@@ -22,8 +22,7 @@ NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
 SYSTEMD_ROOT=/etc/systemd/system
 MEDIA_TURN_REFRESH_TIMER=gate-media-turn-refresh.timer
 MEDIA_TURN_REFRESH_SERVICE=gate-media-turn-refresh.service
-MEDIA_TURN_REFRESH_RUNTIME_DIR=/run/gate-media-turn-refresh
-MEDIA_TURN_REFRESH_LOCK=$MEDIA_TURN_REFRESH_RUNTIME_DIR/refresh.lock
+MEDIA_TURN_REFRESH_LOCK=$MEDIA_STATE_ROOT/turn-refresh.lock
 MEDIA_TURN_REFRESH_LOCK_HELD=0
 PINNED_MEDIAMTX_VERSION=1.19.3
 SOURCE=
@@ -210,13 +209,13 @@ disable_turn_refresh_timer() {
 }
 
 acquire_turn_refresh_install_lock() {
-  [[ ! -L $MEDIA_TURN_REFRESH_RUNTIME_DIR ]] \
-    || fail "TURN refresh runtime directory must not be a symlink"
-  if [[ ! -e $MEDIA_TURN_REFRESH_RUNTIME_DIR ]]; then
-    install -d -o root -g root -m 0700 "$MEDIA_TURN_REFRESH_RUNTIME_DIR"
+  [[ ! -L $MEDIA_STATE_ROOT ]] \
+    || fail "TURN refresh state directory must not be a symlink"
+  if [[ ! -e $MEDIA_STATE_ROOT ]]; then
+    install -d -o root -g root -m 0700 "$MEDIA_STATE_ROOT"
   fi
-  [[ -d $MEDIA_TURN_REFRESH_RUNTIME_DIR && ! -L $MEDIA_TURN_REFRESH_RUNTIME_DIR ]] \
-    || fail "TURN refresh runtime directory must be a directory"
+  [[ -d $MEDIA_STATE_ROOT && ! -L $MEDIA_STATE_ROOT ]] \
+    || fail "TURN refresh state directory must be a directory"
   [[ ! -L $MEDIA_TURN_REFRESH_LOCK ]] \
     || fail "TURN refresh lock must be a regular file"
   if [[ ! -e $MEDIA_TURN_REFRESH_LOCK ]]; then
@@ -230,7 +229,10 @@ acquire_turn_refresh_install_lock() {
     exec 9>&-
     fail "TURN refresh lock must be a regular file"
   }
-  flock 9
+  flock 9 || {
+    exec 9>&-
+    fail "TURN refresh lock could not be acquired"
+  }
   MEDIA_TURN_REFRESH_LOCK_HELD=1
 }
 
@@ -242,8 +244,8 @@ release_turn_refresh_install_lock() {
 }
 
 prepare_turn_refresh_install() {
-  disable_turn_refresh_timer
   acquire_turn_refresh_install_lock
+  disable_turn_refresh_timer
 }
 
 turn_refresh_environment_configured() {
@@ -263,6 +265,7 @@ configure_turn_refresh_timer() {
 }
 
 cleanup_media_install() {
+  [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]] || return 0
   if [[ -n $EXTRACTED_MEDIA_DIR \
       && $EXTRACTED_MEDIA_DIR == "$MEDIA_ARCHIVE_ROOT"/.extract.* ]]; then
     rm -rf -- "$EXTRACTED_MEDIA_DIR"
@@ -282,13 +285,20 @@ cleanup_media_install() {
   release_turn_refresh_install_lock
 }
 
+finish_media_install() {
+  cleanup_media_install
+  configure_turn_refresh_timer
+}
+
 on_media_install_failure() {
   local status=$?
   [[ $status -ne 0 ]] || status=1
   trap - ERR INT TERM
-  disable_media_services
-  disable_turn_refresh_timer
-  cleanup_media_install
+  if [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]]; then
+    disable_media_services
+    disable_turn_refresh_timer
+    cleanup_media_install
+  fi
   exit "$status"
 }
 
@@ -552,9 +562,8 @@ main() {
     disable_media_services
     printf 'Media services remain disabled until split source and HMAC environment values exist.\n'
   fi
-  configure_turn_refresh_timer
+  finish_media_install
   trap - ERR INT TERM
-  cleanup_media_install
   trap - EXIT
 }
 

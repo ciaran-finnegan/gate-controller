@@ -95,11 +95,15 @@ class MediaTurnRefreshTests(unittest.TestCase):
         self.assertNotIn("EnvironmentFile", service["Service"])
         self.assertNotIn("TURN_KEY", (Path(__file__).parents[1] /
                                         "deployment/systemd/gate-media-turn-refresh.service").read_text())
-        self.assertIn("/usr/bin/flock --nonblock", service["Service"].get("ExecStart"))
+        self.assertIn(
+            "/usr/bin/flock --nonblock /var/lib/gate-media/turn-refresh.lock",
+            service["Service"].get("ExecStart"),
+        )
         self.assertEqual(
-            {"/var/lib/gate-media", "/run/gate-media-turn-refresh"},
+            {"/var/lib/gate-media"},
             set(service["Service"].get("ReadWritePaths").split()),
         )
+        self.assertNotIn("RuntimeDirectory", service["Service"])
         self.assertNotIn("/etc", service["Service"].get("ReadWritePaths").split())
         self.assertEqual("", service["Service"].get("CapabilityBoundingSet"))
         self.assertIn("ProtectSystem=strict", (Path(__file__).parents[1] /
@@ -194,7 +198,11 @@ configure_turn_refresh_timer
 
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertEqual(
-                ["disable --now gate-media-turn-refresh.timer"],
+                [
+                    "disable --now gate-media-turn-refresh.timer "
+                    "gate-media-turn-refresh.service",
+                    "stop gate-media-turn-refresh.service",
+                ],
                 log.read_text(encoding="utf-8").splitlines(),
             )
 

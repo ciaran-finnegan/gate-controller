@@ -488,14 +488,21 @@ activate_media_services
             release = root / "release"
             acquired = root / "acquired"
             lock_requested = root / "lock-requested"
+            unit_changed_while_waiting = root / "unit-changed-while-waiting"
+            unit_state_changed = root / "unit-state-changed"
             systemctl_log = root / "systemctl.log"
             command = f"""
 source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
-systemctl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(systemctl_log))}; }}
+systemctl() {{
+  touch {shlex.quote(str(unit_state_changed))}
+  printf '%s\\n' "$*" >> {shlex.quote(str(systemctl_log))}
+}}
 flock() {{
   [[ $1 == -u ]] && return 0
+  [[ ! -e {shlex.quote(str(unit_state_changed))} ]] || touch {shlex.quote(str(unit_changed_while_waiting))}
   touch {shlex.quote(str(lock_requested))}
   while [[ ! -e {shlex.quote(str(release))} ]]; do sleep 0.01; done
 }}
@@ -506,9 +513,12 @@ while [[ ! -e {shlex.quote(str(lock_requested))} ]]; do
   sleep 0.01
 done
 sleep 0.1
-[[ ! -e {shlex.quote(str(acquired))} ]]
+failed=0
+[[ ! -e {shlex.quote(str(acquired))} ]] || failed=1
+[[ ! -e {shlex.quote(str(unit_changed_while_waiting))} ]] || failed=1
 touch {shlex.quote(str(release))}
 wait "$installer_pid"
+exit "$failed"
 """
 
             completed = subprocess.run(
@@ -528,7 +538,7 @@ wait "$installer_pid"
                 systemctl_log.read_text(encoding="utf-8").splitlines(),
             )
 
-    def test_media_install_refuses_symlinked_turn_refresh_runtime_paths(self):
+    def test_media_install_refuses_symlinked_turn_refresh_lock_paths(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             target = root / "target"
@@ -537,6 +547,7 @@ wait "$installer_pid"
             runtime_directory.symlink_to(target)
             command = f"""
 source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(runtime_directory / 'refresh.lock'))}
 acquire_turn_refresh_install_lock
@@ -548,7 +559,7 @@ acquire_turn_refresh_install_lock
             )
 
             self.assertNotEqual(0, runtime_link.returncode)
-            self.assertIn("runtime directory must not be a symlink", runtime_link.stderr)
+            self.assertIn("state directory must not be a symlink", runtime_link.stderr)
 
             runtime_directory.unlink()
             runtime_directory.mkdir(mode=0o700)
@@ -558,6 +569,7 @@ acquire_turn_refresh_install_lock
             lock.symlink_to(lock_target)
             lock_command = f"""
 source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
 MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
 acquire_turn_refresh_install_lock
@@ -570,11 +582,69 @@ acquire_turn_refresh_install_lock
             self.assertNotEqual(0, lock_link.returncode)
             self.assertIn("refresh lock must be a regular file", lock_link.stderr)
 
+    def test_media_install_releases_turn_lock_before_enabling_the_timer(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+turn_refresh_environment_configured() {{ return 0; }}
+systemctl() {{ printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+finish_media_install
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "flock -u 9",
+                    "systemctl enable --now gate-media-turn-refresh.timer",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_interrupted_waiting_media_install_does_not_change_services_or_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            events = root / "events.log"
+            archive_root = root / "archives"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(root / 'state'))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(root / 'state' / 'turn-refresh.lock'))}
+MEDIA_ARCHIVE_ROOT={shlex.quote(str(archive_root))}
+EXTRACTED_MEDIA_DIR={shlex.quote(str(archive_root / '.extract.waiting'))}
+systemctl() {{ printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(events))}; }}
+rm() {{ printf 'rm %s\\n' "$*" >> {shlex.quote(str(events))}; }}
+flock() {{
+  [[ $1 == -u ]] && return 0
+  on_media_install_failure
+}}
+trap on_media_install_failure ERR INT TERM
+prepare_turn_refresh_install
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                timeout=5,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertFalse(events.exists(), events.read_text(encoding="utf-8") if events.exists() else "")
+
     def test_media_install_failure_stops_and_disables_turn_refresh_timer_and_service(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             log = Path(temporary_directory) / "systemctl.log"
             command = f"""
 source deployment/install-media.sh
+MEDIA_TURN_REFRESH_LOCK_HELD=1
 systemctl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
 on_media_install_failure
 """
@@ -1324,7 +1394,7 @@ install_mediamtx_binary {shlex.quote(str(archive))} {PINNED_MEDIAMTX_VERSION} {s
             self.assertNotEqual(0, completed.returncode)
             self.assertEqual("existing-binary\n", binary.read_text(encoding="utf-8"))
 
-    def test_every_installer_failure_disables_media_services(self):
+    def test_prelock_installer_failures_do_not_change_media_services(self):
         for arguments in ("--unknown-option", "--source"):
             with (self.subTest(arguments=arguments),
                   tempfile.TemporaryDirectory() as temporary_directory):
@@ -1340,12 +1410,7 @@ main {arguments}
                 )
 
                 self.assertNotEqual(0, completed.returncode)
-                self.assertTrue(log.is_file())
-                self.assertIn(
-                    "disable --now gate-media-transcoder.service "
-                    "gate-media-gateway.service gate-media-auth.service",
-                    log.read_text(encoding="utf-8"),
-                )
+                self.assertFalse(log.exists())
 
     def _make_mediamtx_archive(self, root, reported_version):
         executable = root / "mediamtx"
