@@ -1195,6 +1195,16 @@ class GateProcessorTests(unittest.TestCase):
         self.assertTrue(finished.wait(0.5))
 
     def test_ocr_setup_time_consumes_the_same_absolute_decision_deadline(self):
+        class FastStore:
+            def event_exists(self, idempotency_key):
+                return False
+
+            def record_event_with_outbox(self, event, outbox_payload=None):
+                return 1
+
+            def attach_event_telemetry(self, event_id, telemetry):
+                return True
+
         class DelayedRecognizer:
             def __init__(self):
                 self.lookups = 0
@@ -1214,7 +1224,7 @@ class GateProcessorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "delayed-setup.jpg")
             processor = self._processor(
-                LocalStore(Path(directory) / "gate.db"),
+                FastStore(),
                 RecordingRelay(relay_calls),
                 DelayedRecognizer(),
                 decision_timeout=0.1,
