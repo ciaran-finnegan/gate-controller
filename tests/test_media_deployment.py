@@ -478,6 +478,124 @@ activate_media_services
                 log.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_media_install_waits_for_an_active_turn_refresh_before_mutating(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runtime_directory = root / "gate-media-turn-refresh"
+            runtime_directory.mkdir(mode=0o700)
+            lock = runtime_directory / "refresh.lock"
+            lock.touch(mode=0o600)
+            release = root / "release"
+            acquired = root / "acquired"
+            lock_requested = root / "lock-requested"
+            systemctl_log = root / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
+systemctl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(systemctl_log))}; }}
+flock() {{
+  [[ $1 == -u ]] && return 0
+  touch {shlex.quote(str(lock_requested))}
+  while [[ ! -e {shlex.quote(str(release))} ]]; do sleep 0.01; done
+}}
+(prepare_turn_refresh_install && touch {shlex.quote(str(acquired))}) &
+installer_pid=$!
+while [[ ! -e {shlex.quote(str(lock_requested))} ]]; do
+  if ! kill -0 "$installer_pid" 2>/dev/null; then break; fi
+  sleep 0.01
+done
+sleep 0.1
+[[ ! -e {shlex.quote(str(acquired))} ]]
+touch {shlex.quote(str(release))}
+wait "$installer_pid"
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue(acquired.is_file())
+            self.assertEqual(
+                [
+                    "disable --now gate-media-turn-refresh.timer "
+                    "gate-media-turn-refresh.service",
+                    "stop gate-media-turn-refresh.service",
+                ],
+                systemctl_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_refuses_symlinked_turn_refresh_runtime_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.mkdir()
+            runtime_directory = root / "gate-media-turn-refresh"
+            runtime_directory.symlink_to(target)
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(runtime_directory / 'refresh.lock'))}
+acquire_turn_refresh_install_lock
+"""
+
+            runtime_link = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, runtime_link.returncode)
+            self.assertIn("runtime directory must not be a symlink", runtime_link.stderr)
+
+            runtime_directory.unlink()
+            runtime_directory.mkdir(mode=0o700)
+            lock_target = root / "lock-target"
+            lock_target.touch()
+            lock = runtime_directory / "refresh.lock"
+            lock.symlink_to(lock_target)
+            lock_command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
+acquire_turn_refresh_install_lock
+"""
+            lock_link = subprocess.run(
+                ["bash", "-c", lock_command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, lock_link.returncode)
+            self.assertIn("refresh lock must be a regular file", lock_link.stderr)
+
+    def test_media_install_failure_stops_and_disables_turn_refresh_timer_and_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                    "disable --now gate-media-turn-refresh.timer "
+                    "gate-media-turn-refresh.service",
+                    "stop gate-media-turn-refresh.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
     def test_media_activation_requires_every_service_to_be_active(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             log = Path(temporary_directory) / "systemctl.log"

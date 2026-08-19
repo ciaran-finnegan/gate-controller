@@ -21,6 +21,10 @@ NGINX_BINARY=/usr/sbin/nginx
 NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
 SYSTEMD_ROOT=/etc/systemd/system
 MEDIA_TURN_REFRESH_TIMER=gate-media-turn-refresh.timer
+MEDIA_TURN_REFRESH_SERVICE=gate-media-turn-refresh.service
+MEDIA_TURN_REFRESH_RUNTIME_DIR=/run/gate-media-turn-refresh
+MEDIA_TURN_REFRESH_LOCK=$MEDIA_TURN_REFRESH_RUNTIME_DIR/refresh.lock
+MEDIA_TURN_REFRESH_LOCK_HELD=0
 PINNED_MEDIAMTX_VERSION=1.19.3
 SOURCE=
 MEDIAMTX_ARCHIVE=
@@ -200,7 +204,46 @@ activate_media_services() {
 }
 
 disable_turn_refresh_timer() {
-  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 || true
+  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" "$MEDIA_TURN_REFRESH_SERVICE" \
+    >/dev/null 2>&1 || true
+  systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 || true
+}
+
+acquire_turn_refresh_install_lock() {
+  [[ ! -L $MEDIA_TURN_REFRESH_RUNTIME_DIR ]] \
+    || fail "TURN refresh runtime directory must not be a symlink"
+  if [[ ! -e $MEDIA_TURN_REFRESH_RUNTIME_DIR ]]; then
+    install -d -o root -g root -m 0700 "$MEDIA_TURN_REFRESH_RUNTIME_DIR"
+  fi
+  [[ -d $MEDIA_TURN_REFRESH_RUNTIME_DIR && ! -L $MEDIA_TURN_REFRESH_RUNTIME_DIR ]] \
+    || fail "TURN refresh runtime directory must be a directory"
+  [[ ! -L $MEDIA_TURN_REFRESH_LOCK ]] \
+    || fail "TURN refresh lock must be a regular file"
+  if [[ ! -e $MEDIA_TURN_REFRESH_LOCK ]]; then
+    (umask 0077; : > "$MEDIA_TURN_REFRESH_LOCK") \
+      || fail "TURN refresh lock could not be created"
+  fi
+  [[ -f $MEDIA_TURN_REFRESH_LOCK && ! -L $MEDIA_TURN_REFRESH_LOCK ]] \
+    || fail "TURN refresh lock must be a regular file"
+  exec 9> "$MEDIA_TURN_REFRESH_LOCK"
+  [[ -f $MEDIA_TURN_REFRESH_LOCK && ! -L $MEDIA_TURN_REFRESH_LOCK ]] || {
+    exec 9>&-
+    fail "TURN refresh lock must be a regular file"
+  }
+  flock 9
+  MEDIA_TURN_REFRESH_LOCK_HELD=1
+}
+
+release_turn_refresh_install_lock() {
+  [[ $MEDIA_TURN_REFRESH_LOCK_HELD -eq 1 ]] || return 0
+  flock -u 9 || true
+  exec 9>&-
+  MEDIA_TURN_REFRESH_LOCK_HELD=0
+}
+
+prepare_turn_refresh_install() {
+  disable_turn_refresh_timer
+  acquire_turn_refresh_install_lock
 }
 
 turn_refresh_environment_configured() {
@@ -236,6 +279,7 @@ cleanup_media_install() {
       && $STAGED_MEDIA_PROXY_CONFIG == "$MEDIA_PROXY_CONFIG".new.* ]]; then
     rm -f -- "$STAGED_MEDIA_PROXY_CONFIG"
   fi
+  release_turn_refresh_install_lock
 }
 
 on_media_install_failure() {
@@ -479,6 +523,7 @@ main() {
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
   preflight_ffmpeg
+  prepare_turn_refresh_install
   for account in gate-media gate-media-auth; do
     if ! id "$account" >/dev/null 2>&1; then
       useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin "$account"
