@@ -4,7 +4,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from time import monotonic
 from unittest.mock import patch
 
@@ -17,6 +17,7 @@ from gate_controller.authorisation import AuthorisationRefreshWorker, Authorised
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
 from gate_controller.outbox import OutboxWorker
+from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
 
 
@@ -83,8 +84,13 @@ class MainConfigurationTests(unittest.TestCase):
         calls = []
 
         class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
             def shutdown(self):
                 calls.append("relay_shutdown")
+                return True
 
         class Store:
             path = Path("gate.db")
@@ -137,6 +143,7 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertLess(calls.index("relay"), calls.index("store"))
         self.assertLess(calls.index("store"), calls.index("recover"))
+        self.assertLess(calls.index("relay_begin_shutdown"), calls.index("processor_close"))
         self.assertLess(calls.index("processor_close"), calls.index("relay_shutdown"))
 
     def test_shutdown_reaches_processor_close_when_relay_shutdown_hangs(self):
@@ -148,6 +155,10 @@ class MainConfigurationTests(unittest.TestCase):
                 calls.append("processor_close")
 
         class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
             def shutdown(self):
                 calls.append("relay_shutdown")
                 release.wait(2)
@@ -160,7 +171,10 @@ class MainConfigurationTests(unittest.TestCase):
 
             self.assertFalse(safe)
             self.assertLess(elapsed, 0.2)
-            self.assertEqual(calls, ["processor_close", "relay_shutdown"])
+            self.assertEqual(
+                calls,
+                ["relay_begin_shutdown", "processor_close", "relay_shutdown"],
+            )
         finally:
             release.set()
 
@@ -186,6 +200,53 @@ class MainConfigurationTests(unittest.TestCase):
             calls,
             ["relay_begin_shutdown", "processor_close", "relay_shutdown"],
         )
+
+    def test_shutdown_waits_for_an_inflight_gpio_boundary_before_processor_cleanup(self):
+        boundary_checked = Event()
+        release_gpio = Event()
+        processor_started = Event()
+        calls = []
+
+        class BoundaryBackend:
+            def off(self):
+                calls.append("off")
+
+            def on(self, *, pre_activation_inhibit=None):
+                inhibition = pre_activation_inhibit()
+                boundary_checked.set()
+                release_gpio.wait(1)
+                if inhibition is not None:
+                    return inhibition
+                calls.append("on")
+                return None
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+                processor_started.set()
+
+        relay = RelayController(BoundaryBackend(), pulse_seconds=10)
+        trigger = Thread(target=lambda: relay.trigger(
+            "remote_command", "command:shutdown-barrier"
+        ))
+        trigger.start()
+        self.assertTrue(boundary_checked.wait(1))
+
+        shutdown_results = []
+        shutdown = Thread(target=lambda: shutdown_results.append(
+            _shutdown_controller(Processor(), relay)
+        ))
+        shutdown.start()
+
+        self.assertFalse(processor_started.wait(0.05))
+        release_gpio.set()
+        trigger.join(1)
+        shutdown.join(1)
+
+        self.assertFalse(trigger.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(shutdown_results, [True])
+        self.assertLess(calls.index("off", 1), calls.index("processor_close"))
 
     def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (

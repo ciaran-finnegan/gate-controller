@@ -132,16 +132,17 @@ def main() -> None:
 
 def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
                          processor_timeout: float = 1.0) -> bool:
-    relay_latched = False
     begin_shutdown = getattr(relay, "begin_shutdown", None)
+    relay_latched = False
     if callable(begin_shutdown):
-        try:
-            begin_shutdown()
-            relay_latched = True
-        except BaseException:
-            pass
-    processor_completed, _ = _bounded_shutdown_call(processor.close, processor_timeout)
-    relay_completed, relay_safe = _bounded_shutdown_call(relay.shutdown, relay_timeout)
+        latch_completed, latch_result = _bounded_shutdown_call(begin_shutdown, relay_timeout)
+        relay_latched = latch_completed and latch_result is not False
+    processor_completed = False
+    relay_completed = False
+    relay_safe = False
+    if relay_latched:
+        processor_completed, _ = _bounded_shutdown_call(processor.close, processor_timeout)
+        relay_completed, relay_safe = _bounded_shutdown_call(relay.shutdown, relay_timeout)
     return relay_latched and processor_completed and relay_completed and relay_safe is True
 
 

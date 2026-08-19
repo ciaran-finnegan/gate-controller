@@ -26,15 +26,13 @@ class RelayController:
     def trigger(self, source: str, idempotency_key: str | None = None, *,
                 pre_activation_inhibit=None, on_activation=None) -> RelayResult:
         with self._lock:
-            if self._latched or self._shutdown_requested.is_set():
-                self._record_outcome("relay_latched")
-                return RelayResult(False, "relay_latched", idempotency_key, latched=True)
-
             def activation_inhibition():
+                if pre_activation_inhibit is not None:
+                    inhibition = pre_activation_inhibit()
+                    if inhibition is not None:
+                        return inhibition
                 if self._shutdown_requested.is_set():
                     return "failed", "relay_latched"
-                if pre_activation_inhibit is not None:
-                    return pre_activation_inhibit()
                 return None
 
             inhibition = activation_inhibition()
@@ -44,6 +42,9 @@ class RelayController:
                 return RelayResult(
                     False, detail, idempotency_key, latched=detail == "relay_latched"
                 )
+            if self._latched:
+                self._record_outcome("relay_latched")
+                return RelayResult(False, "relay_latched", idempotency_key, latched=True)
             activated_at = None
             try:
                 if _accepts_keyword(self._relay.on, "pre_activation_inhibit"):
@@ -73,7 +74,10 @@ class RelayController:
                         on_activation()
                     except Exception:
                         pass
-                self._sleeper(self._pulse_seconds)
+                if self._sleeper is sleep:
+                    self._shutdown_requested.wait(self._pulse_seconds)
+                else:
+                    self._sleeper(self._pulse_seconds)
             except BaseException as error:
                 if not self._deenergize():
                     self._latched = True
@@ -95,8 +99,10 @@ class RelayController:
             self._record_outcome("activated", activated_at)
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self) -> bool:
         self._shutdown_requested.set()
+        with self._lock:
+            return True
 
     def shutdown(self) -> bool:
         self.begin_shutdown()

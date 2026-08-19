@@ -89,6 +89,25 @@ class RelayControllerTests(unittest.TestCase):
         self.assertEqual(results[0].reason, "relay_latched")
         self.assertTrue(results[0].latched)
 
+    def test_expiry_inhibition_remains_authoritative_after_shutdown_is_requested(self):
+        backend = RecordingBackend()
+        controller = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        controller.begin_shutdown()
+        checks = []
+
+        result = controller.trigger(
+            "remote_command",
+            "command:expired-during-shutdown",
+            pre_activation_inhibit=lambda: checks.append("expiry") or (
+                "expired", "expired_before_activation"
+            ),
+        )
+
+        self.assertEqual(checks, ["expiry"])
+        self.assertFalse(result.activated)
+        self.assertEqual(result.reason, "expired_before_activation")
+        self.assertEqual(backend.calls, ["off"])
+
     def test_pi_library_checks_inhibition_at_the_gpio_boundary(self):
         calls = []
         gpio = types.ModuleType("RPi.GPIO")
