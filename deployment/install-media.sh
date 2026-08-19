@@ -209,16 +209,20 @@ disable_turn_refresh_timer() {
 
 turn_refresh_unit_is_installed() {
   local unit=$1
-  local status
+  local load_state
 
-  if systemctl cat "$unit" >/dev/null 2>&1; then
-    return 0
-  else
-    status=$?
+  if ! load_state=$(systemctl show --property=LoadState --value "$unit"); then
+    fail "TURN refresh unit presence could not be determined: $unit"
+    return 2
   fi
-  [[ $status -eq 5 ]] && return 1
-  fail "TURN refresh unit presence could not be determined: $unit"
-  return 2
+  case "$load_state" in
+    not-found) return 1 ;;
+    loaded|masked|bad-setting|error|merged) return 0 ;;
+    *)
+      fail "TURN refresh unit has unexpected load state: $unit: $load_state"
+      return 2
+      ;;
+  esac
 }
 
 quiesce_turn_refresh() {

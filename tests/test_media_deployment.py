@@ -499,6 +499,7 @@ MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
 systemctl() {{
   touch {shlex.quote(str(unit_state_changed))}
   printf '%s\\n' "$*" >> {shlex.quote(str(systemctl_log))}
+  if [[ $1 == show ]]; then printf 'loaded\\n'; return 0; fi
   if [[ $1 == is-active ]]; then return 3; fi
   return 0
 }}
@@ -533,8 +534,8 @@ exit "$failed"
             self.assertTrue(acquired.is_file())
             self.assertEqual(
                 [
-                    "cat gate-media-turn-refresh.timer",
-                    "cat gate-media-turn-refresh.service",
+                    "show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "show --property=LoadState --value gate-media-turn-refresh.service",
                     "disable --now gate-media-turn-refresh.timer",
                     "stop gate-media-turn-refresh.service",
                     "is-active --quiet gate-media-turn-refresh.service",
@@ -661,7 +662,7 @@ MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
 flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
 systemctl() {{
   printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
-  [[ $1 == cat ]] && return 5
+  [[ $1 == show ]] && printf 'not-found\\n' && return 0
   return 99
 }}
 prepare_turn_refresh_install
@@ -677,12 +678,105 @@ release_turn_refresh_install_lock
             self.assertEqual(
                 [
                     "flock 9",
-                    "systemctl cat gate-media-turn-refresh.timer",
-                    "systemctl cat gate-media-turn-refresh.service",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
                     "flock -u 9",
                 ],
                 log.read_text(encoding="utf-8").splitlines(),
             )
+
+    def test_media_install_aborts_when_turn_refresh_load_state_probe_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && return 1
+  return 99
+}}
+set +e
+prepare_turn_refresh_install
+status=$?
+set -e
+release_turn_refresh_install_lock
+exit "$status"
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertIn(
+                "TURN refresh unit presence could not be determined: "
+                "gate-media-turn-refresh.timer",
+                completed.stderr,
+            )
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_turn_refresh_load_state_probe_accepts_known_installed_states(self):
+        for load_state in ("loaded", "masked", "bad-setting", "error", "merged"):
+            with self.subTest(load_state=load_state):
+                command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  [[ "$*" == 'show --property=LoadState --value gate-media-turn-refresh.timer' ]] \\
+    || return 99
+  printf '%s\\n' {shlex.quote(load_state)}
+}}
+set +e
+turn_refresh_unit_is_installed gate-media-turn-refresh.timer
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+
+                completed = subprocess.run(
+                    ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertEqual("status=0\n", completed.stdout)
+
+    def test_turn_refresh_load_state_probe_rejects_unknown_or_ambiguous_output(self):
+        for load_state in ("future-state", "loaded\nnot-found"):
+            with self.subTest(load_state=load_state):
+                command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\\n' {shlex.quote(load_state)}
+}}
+set +e
+turn_refresh_unit_is_installed gate-media-turn-refresh.timer
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+
+                completed = subprocess.run(
+                    ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertEqual("status=2\n", completed.stdout)
+                self.assertIn("unexpected load state", completed.stderr)
 
     def test_media_install_aborts_and_cleans_up_when_an_installed_turn_refresh_service_stop_fails(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -697,8 +791,7 @@ MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
 flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
 systemctl() {{
   printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
-  [[ "$*" == 'cat gate-media-turn-refresh.timer' ]] && return 0
-  [[ "$*" == 'cat gate-media-turn-refresh.service' ]] && return 0
+  [[ $1 == show ]] && printf 'loaded\\n' && return 0
   [[ "$*" == 'disable --now gate-media-turn-refresh.timer' ]] && return 0
   [[ "$*" == 'stop gate-media-turn-refresh.service' ]] && return 1
   return 99
@@ -716,8 +809,8 @@ on_media_install_failure
             self.assertEqual(
                 [
                     "flock 9",
-                    "systemctl cat gate-media-turn-refresh.timer",
-                    "systemctl cat gate-media-turn-refresh.service",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-transcoder.service "
@@ -742,6 +835,7 @@ MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
 flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
 systemctl() {{
   printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && printf 'loaded\\n' && return 0
   [[ "$*" == 'is-active --quiet gate-media-turn-refresh.service' ]] && return 0
   return 0
 }}
@@ -758,8 +852,8 @@ on_media_install_failure
             self.assertEqual(
                 [
                     "flock 9",
-                    "systemctl cat gate-media-turn-refresh.timer",
-                    "systemctl cat gate-media-turn-refresh.service",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
                     "systemctl disable --now gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
                     "systemctl is-active --quiet gate-media-turn-refresh.service",
