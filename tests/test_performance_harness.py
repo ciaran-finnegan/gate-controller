@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 
-HARNESS_PATH = Path(__file__).parents[1] / "scripts" / "pi-cloudflare-performance-harness.py"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+HARNESS_PATH = REPOSITORY_ROOT / "scripts" / "pi-cloudflare-performance-harness.py"
 
 
 def load_harness():
@@ -19,7 +20,11 @@ class PerformanceHarnessTests(unittest.TestCase):
     def test_performance_harness_rejects_removed_actuation_arguments(self):
         harness = load_harness()
 
-        for arguments in (["--actuate"], ["--controller-id", "primary"]):
+        for arguments in (
+            ["--actuate"],
+            ["--controller-id", "primary"],
+            ["--command-url", "http://127.0.0.1:8765/commands"],
+        ):
             with self.subTest(arguments=arguments), mock.patch("sys.stderr"):
                 with self.assertRaises(SystemExit):
                     harness.parse_args(arguments)
@@ -67,22 +72,50 @@ class PerformanceHarnessTests(unittest.TestCase):
             read_proc.call_args_list,
         )
 
-    def test_default_execution_issues_only_get_probes(self):
+    def test_default_execution_probes_only_read_only_media_endpoints(self):
         harness = load_harness()
         calls = []
 
         def measure_request(url, **kwargs):
-            calls.append((url, kwargs.get("method", "GET")))
-            return {"url": url, "method": kwargs.get("method", "GET"), "latency_ms": 1}
+            calls.append(url)
+            return {"url": url, "method": "GET", "latency_ms": 1}
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             harness, "measure_request", side_effect=measure_request
         ), mock.patch.object(harness, "collect_host_metrics", return_value={}):
             summary = harness.main(["--output", str(Path(directory) / "summary.json")])
 
-        self.assertEqual([method for _, method in calls], ["GET", "GET"])
+        self.assertEqual(calls, [
+            "http://127.0.0.1:9997/v3/paths/list",
+            "http://127.0.0.1:9998/metrics",
+        ])
         self.assertEqual("passive_endpoint_probe", summary["run_mode"])
         self.assertNotIn("actuation_requested", summary)
+
+    def test_harness_artifacts_do_not_reference_the_command_endpoint(self):
+        plan = (
+            REPOSITORY_ROOT
+            / "docs/superpowers/plans/2026-08-17-cloudflare-replatform.md"
+        ).read_text(encoding="utf-8")
+        harness_task = plan.split("### Task 7:", 1)[1].split("\n---", 1)[0]
+        artifacts = {
+            "harness": HARNESS_PATH.read_text(encoding="utf-8"),
+            "performance docs": (
+                REPOSITORY_ROOT / "docs/pi-cloudflare-performance.md"
+            ).read_text(encoding="utf-8"),
+            "camera docs": (
+                REPOSITORY_ROOT / "docs/reolink-rlc-811a.md"
+            ).read_text(encoding="utf-8"),
+            "media config": (
+                REPOSITORY_ROOT / "deployment/media/mediamtx.yml"
+            ).read_text(encoding="utf-8"),
+            "historical harness plan": harness_task,
+        }
+
+        for name, content in artifacts.items():
+            with self.subTest(artifact=name):
+                self.assertNotIn("/commands", content)
+                self.assertNotIn("--command-url", content)
 
     def test_skip_network_execution_issues_no_requests(self):
         harness = load_harness()

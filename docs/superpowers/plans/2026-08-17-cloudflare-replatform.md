@@ -468,7 +468,7 @@ git commit -m "refactor: remove Supabase and S3 controller runtime"
 
 **Interfaces:**
 - Produces: local harness command that can run on the Pi when reachable
-- Consumes: command server local endpoint and media gateway health endpoint
+- Consumes: media gateway read-only API and metrics endpoints
 
 - [ ] **Step 1: Write failing harness tests**
 
@@ -493,7 +493,7 @@ Expected: FAIL because harness is absent.
 
 - [ ] **Step 3: Implement harness**
 
-Harness records local command endpoint latency with a passive GET request, media gateway health URL latency, CPU load from `/proc/loadavg` when present, memory from `/proc/meminfo` when present, disk usage via `shutil.disk_usage("/")`, and JSON output. The diagnostic harness has no relay-actuation mode.
+Harness records MediaMTX paths API and Prometheus metrics latency with passive GET requests, CPU load from `/proc/loadavg` when present, memory from `/proc/meminfo` when present, disk usage via `shutil.disk_usage("/")`, and JSON output. The diagnostic harness has no relay-actuation mode.
 
 - [ ] **Step 4: Verify**
 

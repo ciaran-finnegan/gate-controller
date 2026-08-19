@@ -19,8 +19,8 @@ MAX_NETWORK_INTERFACES = 32
 
 def parse_args(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--command-url", default="http://127.0.0.1:8765/commands")
     parser.add_argument("--media-health-url", default="http://127.0.0.1:9997/v3/paths/list")
+    parser.add_argument("--media-metrics-url", default="http://127.0.0.1:9998/metrics")
     parser.add_argument("--output", type=Path, default=Path("gate-pi-performance.json"))
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
     parser.add_argument("--skip-network", action="store_true")
@@ -128,10 +128,10 @@ def main(arguments=None):
     samples = []
     if not args.skip_network:
         samples.append(measure_request(
-            args.command_url, timeout_seconds=args.timeout_seconds,
+            args.media_health_url, timeout_seconds=args.timeout_seconds,
         ))
         samples.append(measure_request(
-            args.media_health_url, timeout_seconds=args.timeout_seconds,
+            args.media_metrics_url, timeout_seconds=args.timeout_seconds,
         ))
     run_mode = "host_metrics_only" if args.skip_network else "passive_endpoint_probe"
     summary = build_summary(
