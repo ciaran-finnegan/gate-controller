@@ -60,6 +60,10 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main.main()
 
         self.assertEqual(0.2, run_worker.call_args.kwargs["quiet_window"])
+        self.assertIs(
+            run_worker.call_args.kwargs["on_timed_skipped"],
+            run_worker.call_args.kwargs["on_skipped"],
+        )
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(

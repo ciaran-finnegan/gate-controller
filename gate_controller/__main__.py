@@ -104,10 +104,17 @@ def main() -> None:
             processing_started_at=processing_started_at,
         )
 
-    def record_skipped(paths, reason, received_at):
+    def record_skipped(paths, reason, received_at, decision_started_at=None,
+                       processing_started_at=None):
         logging.getLogger(__name__).warning("image_burst_skipped reason=%s count=%d", reason,
                                             len(paths))
-        return processor.record_skipped(paths, reason, received_at)
+        return processor.record_skipped(
+            paths,
+            reason,
+            received_at,
+            decision_started_at=decision_started_at,
+            processing_started_at=processing_started_at,
+        )
 
     def record_error(paths, error, received_at):
         logging.getLogger(__name__).exception(
@@ -127,6 +134,7 @@ def main() -> None:
         background_workers=background_workers,
         max_image_age=max_image_age,
         on_skipped=record_skipped,
+        on_timed_skipped=record_skipped,
         on_error=record_error,
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,

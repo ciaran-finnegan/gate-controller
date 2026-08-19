@@ -260,6 +260,7 @@ class OutboxWorker:
         self._controller_id = controller_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_retention_at: datetime | None = None
+        self._last_item_id: int | None = None
         try:
             self._store.bind_pending_outbox_controller(self._controller_id)
             self._evidence_spool.cleanup(self._store.pending_evidence_digests())
@@ -282,7 +283,10 @@ class OutboxWorker:
         now = self._clock()
         self._run_retention(now)
         completed = 0
-        for item_id, _queued_payload in self._store.pending_outbox_items():
+        for item_id, _queued_payload in self._store.pending_outbox_items(
+            after_id=self._last_item_id
+        ):
+            self._last_item_id = item_id
             trace_id = "unavailable"
             try:
                 payload = self._store.prepare_outbox_attempt(item_id, self._clock())

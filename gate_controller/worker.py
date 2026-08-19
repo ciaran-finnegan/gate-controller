@@ -323,16 +323,23 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                poll_interval: float = 0.05, background_workers=(), max_pending_bursts: int = 2,
                max_image_age: float = 8.0, on_skipped=None, on_error=None,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
-               max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES) -> None:
+               max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
+               on_timed_skipped=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
     bursts = BoundedBurstQueue(max_pending_bursts)
+
+    def report_dropped(item, reason):
+        paths, received_at, *timing = item
+        if on_timed_skipped is not None and timing:
+            on_timed_skipped(paths, reason, received_at, *timing)
+        elif on_skipped is not None:
+            on_skipped(paths, reason, received_at)
 
     def enqueue(item):
         dropped = bursts.put(item)
         if dropped is not None:
             try:
-                if on_skipped is not None:
-                    on_skipped(dropped[0], "queue_coalesced", dropped[1])
+                report_dropped(dropped, "queue_coalesced")
             finally:
                 _remove_uploads(dropped[0])
 
@@ -418,8 +425,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                     dropped = bursts.put(None)
                     if dropped is not None:
                         try:
-                            if on_skipped is not None:
-                                on_skipped(dropped[0], "service_stopping", dropped[1])
+                            report_dropped(dropped, "service_stopping")
                         finally:
                             _remove_uploads(dropped[0])
                     processing_thread.join(timeout=5)

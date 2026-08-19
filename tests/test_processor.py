@@ -356,6 +356,39 @@ class GateProcessorTests(unittest.TestCase):
             processing_started_at.isoformat(),
         )
 
+    def test_queue_coalesced_skip_persists_the_exact_pre_ranking_wall_boundary(self):
+        processing_started_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        stepped_wall = processing_started_at - timedelta(minutes=5)
+        monotonic_clock = MutableClock()
+        monotonic_clock.value = 104.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "coalesced-wall-step.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                SequenceRecognizer([]),
+                outbox=object(),
+                clock=lambda: processing_started_at + timedelta(seconds=4),
+                decision_clock=monotonic_clock,
+                telemetry_clock=monotonic_clock,
+                telemetry_wall_clock=lambda: stepped_wall,
+            ).record_skipped(
+                (frame,),
+                "queue_coalesced",
+                processing_started_at - timedelta(seconds=1),
+                decision_started_at=100.0,
+                processing_started_at=processing_started_at,
+            )
+
+            persisted = store.event_telemetry(result.event_id)
+
+        self.assertEqual(
+            persisted["stage_timestamps"]["burst_processing_started_at"],
+            processing_started_at.isoformat(),
+        )
+
     def test_upstream_seed_failure_is_best_effort(self):
         captured_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
         monotonic_clock = MutableClock()
@@ -874,6 +907,9 @@ class GateProcessorTests(unittest.TestCase):
             self.assertIsNotNone(result.event_id)
             self.assertIsNone(result.telemetry)
             self.assertEqual(store.pending_outbox_count(), 1)
+            queued = store.pending_outbox_items()
+            self.assertEqual(len(queued), 1)
+            self.assertNotIn("_awaiting_telemetry", queued[0][1])
 
     def test_duplicate_direct_skip_does_not_create_a_second_trace(self):
         created_traces = []
@@ -1970,6 +2006,55 @@ class GateProcessorTests(unittest.TestCase):
 
             self.assertFalse(result.opened)
             self.assertEqual(store.pending_outbox_count(), 1)
+
+    def test_processor_outbox_cannot_send_until_telemetry_attachment_finishes(self):
+        attach_started = Event()
+        allow_attach = Event()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = self._jpeg(directory, "telemetry-race.jpg")
+
+            class PausingStore(LocalStore):
+                def attach_event_telemetry(self, event_id, telemetry):
+                    attach_started.set()
+                    if not allow_attach.wait(timeout=1):
+                        raise TimeoutError("test did not release telemetry attachment")
+                    return super().attach_event_telemetry(event_id, telemetry)
+
+            store = PausingStore(root / "gate.db")
+            spool = EvidenceSpool(root / "event-evidence")
+            sent = []
+            outbox = OutboxWorker(
+                store,
+                send=lambda payload, evidence: sent.append((dict(payload), evidence)),
+                evidence_spool=spool,
+            )
+            processor = self._processor(
+                store,
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("NOPE", 0.95)),
+                outbox=outbox,
+            )
+            result = []
+            processing = Thread(target=lambda: result.append(processor.process((frame,))))
+            processing.start()
+            self.assertTrue(attach_started.wait(timeout=1))
+
+            self.assertEqual(outbox.run_once(), 0)
+            self.assertEqual(sent, [])
+
+            allow_attach.set()
+            processing.join(timeout=1)
+            self.assertFalse(processing.is_alive())
+            self.assertEqual(outbox.run_once(), 1)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0]["schema_version"], 3)
+        self.assertEqual(
+            sent[0][0]["telemetry"]["trace_id"], result[0].telemetry.trace_id
+        )
 
     def test_outbox_binds_an_immutable_best_image_before_queuing(self):
         with tempfile.TemporaryDirectory() as directory:

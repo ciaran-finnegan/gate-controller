@@ -162,7 +162,7 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
-    def test_completion_keeps_the_payload_sent_when_telemetry_attaches_mid_send(self):
+    def test_legacy_v2_mid_send_attachment_remains_truthfully_pending(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
         sent = []
@@ -184,8 +184,85 @@ class OutboxWorkerTests(unittest.TestCase):
         self.assertIsNotNone(completed_at)
         self.assertEqual(
             store.event_telemetry(event_id)["delivery"],
-            {"outbox_attempt": 0, "state": "delivered"},
+            {"outbox_attempt": 0, "state": "pending"},
         )
+
+    def test_telemetry_wait_prevents_v2_send_and_preserves_v3_evidence(self):
+        store, event_id = self._queued_store()
+        source = store.path.parent / "camera.jpg"
+        Image.new("RGB", (32, 32), color="red").save(source, format="JPEG")
+        spool = outbox_module.EvidenceSpool(store.path.parent / "event-evidence")
+        digest = spool.stage(source)
+        evidence_path = spool.root / f"{digest}.jpg"
+        expected_evidence = evidence_path.read_bytes()
+        item_id = store.queue_outbox(event_id, {
+            "controller_id": "pi-front-gate",
+            "image_sha256": digest,
+            "_awaiting_telemetry": True,
+        })
+        sent = []
+        worker = OutboxWorker(
+            store,
+            send=lambda payload, evidence: sent.append((dict(payload), evidence)),
+            evidence_spool=spool,
+        )
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(sent, [])
+        self.assertTrue(evidence_path.exists())
+
+        store.attach_event_telemetry(event_id, _telemetry())
+        completed = worker.run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(len(sent), 1)
+        sent_payload, sent_evidence = sent[0]
+        self.assertEqual(sent_payload["schema_version"], 3)
+        self.assertEqual(sent_payload["image_sha256"], digest)
+        self.assertEqual(sent_payload["telemetry"]["trace_id"], _telemetry().trace_id)
+        self.assertEqual(sent_evidence, expected_evidence)
+        with closing(sqlite3.connect(store.path)) as connection:
+            saved, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved), sent_payload)
+        self.assertIsNotNone(completed_at)
+        self.assertFalse(evidence_path.exists())
+        self.assertEqual(
+            store.event_telemetry(event_id)["delivery"],
+            {"outbox_attempt": 1, "state": "delivered"},
+        )
+
+    def test_poison_batch_does_not_starve_a_newer_delivery(self):
+        store, _ = self._queued_store()
+        poison_keys = set()
+        for index in range(20):
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key=f"poison-{index}",
+                received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+            ))
+            store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+            poison_keys.add(f"poison-{index}")
+        fresh_event_id = store.record_event(GateEvent(
+            source="ocr", reason="no_match", opened=False,
+            idempotency_key="fresh-delivery",
+            received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+        ))
+        store.queue_outbox(fresh_event_id, {"controller_id": "pi-front-gate"})
+        sent = []
+
+        def send(payload):
+            if payload["idempotency_key"] in poison_keys:
+                raise OutboxSyncError("permanent receiver rejection")
+            sent.append(payload["idempotency_key"])
+
+        worker = OutboxWorker(store, send=send)
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(sent, ["fresh-delivery"])
+        self.assertEqual(store.pending_outbox_count(), 20)
 
     def test_malformed_telemetry_falls_back_to_the_original_v2_delivery(self):
         store, event_id = self._queued_store()

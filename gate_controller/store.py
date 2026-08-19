@@ -21,6 +21,9 @@ _MAX_TELEMETRY_PAGE_SIZE = 100
 _SNAPSHOT_PAGES_PER_STEP = 16
 _SNAPSHOT_BUSY_TIMEOUT_SECONDS = 0.25
 _SNAPSHOT_BUSY_SLICE_MS = 10
+_OUTBOX_READY = "ready"
+_OUTBOX_AWAITING_TELEMETRY = "awaiting_telemetry"
+_OUTBOX_LOCAL_ONLY = "local_only"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -279,14 +282,49 @@ class LocalStore:
 
     def pending_outbox_count(self) -> int:
         with closing(self._connect()) as connection:
-            return connection.execute("SELECT COUNT(*) FROM outbox WHERE completed_at IS NULL").fetchone()[0]
+            return connection.execute(
+                """
+                SELECT COUNT(*) FROM outbox
+                WHERE completed_at IS NULL AND send_state != ?
+                """,
+                (_OUTBOX_LOCAL_ONLY,),
+            ).fetchone()[0]
 
-    def pending_outbox_items(self, limit: int = 20) -> list[tuple[int, dict]]:
+    def pending_outbox_items(
+        self, limit: int = 20, *, after_id: int | None = None,
+    ) -> list[tuple[int, dict]]:
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT id, payload FROM outbox WHERE completed_at IS NULL ORDER BY id LIMIT ?", (limit,)
-            ).fetchall()
+            if after_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT id, payload FROM outbox
+                    WHERE completed_at IS NULL AND send_state = ?
+                    ORDER BY id LIMIT ?
+                    """,
+                    (_OUTBOX_READY, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, payload FROM outbox
+                    WHERE completed_at IS NULL AND send_state = ?
+                    ORDER BY CASE WHEN id > ? THEN 0 ELSE 1 END, id
+                    LIMIT ?
+                    """,
+                    (_OUTBOX_READY, after_id, limit),
+                ).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
+
+    def release_outbox_without_telemetry(self, event_id: int) -> None:
+        """Make a processor outbox sendable when no trace could be attached."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE outbox SET send_state = ?
+                WHERE event_id = ? AND completed_at IS NULL AND send_state = ?
+                """,
+                (_OUTBOX_READY, event_id, _OUTBOX_AWAITING_TELEMETRY),
+            )
 
     def attach_event_telemetry(self, event_id: int, telemetry: EventTelemetry) -> bool:
         """Attach one trace after the terminal event transaction has committed."""
@@ -442,9 +480,9 @@ class LocalStore:
             row = connection.execute(
                 """
                 SELECT event_id, payload, created_at FROM outbox
-                WHERE id = ? AND completed_at IS NULL
+                WHERE id = ? AND completed_at IS NULL AND send_state = ?
                 """,
-                (item_id,),
+                (item_id, _OUTBOX_READY),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -652,10 +690,12 @@ class LocalStore:
             telemetry_row = connection.execute(
                 "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
             ).fetchone()
-            if telemetry_row is not None:
+            prepared_telemetry = payload.get("telemetry")
+            if telemetry_row is not None and (
+                prepared_payload is None or prepared_telemetry is not None
+            ):
                 connection.execute("SAVEPOINT telemetry_delivery_state")
                 try:
-                    prepared_telemetry = payload.get("telemetry")
                     telemetry_source = (
                         _encode_json(prepared_telemetry)
                         if prepared_telemetry is not None else telemetry_row[0]
@@ -733,16 +773,12 @@ class LocalStore:
         outbox_id, payload_text, completed_at = row
         payload = json.loads(payload_text)
         if completed_at is not None:
-            if telemetry.get("delivery", {}).get("state") != "pending":
-                return
-            payload = _v2_outbox_payload(payload)
-            if payload.pop("image_sha256", None) is not None:
-                payload["image_status"] = "delivered_before_telemetry"
+            return
         payload["schema_version"] = 3
         payload["telemetry"] = telemetry
         connection.execute(
-            "UPDATE outbox SET payload = ?, completed_at = NULL WHERE id = ?",
-            (_encode_json(payload), outbox_id),
+            "UPDATE outbox SET payload = ?, send_state = ? WHERE id = ?",
+            (_encode_json(payload), _OUTBOX_READY, outbox_id),
         )
 
     def _event_id(self, idempotency_key: str) -> int | None:
@@ -776,13 +812,25 @@ class LocalStore:
                        payload: dict | None) -> int | None:
         if payload is None:
             return None
+        payload = dict(payload)
+        send_state = (
+            _OUTBOX_AWAITING_TELEMETRY
+            if payload.pop("_awaiting_telemetry", False) is True
+            else _OUTBOX_READY
+        )
         encoded = LocalStore._event_payload(connection, event_id) or {}
         encoded.update(payload)
         if encoded.get("event_id") is None:
             encoded["event_id"] = event_id
         cursor = connection.execute(
-            "INSERT OR IGNORE INTO outbox (event_id, payload, created_at) VALUES (?, ?, ?)",
-            (event_id, json.dumps(encoded, sort_keys=True), _timestamp(datetime.now(timezone.utc))),
+            """
+            INSERT OR IGNORE INTO outbox (event_id, payload, created_at, send_state)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                event_id, json.dumps(encoded, sort_keys=True),
+                _timestamp(datetime.now(timezone.utc)), send_state,
+            ),
         )
         return cursor.lastrowid or None
 
@@ -892,7 +940,8 @@ class LocalStore:
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
                     id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events(id),
-                    payload TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT,
+                    send_state TEXT NOT NULL DEFAULT 'ready'
                 );
                 CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS command_ack_outbox (
@@ -920,6 +969,19 @@ class LocalStore:
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE actuation_claims ADD COLUMN {name} TEXT")
+            outbox_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(outbox)")
+            }
+            if "send_state" not in outbox_columns:
+                connection.execute(
+                    "ALTER TABLE outbox ADD COLUMN send_state TEXT NOT NULL DEFAULT 'ready'"
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS outbox_pending_send
+                ON outbox (send_state, completed_at, id)
+                """
+            )
             applied = connection.execute("SELECT 1 FROM schema_migrations WHERE name = 'legacy_log_import'").fetchone()
             if not applied and self._legacy_log_exists(connection):
                 self._import_legacy_log(connection)
@@ -968,6 +1030,36 @@ class LocalStore:
                     )
                 connection.execute(
                     "INSERT INTO schema_migrations (name) VALUES ('outbox_evidence_v2')"
+                )
+            incompatible_followup = connection.execute(
+                """
+                SELECT 1 FROM schema_migrations
+                WHERE name = 'outbox_incompatible_followup_v1'
+                """
+            ).fetchone()
+            if not incompatible_followup:
+                for outbox_id, payload_text in connection.execute(
+                    """
+                    SELECT id, payload FROM outbox
+                    WHERE completed_at IS NULL AND send_state = ?
+                    """,
+                    (_OUTBOX_READY,),
+                ).fetchall():
+                    try:
+                        payload = json.loads(payload_text)
+                    except (TypeError, ValueError):
+                        continue
+                    if not _is_incompatible_v3_followup(payload):
+                        continue
+                    connection.execute(
+                        "UPDATE outbox SET send_state = ? WHERE id = ?",
+                        (_OUTBOX_LOCAL_ONLY, outbox_id),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO schema_migrations (name)
+                    VALUES ('outbox_incompatible_followup_v1')
+                    """
                 )
     def _recover_interrupted_actuations(self, connection: sqlite3.Connection) -> int:
         rows = connection.execute(
@@ -1028,6 +1120,13 @@ class LocalStore:
                 (event_id, recovery_reason, claim_id),
             )
             recovered_count += 1
+        connection.execute(
+            """
+            UPDATE outbox SET send_state = ?
+            WHERE completed_at IS NULL AND send_state = ?
+            """,
+            (_OUTBOX_READY, _OUTBOX_AWAITING_TELEMETRY),
+        )
         return recovered_count
 
     @staticmethod
@@ -1177,6 +1276,15 @@ def _v2_outbox_payload(payload: object) -> dict:
     fallback.pop("telemetry", None)
     fallback["schema_version"] = 2
     return fallback
+
+
+def _is_incompatible_v3_followup(payload: object) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 3
+        and payload.get("image_status") == "delivered_before_telemetry"
+        and isinstance(payload.get("telemetry"), dict)
+    )
 
 
 def _decode_telemetry_payload(encoded: object) -> dict:

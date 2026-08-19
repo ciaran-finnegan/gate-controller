@@ -635,6 +635,72 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(configured["handler"]["max_candidate_bytes"], 1024)
         self.assertEqual(configured["handler"]["max_pending_candidates"], 5)
 
+    def test_queue_coalesced_callback_receives_exact_collector_boundaries(self):
+        configured = {}
+        received_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        processing_started_at = received_at + timedelta(milliseconds=250)
+        timed_skips = []
+        legacy_skips = []
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                configured["emit"] = emit
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                pass
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def enqueue_then_stop(_):
+            configured["emit"](((Path("first.jpg"),), received_at, 12.5,
+                                 processing_started_at))
+            configured["emit"](((Path("second.jpg"),), received_at, 13.0,
+                                 processing_started_at + timedelta(seconds=1)))
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=enqueue_then_stop
+        ):
+            run_worker(
+                Path(directory), lambda *_: None, max_pending_bursts=1,
+                on_skipped=lambda *args: legacy_skips.append(args),
+                on_timed_skipped=lambda *args: timed_skips.append(args),
+            )
+
+        self.assertEqual(timed_skips[0], (
+            (Path("first.jpg"),), "queue_coalesced", received_at, 12.5,
+            processing_started_at,
+        ))
+        self.assertEqual(legacy_skips, [])
+
     def test_fatal_image_worker_exception_fails_the_service(self):
         started = ThreadEvent()
 

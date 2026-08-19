@@ -174,7 +174,7 @@ class LocalStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.attach_event_telemetry(second, _telemetry(reason="no_match"))
 
-    def test_attach_after_v2_completion_queues_a_v3_follow_up_delivery(self):
+    def test_attach_after_v2_completion_preserves_the_acknowledged_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             store = LocalStore(Path(directory) / "gate.db")
             queued_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
@@ -213,16 +213,10 @@ class LocalStoreTests(unittest.TestCase):
                     "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
                 ).fetchone()
             saved = store.event_telemetry(event_id)
-            self.assertIsNone(promoted_completed_at)
-            self.assertEqual(store.pending_outbox_count(), 1)
-            follow_up_base = dict(prepared)
-            follow_up_base.pop("image_sha256")
-            follow_up_base["image_status"] = "delivered_before_telemetry"
-            self.assertEqual(json.loads(promoted_payload), {
-                **follow_up_base,
-                "schema_version": 3,
-                "telemetry": saved,
-            })
+            self.assertEqual(promoted_completed_at, acknowledged_at.isoformat())
+            self.assertEqual(store.pending_outbox_count(), 0)
+            self.assertEqual(store.pending_outbox_items(), [])
+            self.assertEqual(json.loads(promoted_payload), prepared)
             self.assertEqual(saved["delivery"], {
                 "outbox_attempt": 0,
                 "state": "pending",
@@ -230,6 +224,88 @@ class LocalStoreTests(unittest.TestCase):
             self.assertEqual(saved["stage_timestamps"], {
                 "cloud_enqueued_at": queued_at.isoformat(),
             })
+
+    def test_interrupted_telemetry_wait_is_released_for_v2_startup_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key="interrupted-telemetry",
+                    received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+                ),
+                {
+                    "controller_id": "pi-front-gate",
+                    "_awaiting_telemetry": True,
+                },
+            )
+
+            self.assertEqual(store.pending_outbox_count(), 1)
+            self.assertEqual(store.pending_outbox_items(), [])
+
+            self.assertEqual(store.recover_interrupted_actuations(), 0)
+
+            queued = store.pending_outbox_items()
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0][1]["event_id"], event_id)
+            self.assertEqual(queued[0][1]["schema_version"], 2)
+            self.assertNotIn("_awaiting_telemetry", queued[0][1])
+
+    def test_migration_quarantines_rejected_v3_follow_up_without_losing_telemetry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.db"
+            store = LocalStore(path)
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="legacy-invalid-follow-up",
+                received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+            ))
+            item_id = store.queue_outbox(event_id, {
+                "controller_id": "pi-front-gate",
+                "image_sha256": "a" * 64,
+            })
+            prepared = store.prepare_outbox_attempt(item_id)
+            store.complete_outbox_item(item_id, prepared_payload=prepared)
+            store.attach_event_telemetry(event_id, _telemetry(reason="no_match"))
+            telemetry = store.event_telemetry(event_id)
+            invalid_follow_up = dict(prepared)
+            invalid_follow_up.pop("image_sha256")
+            invalid_follow_up.update({
+                "image_status": "delivered_before_telemetry",
+                "schema_version": 3,
+                "telemetry": telemetry,
+            })
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE outbox SET payload = ?, completed_at = NULL,
+                        send_state = 'ready'
+                    WHERE id = ?
+                    """,
+                    (json.dumps(invalid_follow_up, sort_keys=True), item_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name = 'outbox_incompatible_followup_v1'
+                    """
+                )
+
+            migrated = LocalStore(path)
+
+            self.assertEqual(migrated.pending_outbox_count(), 0)
+            self.assertEqual(migrated.pending_outbox_items(), [])
+            self.assertEqual(
+                migrated.event_telemetry(event_id)["trace_id"], telemetry["trace_id"]
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                payload_text, completed_at, send_state = connection.execute(
+                    "SELECT payload, completed_at, send_state FROM outbox WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+            self.assertEqual(json.loads(payload_text), invalid_follow_up)
+            self.assertIsNone(completed_at)
+            self.assertEqual(send_state, "local_only")
 
     def test_retention_removes_only_old_telemetry_with_completed_delivery(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -233,7 +233,7 @@ class GateProcessor:
             trace.mark_decision("denied", event.reason)
         else:
             trace.mark_decision("allowed", decision.reason)
-        outbox_payload = self._outbox_payload(paths)
+        outbox_payload = self._outbox_payload(paths, await_telemetry=True)
         if not decision.allowed:
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
@@ -287,7 +287,9 @@ class GateProcessor:
     def record_skipped(self, paths: Iterable[Path], reason: str,
                        received_at: datetime | None = None,
                        trace: ProcessingTrace | _BestEffortTrace | None = None,
-                       idempotency_key: str | None = None) -> ProcessingResult:
+                       idempotency_key: str | None = None, *,
+                       decision_started_at: float | None = None,
+                       processing_started_at: datetime | None = None) -> ProcessingResult:
         paths = tuple(Path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
@@ -301,9 +303,16 @@ class GateProcessor:
             )
         if trace is None:
             trace = self._new_trace()
-            if received_at is not None:
-                trace.seed_upstream(received_at, None)
-            trace.mark_burst()
+            if (
+                received_at is not None
+                or decision_started_at is not None
+                or processing_started_at is not None
+            ):
+                trace.seed_upstream(
+                    received_at, decision_started_at, processing_started_at
+                )
+            if decision_started_at is None:
+                trace.mark_burst()
         else:
             trace = _BestEffortTrace.wrap(trace)
         trace.mark_decision("denied", reason)
@@ -321,6 +330,7 @@ class GateProcessor:
     ) -> ProcessingResult:
         telemetry = trace.finish()
         if telemetry is None:
+            self._release_outbox_without_telemetry(result.event_id)
             return result
         completed = replace(result, telemetry=telemetry)
         _log_completed_trace(telemetry)
@@ -331,7 +341,18 @@ class GateProcessor:
                 logging.getLogger(__name__).warning(
                     "event_telemetry_attach status=persistence_failed"
                 )
+                self._release_outbox_without_telemetry(result.event_id)
         return completed
+
+    def _release_outbox_without_telemetry(self, event_id: int | None) -> None:
+        if not self._outbox_enabled or event_id is None:
+            return
+        try:
+            self._store.release_outbox_without_telemetry(event_id)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "outbox_telemetry_wait status=release_failed"
+            )
 
     def _new_trace(self) -> _BestEffortTrace:
         return _BestEffortTrace.create(
@@ -341,17 +362,23 @@ class GateProcessor:
         )
 
     def _record(self, event: GateEvent, paths: Iterable[Path] = ()) -> int:
-        payload = self._outbox_payload(paths)
+        payload = self._outbox_payload(paths, await_telemetry=True)
         return self._store.record_event_with_outbox(event, payload)
 
-    def _outbox_payload(self, paths: Iterable[Path]) -> dict | None:
+    def _outbox_payload(
+        self, paths: Iterable[Path], *, await_telemetry: bool = False,
+    ) -> dict | None:
         if not self._outbox_enabled:
             return None
         paths = tuple(Path(path) for path in paths)
         prepare_payload = getattr(self._outbox, "prepare_payload", None)
         if not callable(prepare_payload):
-            return {"event_id": None}
-        return prepare_payload(paths[0] if paths else None)
+            payload = {"event_id": None}
+        else:
+            payload = prepare_payload(paths[0] if paths else None)
+        if await_telemetry:
+            payload["_awaiting_telemetry"] = True
+        return payload
 
     def _recognise(self, path: Path, deadline: float, on_start=None):
         remaining = deadline - self._decision_clock()
