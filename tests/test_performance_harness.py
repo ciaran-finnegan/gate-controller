@@ -1,6 +1,9 @@
 import importlib.util
+import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -134,6 +137,35 @@ class PerformanceHarnessTests(unittest.TestCase):
 
         self.assertEqual(rejected.exception.code, 302)
         rejected.exception.close()
+
+    def test_loopback_probe_ignores_ambient_proxy_environment(self):
+        proxy_requests = []
+
+        class RecordingProxyHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                proxy_requests.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), RecordingProxyHandler) as proxy:
+            proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            proxy_thread.start()
+            proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+            try:
+                with mock.patch.dict(os.environ, {
+                    "HTTP_PROXY": proxy_url,
+                    "HTTPS_PROXY": proxy_url,
+                }, clear=True):
+                    harness = load_harness()
+                    harness.measure_request(harness.PATHS_URL, timeout_seconds=0.5)
+            finally:
+                proxy.shutdown()
+                proxy_thread.join(timeout=1)
+
+        self.assertEqual([], proxy_requests)
 
     def test_harness_artifacts_do_not_reference_the_command_endpoint(self):
         plan = (

@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 MAX_PROC_NET_DEV_BYTES = 64 * 1024
@@ -27,7 +27,7 @@ class _RejectRedirects(HTTPRedirectHandler):
         )
 
 
-_URL_OPENER = build_opener(_RejectRedirects())
+_URL_OPENER = build_opener(ProxyHandler({}), _RejectRedirects())
 
 
 def parse_args(arguments=None):
