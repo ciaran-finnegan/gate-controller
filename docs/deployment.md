@@ -190,14 +190,15 @@ Run `cloudflared` with the validated configuration through the operator-managed
 Cloudflare package/service workflow. Do not run Cloudflare account commands or
 create tunnel credentials from the controller installer.
 
-The managed systemd drop-in pins the tunnel transport to HTTP/2. This avoids
-the repeated QUIC idle disconnects observed on the gate network while keeping
-all four outbound tunnel connections encrypted. After bootstrap, confirm the
-effective setting and connection protocol:
+The managed systemd drop-in keeps transport selection on `auto`. Cloudflare's
+startup connectivity checks can then choose QUIC when UDP reaches both tunnel
+regions but TCP/HTTP2 does not. All four outbound tunnel connections remain
+encrypted. After bootstrap, confirm the effective setting and selected
+connection protocol:
 
 ```sh
 sudo systemctl show cloudflared.service --property=Environment
-sudo journalctl -u cloudflared.service -n 100 --no-pager | grep 'protocol=http2'
+sudo journalctl -u cloudflared.service -n 100 --no-pager | grep 'protocol='
 ```
 
 ## Cloudflare Event Ingest And Retention

@@ -72,14 +72,14 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertNotIn("service: http://127.0.0.1:8889", config)
         self.assertRegex(config, r"- service: http_status:404\s*$")
 
-    def test_cloudflared_http2_transport_drop_in_is_managed_by_bootstrap(self):
+    def test_cloudflared_auto_transport_drop_in_is_managed_by_bootstrap(self):
         drop_in = Path(
             "deployment/systemd/cloudflared.service.d/20-http2.conf"
         ).read_text(encoding="utf-8")
         installer = Path("deployment/install.sh").read_text(encoding="utf-8")
 
         self.assertEqual(
-            "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=http2\n",
+            "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n",
             drop_in,
         )
         self.assertIn("install_cloudflared_transport_drop_in", installer)
@@ -269,7 +269,7 @@ install_fixed_trust_anchors \
                 source
                 / "deployment/systemd/cloudflared.service.d/20-http2.conf"
             ).write_text(
-                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=http2\n"
+                "[Service]\nEnvironment=TUNNEL_TRANSPORT_PROTOCOL=auto\n"
             )
             command = f"""
 source deployment/install.sh
