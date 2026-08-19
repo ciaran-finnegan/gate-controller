@@ -644,84 +644,443 @@ install_fixed_media_bootstrap() {
   done
 }
 
-backup_fixed_media_bootstrap() {
-  local bootstrap_root=$1
-  local backup_dir=$2
-  local backup=$backup_dir/fixed-media-bootstrap
-  local absent=$backup_dir/fixed-media-bootstrap.absent
+pin_trusted_directory() {
+  local directory=$1
+  local descriptor=$2
 
-  if [[ ! -d $backup_dir || -L $backup_dir ]]; then
-    fail "$backup_dir must be a directory" || true
+  if [[ $directory != /* ]]; then
+    fail "trusted directory path must be absolute: $directory" || true
     return 1
   fi
-  if [[ -e $backup || -L $backup || -e $absent || -L $absent ]]; then
+  case "$descriptor" in
+    18)
+      if ! exec 18<"$directory"; then
+        fail "could not pin trusted directory: $directory" || true
+        return 1
+      fi
+      ;;
+    19)
+      if ! exec 19<"$directory"; then
+        fail "could not pin trusted directory: $directory" || true
+        return 1
+      fi
+      ;;
+    *)
+      fail "unsupported trusted directory descriptor: $descriptor" || true
+      return 1
+      ;;
+  esac
+
+  if python3 - "$directory" "$descriptor" <<'PY'
+import os
+import sys
+
+directory = os.path.normpath(sys.argv[1])
+pinned_descriptor = int(sys.argv[2])
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+walk_descriptor = os.open(os.sep, flags)
+try:
+    for component in directory.split(os.sep)[1:]:
+        if not component:
+            continue
+        next_descriptor = os.open(
+            component,
+            flags,
+            dir_fd=walk_descriptor,
+        )
+        os.close(walk_descriptor)
+        walk_descriptor = next_descriptor
+    pinned = os.fstat(pinned_descriptor)
+    walked = os.fstat(walk_descriptor)
+    if (pinned.st_dev, pinned.st_ino) != (walked.st_dev, walked.st_ino):
+        raise OSError("directory changed while its trusted chain was validated")
+finally:
+    os.close(walk_descriptor)
+PY
+  then
+    return 0
+  fi
+
+  case "$descriptor" in
+    18) exec 18<&- ;;
+    19) exec 19<&- ;;
+  esac
+  fail "trusted directory chain is unsafe: $directory" || true
+  return 1
+}
+
+publish_fixed_media_restore() {
+  local parent_descriptor=$1
+  local live_name=$2
+  local staged_name=$3
+
+  python3 - "$parent_descriptor" "$live_name" "$staged_name" <<'PY'
+import ctypes
+import errno
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+live_name = sys.argv[2]
+staged_name = sys.argv[3]
+for name in (live_name, staged_name):
+    if not name or name in (".", "..") or os.sep in name:
+        raise SystemExit("fixed media restore name is unsafe")
+
+staged = os.stat(staged_name, dir_fd=parent_descriptor, follow_symlinks=False)
+if not stat.S_ISDIR(staged.st_mode):
+    raise SystemExit("staged fixed media restore must be a directory")
+
+try:
+    live = os.stat(live_name, dir_fd=parent_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    live = None
+if live is not None and not stat.S_ISDIR(live.st_mode):
+    raise SystemExit("live fixed media bootstrap must be a directory")
+
+if live is None:
+    os.rename(
+        staged_name,
+        live_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+    )
+else:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        try:
+            rename_exchange = libc.renameat2
+        except AttributeError as error:
+            raise OSError(errno.ENOSYS, "renameat2 is unavailable") from error
+        rename_exchange.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_exchange.restype = ctypes.c_int
+        result = rename_exchange(
+            parent_descriptor,
+            os.fsencode(live_name),
+            parent_descriptor,
+            os.fsencode(staged_name),
+            0x00000002,
+        )
+    elif sys.platform == "darwin":
+        rename_exchange = libc.renameatx_np
+        rename_exchange.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_exchange.restype = ctypes.c_int
+        result = rename_exchange(
+            parent_descriptor,
+            os.fsencode(live_name),
+            parent_descriptor,
+            os.fsencode(staged_name),
+            0x00000002,
+        )
+    else:
+        raise OSError(errno.ENOTSUP, "atomic directory exchange is unsupported")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+os.fsync(parent_descriptor)
+PY
+}
+
+fixed_media_path_kind() {
+  local parent_descriptor=$1
+  local name=$2
+
+  python3 - "$parent_descriptor" "$name" <<'PY'
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+name = sys.argv[2]
+if not name or name in (".", "..") or os.sep in name:
+    raise SystemExit("fixed media path name is unsafe")
+try:
+    metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    print("absent")
+else:
+    if stat.S_ISLNK(metadata.st_mode):
+        print("symlink")
+    elif stat.S_ISDIR(metadata.st_mode):
+        print("directory")
+    elif stat.S_ISREG(metadata.st_mode):
+        print("file")
+    else:
+        print("other")
+PY
+}
+
+create_fixed_media_absent_marker() {
+  local parent_descriptor=$1
+  local name=$2
+
+  python3 - "$parent_descriptor" "$name" <<'PY'
+import os
+import sys
+
+parent_descriptor = int(sys.argv[1])
+name = sys.argv[2]
+if not name or name in (".", "..") or os.sep in name:
+    raise SystemExit("fixed media marker name is unsafe")
+descriptor = os.open(
+    name,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+    0o600,
+    dir_fd=parent_descriptor,
+)
+os.close(descriptor)
+PY
+}
+
+copy_fixed_media_tree_real() {
+  local source_descriptor=$1
+  local source_name=$2
+  local destination_descriptor=$3
+  local destination_name=$4
+
+  python3 - \
+    "$source_descriptor" "$source_name" \
+    "$destination_descriptor" "$destination_name" <<'PY'
+import os
+import stat
+import subprocess
+import sys
+
+source_descriptor = int(sys.argv[1])
+source_name = sys.argv[2]
+destination_descriptor = int(sys.argv[3])
+destination_name = sys.argv[4]
+for name in (source_name, destination_name):
+    if not name or name in (".", "..") or os.sep in name:
+        raise SystemExit("fixed media copy name is unsafe")
+
+source = os.stat(
+    source_name,
+    dir_fd=source_descriptor,
+    follow_symlinks=False,
+)
+if not stat.S_ISDIR(source.st_mode):
+    raise SystemExit("fixed media copy source must be a directory")
+try:
+    os.stat(
+        destination_name,
+        dir_fd=destination_descriptor,
+        follow_symlinks=False,
+    )
+except FileNotFoundError:
+    pass
+else:
+    raise SystemExit("fixed media copy destination already exists")
+
+if sys.platform.startswith("linux"):
+    subprocess.run(
+        [
+            "cp",
+            "-a",
+            "--",
+            f"/proc/self/fd/{source_descriptor}/{source_name}",
+            f"/proc/self/fd/{destination_descriptor}/{destination_name}",
+        ],
+        check=True,
+        pass_fds=(source_descriptor, destination_descriptor),
+    )
+else:
+    os.mkdir(destination_name, 0o700, dir_fd=destination_descriptor)
+    source_tree_descriptor = os.open(
+        source_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=source_descriptor,
+    )
+    destination_tree_descriptor = os.open(
+        destination_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=destination_descriptor,
+    )
+    original_directory = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    producer = None
+    try:
+        os.fchdir(source_tree_descriptor)
+        producer = subprocess.Popen(
+            ["tar", "-cpf", "-", "."],
+            stdout=subprocess.PIPE,
+        )
+        os.fchdir(destination_tree_descriptor)
+        consumer = subprocess.run(
+            ["tar", "-xpf", "-"],
+            stdin=producer.stdout,
+            check=False,
+        )
+        if producer.stdout is not None:
+            producer.stdout.close()
+        producer_status = producer.wait()
+        if producer_status != 0 or consumer.returncode != 0:
+            raise OSError("could not copy fixed media tree with tar")
+    finally:
+        if producer is not None and producer.poll() is None:
+            producer.kill()
+            producer.wait()
+        os.fchdir(original_directory)
+        os.close(original_directory)
+        os.close(destination_tree_descriptor)
+        os.close(source_tree_descriptor)
+PY
+}
+
+copy_fixed_media_tree() {
+  copy_fixed_media_tree_real "$@"
+}
+
+remove_fixed_media_tree() {
+  local parent_descriptor=$1
+  local name=$2
+
+  python3 - "$parent_descriptor" "$name" <<'PY'
+import os
+import stat
+import subprocess
+import sys
+
+parent_descriptor = int(sys.argv[1])
+name = sys.argv[2]
+if not name or name in (".", "..") or os.sep in name:
+    raise SystemExit("fixed media removal name is unsafe")
+try:
+    metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("fixed media removal target must be a directory")
+original_directory = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fchdir(parent_descriptor)
+    subprocess.run(["rm", "-rf", "--", name], check=True)
+finally:
+    os.fchdir(original_directory)
+    os.close(original_directory)
+PY
+}
+
+backup_fixed_media_bootstrap() (
+  local bootstrap_root=$1
+  local backup_dir=$2
+  local bootstrap_parent=${bootstrap_root%/*}
+  local bootstrap_name=${bootstrap_root##*/}
+  local bootstrap_kind backup_kind absent_kind
+
+  if [[ $bootstrap_root != /* || $bootstrap_root == / || -z $bootstrap_name ]]; then
+    fail "fixed media bootstrap path must be an absolute child path" || true
+    return 1
+  fi
+  [[ -n $bootstrap_parent ]] || bootstrap_parent=/
+  pin_trusted_directory "$bootstrap_parent" 18 || return 1
+  pin_trusted_directory "$backup_dir" 19 || return 1
+  backup_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap) || return 1
+  absent_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap.absent) \
+    || return 1
+  if [[ $backup_kind != absent || $absent_kind != absent ]]; then
     fail "fixed media bootstrap backup already exists" || true
     return 1
   fi
-  if [[ -L $bootstrap_root ]]; then
-    fail "$bootstrap_root must not be a symbolic link" || true
-    return 1
-  fi
-  if [[ -e $bootstrap_root ]]; then
-    if [[ ! -d $bootstrap_root ]]; then
+  bootstrap_kind=$(fixed_media_path_kind 18 "$bootstrap_name") || return 1
+  case "$bootstrap_kind" in
+    directory)
+      if ! copy_fixed_media_tree \
+        18 "$bootstrap_name" 19 fixed-media-bootstrap; then
+        remove_fixed_media_tree 19 fixed-media-bootstrap || true
+        fail "could not back up the fixed media bootstrap" || true
+        return 1
+      fi
+      ;;
+    absent)
+      create_fixed_media_absent_marker 19 fixed-media-bootstrap.absent
+      ;;
+    symlink)
+      fail "$bootstrap_root must not be a symbolic link" || true
+      return 1
+      ;;
+    *)
       fail "$bootstrap_root must be a directory" || true
       return 1
-    fi
-    cp -a -- "$bootstrap_root" "$backup"
-  else
-    : >"$absent"
-  fi
-}
+      ;;
+  esac
+)
 
-restore_fixed_media_bootstrap() {
+restore_fixed_media_bootstrap() (
   local bootstrap_root=$1
   local backup_dir=$2
-  local backup=$backup_dir/fixed-media-bootstrap
-  local absent=$backup_dir/fixed-media-bootstrap.absent
-  local temporary=$bootstrap_root.rollback.$$
+  local bootstrap_parent=${bootstrap_root%/*}
+  local bootstrap_name=${bootstrap_root##*/}
+  local temporary_name=$bootstrap_name.rollback.$$
+  local bootstrap_kind backup_kind absent_kind temporary_kind
 
-  if [[ ! -d $backup_dir || -L $backup_dir ]]; then
-    fail "$backup_dir must be a directory" || true
+  if [[ $bootstrap_root != /* || $bootstrap_root == / || -z $bootstrap_name ]]; then
+    fail "fixed media bootstrap path must be an absolute child path" || true
     return 1
   fi
-  if [[ -L $bootstrap_root ]]; then
+  [[ -n $bootstrap_parent ]] || bootstrap_parent=/
+  pin_trusted_directory "$bootstrap_parent" 18 || return 1
+  pin_trusted_directory "$backup_dir" 19 || return 1
+  bootstrap_kind=$(fixed_media_path_kind 18 "$bootstrap_name") || return 1
+  if [[ $bootstrap_kind == symlink ]]; then
     fail "$bootstrap_root must not be a symbolic link" || true
     return 1
   fi
-  if [[ -e $bootstrap_root && ! -d $bootstrap_root ]]; then
+  if [[ $bootstrap_kind != absent && $bootstrap_kind != directory ]]; then
     fail "$bootstrap_root must be a directory" || true
     return 1
   fi
-  if [[ -e $temporary || -L $temporary ]]; then
+  temporary_kind=$(fixed_media_path_kind 18 "$temporary_name") || return 1
+  if [[ $temporary_kind != absent ]]; then
     fail "fixed media bootstrap restore path already exists" || true
     return 1
   fi
-  if [[ -e $backup || -L $backup ]]; then
-    if [[ ! -d $backup || -L $backup ]]; then
+  backup_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap) || return 1
+  absent_kind=$(fixed_media_path_kind 19 fixed-media-bootstrap.absent) \
+    || return 1
+  if [[ $backup_kind != absent ]]; then
+    if [[ $backup_kind != directory ]]; then
       fail "fixed media bootstrap backup must be a directory" || true
       return 1
     fi
-    if [[ -e $absent || -L $absent ]]; then
+    if [[ $absent_kind != absent ]]; then
       fail "fixed media bootstrap backup state is ambiguous" || true
       return 1
     fi
-    if ! cp -a -- "$backup" "$temporary"; then
-      rm -rf -- "$temporary"
+    if ! copy_fixed_media_tree \
+      19 fixed-media-bootstrap 18 "$temporary_name"; then
+      remove_fixed_media_tree 18 "$temporary_name" || true
       fail "could not copy the fixed media bootstrap backup" || true
       return 1
     fi
-    if [[ -e $bootstrap_root ]] && ! rm -rf -- "$bootstrap_root"; then
-      rm -rf -- "$temporary"
-      fail "could not remove the candidate fixed media bootstrap" || true
+    if ! publish_fixed_media_restore 18 "$bootstrap_name" "$temporary_name"; then
+      remove_fixed_media_tree 18 "$temporary_name" || true
+      fail "could not atomically publish the fixed media bootstrap restore" \
+        || true
       return 1
     fi
-    if ! mv -f -- "$temporary" "$bootstrap_root"; then
-      rm -rf -- "$temporary"
-      fail "could not restore the fixed media bootstrap" || true
+    temporary_kind=$(fixed_media_path_kind 18 "$temporary_name") || return 1
+    if [[ $temporary_kind != absent ]] \
+      && ! remove_fixed_media_tree 18 "$temporary_name"; then
+      fail "could not remove the replaced fixed media bootstrap" || true
       return 1
     fi
-  elif [[ -f $absent && ! -L $absent ]]; then
-    if [[ -e $bootstrap_root ]] && ! rm -rf -- "$bootstrap_root"; then
+  elif [[ $absent_kind == file ]]; then
+    if [[ $bootstrap_kind == directory ]] \
+      && ! remove_fixed_media_tree 18 "$bootstrap_name"; then
       fail "could not restore absence of the fixed media bootstrap" || true
       return 1
     fi
@@ -729,7 +1088,7 @@ restore_fixed_media_bootstrap() {
     fail "fixed media bootstrap backup is missing" || true
     return 1
   fi
-}
+)
 
 backup_fixed_updater_helper() {
   local updater_helper=$1
