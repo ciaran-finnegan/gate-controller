@@ -163,6 +163,7 @@ class MediaTurnRefreshTests(unittest.TestCase):
     def test_installer_enables_timer_only_for_a_valid_root_turn_secret(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            installer = Path(__file__).parents[1] / "deployment" / "install-media.sh"
             turn = root / "gate-media-turn.env"
             turn.write_text(
                 "TURN_KEY_ID=turn-key-id\nTURN_KEY_API_TOKEN=long-term-api-token\n",
@@ -171,7 +172,7 @@ class MediaTurnRefreshTests(unittest.TestCase):
             turn.chmod(0o600)
             log = root / "systemctl.log"
             command = f"""
-source deployment/install-media.sh
+source {shlex.quote(str(installer))}
 MEDIA_TURN_ENV={shlex.quote(str(turn))}
 MEDIA_LIBRARY={shlex.quote(str(Path(__file__).parents[1]))}
 MEDIA_TURN_REFRESH_HELPER={shlex.quote(str(Path(__file__).parents[1] / 'deployment/gate_media_turn_refresh.py'))}
@@ -179,11 +180,12 @@ systemctl() {{ printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}; }}
 configure_turn_refresh_timer
 """
             completed = subprocess.run(
-                ["bash", "-c", command], cwd=Path(__file__).parents[1],
+                ["bash", "-c", command], cwd=root,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
 
             self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue(log.is_file())
             self.assertEqual(
                 ["enable --now gate-media-turn-refresh.timer"],
                 log.read_text(encoding="utf-8").splitlines(),
