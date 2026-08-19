@@ -1793,9 +1793,10 @@ source deployment/install-media.sh
 systemctl() {{
   printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
   case "$*" in
-    'disable --now gate-media-gateway.service') return 1 ;;
+    'stop gate-media-gateway.service') return 1 ;;
     'is-active --quiet gate-media-gateway.service') return 0 ;;
     is-active*) return 3 ;;
+    is-enabled*) return 1 ;;
     *) return 0 ;;
   esac
 }}
@@ -1814,16 +1815,24 @@ printf 'status=%s\n' "$status" >> {shlex.quote(str(log))}
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertEqual(
                 [
-                    "systemctl disable --now gate-media-transcoder.service",
-                    "systemctl disable --now gate-media-gateway.service",
-                    "systemctl disable --now gate-media-auth.service",
-                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-transcoder.service",
+                    "systemctl stop gate-media-gateway.service",
+                    "systemctl stop gate-media-auth.service",
+                    "systemctl stop gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl disable gate-media-transcoder.service",
+                    "systemctl disable gate-media-gateway.service",
+                    "systemctl disable gate-media-auth.service",
+                    "systemctl disable gate-media-turn-refresh.timer",
                     "systemctl is-active --quiet gate-media-transcoder.service",
                     "systemctl is-active --quiet gate-media-gateway.service",
                     "systemctl is-active --quiet gate-media-auth.service",
                     "systemctl is-active --quiet gate-media-turn-refresh.timer",
                     "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "systemctl is-enabled --quiet gate-media-transcoder.service",
+                    "systemctl is-enabled --quiet gate-media-gateway.service",
+                    "systemctl is-enabled --quiet gate-media-auth.service",
+                    "systemctl is-enabled --quiet gate-media-turn-refresh.timer",
                     "status=1",
                 ],
                 log.read_text(encoding="utf-8").splitlines(),
@@ -1847,8 +1856,9 @@ MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
 systemctl() {{
   printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
   case "$*" in
-    'disable --now gate-media-gateway.service') return 1 ;;
+    'stop gate-media-gateway.service') return 1 ;;
     is-active*) return 3 ;;
+    is-enabled*) return 1 ;;
     *) return 0 ;;
   esac
 }}
@@ -1867,19 +1877,144 @@ on_media_install_failure
             self.assertNotEqual(0, completed.returncode)
             self.assertEqual(
                 [
-                    "systemctl disable --now gate-media-transcoder.service",
-                    "systemctl disable --now gate-media-gateway.service",
-                    "systemctl disable --now gate-media-auth.service",
-                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-transcoder.service",
+                    "systemctl stop gate-media-gateway.service",
+                    "systemctl stop gate-media-auth.service",
+                    "systemctl stop gate-media-turn-refresh.timer",
                     "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl disable gate-media-transcoder.service",
+                    "systemctl disable gate-media-gateway.service",
+                    "systemctl disable gate-media-auth.service",
+                    "systemctl disable gate-media-turn-refresh.timer",
                     "systemctl is-active --quiet gate-media-transcoder.service",
                     "systemctl is-active --quiet gate-media-gateway.service",
                     "systemctl is-active --quiet gate-media-auth.service",
                     "systemctl is-active --quiet gate-media-turn-refresh.timer",
                     "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "systemctl is-enabled --quiet gate-media-transcoder.service",
+                    "systemctl is-enabled --quiet gate-media-gateway.service",
+                    "systemctl is-enabled --quiet gate-media-auth.service",
+                    "systemctl is-enabled --quiet gate-media-turn-refresh.timer",
                     "flock -u 9",
                 ],
                 log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertTrue(backup.is_dir())
+            self.assertIn("transaction backup was retained", completed.stderr)
+
+    def test_rollback_disables_candidate_after_partial_disable_now_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            backup = state / ".install-backup.test"
+            backup.mkdir(mode=0o700)
+            unit_state = root / "unit-state"
+            unit_state.mkdir(mode=0o700)
+            log = root / "events.log"
+            enableable_units = (
+                "gate-media-transcoder.service",
+                "gate-media-gateway.service",
+                "gate-media-auth.service",
+                "gate-media-turn-refresh.timer",
+            )
+            active_units = (*enableable_units, "gate-media-turn-refresh.service")
+            for unit in active_units:
+                (unit_state / f"{unit}.active").write_text("1", encoding="utf-8")
+            for unit in enableable_units:
+                (unit_state / f"{unit}.enabled").write_text("1", encoding="utf-8")
+
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_INSTALL_BACKUP_DIR={shlex.quote(str(backup))}
+MEDIA_TRANSACTION_STARTED=1
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+UNIT_STATE_ROOT={shlex.quote(str(unit_state))}
+PARTIAL_DISABLE_MARKER={shlex.quote(str(root / "partial-disable"))}
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  local command=$1
+  shift
+  case "$command" in
+    disable)
+      local disable_now=0
+      if [[ ${{1-}} == --now ]]; then
+        disable_now=1
+        shift
+      fi
+      local unit=$1
+      if [[ $disable_now -eq 1 ]]; then
+        printf '0' > "$UNIT_STATE_ROOT/$unit.active"
+      fi
+      if [[ $unit == gate-media-gateway.service \
+          && ! -e $PARTIAL_DISABLE_MARKER ]]; then
+        : > "$PARTIAL_DISABLE_MARKER"
+        return 1
+      fi
+      printf '0' > "$UNIT_STATE_ROOT/$unit.enabled"
+      ;;
+    stop)
+      printf '0' > "$UNIT_STATE_ROOT/$1.active"
+      ;;
+    is-active)
+      [[ $1 == --quiet ]]
+      [[ $(<"$UNIT_STATE_ROOT/$2.active") == 1 ]] && return 0
+      return 3
+      ;;
+    is-enabled)
+      [[ $1 == --quiet ]]
+      [[ $(<"$UNIT_STATE_ROOT/$2.enabled") == 1 ]] && return 0
+      return 1
+      ;;
+    daemon-reload)
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}}
+restore_media_artifacts() {{
+  printf 'restore artifacts\n' >> {shlex.quote(str(log))}
+}}
+validate_restored_nginx() {{ printf 'validate nginx\n' >> {shlex.quote(str(log))}; }}
+restore_media_unit_states() {{ printf 'restore states\n' >> {shlex.quote(str(log))}; }}
+flock() {{ printf 'flock %s\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            for unit in active_units:
+                self.assertEqual(
+                    "0", (unit_state / f"{unit}.active").read_text(encoding="utf-8"),
+                    unit,
+                )
+            for unit in enableable_units:
+                self.assertEqual(
+                    "0", (unit_state / f"{unit}.enabled").read_text(encoding="utf-8"),
+                    unit,
+                )
+            events = log.read_text(encoding="utf-8").splitlines()
+            for unit in enableable_units:
+                self.assertIn(f"systemctl is-enabled --quiet {unit}", events)
+            self.assertGreaterEqual(
+                events.count(
+                    "systemctl is-enabled --quiet gate-media-gateway.service"
+                ),
+                2,
+            )
+            self.assertNotIn("restore artifacts", events)
+            self.assertNotIn(
+                "systemctl disable gate-media-turn-refresh.service", events,
+            )
+            self.assertNotIn(
+                "systemctl is-enabled --quiet gate-media-turn-refresh.service", events,
             )
             self.assertTrue(backup.is_dir())
             self.assertIn("transaction backup was retained", completed.stderr)

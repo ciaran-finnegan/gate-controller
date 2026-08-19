@@ -545,27 +545,49 @@ restore_media_artifacts() {
 quiesce_published_media() {
   local failed=0
   local status unit
-  local -a media_units=(
+  local -a enableable_units=(
     gate-media-transcoder.service
     gate-media-gateway.service
     gate-media-auth.service
+    "$MEDIA_TURN_REFRESH_TIMER"
+  )
+  local -a active_units=(
+    "${enableable_units[@]}"
+    "$MEDIA_TURN_REFRESH_SERVICE"
   )
 
-  for unit in "${media_units[@]}"; do
-    systemctl disable --now "$unit" >/dev/null 2>&1 || failed=1
+  for unit in "${active_units[@]}"; do
+    systemctl stop "$unit" >/dev/null 2>&1 || failed=1
   done
-  systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 \
-    || failed=1
-  systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 \
-    || failed=1
+  for unit in "${enableable_units[@]}"; do
+    systemctl disable "$unit" >/dev/null 2>&1 || failed=1
+  done
 
-  for unit in "${media_units[@]}" \
-      "$MEDIA_TURN_REFRESH_TIMER" "$MEDIA_TURN_REFRESH_SERVICE"; do
+  for unit in "${active_units[@]}"; do
     if systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
       failed=1
     else
       status=$?
       [[ $status -eq 3 ]] || failed=1
+    fi
+  done
+  for unit in "${enableable_units[@]}"; do
+    if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
+      failed=1
+    else
+      status=$?
+      if [[ $status -eq 1 ]]; then
+        continue
+      fi
+      failed=1
+    fi
+
+    systemctl disable "$unit" >/dev/null 2>&1 || failed=1
+    if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
+      failed=1
+    else
+      status=$?
+      [[ $status -eq 1 ]] || failed=1
     fi
   done
   [[ $failed -eq 0 ]]
