@@ -1,7 +1,12 @@
+import importlib.util
+import sys
+import types
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
-from gate_controller.relay import RelayController
+from gate_controller.relay import PiRelayAdapter, RelayController
 from gate_controller.relay_safe import force_relay_off
 
 
@@ -45,6 +50,53 @@ class RecordingBackend:
 
 
 class RelayControllerTests(unittest.TestCase):
+    def test_pi_library_checks_inhibition_at_the_gpio_boundary(self):
+        calls = []
+        gpio = types.ModuleType("RPi.GPIO")
+        gpio.BOARD, gpio.OUT, gpio.LOW, gpio.HIGH = 1, 2, 0, 1
+        gpio.setmode = lambda mode: None
+        gpio.setwarnings = lambda enabled: None
+        gpio.setup = lambda pin, mode: None
+        gpio.output = lambda pin, value: calls.append(("gpio", value))
+        rpi = types.ModuleType("RPi")
+        rpi.GPIO = gpio
+        spec = importlib.util.spec_from_file_location(
+            "PiRelay_test_boundary", Path("PiRelay.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+
+        with patch.dict(sys.modules, {"RPi": rpi, "RPi.GPIO": gpio}):
+            spec.loader.exec_module(module)
+        relay = module.Relay("RELAY1")
+        calls.clear()
+        inhibition = ("failed", "decision_timeout")
+
+        inhibited = relay.on(pre_activation_inhibit=lambda: inhibition)
+        with patch("builtins.print") as output:
+            activated = relay.on(pre_activation_inhibit=lambda: None)
+
+        self.assertEqual(inhibited, inhibition)
+        self.assertIsNone(activated)
+        self.assertEqual(calls, [("gpio", gpio.HIGH)])
+        output.assert_not_called()
+
+    def test_pi_adapter_forwards_the_last_moment_gpio_inhibition(self):
+        calls = []
+
+        class Backend:
+            def on(self, *, pre_activation_inhibit=None):
+                calls.append("backend")
+                return pre_activation_inhibit()
+
+        adapter = object.__new__(PiRelayAdapter)
+        adapter._relay = Backend()
+        inhibition = ("failed", "decision_timeout")
+
+        result = adapter.on(pre_activation_inhibit=lambda: inhibition)
+
+        self.assertEqual(result, inhibition)
+        self.assertEqual(calls, ["backend"])
+
     def test_prestart_safety_helper_retries_until_relay_is_off(self):
         class Backend:
             def __init__(self):

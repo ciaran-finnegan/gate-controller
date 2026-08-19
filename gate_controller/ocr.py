@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from math import isfinite
 from pathlib import Path
+from threading import Lock
 
 from .matching import normalise_plate
 from .models import PlateObservation
@@ -19,13 +20,24 @@ class PlateRecognizerClient:
                  timeout: tuple[int, int] = DEFAULT_TIMEOUT):
         self._token = token
         self._session = session
+        self._session_generation = 0
+        self._session_lock = Lock()
         self._endpoint = endpoint
         self._timeout = timeout
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
-        if self._session is None:
-            self._session = self._create_session()
-        session = self._session
+        with self._session_lock:
+            generation = self._session_generation
+            session = self._session
+        if session is None:
+            created = self._create_session()
+            with self._session_lock:
+                if generation == self._session_generation:
+                    if self._session is None:
+                        self._session = created
+                    session = self._session
+                else:
+                    session = created
         with path.open("rb") as image:
             response = session.post(
                 self._endpoint,
@@ -63,6 +75,12 @@ class PlateRecognizerClient:
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
+
+    def abandon_in_flight(self) -> None:
+        """Detach a timed-out request so later work receives a fresh session."""
+        with self._session_lock:
+            self._session_generation += 1
+            self._session = None
 
     @staticmethod
     def _create_session():

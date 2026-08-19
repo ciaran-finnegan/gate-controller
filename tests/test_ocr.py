@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from math import inf, nan
 from pathlib import Path
+from threading import Event, Thread
 from unittest.mock import patch
 
 from gate_controller.ocr import OcrResponseError, PlateRecognizerClient
@@ -108,6 +109,55 @@ class OcrClientTests(unittest.TestCase):
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(len(sessions[0].calls), 2)
+
+    def test_abandoning_a_timed_out_request_forces_a_fresh_http_session(self):
+        original = FakeSession(
+            response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
+        )
+        replacement = FakeSession(
+            response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
+        )
+        client = PlateRecognizerClient("token", session=original)
+
+        client.abandon_in_flight()
+        with patch.object(client, "_create_session", return_value=replacement):
+            client.recognise(self.path)
+
+        self.assertEqual(original.calls, [])
+        self.assertEqual(len(replacement.calls), 1)
+
+    def test_late_session_creation_cannot_replace_the_fresh_generation(self):
+        creating_first = Event()
+        release_first = Event()
+        obsolete = FakeSession(
+            response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
+        )
+        replacement = FakeSession(
+            response=FakeResponse(payload={"results": [{"plate": "12D3456", "score": 0.93}]})
+        )
+        sessions = iter((obsolete, replacement))
+
+        def create_session():
+            session = next(sessions)
+            if session is obsolete:
+                creating_first.set()
+                release_first.wait(0.5)
+            return session
+
+        client = PlateRecognizerClient("token")
+        with patch.object(client, "_create_session", side_effect=create_session):
+            first = Thread(target=client.recognise, args=(self.path,), daemon=True)
+            first.start()
+            self.assertTrue(creating_first.wait(0.5))
+            client.abandon_in_flight()
+            client.recognise(self.path)
+            release_first.set()
+            first.join(0.5)
+
+        self.assertFalse(first.is_alive())
+        self.assertIs(client._session, replacement)
+        self.assertEqual(len(obsolete.calls), 1)
+        self.assertEqual(len(replacement.calls), 1)
 
     def test_rejects_confidence_outside_the_closed_zero_to_one_range(self):
         for score in (-0.01, 1.01, nan, inf, -inf):

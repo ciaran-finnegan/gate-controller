@@ -28,10 +28,13 @@ class Relay:
         GPIO.setup(self.pin,GPIO.OUT)
         GPIO.output(self.pin, GPIO.LOW)
 
-    def on(self):
-        print(self.relay + " - ON")
+    def on(self, pre_activation_inhibit=None):
+        if pre_activation_inhibit is not None:
+            inhibition = pre_activation_inhibit()
+            if inhibition is not None:
+                return inhibition
         GPIO.output(self.pin,GPIO.HIGH)
+        return None
 
     def off(self):
-        print(self.relay + " - OFF")
         GPIO.output(self.pin,GPIO.LOW)

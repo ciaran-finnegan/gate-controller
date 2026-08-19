@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import math
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
-from threading import BoundedSemaphore, Thread
+from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
 from .actuation import ActuationCoordinator
@@ -35,6 +36,8 @@ class GateProcessor:
                  coordinator=None, max_image_age: timedelta = timedelta(seconds=8),
                  decision_timeout: float = 4.0, decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None):
+        if not math.isfinite(decision_timeout) or decision_timeout <= 0:
+            raise ValueError("decision timeout must be finite and greater than zero")
         self._recognizer = recognizer
         self._store = store
         self._authorised = authorised if callable(authorised) else lambda: tuple(authorised)
@@ -51,6 +54,7 @@ class GateProcessor:
         self._trace_factory = trace_factory or ProcessingTrace
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
         self._ocr_slot = BoundedSemaphore(1)
+        self._ocr_slot_lock = Lock()
         self._recognise_call = self._recognizer.recognise
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
@@ -324,19 +328,22 @@ class GateProcessor:
         return self._run_ocr_bounded(operation, deadline, on_start)
 
     def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
-        if not self._ocr_slot.acquire(blocking=False):
-            raise _OcrBusy("previous OCR request is still running")
+        with self._ocr_slot_lock:
+            slot = self._ocr_slot
+            if not slot.acquire(blocking=False):
+                raise _OcrBusy("previous OCR request is still running")
         if on_start is not None:
             on_start()
         result = Queue(maxsize=1)
 
         def invoke():
             try:
-                result.put((True, operation()))
+                outcome = (True, operation())
             except Exception as error:
-                result.put((False, error))
+                outcome = (False, error)
             finally:
-                self._ocr_slot.release()
+                slot.release()
+            result.put(outcome)
 
         worker = Thread(target=invoke, name="gate-ocr-request", daemon=True)
         try:
@@ -346,16 +353,31 @@ class GateProcessor:
             raise
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
+            self._abandon_ocr_generation(slot)
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         try:
             succeeded, value = result.get(timeout=max(remaining, 0.0))
         except Empty as error:
+            self._abandon_ocr_generation(slot)
             raise _OcrDeadlineExceeded(
                 "OCR request exceeded the decision deadline"
             ) from error
         if succeeded:
             return value
         raise value
+
+    def _abandon_ocr_generation(self, slot) -> None:
+        abandon = getattr(self._recognizer, "abandon_in_flight", None)
+        if not callable(abandon):
+            return
+        with self._ocr_slot_lock:
+            if self._ocr_slot is not slot:
+                return
+            try:
+                abandon()
+            except Exception:
+                return
+            self._ocr_slot = BoundedSemaphore(1)
 
 
 class _BestEffortTrace:
@@ -485,7 +507,9 @@ def _actuation_telemetry(execution) -> tuple[str, bool, str]:
         return "cooldown", False, "not_attempted"
     if execution.reason == "actuation_inhibit_error":
         return "claim_error", False, "not_attempted"
-    if execution.reason in {"stale_burst", "authorisation_error", "authorisation_revoked"}:
+    if execution.reason in {
+        "stale_burst", "authorisation_error", "authorisation_revoked", "decision_timeout",
+    }:
         return "claimed", False, "inhibited"
     if execution.reason == "indeterminate_claim":
         return "claimed", True, "indeterminate"

@@ -1,3 +1,4 @@
+import inspect
 from datetime import datetime, timezone
 from threading import Lock
 from time import sleep
@@ -36,7 +37,18 @@ class RelayController:
                 return RelayResult(False, detail, idempotency_key)
             activated_at = None
             try:
-                self._relay.on()
+                if pre_activation_inhibit is not None and _accepts_keyword(
+                    self._relay.on, "pre_activation_inhibit"
+                ):
+                    last_moment_inhibition = self._relay.on(
+                        pre_activation_inhibit=pre_activation_inhibit
+                    )
+                    if last_moment_inhibition is not None:
+                        _, detail = last_moment_inhibition
+                        self._record_outcome(detail)
+                        return RelayResult(False, detail, idempotency_key)
+                else:
+                    self._relay.on()
                 activated_at = self._clock()
                 if on_activation is not None:
                     try:
@@ -103,8 +115,19 @@ class PiRelayAdapter:
         import PiRelay
         self._relay = PiRelay.Relay(relay_name)
 
-    def on(self) -> None:
-        self._relay.on()
+    def on(self, *, pre_activation_inhibit=None):
+        return self._relay.on(pre_activation_inhibit=pre_activation_inhibit)
 
     def off(self) -> None:
         self._relay.off()
+
+
+def _accepts_keyword(callable_object, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )

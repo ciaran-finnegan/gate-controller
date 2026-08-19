@@ -4,6 +4,7 @@ import unittest
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Queue as ThreadQueue
 from threading import Event
 from time import monotonic
 from unittest.mock import patch
@@ -169,6 +170,18 @@ class GateProcessorTests(unittest.TestCase):
         path = Path(directory) / name
         Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
         return path
+
+    def test_rejects_nonfinite_or_nonpositive_decision_budgets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            for timeout in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+                with self.subTest(timeout=timeout), self.assertRaisesRegex(
+                    ValueError, "decision timeout must be finite and greater than zero"
+                ):
+                    self._processor(
+                        store, RecordingRelay([]), SequenceRecognizer([]),
+                        decision_timeout=timeout,
+                    )
 
     def test_early_allow_traces_one_ocr_attempt_and_decision_to_relay_time(self):
         trace_clock = SequenceClock((10.0, 10.01, 10.02, 10.07, 10.08, 10.11, 10.12))
@@ -1032,7 +1045,7 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(result.reason, "decision_timeout")
         self.assertEqual(calls, [])
 
-    def test_blocked_ocr_returns_at_the_hard_decision_deadline_without_relay(self):
+    def test_blocked_ocr_wait_is_bounded_without_waiting_for_the_request(self):
         finished = Event()
 
         class BlockingRecognizer:
@@ -1137,6 +1150,75 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(relay_calls, [])
         self.assertTrue(finished.wait(0.5))
 
+    def test_timed_out_resettable_ocr_uses_a_fresh_generation_for_the_next_event(self):
+        release_first = Event()
+
+        class ResettableRecognizer:
+            def __init__(self):
+                self.calls = []
+                self.abandoned = 0
+
+            def recognise(self, path, timeout=None):
+                self.calls.append(path)
+                if len(self.calls) == 1:
+                    release_first.wait(0.5)
+                return PlateObservation(None, 0.0)
+
+            def abandon_in_flight(self):
+                self.abandoned += 1
+
+        recognizer = ResettableRecognizer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._jpeg(directory, "first-resettable.jpg", 32)
+            second = self._jpeg(directory, "second-resettable.jpg", 224)
+            processor = self._processor(
+                LocalStore(root / "gate.db"), RecordingRelay([]), recognizer,
+                decision_timeout=0.1,
+            )
+
+            first_result = processor.process((first,))
+            second_result = processor.process((second,))
+            release_first.set()
+
+        self.assertEqual(first_result.reason, "decision_timeout")
+        self.assertEqual(second_result.reason, "no_match")
+        self.assertEqual(recognizer.calls, [first, second])
+        self.assertEqual(recognizer.abandoned, 1)
+
+    def test_completed_ocr_releases_its_slot_before_publishing_the_result(self):
+        allow_worker_put_to_return = Event()
+
+        class HoldingQueue(ThreadQueue):
+            def put(self, item, *args, **kwargs):
+                super().put(item, *args, **kwargs)
+                allow_worker_put_to_return.wait(0.5)
+
+        recognizer = SequenceRecognizer([
+            PlateObservation(None, 0.0),
+            PlateObservation(None, 0.0),
+        ])
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            processor_module, "Queue", HoldingQueue
+        ):
+            frames = (
+                self._jpeg(directory, "first-race.jpg", 32),
+                self._jpeg(directory, "second-race.jpg", 224),
+            )
+            result = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay([]),
+                recognizer,
+            ).process(frames)
+            allow_worker_put_to_return.set()
+
+        self.assertEqual(result.reason, "no_match")
+        self.assertEqual(recognizer.calls, list(frames))
+        self.assertEqual(
+            [attempt["status"] for attempt in result.telemetry.to_wire()["ocr_attempts"]],
+            ["no_plate", "no_plate"],
+        )
+
     def test_deadline_expiring_during_final_authorisation_check_inhibits_gpio(self):
         decision_clock = MutableClock()
         authorisation_checks = 0
@@ -1163,6 +1245,45 @@ class GateProcessorTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "decision_timeout")
         self.assertEqual(relay_calls, [])
+
+    def test_deadline_is_rechecked_by_the_backend_immediately_before_gpio(self):
+        decision_clock = MutableClock()
+
+        class DeadlineAwareBackend:
+            def __init__(self):
+                self.calls = []
+
+            def off(self):
+                self.calls.append("off")
+
+            def on(self, *, pre_activation_inhibit=None):
+                decision_clock.value = 4.1
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+                self.calls.append("on")
+                return None
+
+        backend = DeadlineAwareBackend()
+        relay = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        with tempfile.TemporaryDirectory() as directory:
+            result = GateProcessor(
+                recognizer=SequenceRecognizer([PlateObservation("12D3456", 0.99)]),
+                store=LocalStore(Path(directory) / "gate.db"),
+                relay=relay,
+                authorised={"12D3456"},
+                decision_timeout=4.0,
+                decision_clock=decision_clock,
+                clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+            ).process((Path("deadline-inside-backend.jpg"),))
+
+        self.assertEqual(result.reason, "decision_timeout")
+        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(result.telemetry.to_wire()["actuation"], {
+            "claim": "claimed",
+            "attempted": False,
+            "relay_outcome": "inhibited",
+        })
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
