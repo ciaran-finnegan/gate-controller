@@ -23,6 +23,14 @@ class PerformanceHarnessTests(unittest.TestCase):
 
         self.assertFalse(result.actuate)
 
+    def test_performance_harness_rejects_actuation_when_network_is_skipped(self):
+        harness = load_harness()
+
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as exit_error:
+            harness.parse_args(["--skip-network", "--actuate"])
+
+        self.assertEqual(exit_error.exception.code, 2)
+
     def test_performance_harness_records_passive_on_device_validation(self):
         harness = load_harness()
 

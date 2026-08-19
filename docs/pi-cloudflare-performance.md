@@ -31,7 +31,8 @@ The JSON summary records how it was collected. The safe default is:
 "actuation_requested": false
 ```
 
-`--skip-network` reports `host_metrics_only`. An explicitly actuating run reports
+`--skip-network` cannot be combined with `--actuate`; it reports
+`host_metrics_only`. An explicitly actuating run reports
 `actuating_endpoint_probe` and `actuation_requested: true`. Running the harness
 through SSH does not change its schema; the probes themselves execute on the Pi.
 

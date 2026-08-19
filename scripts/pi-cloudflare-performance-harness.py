@@ -24,8 +24,9 @@ def parse_args(arguments=None):
     parser.add_argument("--media-health-url", default="http://127.0.0.1:9997/v3/paths/list")
     parser.add_argument("--output", type=Path, default=Path("gate-pi-performance.json"))
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
-    parser.add_argument("--skip-network", action="store_true")
-    parser.add_argument(
+    collection_mode = parser.add_mutually_exclusive_group()
+    collection_mode.add_argument("--skip-network", action="store_true")
+    collection_mode.add_argument(
         "--actuate",
         action="store_true",
         help="send one real open_gate command; omitted by default",

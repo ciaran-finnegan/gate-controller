@@ -78,6 +78,24 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("--actuate", camera)
         self.assertNotIn("skipped_until_tailscale_or_home_wifi", camera)
 
+    def test_historical_plan_uses_the_current_performance_summary_schema(self):
+        plan = (
+            REPOSITORY_ROOT
+            / "docs/superpowers/plans/2026-08-17-cloudflare-replatform.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"run_mode": "host_metrics_only"', plan)
+        self.assertIn('"actuation_requested": false', plan)
+        self.assertNotIn("pi_ssh_tests", plan)
+        self.assertNotIn("skipped_until_tailscale_or_home_wifi", plan)
+
+    def test_performance_docs_reject_actuation_when_network_is_skipped(self):
+        performance = (
+            REPOSITORY_ROOT / "docs/pi-cloudflare-performance.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("cannot be combined with `--actuate`", performance)
+
 
 class SystemdTrustBoundaryTests(unittest.TestCase):
     def test_cloudflared_config_has_command_media_and_catch_all_rules(self):
