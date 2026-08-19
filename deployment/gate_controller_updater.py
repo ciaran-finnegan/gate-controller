@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import logging
 import os
@@ -266,7 +267,12 @@ def _github_json(config: UpdateConfig, endpoint: str) -> object:
             request, timeout=config.request_timeout_seconds
         ) as response:
             content = response.read(MAX_API_RESPONSE_BYTES + 1)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+    except (
+        http.client.IncompleteRead,
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+    ) as error:
         raise UpdateError(f"GitHub API request deferred: {error}") from error
     if len(content) > MAX_API_RESPONSE_BYTES:
         raise UpdateError("GitHub API response exceeded the size limit")
@@ -278,7 +284,17 @@ def _github_json(config: UpdateConfig, endpoint: str) -> object:
 
 def _main_commit_payload(config: UpdateConfig) -> object:
     branch = urllib.parse.quote(config.branch, safe="")
-    return _github_json(config, f"commits/{branch}")
+    payload = _github_json(config, f"git/ref/heads/{branch}")
+    expected_ref = f"refs/heads/{config.branch}"
+    if not isinstance(payload, dict) or payload.get("ref") != expected_ref:
+        raise UpdateError("GitHub API returned a mismatched branch ref")
+    target = payload.get("object")
+    if not isinstance(target, dict) or target.get("type") != "commit":
+        raise UpdateError("GitHub branch ref did not target a commit")
+    sha = target.get("sha")
+    if not isinstance(sha, str) or SHA_PATTERN.fullmatch(sha) is None:
+        raise UpdateError("GitHub branch ref did not contain a valid commit SHA")
+    return {"sha": sha}
 
 
 def _workflow_runs_payload(config: UpdateConfig, sha: str) -> object:

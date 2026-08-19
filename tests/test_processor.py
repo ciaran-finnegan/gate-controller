@@ -1571,6 +1571,7 @@ class GateProcessorTests(unittest.TestCase):
     def test_processor_close_terminally_inhibits_an_in_flight_exact_match(self):
         recognising = Event()
         release = Event()
+        completed = Event()
 
         class LateExactRecognizer:
             def recognise(self, path, timeout=None):
@@ -1579,25 +1580,46 @@ class GateProcessorTests(unittest.TestCase):
                 return PlateObservation("12D3456", 0.99)
 
         results = []
+        worker_errors = []
         relay_calls = []
         with tempfile.TemporaryDirectory() as directory:
             processor = self._processor(
                 LocalStore(Path(directory) / "gate.db"), RecordingRelay(relay_calls),
                 LateExactRecognizer(), decision_timeout=2.0,
             )
+
+            def process_in_flight_match():
+                try:
+                    results.append(
+                        processor.process(
+                            (self._jpeg(directory, "close-exact.jpg"),)
+                        )
+                    )
+                except BaseException as error:
+                    worker_errors.append(error)
+                finally:
+                    completed.set()
+
             worker = Thread(
-                target=lambda: results.append(
-                    processor.process((self._jpeg(directory, "close-exact.jpg"),))
-                ),
+                target=process_in_flight_match,
                 daemon=True,
             )
             worker.start()
-            self.assertTrue(recognising.wait(0.5))
-            processor.close()
-            release.set()
-            worker.join(1.0)
+            try:
+                self.assertTrue(recognising.wait(5.0))
+                processor.close()
+                release.set()
+                self.assertTrue(completed.wait(5.0))
+            finally:
+                try:
+                    processor.close()
+                finally:
+                    release.set()
+                    completed.wait(5.0)
+                    worker.join(1.0)
 
         self.assertFalse(worker.is_alive())
+        self.assertEqual(worker_errors, [])
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].opened)
         self.assertEqual(results[0].reason, "processor_closed")
