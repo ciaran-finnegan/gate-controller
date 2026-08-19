@@ -32,6 +32,7 @@ from .runtime import require_python_version
 
 MIN_QUIET_WINDOW_SECONDS = 0.1
 MAX_QUIET_WINDOW_SECONDS = 2.0
+DEFAULT_QUIET_WINDOW_SECONDS = 0.2
 
 
 def main() -> None:
@@ -51,7 +52,9 @@ def main() -> None:
                         default=authorised_default)
     parser.add_argument("--database", type=Path,
                         default=database_default)
-    parser.add_argument("--quiet-window", type=_quiet_window, default=0.5)
+    parser.add_argument(
+        "--quiet-window", type=_quiet_window, default=DEFAULT_QUIET_WINDOW_SECONDS
+    )
     arguments = parser.parse_args()
     token = os.environ.get("PLATE_RECOGNIZER_API_TOKEN")
     if not token:

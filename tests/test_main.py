@@ -33,6 +33,30 @@ class MainConfigurationTests(unittest.TestCase):
             ):
                 _quiet_window(value)
 
+    def test_candidate_release_defaults_to_200ms_without_a_refreshed_service_argument(self):
+        with patch.dict(
+            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker") as run_worker:
+            gate_main.main()
+
+        self.assertEqual(0.2, run_worker.call_args.kwargs["quiet_window"])
+
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
             "sys.argv",
