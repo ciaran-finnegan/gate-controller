@@ -21,6 +21,14 @@ from .telemetry import OcrAttemptTelemetry, ProcessingTrace
 MAX_OCR_FRAMES = 3
 
 
+class _OcrBusy(TimeoutError):
+    pass
+
+
+class _OcrDeadlineExceeded(TimeoutError):
+    pass
+
+
 class GateProcessor:
     def __init__(self, recognizer, store, relay, authorised: Iterable[str],
                  cooldown: timedelta = timedelta(seconds=20), outbox=None, clock=None,
@@ -43,10 +51,13 @@ class GateProcessor:
         self._trace_factory = trace_factory or ProcessingTrace
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
         self._ocr_slot = BoundedSemaphore(1)
+        self._recognise_call = self._recognizer.recognise
+        self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None) -> ProcessingResult:
         started = self._decision_clock() if decision_started_at is None else decision_started_at
+        deadline = started + self._decision_timeout
         candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
@@ -83,7 +94,7 @@ class GateProcessor:
                 idempotency_key=idempotency_key,
             )
         observations = []
-        saw_ocr_error = False
+        ocr_failure_reason = None
         decision = None
         timed_out = False
         for sequence, path in enumerate(paths[:MAX_OCR_FRAMES]):
@@ -112,14 +123,29 @@ class GateProcessor:
                 ocr_started = True
 
             try:
-                observation = self._recognise(path, remaining, mark_ocr_start)
+                observation = self._recognise(path, deadline, mark_ocr_start)
+            except _OcrBusy:
+                trace.add_ocr_rejection(OcrAttemptTelemetry(
+                    frame_sequence=sequence,
+                    status="ocr_busy",
+                ))
+                ocr_failure_reason = "ocr_busy"
+                break
+            except _OcrDeadlineExceeded:
+                if ocr_started:
+                    trace.add_ocr_attempt(OcrAttemptTelemetry(
+                        frame_sequence=sequence,
+                        status="ocr_timeout",
+                    ))
+                timed_out = True
+                break
             except Exception:
                 if ocr_started:
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_error",
                     ))
-                saw_ocr_error = True
+                ocr_failure_reason = "ocr_error"
                 continue
             trace.add_ocr_attempt(OcrAttemptTelemetry(
                 frame_sequence=sequence,
@@ -139,7 +165,7 @@ class GateProcessor:
         if not (decision and decision.allowed) and self._decision_clock() - started >= self._decision_timeout:
             timed_out = True
         if decision is None:
-            reason = "decision_timeout" if timed_out else ("ocr_error" if saw_ocr_error else "no_match")
+            reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
             return self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -168,7 +194,7 @@ class GateProcessor:
             ocr_confidence=decision.confidence,
         )
         if not decision.allowed:
-            if saw_ocr_error:
+            if ocr_failure_reason == "ocr_error":
                 event = _denied_event(idempotency_key, received_at, decision_at, "ocr_error",
                                       decision)
             trace.mark_decision("denied", event.reason)
@@ -198,6 +224,8 @@ class GateProcessor:
                 }
             except Exception:
                 return "failed", "authorisation_error"
+            if self._decision_clock() >= deadline:
+                return "failed", "decision_timeout"
             if normalise_plate(decision.authorised_plate) not in current_authorised:
                 return "failed", "authorisation_revoked"
             return None
@@ -283,19 +311,21 @@ class GateProcessor:
             return {"event_id": None}
         return prepare_payload(paths[0] if paths else None)
 
-    def _recognise(self, path: Path, remaining: float, on_start=None):
-        parameters = inspect.signature(self._recognizer.recognise).parameters
-        operation = lambda: self._recognizer.recognise(path)
-        if "timeout" not in parameters:
-            return self._run_ocr_bounded(operation, remaining, on_start)
+    def _recognise(self, path: Path, deadline: float, on_start=None):
+        remaining = deadline - self._decision_clock()
+        if remaining <= 0:
+            raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
+        operation = lambda: self._recognise_call(path)
+        if not self._recognizer_accepts_timeout:
+            return self._run_ocr_bounded(operation, deadline, on_start)
         connect = min(1.0, max(0.1, remaining / 3))
         read = min(2.0, max(0.1, remaining - connect))
-        operation = lambda: self._recognizer.recognise(path, timeout=(connect, read))
-        return self._run_ocr_bounded(operation, remaining, on_start)
+        operation = lambda: self._recognise_call(path, timeout=(connect, read))
+        return self._run_ocr_bounded(operation, deadline, on_start)
 
-    def _run_ocr_bounded(self, operation, remaining: float, on_start=None):
+    def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
         if not self._ocr_slot.acquire(blocking=False):
-            raise TimeoutError("previous OCR request is still running")
+            raise _OcrBusy("previous OCR request is still running")
         if on_start is not None:
             on_start()
         result = Queue(maxsize=1)
@@ -314,10 +344,15 @@ class GateProcessor:
         except BaseException:
             self._ocr_slot.release()
             raise
+        remaining = deadline - self._decision_clock()
+        if remaining <= 0:
+            raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         try:
             succeeded, value = result.get(timeout=max(remaining, 0.0))
         except Empty as error:
-            raise TimeoutError("OCR request exceeded the decision deadline") from error
+            raise _OcrDeadlineExceeded(
+                "OCR request exceeded the decision deadline"
+            ) from error
         if succeeded:
             return value
         raise value
@@ -369,6 +404,9 @@ class _BestEffortTrace:
 
     def add_ocr_attempt(self, attempt) -> None:
         self._call("add_ocr_attempt", attempt)
+
+    def add_ocr_rejection(self, attempt) -> None:
+        self._call("add_ocr_rejection", attempt)
 
     def mark_decision(self, outcome: str, reason: str) -> None:
         self._call("mark_decision", outcome, reason)

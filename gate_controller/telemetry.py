@@ -296,6 +296,11 @@ class ProcessingTrace:
         self._ocr_work_ms += duration_ms
         self._ocr_attempts.append(replace(attempt, duration_ms=duration_ms))
 
+    def add_ocr_rejection(self, attempt: OcrAttemptTelemetry) -> None:
+        """Record an OCR attempt rejected before network work could start."""
+        if len(self._ocr_attempts) < MAX_ITEMS:
+            self._ocr_attempts.append(replace(attempt, duration_ms=0.0))
+
     def mark_decision(self, outcome: str, reason: str) -> None:
         if self._decision is None:
             self._decision = self._monotonic_clock()
