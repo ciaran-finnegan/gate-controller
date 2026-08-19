@@ -1,7 +1,10 @@
 import importlib.util
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request
 from unittest import mock
 
 
@@ -20,10 +23,19 @@ class PerformanceHarnessTests(unittest.TestCase):
     def test_performance_harness_rejects_removed_actuation_arguments(self):
         harness = load_harness()
 
+        for arguments in (["--actuate"], ["--controller-id", "primary"]):
+            with self.subTest(arguments=arguments), mock.patch("sys.stderr"):
+                with self.assertRaises(SystemExit):
+                    harness.parse_args(arguments)
+
+    def test_performance_harness_rejects_all_endpoint_override_arguments(self):
+        harness = load_harness()
+
         for arguments in (
-            ["--actuate"],
-            ["--controller-id", "primary"],
-            ["--command-url", "http://127.0.0.1:8765/commands"],
+            ["--paths-url", "https://example.invalid/paths"],
+            ["--metrics-url", "https://example.invalid/metrics"],
+            ["--media-health-url", "https://example.invalid/paths"],
+            ["--media-metrics-url", "https://example.invalid/metrics"],
         ):
             with self.subTest(arguments=arguments), mock.patch("sys.stderr"):
                 with self.assertRaises(SystemExit):
@@ -92,6 +104,37 @@ class PerformanceHarnessTests(unittest.TestCase):
         self.assertEqual("passive_endpoint_probe", summary["run_mode"])
         self.assertNotIn("actuation_requested", summary)
 
+    def test_measurement_rejects_non_allowlisted_url_before_opening_it(self):
+        harness = load_harness()
+
+        with mock.patch("urllib.request.OpenerDirector.open") as open_url:
+            with self.assertRaises(ValueError):
+                harness.measure_request("https://example.invalid/")
+
+        open_url.assert_not_called()
+
+    def test_redirect_handler_rejects_redirect_without_following_it(self):
+        harness = load_harness()
+        handler_class = getattr(harness, "_RejectRedirects", None)
+
+        self.assertIsNotNone(handler_class)
+        self.assertTrue(any(
+            isinstance(handler, handler_class)
+            for handler in harness._URL_OPENER.handlers
+        ))
+        with self.assertRaises(HTTPError) as rejected:
+            handler_class().redirect_request(
+                Request("http://127.0.0.1:9997/v3/paths/list"),
+                BytesIO(),
+                302,
+                "Found",
+                {},
+                "https://example.invalid/redirected",
+            )
+
+        self.assertEqual(rejected.exception.code, 302)
+        rejected.exception.close()
+
     def test_harness_artifacts_do_not_reference_the_command_endpoint(self):
         plan = (
             REPOSITORY_ROOT
@@ -100,6 +143,7 @@ class PerformanceHarnessTests(unittest.TestCase):
         harness_task = plan.split("### Task 7:", 1)[1].split("\n---", 1)[0]
         artifacts = {
             "harness": HARNESS_PATH.read_text(encoding="utf-8"),
+            "harness tests": Path(__file__).read_text(encoding="utf-8"),
             "performance docs": (
                 REPOSITORY_ROOT / "docs/pi-cloudflare-performance.md"
             ).read_text(encoding="utf-8"),
@@ -111,11 +155,13 @@ class PerformanceHarnessTests(unittest.TestCase):
             ).read_text(encoding="utf-8"),
             "historical harness plan": harness_task,
         }
+        forbidden_path = "/" + "".join(("com", "mands"))
+        forbidden_option = "--" + "-".join(("command", "url"))
 
         for name, content in artifacts.items():
             with self.subTest(artifact=name):
-                self.assertNotIn("/commands", content)
-                self.assertNotIn("--command-url", content)
+                self.assertNotIn(forbidden_path, content)
+                self.assertNotIn(forbidden_option, content)
 
     def test_skip_network_execution_issues_no_requests(self):
         harness = load_harness()

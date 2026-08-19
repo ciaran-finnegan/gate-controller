@@ -10,17 +10,28 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 MAX_PROC_NET_DEV_BYTES = 64 * 1024
 MAX_NETWORK_INTERFACES = 32
+PATHS_URL = "http://127.0.0.1:9997/v3/paths/list"
+METRICS_URL = "http://127.0.0.1:9998/metrics"
+_READ_ONLY_ENDPOINTS = frozenset((PATHS_URL, METRICS_URL))
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        raise HTTPError(
+            request.full_url, code, "redirect response rejected", headers, file_pointer
+        )
+
+
+_URL_OPENER = build_opener(_RejectRedirects())
 
 
 def parse_args(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--media-health-url", default="http://127.0.0.1:9997/v3/paths/list")
-    parser.add_argument("--media-metrics-url", default="http://127.0.0.1:9998/metrics")
     parser.add_argument("--output", type=Path, default=Path("gate-pi-performance.json"))
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
     parser.add_argument("--skip-network", action="store_true")
@@ -28,11 +39,13 @@ def parse_args(arguments=None):
 
 
 def measure_request(url, *, timeout_seconds=5.0):
+    if url not in _READ_ONLY_ENDPOINTS:
+        raise ValueError("performance harness endpoint is not allowlisted")
     request = Request(url, method="GET")
     started = time.perf_counter()
     sample = {"url": url, "method": "GET"}
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
+        with _URL_OPENER.open(request, timeout=timeout_seconds) as response:
             response.read()
             sample["status_code"] = response.status
     except HTTPError as error:
@@ -128,10 +141,10 @@ def main(arguments=None):
     samples = []
     if not args.skip_network:
         samples.append(measure_request(
-            args.media_health_url, timeout_seconds=args.timeout_seconds,
+            PATHS_URL, timeout_seconds=args.timeout_seconds,
         ))
         samples.append(measure_request(
-            args.media_metrics_url, timeout_seconds=args.timeout_seconds,
+            METRICS_URL, timeout_seconds=args.timeout_seconds,
         ))
     run_mode = "host_metrics_only" if args.skip_network else "passive_endpoint_probe"
     summary = build_summary(
