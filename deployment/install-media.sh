@@ -11,7 +11,6 @@ MEDIA_CONFIG_ROOT=/etc/gate-media
 MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml
 MEDIA_PROXY_TEMPLATE=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf.template
 MEDIA_PROXY_CONFIG=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf
-MEDIA_RUNTIME=/run/gate-media
 MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_TURN_REFRESH_HELPER=$MEDIA_LIBRARY/gate_media_turn_refresh.py
