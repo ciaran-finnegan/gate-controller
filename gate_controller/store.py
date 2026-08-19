@@ -291,7 +291,6 @@ class LocalStore:
     def attach_event_telemetry(self, event_id: int, telemetry: EventTelemetry) -> bool:
         """Attach one trace after the terminal event transaction has committed."""
         payload = _telemetry_payload(telemetry)
-        encoded = _encode_json(payload)
         created_at = _timestamp(datetime.now(timezone.utc))
         connection = self._connect()
         try:
@@ -300,6 +299,8 @@ class LocalStore:
                 "SELECT 1 FROM events WHERE id = ?", (event_id,)
             ).fetchone() is None:
                 raise KeyError(f"unknown event {event_id}")
+            _enrich_cloud_enqueued(connection, event_id, payload)
+            encoded = _encode_json(payload)
             existing = connection.execute(
                 "SELECT trace_id, payload FROM event_telemetry WHERE event_id = ?",
                 (event_id,),
@@ -329,6 +330,15 @@ class LocalStore:
                 )
             self._promote_pending_outbox(connection, event_id, payload)
             connection.commit()
+            cloud_enqueued_at = payload.get("stage_timestamps", {}).get(
+                "cloud_enqueued_at"
+            )
+            if cloud_enqueued_at is not None:
+                _LOGGER.info(
+                    "gate_pipeline stage=cloud_enqueued trace_id=%s event_id=%d "
+                    "observed_at=%s",
+                    payload["trace_id"], event_id, cloud_enqueued_at,
+                )
             return inserted
         except Exception:
             connection.rollback()
@@ -455,6 +465,11 @@ class LocalStore:
                 )
                 telemetry["delivery"] = {"outbox_attempt": attempt, "state": "sending"}
                 queued_at = _parse_timestamp(created_at)
+                stage_timestamps = dict(telemetry.get("stage_timestamps", {}))
+                stage_timestamps.setdefault("cloud_enqueued_at", _timestamp(queued_at))
+                stage_timestamps["cloud_send_started_at"] = _timestamp(attempted_at)
+                stage_timestamps.pop("cloud_acknowledged_at", None)
+                telemetry["stage_timestamps"] = stage_timestamps
                 lag_ms = max(
                     0,
                     int((_as_utc(attempted_at) - queued_at).total_seconds() * 1000),
@@ -634,6 +649,23 @@ class LocalStore:
                         "outbox_attempt": _telemetry_attempt(telemetry),
                         "state": state,
                     }
+                    if state == "delivered" and completed_at is not None:
+                        stage_timestamps = dict(
+                            telemetry.get("stage_timestamps", {})
+                        )
+                        acknowledged_at = _timestamp(completed_at)
+                        stage_timestamps["cloud_acknowledged_at"] = acknowledged_at
+                        telemetry["stage_timestamps"] = stage_timestamps
+                        send_started_at = stage_timestamps.get(
+                            "cloud_send_started_at"
+                        )
+                        send_to_ack_ms = _bounded_interval_ms(
+                            send_started_at, acknowledged_at
+                        )
+                        if send_to_ack_ms is not None:
+                            telemetry["stage_durations"][
+                                "cloud_send_to_ack_ms"
+                            ] = send_to_ack_ms
                     self._write_telemetry_payload(connection, event_id, telemetry)
                     payload = dict(fallback)
                     payload["schema_version"] = 3
@@ -1053,7 +1085,7 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
     raw = telemetry.to_wire()
     if raw.get("schema_version") != 3:
         raise ValueError("telemetry must use schema version 3")
-    return {
+    payload = {
         "trace_id": raw["trace_id"],
         "taxonomy_version": raw["taxonomy_version"],
         "stage_durations": dict(raw["stage_durations"]),
@@ -1069,6 +1101,9 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
         "actuation": dict(raw["actuation"]),
         "delivery": dict(raw["delivery"]),
     }
+    if "stage_timestamps" in raw:
+        payload["stage_timestamps"] = dict(raw["stage_timestamps"])
+    return payload
 
 
 def _same_trace(left: dict, right: dict) -> bool:
@@ -1080,8 +1115,19 @@ def _same_trace(left: dict, right: dict) -> bool:
     right_durations = dict(right_immutable.get("stage_durations", {}))
     left_durations.pop("delivery_lag_ms", None)
     right_durations.pop("delivery_lag_ms", None)
+    left_durations.pop("cloud_send_to_ack_ms", None)
+    right_durations.pop("cloud_send_to_ack_ms", None)
     left_immutable["stage_durations"] = left_durations
     right_immutable["stage_durations"] = right_durations
+    for candidate in (left_immutable, right_immutable):
+        stage_timestamps = dict(candidate.get("stage_timestamps", {}))
+        for key in tuple(stage_timestamps):
+            if key.startswith("cloud_"):
+                stage_timestamps.pop(key)
+        if stage_timestamps:
+            candidate["stage_timestamps"] = stage_timestamps
+        else:
+            candidate.pop("stage_timestamps", None)
     return left_immutable == right_immutable
 
 
@@ -1130,7 +1176,46 @@ def _decode_telemetry_payload(encoded: object) -> dict:
     if any(not isinstance(telemetry.get(key), value_type)
            for key, value_type in expected.items()):
         raise _MalformedTelemetry("telemetry has an invalid bounded contract")
+    stage_timestamps = telemetry.get("stage_timestamps")
+    if stage_timestamps is not None and (
+        not isinstance(stage_timestamps, dict)
+        or any(not isinstance(value, str) for value in stage_timestamps.values())
+    ):
+        raise _MalformedTelemetry("telemetry stage timestamps are invalid")
     return telemetry
+
+
+def _enrich_cloud_enqueued(
+    connection: sqlite3.Connection, event_id: int, telemetry: dict
+) -> None:
+    row = connection.execute(
+        "SELECT created_at FROM outbox WHERE event_id = ? AND completed_at IS NULL",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return
+    stage_timestamps = dict(telemetry.get("stage_timestamps", {}))
+    stage_timestamps.setdefault("cloud_enqueued_at", row[0])
+    telemetry["stage_timestamps"] = stage_timestamps
+
+
+def _bounded_interval_ms(start: object, end: object) -> int | None:
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        parsed_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        parsed_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        if parsed_start.tzinfo is None or parsed_end.tzinfo is None:
+            return None
+        interval = (
+            parsed_end.astimezone(timezone.utc)
+            - parsed_start.astimezone(timezone.utc)
+        ).total_seconds()
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return None
+    if interval < 0:
+        return None
+    return min(round(interval * 1_000), MAX_DURATION_MS)
 
 
 def _telemetry_attempt(telemetry: dict) -> int:

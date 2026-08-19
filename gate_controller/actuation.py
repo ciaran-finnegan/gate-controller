@@ -23,7 +23,8 @@ class ActuationCoordinator:
 
     def actuate(self, event: GateEvent, *, outbox_payload: dict | None = None,
                 command_ack: tuple[str, datetime] | None = None,
-                pre_activation_inhibit=None, on_activation=None) -> ActuationExecution:
+                pre_activation_inhibit=None, on_activation=None,
+                on_deactivation=None) -> ActuationExecution:
         key = event.idempotency_key
         if not key:
             raise ValueError("actuation events require an idempotency key")
@@ -115,6 +116,16 @@ class ActuationCoordinator:
                         pass
 
                 relay_kwargs["on_activation"] = notify_activation
+            if on_deactivation is not None and _accepts_keyword(
+                self._relay.trigger, "on_deactivation"
+            ):
+                def notify_deactivation():
+                    try:
+                        on_deactivation()
+                    except Exception:
+                        pass
+
+                relay_kwargs["on_deactivation"] = notify_deactivation
             relay_result = self._relay.trigger(event.source, **relay_kwargs)
             activation_attempted = (
                 inhibition is None and relay_result.reason != "relay_latched"

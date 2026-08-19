@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import os
 import tempfile
 import warnings
@@ -19,6 +20,7 @@ Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMA
 LOCAL_IMAGE_PATH_KEY = "_local_image_path"
 MAX_OUTBOX_IMAGE_BYTES = 512 * 1024
 MAX_OUTBOX_IMAGE_DIMENSION = 1280
+LOGGER = logging.getLogger(__name__)
 
 
 class OutboxSyncError(RuntimeError):
@@ -281,25 +283,49 @@ class OutboxWorker:
         self._run_retention(now)
         completed = 0
         for item_id, _queued_payload in self._store.pending_outbox_items():
+            trace_id = "unavailable"
             try:
                 payload = self._store.prepare_outbox_attempt(item_id, self._clock())
                 if payload is None:
                     continue
+                telemetry = payload.get("telemetry", {})
+                trace_id = telemetry.get("trace_id", "unavailable")
+                send_started_at = telemetry.get("stage_timestamps", {}).get(
+                    "cloud_send_started_at", "unavailable"
+                )
+                LOGGER.info(
+                    "gate_pipeline stage=cloud_send_started trace_id=%s item_id=%d "
+                    "observed_at=%s attempt=%s",
+                    trace_id,
+                    item_id,
+                    send_started_at,
+                    telemetry.get("delivery", {}).get("outbox_attempt", "unavailable"),
+                )
                 image_digest = payload.get("image_sha256")
                 if image_digest is None:
                     self._send(payload)
                 else:
                     self._send(payload, self._evidence_spool.load(image_digest))
             except Exception:
+                LOGGER.warning(
+                    "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d",
+                    trace_id, item_id,
+                )
                 try:
                     self._store.mark_outbox_retry(item_id)
                 except Exception:
                     pass
                 continue
             try:
-                self._store.complete_outbox_item(item_id, self._clock())
+                acknowledged_at = self._clock()
+                self._store.complete_outbox_item(item_id, acknowledged_at)
             except Exception:
                 continue
+            LOGGER.info(
+                "gate_pipeline stage=cloud_acknowledged trace_id=%s item_id=%d "
+                "observed_at=%s",
+                trace_id, item_id, acknowledged_at.astimezone(timezone.utc).isoformat(),
+            )
             if (
                 image_digest is not None
                 and image_digest not in self._store.pending_evidence_digests()

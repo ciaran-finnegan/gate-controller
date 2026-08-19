@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from itertools import islice
 import math
 import re
@@ -128,6 +128,35 @@ class OcrAttemptTelemetry:
 
 
 @dataclass(frozen=True)
+class StageTimestamps:
+    filesystem_ingress_at: datetime | None = None
+    burst_processing_started_at: datetime | None = None
+    ocr_started_at: datetime | None = None
+    ocr_finished_at: datetime | None = None
+    decision_at: datetime | None = None
+    relay_started_at: datetime | None = None
+    relay_finished_at: datetime | None = None
+    processing_finished_at: datetime | None = None
+
+    def to_wire(self) -> dict[str, str]:
+        values = (
+            ("filesystem_ingress_at", self.filesystem_ingress_at),
+            ("burst_processing_started_at", self.burst_processing_started_at),
+            ("ocr_started_at", self.ocr_started_at),
+            ("ocr_finished_at", self.ocr_finished_at),
+            ("decision_at", self.decision_at),
+            ("relay_started_at", self.relay_started_at),
+            ("relay_finished_at", self.relay_finished_at),
+            ("processing_finished_at", self.processing_finished_at),
+        )
+        return {
+            name: encoded
+            for name, value in values
+            if (encoded := _wire_timestamp(value)) is not None
+        }
+
+
+@dataclass(frozen=True)
 class StageDurations:
     capture_to_burst_ms: float | None = None
     burst_to_ocr_ms: float | None = None
@@ -136,6 +165,10 @@ class StageDurations:
     decision_to_relay_ms: float | None = None
     end_to_end_ms: float | None = None
     delivery_lag_ms: float | None = None
+    filesystem_ingress_to_decision_ms: float | None = None
+    filesystem_ingress_to_relay_ms: float | None = None
+    relay_ms: float | None = None
+    cloud_send_to_ack_ms: float | None = None
 
     def to_wire(self) -> dict[str, int]:
         values = (
@@ -146,6 +179,13 @@ class StageDurations:
             ("decision_to_relay_ms", self.decision_to_relay_ms),
             ("end_to_end_ms", self.end_to_end_ms),
             ("delivery_lag_ms", self.delivery_lag_ms),
+            (
+                "filesystem_ingress_to_decision_ms",
+                self.filesystem_ingress_to_decision_ms,
+            ),
+            ("filesystem_ingress_to_relay_ms", self.filesystem_ingress_to_relay_ms),
+            ("relay_ms", self.relay_ms),
+            ("cloud_send_to_ack_ms", self.cloud_send_to_ack_ms),
         )
         return {name: duration for name, value in values if (duration := _duration(value)) is not None}
 
@@ -163,6 +203,7 @@ class EventTelemetry:
     relay_outcome: str
     outbox_attempt: int
     delivery_state: str
+    stage_timestamps: StageTimestamps = field(default_factory=StageTimestamps)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
@@ -183,7 +224,7 @@ class EventTelemetry:
                 frames.append(encoded)
 
         attempts = [attempt.to_wire() for attempt in self.ocr_attempts][:MAX_ITEMS]
-        return {
+        payload = {
             "schema_version": 3,
             "trace_id": self.trace_id,
             "taxonomy_version": 1,
@@ -208,6 +249,10 @@ class EventTelemetry:
                 "state": _token(self.delivery_state),
             },
         }
+        timestamps = self.stage_timestamps.to_wire()
+        if timestamps:
+            payload["stage_timestamps"] = timestamps
+        return payload
 
 
 class ProcessingTrace:
@@ -222,9 +267,11 @@ class ProcessingTrace:
     ) -> None:
         self._monotonic_clock = monotonic_clock
         self._wall_anchor = wall_clock()
+        self._monotonic_anchor = monotonic_clock()
         self.captured_at = self._wall_anchor
         self.trace_id = _trace_id(trace_id) if trace_id is not None else str(uuid4())
-        self._captured = monotonic_clock()
+        self._captured = self._monotonic_anchor
+        self._filesystem_ingress_at: datetime | None = None
         self._burst: float | None = None
         self._first_ocr_start: float | None = None
         self._pending_ocr_start: float | None = None
@@ -232,6 +279,7 @@ class ProcessingTrace:
         self._ocr_work_ms = 0.0
         self._decision: float | None = None
         self._actuation: float | None = None
+        self._relay_finished: float | None = None
         self._actuation_details_marked = False
         self._finished: float | None = None
         self._frames: list[FrameTelemetry] = []
@@ -258,6 +306,7 @@ class ProcessingTrace:
             self._captured = capture
         if capture is not None:
             self.captured_at = received_at
+            self._filesystem_ingress_at = received_at
         if decision_started_at is not None:
             self._burst = burst
 
@@ -323,6 +372,10 @@ class ProcessingTrace:
         if self._actuation is None:
             self._actuation = self._monotonic_clock()
 
+    def mark_relay_finished(self) -> None:
+        if self._actuation is not None and self._relay_finished is None:
+            self._relay_finished = self._monotonic_clock()
+
     def set_actuation_outcome(
         self, claim: str, attempted: bool, relay_outcome: str
     ) -> None:
@@ -352,6 +405,15 @@ class ProcessingTrace:
                 decision_to_relay_ms=_elapsed(self._decision, self._actuation),
                 end_to_end_ms=_elapsed(self._captured, self._finished),
                 delivery_lag_ms=delivery_lag_ms,
+                filesystem_ingress_to_decision_ms=_elapsed(
+                    self._captured if self._filesystem_ingress_at is not None else None,
+                    self._decision,
+                ),
+                filesystem_ingress_to_relay_ms=_elapsed(
+                    self._captured if self._filesystem_ingress_at is not None else None,
+                    self._actuation,
+                ),
+                relay_ms=_elapsed(self._actuation, self._relay_finished),
             ),
             frames=tuple(self._frames),
             ocr_attempts=tuple(self._ocr_attempts),
@@ -362,14 +424,44 @@ class ProcessingTrace:
             relay_outcome=self._relay_outcome,
             outbox_attempt=outbox_attempt,
             delivery_state=delivery_state,
+            stage_timestamps=StageTimestamps(
+                filesystem_ingress_at=self._filesystem_ingress_at,
+                burst_processing_started_at=self._wall_at(self._burst),
+                ocr_started_at=self._wall_at(self._first_ocr_start),
+                ocr_finished_at=self._wall_at(self._last_ocr_end),
+                decision_at=self._wall_at(self._decision),
+                relay_started_at=self._wall_at(self._actuation),
+                relay_finished_at=self._wall_at(self._relay_finished),
+                processing_finished_at=self._wall_at(self._finished),
+            ),
         )
         return self._finished_telemetry
+
+    def _wall_at(self, monotonic_value: float | None) -> datetime | None:
+        if monotonic_value is None:
+            return None
+        try:
+            offset = monotonic_value - self._monotonic_anchor
+        except TypeError:
+            return None
+        if not math.isfinite(offset) or abs(offset) > MAX_UPSTREAM_INTERVAL_SECONDS:
+            return None
+        return self._wall_anchor + timedelta(seconds=offset)
 
 
 def _elapsed(start: float | None, end: float | None) -> float | None:
     if start is None or end is None:
         return None
     return max(0.0, (end - start) * 1_000)
+
+
+def _wire_timestamp(value: datetime | None) -> str | None:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    try:
+        return value.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError):
+        return None
 
 
 def _wall_to_monotonic(

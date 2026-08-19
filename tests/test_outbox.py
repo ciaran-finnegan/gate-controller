@@ -290,6 +290,66 @@ class OutboxWorkerTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertIsNotNone(completed_at)
 
+    def test_cloud_queue_send_and_ack_boundaries_are_persisted_and_logged(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        queued_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        send_at = queued_at + timedelta(milliseconds=250)
+        ack_at = send_at + timedelta(milliseconds=125)
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE outbox SET created_at = ? WHERE id = ?",
+                (queued_at.isoformat(), item_id),
+            )
+        store.attach_event_telemetry(event_id, _telemetry())
+        clock = iter((send_at, send_at, ack_at))
+        worker = OutboxWorker(store, send=lambda payload: None, clock=lambda: next(clock))
+
+        with self.assertLogs("gate_controller.outbox", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 1)
+
+        telemetry = store.event_telemetry(event_id)
+        self.assertEqual(telemetry["stage_timestamps"], {
+            "cloud_enqueued_at": queued_at.isoformat(),
+            "cloud_send_started_at": send_at.isoformat(),
+            "cloud_acknowledged_at": ack_at.isoformat(),
+        })
+        self.assertEqual(telemetry["stage_durations"]["delivery_lag_ms"], 250)
+        self.assertEqual(telemetry["stage_durations"]["cloud_send_to_ack_ms"], 125)
+        combined = "\n".join(logs.output)
+        self.assertIn(
+            "gate_pipeline stage=cloud_send_started "
+            "trace_id=ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            combined,
+        )
+        self.assertIn(
+            "gate_pipeline stage=cloud_acknowledged "
+            "trace_id=ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            combined,
+        )
+
+    def test_invalid_send_timestamp_does_not_fabricate_cloud_ack_duration(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.attach_event_telemetry(event_id, _telemetry())
+        store.prepare_outbox_attempt(
+            item_id, datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        )
+        telemetry = store.event_telemetry(event_id)
+        telemetry["stage_timestamps"]["cloud_send_started_at"] = "not-a-timestamp"
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET payload = ? WHERE event_id = ?",
+                (json.dumps(telemetry), event_id),
+            )
+
+        store.complete_outbox_item(
+            item_id, datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc)
+        )
+
+        persisted = store.event_telemetry(event_id)
+        self.assertNotIn("cloud_send_to_ack_ms", persisted["stage_durations"])
+
     def test_retention_runs_at_startup_then_no_more_than_hourly(self):
         store, _ = self._queued_store()
         calls = []

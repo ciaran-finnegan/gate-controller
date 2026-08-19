@@ -25,7 +25,8 @@ class RelayController:
         self._last_outcome_at = self._clock()
 
     def trigger(self, source: str, idempotency_key: str | None = None, *,
-                pre_activation_inhibit=None, on_activation=None) -> RelayResult:
+                pre_activation_inhibit=None, on_activation=None,
+                on_deactivation=None) -> RelayResult:
         with self._lock:
             def activation_inhibition():
                 if pre_activation_inhibit is not None:
@@ -88,6 +89,7 @@ class RelayController:
                         raise
                     return RelayResult(False, "relay_deenergize_error", idempotency_key,
                                        activated_at, True)
+                _notify(on_deactivation)
                 if not isinstance(error, Exception):
                     self._record_outcome("relay_error", activated_at)
                     raise
@@ -98,6 +100,7 @@ class RelayController:
                 self._record_outcome("relay_deenergize_error")
                 return RelayResult(False, "relay_deenergize_error", idempotency_key,
                                    activated_at, True)
+            _notify(on_deactivation)
             self._record_outcome("activated", activated_at)
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
@@ -166,3 +169,12 @@ def _accepts_keyword(callable_object, keyword: str) -> bool:
         parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+
+
+def _notify(callback) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        pass

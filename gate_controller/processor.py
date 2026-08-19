@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import math
 from collections.abc import Iterable
@@ -264,6 +265,8 @@ class GateProcessor:
         }
         if _accepts_keyword(self._coordinator.actuate, "on_activation"):
             actuation_kwargs["on_activation"] = trace.mark_relay_activation
+        if _accepts_keyword(self._coordinator.actuate, "on_deactivation"):
+            actuation_kwargs["on_deactivation"] = trace.mark_relay_finished
         with self._actuation_lock:
             execution = self._coordinator.actuate(event, **actuation_kwargs)
         if execution.reason in FINAL_INHIBITION_REASONS:
@@ -313,6 +316,7 @@ class GateProcessor:
         if telemetry is None:
             return result
         completed = replace(result, telemetry=telemetry)
+        _log_completed_trace(telemetry)
         if result.event_id is not None:
             try:
                 self._store.attach_event_telemetry(result.event_id, telemetry)
@@ -524,6 +528,9 @@ class _BestEffortTrace:
     def mark_relay_activation(self) -> None:
         self._call("mark_relay_activation")
 
+    def mark_relay_finished(self) -> None:
+        self._call("mark_relay_finished")
+
     def set_actuation_outcome(
         self, claim: str, attempted: bool, relay_outcome: str
     ) -> None:
@@ -613,3 +620,35 @@ def _accepts_keyword(callable_object, keyword: str) -> bool:
         parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+
+
+def _log_completed_trace(telemetry) -> None:
+    try:
+        wire = telemetry.to_wire()
+        attempts = [
+            {
+                "frame_sequence": attempt.get("frame_sequence"),
+                "duration_ms": attempt.get("duration_ms"),
+                "status": attempt.get("status"),
+            }
+            for attempt in wire.get("ocr_attempts", ())
+        ]
+        logging.getLogger(__name__).info(
+            "gate_pipeline stage=processing_finished trace_id=%s outcome=%s reason=%s "
+            "relay_outcome=%s durations=%s timestamps=%s ocr_attempts=%s",
+            wire["trace_id"],
+            wire["decision"]["outcome"],
+            wire["decision"]["reason"],
+            wire["actuation"]["relay_outcome"],
+            json.dumps(
+                wire["stage_durations"], sort_keys=True, separators=(",", ":")
+            ),
+            json.dumps(
+                wire.get("stage_timestamps", {}),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            json.dumps(attempts, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        return

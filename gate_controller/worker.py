@@ -51,7 +51,8 @@ class BurstCollector:
     def __init__(self, emit, quiet_window: float = 0.5, ranker=rank_images, clock=monotonic,
                  arrival_clock=None, include_received_at: bool = False,
                  include_decision_started_at: bool = False,
-                 max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES):
+                 max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
+                 wall_clock=None):
         if not 1 <= max_candidates <= MAX_BURST_CANDIDATES:
             raise ValueError("max_candidates exceeds the safe range")
         self._emit = emit
@@ -59,11 +60,13 @@ class BurstCollector:
         self._ranker = ranker
         self._clock = clock
         self._arrival_clock = arrival_clock or (lambda: datetime.now(timezone.utc))
+        self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._include_received_at = include_received_at
         self._include_decision_started_at = include_decision_started_at
         self._max_candidates = max_candidates
         self._pending: list[Path] = []
         self._received_at: datetime | None = None
+        self._first_seen: float | None = None
         self._deadline: float | None = None
         self._lock = Lock()
 
@@ -73,6 +76,7 @@ class BurstCollector:
         with self._lock:
             if not self._pending:
                 self._received_at = received_at or self._arrival_clock()
+                self._first_seen = self._clock()
             elif received_at is not None and received_at < self._received_at:
                 self._received_at = received_at
             if path in self._pending:
@@ -91,14 +95,27 @@ class BurstCollector:
                 return False
             pending = tuple(self._pending)
             received_at = self._received_at
+            first_seen = self._first_seen
             self._pending = []
             self._received_at = None
+            self._first_seen = None
             self._deadline = None
         ranked = tuple(self._ranker(pending))
         ranked_paths = set(ranked)
         _remove_uploads(path for path in pending if path not in ranked_paths)
         if not ranked:
             return False
+        wait_ms = (
+            max(0, round((decision_started_at - first_seen) * 1_000))
+            if first_seen is not None else None
+        )
+        LOGGER.info(
+            "gate_pipeline stage=burst_processing_started observed_at=%s "
+            "candidate_count=%d ingress_wait_ms=%s",
+            self._wall_clock().astimezone(timezone.utc).isoformat(),
+            len(ranked),
+            wait_ms if wait_ms is not None else "unavailable",
+        )
         details = [ranked]
         if self._include_received_at:
             details.append(received_at)
@@ -144,14 +161,24 @@ class CompletedImageHandler(FileSystemEventHandler):
         if is_directory or path.suffix.lower() not in {".jpg", ".jpeg"}:
             return
         dropped = []
+        first_observation = None
         with self._lock:
             now = self._clock()
             candidate = self._retry_at.pop(path, None)
-            self._retry_at[path] = candidate or (now, now, 0, self._arrival_clock())
+            if candidate is None:
+                first_observation = self._arrival_clock()
+            self._retry_at[path] = candidate or (now, now, 0, first_observation)
             while len(self._retry_at) > self._max_pending_candidates:
                 dropped_path = next(iter(self._retry_at))
                 self._retry_at.pop(dropped_path)
                 dropped.append(dropped_path)
+            pending_count = len(self._retry_at)
+        if first_observation is not None:
+            LOGGER.info(
+                "gate_pipeline stage=filesystem_ingress observed_at=%s pending_count=%d",
+                first_observation.astimezone(timezone.utc).isoformat(),
+                pending_count,
+            )
         for dropped_path in dropped:
             self._reject(dropped_path, "candidate_coalesced")
 

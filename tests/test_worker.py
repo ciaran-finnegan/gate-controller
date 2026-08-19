@@ -57,6 +57,20 @@ class PassiveObserver:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_filesystem_ingress_is_logged_without_exposing_the_image_path(self):
+        collector = RecordingCollector()
+        observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        handler = CompletedImageHandler(collector, arrival_clock=lambda: observed_at)
+        private_path = Path("/private/camera/customer-plate.jpg")
+
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            handler.schedule_candidate(private_path)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_pipeline stage=filesystem_ingress", combined)
+        self.assertIn("observed_at=2026-08-14T10:00:00+00:00", combined)
+        self.assertNotIn(str(private_path), combined)
+
     def test_coalesces_completed_files_until_the_quiet_window_expires(self):
         clock = MutableClock()
         emitted = []

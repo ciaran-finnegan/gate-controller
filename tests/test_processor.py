@@ -171,6 +171,29 @@ class GateProcessorTests(unittest.TestCase):
         Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
         return path
 
+    def test_completed_trace_log_correlates_sanitized_stage_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "private-owner-registration.jpg")
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+            )
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,))
+
+        combined = "\n".join(logs.output)
+        self.assertIn(
+            f"gate_pipeline stage=processing_finished "
+            f"trace_id={result.telemetry.trace_id}",
+            combined,
+        )
+        self.assertIn("outcome=allowed reason=exact_match", combined)
+        self.assertIn('ocr_attempts=[{"duration_ms":', combined)
+        self.assertNotIn(str(frame), combined)
+        self.assertNotIn("12D3456", combined)
+
     def test_rejects_nonfinite_or_nonpositive_decision_budgets(self):
         with tempfile.TemporaryDirectory() as directory:
             store = LocalStore(Path(directory) / "gate.db")
@@ -295,6 +318,8 @@ class GateProcessorTests(unittest.TestCase):
             "decision_ms": 0,
             "decision_to_relay_ms": 0,
             "end_to_end_ms": 1_150,
+            "filesystem_ingress_to_decision_ms": 1_150,
+            "filesystem_ingress_to_relay_ms": 1_150,
         })
 
     def test_upstream_seed_failure_is_best_effort(self):
@@ -644,6 +669,7 @@ class GateProcessorTests(unittest.TestCase):
             "capture_to_burst_ms": 500,
             "ocr_ms": 0,
             "end_to_end_ms": 4_600,
+            "filesystem_ingress_to_decision_ms": 4_600,
         })
 
     def test_preprocessing_stale_path_retains_upstream_terminal_durations(self):
@@ -696,6 +722,7 @@ class GateProcessorTests(unittest.TestCase):
             "capture_to_burst_ms": 500,
             "ocr_ms": 0,
             "end_to_end_ms": 6_200,
+            "filesystem_ingress_to_decision_ms": 6_200,
         })
 
     def test_stale_burst_has_zero_ocr_work_and_no_recognizer_or_relay_calls(self):

@@ -51,6 +51,30 @@ class RecordingBackend:
 
 
 class RelayControllerTests(unittest.TestCase):
+    def test_reports_relay_start_and_finish_at_the_physical_boundaries(self):
+        backend = RecordingBackend()
+        calls = []
+        controller = RelayController(
+            backend,
+            pulse_seconds=0,
+            sleeper=lambda _: calls.append("pulse"),
+        )
+        backend.calls.clear()
+
+        try:
+            result = controller.trigger(
+                "ocr",
+                "image:one",
+                on_activation=lambda: calls.append("started"),
+                on_deactivation=lambda: calls.append("finished"),
+            )
+        except TypeError as error:
+            self.fail(f"relay completion observability is unavailable: {error}")
+
+        self.assertTrue(result.activated)
+        self.assertEqual(backend.calls, ["on", "off"])
+        self.assertEqual(calls, ["started", "pulse", "finished"])
+
     def test_pi_gpio_high_cannot_follow_shutdown_latch_establishment(self):
         shutdown_progress = Event()
         high_edge_reached = Event()
