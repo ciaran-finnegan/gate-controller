@@ -194,12 +194,17 @@ The managed systemd drop-in keeps transport selection on `auto`, which first
 tries QUIC and falls back to HTTP/2 when UDP cannot connect. All four outbound
 tunnel connections remain encrypted. Bootstrap records the existing service
 state and drop-in before activation. When the effective drop-in changes and
-`cloudflared.service` was active, bootstrap restarts it with a 30-second bound
-and explicitly confirms it is active afterward. An inactive or absent service
-is never started, and the previous enabled state is left unchanged. If later
+`cloudflared.service` was active, bootstrap queues a non-blocking restart, tracks
+the PID 1 job with a 30-second bound, and explicitly confirms it is active
+afterward. A timed-out job is cancelled and the unit must leave every
+transitional state before rollback can queue another restart. An inactive or
+absent service is never started, the previous enabled state is left unchanged,
+and an unchanged drop-in does not restart the tunnel during rollback. If later
 bootstrap activation fails, the exact previous drop-in, including its absence,
 is restored before an originally active service is restarted and checked
-against the prior setting.
+against the prior setting. Exact-restore or `daemon-reload` failure is reported
+without being masked by later rollback work; the backup and rollback diagnostics
+remain under the printed `/run/gate-controller-install.*` path for recovery.
 
 After bootstrap, confirm the effective setting and selected connection
 protocol:

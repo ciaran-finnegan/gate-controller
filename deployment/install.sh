@@ -36,6 +36,12 @@ CLOUDFLARED_WAS_PRESENT=false
 CLOUDFLARED_WAS_ENABLED=false
 CLOUDFLARED_WAS_ACTIVE=false
 CLOUDFLARED_DROP_IN_CHANGED=false
+CLOUDFLARED_CURRENT_JOB=
+CLOUDFLARED_CURRENT_ACTIVE_STATE=
+CLOUDFLARED_JOB_TIMEOUT_SECONDS=30
+CLOUDFLARED_QUIESCE_TIMEOUT_SECONDS=10
+CLOUDFLARED_POLL_SECONDS=1
+ROLLBACK_FAILED=false
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
 
@@ -186,6 +192,131 @@ run_systemctl_bounded() {
   timeout --signal=TERM --kill-after=5s 30s systemctl "$@"
 }
 
+inspect_cloudflared_runtime_state() {
+  local line output property value
+
+  output=$(
+    run_systemctl_bounded show "$CLOUDFLARED_SERVICE" \
+      --property=Job --property=ActiveState --all
+  ) || {
+    fail "could not inspect the runtime state of $CLOUDFLARED_SERVICE" || true
+    return 1
+  }
+  CLOUDFLARED_CURRENT_JOB=
+  CLOUDFLARED_CURRENT_ACTIVE_STATE=
+  while IFS= read -r line; do
+    property=${line%%=*}
+    value=${line#*=}
+    case "$property" in
+      Job) CLOUDFLARED_CURRENT_JOB=$value ;;
+      ActiveState) CLOUDFLARED_CURRENT_ACTIVE_STATE=$value ;;
+    esac
+  done <<<"$output"
+  [[ -n $CLOUDFLARED_CURRENT_ACTIVE_STATE ]] || {
+    fail "$CLOUDFLARED_SERVICE returned no ActiveState" || true
+    return 1
+  }
+}
+
+cloudflared_runtime_is_quiescent() {
+  [[ -z $CLOUDFLARED_CURRENT_JOB ]] || return 1
+  case "$CLOUDFLARED_CURRENT_ACTIVE_STATE" in
+    active|inactive|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_cloudflared_quiescence() {
+  local timeout_seconds=${1:-$CLOUDFLARED_QUIESCE_TIMEOUT_SECONDS}
+  local deadline=$((SECONDS + timeout_seconds))
+
+  while true; do
+    inspect_cloudflared_runtime_state || return 1
+    cloudflared_runtime_is_quiescent && return 0
+    (( SECONDS < deadline )) || return 1
+    sleep "$CLOUDFLARED_POLL_SECONDS"
+  done
+}
+
+cancel_cloudflared_job_and_wait() {
+  local job_path=$1
+  local job_id=${job_path##*/}
+  local cancel_failed=false
+
+  if [[ ! $job_id =~ ^[1-9][0-9]*$ ]]; then
+    fail "$CLOUDFLARED_SERVICE returned an invalid systemd job path: $job_path" \
+      || true
+    return 1
+  fi
+  if ! run_systemctl_bounded cancel "$job_id"; then
+    fail "could not cancel systemd job $job_id for $CLOUDFLARED_SERVICE" \
+      || true
+    cancel_failed=true
+  fi
+  if ! wait_for_cloudflared_quiescence; then
+    fail "$CLOUDFLARED_SERVICE did not become quiescent after cancelling job $job_id" \
+      || true
+    return 1
+  fi
+  [[ $cancel_failed == false ]]
+}
+
+quiesce_cloudflared_before_rollback() {
+  inspect_cloudflared_runtime_state || return 1
+  if [[ -n $CLOUDFLARED_CURRENT_JOB ]]; then
+    cancel_cloudflared_job_and_wait "$CLOUDFLARED_CURRENT_JOB"
+  elif ! cloudflared_runtime_is_quiescent; then
+    wait_for_cloudflared_quiescence
+  fi
+}
+
+restart_cloudflared_bounded() {
+  local deadline=$((SECONDS + CLOUDFLARED_JOB_TIMEOUT_SECONDS))
+  local job_path
+
+  if ! run_systemctl_bounded --no-block restart "$CLOUDFLARED_SERVICE"; then
+    fail "could not enqueue restart for $CLOUDFLARED_SERVICE" || true
+    return 1
+  fi
+  while true; do
+    inspect_cloudflared_runtime_state || return 1
+    if [[ -z $CLOUDFLARED_CURRENT_JOB ]]; then
+      if [[ $CLOUDFLARED_CURRENT_ACTIVE_STATE == active ]]; then
+        break
+      fi
+      case "$CLOUDFLARED_CURRENT_ACTIVE_STATE" in
+        inactive|failed)
+          fail "$CLOUDFLARED_SERVICE became $CLOUDFLARED_CURRENT_ACTIVE_STATE during restart" \
+            || true
+          return 1
+          ;;
+      esac
+    fi
+    if (( SECONDS >= deadline )); then
+      job_path=$CLOUDFLARED_CURRENT_JOB
+      if [[ -n $job_path ]]; then
+        cancel_cloudflared_job_and_wait "$job_path" || {
+          fail "$CLOUDFLARED_SERVICE restart timed out and its systemd job could not be quiesced" \
+            || true
+          return 1
+        }
+      elif ! wait_for_cloudflared_quiescence; then
+        fail "$CLOUDFLARED_SERVICE restart timed out in a transitional state" \
+          || true
+        return 1
+      fi
+      fail "$CLOUDFLARED_SERVICE restart timed out; its systemd job was cancelled and quiesced" \
+        || true
+      return 1
+    fi
+    sleep "$CLOUDFLARED_POLL_SECONDS"
+  done
+  run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE" || {
+    fail "$CLOUDFLARED_SERVICE is not active after restart" || true
+    return 1
+  }
+}
+
 capture_cloudflared_service_state() {
   local load_state status
 
@@ -269,10 +400,10 @@ apply_cloudflared_transport_if_active() {
   [[ $CLOUDFLARED_WAS_PRESENT == true ]] || return 0
   [[ $CLOUDFLARED_WAS_ACTIVE == true ]] || return 0
 
-  run_systemctl_bounded restart "$CLOUDFLARED_SERVICE" \
-    || fail "could not restart $CLOUDFLARED_SERVICE"
-  run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE" \
-    || fail "$CLOUDFLARED_SERVICE is not active after transport restart"
+  restart_cloudflared_bounded || {
+    fail "could not restart $CLOUDFLARED_SERVICE" || true
+    return 1
+  }
   verify_cloudflared_enabled_state
 }
 
@@ -301,23 +432,43 @@ restore_cloudflared_transport_drop_in() {
   local temporary
 
   if [[ -e $backup || -L $backup ]]; then
-    [[ ! -L $destination_root ]] \
-      || fail "$destination_root must not be a symbolic link"
-    [[ ! -d $destination ]] \
-      || fail "$destination must not be a directory"
-    install -d -o root -g root -m 0755 "$destination_root"
-    temporary=$destination_root/.20-http2.conf.restore.$$
-    [[ ! -e $temporary && ! -L $temporary ]] \
-      || fail "cloudflared transport restore path already exists"
-    if ! cp -a -- "$backup" "$temporary"; then
-      rm -f -- "$temporary"
+    if [[ -L $destination_root ]]; then
+      fail "$destination_root must not be a symbolic link" || true
       return 1
     fi
-    mv -f -- "$temporary" "$destination"
+    if [[ -d $destination ]]; then
+      fail "$destination must not be a directory" || true
+      return 1
+    fi
+    if ! install -d -o root -g root -m 0755 "$destination_root"; then
+      fail "could not prepare cloudflared transport restore directory" || true
+      return 1
+    fi
+    temporary=$destination_root/.20-http2.conf.restore.$$
+    if [[ -e $temporary || -L $temporary ]]; then
+      fail "cloudflared transport restore path already exists" || true
+      return 1
+    fi
+    if ! cp -a -- "$backup" "$temporary"; then
+      rm -f -- "$temporary"
+      fail "could not copy the exact cloudflared transport backup" || true
+      return 1
+    fi
+    if ! mv -f -- "$temporary" "$destination"; then
+      rm -f -- "$temporary"
+      fail "could not atomically restore the cloudflared transport drop-in" \
+        || true
+      return 1
+    fi
   elif [[ -f $absent && ! -L $absent ]]; then
-    rm -f -- "$destination"
+    if ! rm -f -- "$destination"; then
+      fail "could not restore absence of the cloudflared transport drop-in" \
+        || true
+      return 1
+    fi
   else
-    fail "cloudflared transport backup is missing"
+    fail "cloudflared transport backup is missing" || true
+    return 1
   fi
 }
 
@@ -325,17 +476,61 @@ restore_cloudflared_transport_after_rollback() {
   local systemd_root=$1
   local backup_dir=$2
 
-  restore_cloudflared_transport_drop_in "$systemd_root" "$backup_dir"
-  run_systemctl_bounded daemon-reload \
-    || fail "could not reload systemd after cloudflared transport rollback"
-  if [[ $CLOUDFLARED_WAS_PRESENT == true \
+  if ! restore_cloudflared_transport_drop_in "$systemd_root" "$backup_dir"; then
+    fail "could not restore exact cloudflared transport drop-in during rollback" \
+      || true
+    return 1
+  fi
+  if [[ $CLOUDFLARED_DROP_IN_CHANGED == true \
+        && $CLOUDFLARED_WAS_PRESENT == true \
         && $CLOUDFLARED_WAS_ACTIVE == true ]]; then
-    run_systemctl_bounded restart "$CLOUDFLARED_SERVICE" \
-      || fail "could not restart $CLOUDFLARED_SERVICE during rollback"
-    run_systemctl_bounded is-active --quiet "$CLOUDFLARED_SERVICE" \
-      || fail "$CLOUDFLARED_SERVICE is not active after rollback"
+    if ! quiesce_cloudflared_before_rollback; then
+      fail "$CLOUDFLARED_SERVICE could not be quiesced before rollback" \
+        || true
+      return 1
+    fi
+  fi
+  if ! run_systemctl_bounded daemon-reload; then
+    fail "could not reload systemd after cloudflared transport rollback" \
+      || true
+    return 1
+  fi
+  if [[ $CLOUDFLARED_DROP_IN_CHANGED == true \
+        && $CLOUDFLARED_WAS_PRESENT == true \
+        && $CLOUDFLARED_WAS_ACTIVE == true ]]; then
+    restart_cloudflared_bounded || {
+      fail "could not restart $CLOUDFLARED_SERVICE during rollback" \
+        || true
+      return 1
+    }
     verify_cloudflared_enabled_state
   fi
+}
+
+restore_cloudflared_transport_with_diagnostics() {
+  local systemd_root=$1
+  local backup_dir=$2
+  local diagnostics=$backup_dir/cloudflared-rollback-error.log
+  local status
+
+  if ! (umask 077 && : >"$diagnostics"); then
+    fail "could not create cloudflared rollback diagnostics at $diagnostics" \
+      || true
+    return 1
+  fi
+  if restore_cloudflared_transport_after_rollback \
+    "$systemd_root" "$backup_dir" 2>"$diagnostics"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ -s $diagnostics ]]; then
+    cat -- "$diagnostics" >&2 || true
+  fi
+  if [[ $status -eq 0 ]]; then
+    rm -f -- "$diagnostics"
+  fi
+  return "$status"
 }
 
 install_fixed_media_bootstrap() {
@@ -655,7 +850,8 @@ cleanup() {
   if [[ -n $STAGING && -d $STAGING ]]; then
     rm -rf -- "$STAGING"
   fi
-  if [[ -n $BACKUP_DIR && -d $BACKUP_DIR ]]; then
+  if [[ $ROLLBACK_FAILED == false \
+        && -n $BACKUP_DIR && -d $BACKUP_DIR ]]; then
     rm -rf -- "$BACKUP_DIR"
   fi
 }
@@ -686,7 +882,13 @@ rollback() {
     restore_path "$UPDATER_SERVICE"
     restore_path "$UPDATER_TIMER"
     restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
-    restore_cloudflared_transport_after_rollback "$SYSTEMD_ROOT" "$BACKUP_DIR"
+    if ! restore_cloudflared_transport_with_diagnostics \
+      "$SYSTEMD_ROOT" "$BACKUP_DIR"; then
+      ROLLBACK_FAILED=true
+      printf '%s\n' \
+        "Cloudflared rollback was incomplete; exact backup and diagnostics retained at $BACKUP_DIR." \
+        >&2
+    fi
     configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
     if [[ $UPDATER_WAS_ENABLED == false ]]; then
       systemctl disable --now "$UPDATER_TIMER"
