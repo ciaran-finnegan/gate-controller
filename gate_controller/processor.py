@@ -595,6 +595,8 @@ def _actuation_telemetry(execution) -> tuple[str, bool, str]:
         return "cooldown", False, "not_attempted"
     if execution.reason == "actuation_inhibit_error":
         return "claim_error", False, "not_attempted"
+    if execution.reason == "relay_latched":
+        return "claimed", False, "relay_latched"
     if execution.reason in FINAL_INHIBITION_REASONS:
         return "claimed", False, "inhibited"
     if execution.reason == "indeterminate_claim":

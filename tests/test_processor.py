@@ -1287,6 +1287,40 @@ class GateProcessorTests(unittest.TestCase):
             "relay_outcome": "inhibited",
         })
 
+    def test_shutdown_latch_reports_no_physical_activation_attempt(self):
+        class Backend:
+            def __init__(self):
+                self.calls = []
+
+            def on(self, *, pre_activation_inhibit=None):
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+                self.calls.append("on")
+                return None
+
+            def off(self):
+                self.calls.append("off")
+
+        backend = Backend()
+        relay = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        relay.begin_shutdown()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                relay,
+                SequenceRecognizer([PlateObservation("12D3456", 0.99)]),
+            ).process((Path("shutdown-latched.jpg"),))
+
+        self.assertFalse(result.opened)
+        self.assertEqual(result.reason, "relay_latched")
+        self.assertEqual(backend.calls, ["off"])
+        self.assertEqual(result.telemetry.to_wire()["actuation"], {
+            "claim": "claimed",
+            "attempted": False,
+            "relay_outcome": "relay_latched",
+        })
+
     def test_deadline_check_follows_all_final_validation_before_gpio(self):
         decision_clock = MutableClock()
         original_normalise = processor_module.normalise_plate
