@@ -893,6 +893,169 @@ rollback
             self.assertLess(reload_index, actions.index("restart application"))
             self.assertLess(reload_index, actions.index("restart legacy command"))
 
+    def test_critical_restore_failure_blocks_all_later_service_actions(self):
+        prerequisites = [
+            "restore current release",
+            "restore file-monitor.service",
+            "restore gate-command-server.service",
+            "restore gate-controller-updater.service",
+            "restore gate-controller-updater.timer",
+            "restore fixed updater helper",
+        ]
+        independent_restores = [
+            *prerequisites,
+            "reload restored systemd units",
+            "restore cloudflared files",
+            "restore FTP home",
+        ]
+        unsafe_actions = [
+            "unsafe cloudflared service action",
+            "unsafe timer enablement action",
+            "unsafe timer activity action",
+            "unsafe application enablement action",
+            "unsafe application activity",
+            "unsafe legacy activity",
+        ]
+
+        for failed_prerequisite in prerequisites:
+            with self.subTest(failed_prerequisite=failed_prerequisite):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    backup = root / "backup"
+                    backup.mkdir()
+                    action_log = root / "actions.log"
+                    command = f"""
+source deployment/install.sh
+FAIL_STEP={shlex.quote(failed_prerequisite)}
+record_restore() {{
+  printf '%s\n' "$1" >> {shlex.quote(str(action_log))}
+  [[ $1 != "$FAIL_STEP" ]]
+}}
+restore_current_release() {{ record_restore 'restore current release'; }}
+restore_path() {{ record_restore "restore $1"; }}
+run_systemctl_bounded() {{ record_restore 'reload restored systemd units'; }}
+restore_fixed_updater_helper() {{ record_restore 'restore fixed updater helper'; }}
+restore_cloudflared_transport_with_diagnostics() {{
+  record_restore 'unsafe cloudflared service action'
+}}
+restore_cloudflared_transport_drop_in() {{ record_restore 'restore cloudflared files'; }}
+configure_ftp_home() {{ record_restore 'restore FTP home'; }}
+restore_unit_enablement() {{ record_restore 'unsafe timer enablement action'; }}
+restore_unit_activity() {{ record_restore 'unsafe timer activity action'; }}
+systemctl() {{ record_restore 'unsafe application enablement action'; }}
+restore_application_activity() {{ record_restore 'unsafe application activity'; }}
+restore_legacy_command_activity() {{ record_restore 'unsafe legacy activity'; }}
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+BACKUP_DIR={shlex.quote(str(backup))}
+: >"$BACKUP_DIR/$UPDATER_TIMER"
+STAGING=
+APP_WAS_ENABLED=false
+set +e
+false
+rollback
+"""
+
+                    completed = subprocess.run(
+                        ["bash", "-c", command],
+                        cwd=REPOSITORY_ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(1, completed.returncode, completed.stderr)
+                    actions = action_log.read_text(encoding="utf-8").splitlines()
+                    for expected_restore in independent_restores:
+                        self.assertIn(expected_restore, actions)
+                    for unsafe_action in unsafe_actions:
+                        self.assertNotIn(unsafe_action, actions)
+                    self.assertIn(
+                        f"Rollback step failed: {failed_prerequisite}",
+                        (backup / "rollback-error.log").read_text(encoding="utf-8"),
+                    )
+
+    def test_restore_path_rejects_preexisting_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            backup = root / "backup"
+            systemd_root = root / "systemd"
+            backup.mkdir()
+            systemd_root.mkdir()
+            destination = systemd_root / "file-monitor.service"
+            sentinel = root / "sentinel"
+            action_log = root / "actions.log"
+            destination.write_text("candidate unit\n", encoding="utf-8")
+            sentinel.write_text("sentinel unchanged\n", encoding="utf-8")
+            (backup / "file-monitor.service").write_text(
+                "previous unit\n", encoding="utf-8"
+            )
+            for unit in (
+                "gate-command-server.service",
+                "gate-controller-updater.service",
+                "gate-controller-updater.timer",
+            ):
+                (backup / f"{unit}.absent").touch()
+            command = f"""
+source deployment/install.sh
+record_action() {{ printf '%s\n' "$1" >> {shlex.quote(str(action_log))}; }}
+restore_current_release() {{ :; }}
+run_systemctl_bounded() {{ record_action 'reload restored systemd units'; }}
+restore_fixed_updater_helper() {{ :; }}
+restore_cloudflared_transport_with_diagnostics() {{
+  record_action 'unsafe cloudflared service action'
+}}
+restore_cloudflared_transport_drop_in() {{ record_action 'restore cloudflared files'; }}
+configure_ftp_home() {{ record_action 'restore FTP home'; }}
+restore_unit_enablement() {{ record_action 'unsafe timer enablement action'; }}
+restore_application_activity() {{ record_action 'unsafe application activity'; }}
+restore_legacy_command_activity() {{ record_action 'unsafe legacy activity'; }}
+SYSTEMD_ROOT={shlex.quote(str(systemd_root))}
+BACKUP_DIR={shlex.quote(str(backup))}
+STAGING=
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+APP_WAS_ENABLED=true
+ln -s {shlex.quote(str(sentinel))} "$SYSTEMD_ROOT/.$APP_SERVICE.rollback.$$"
+set +e
+false
+rollback
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertEqual(
+                "sentinel unchanged\n", sentinel.read_text(encoding="utf-8")
+            )
+            self.assertTrue(destination.is_file())
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(
+                "candidate unit\n", destination.read_text(encoding="utf-8")
+            )
+            actions = action_log.read_text(encoding="utf-8").splitlines()
+            self.assertIn("restore cloudflared files", actions)
+            self.assertIn("restore FTP home", actions)
+            for unsafe_action in (
+                "unsafe cloudflared service action",
+                "unsafe timer enablement action",
+                "unsafe application activity",
+                "unsafe legacy activity",
+            ):
+                self.assertNotIn(unsafe_action, actions)
+            self.assertIn(
+                "Rollback step failed: restore file-monitor.service",
+                (backup / "rollback-error.log").read_text(encoding="utf-8"),
+            )
+
     def test_failed_unit_reload_withholds_dependent_service_actions(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1006,8 +1169,11 @@ kill -s {signal_name} $$
                 "restore gate-controller-updater.service",
                 "restore gate-controller-updater.timer",
                 "restore fixed updater helper",
-                "restore cloudflared transport",
+                "restore cloudflared transport files",
                 "restore FTP home",
+            ]
+            unsafe_actions = [
+                "restore cloudflared transport",
                 "restore updater timer enablement",
                 "restore updater timer activity",
                 "restore application enablement",
@@ -1028,6 +1194,7 @@ run_systemctl_bounded() {{
 }}
 restore_fixed_updater_helper() {{ record_failure 'restore fixed updater helper'; }}
 restore_cloudflared_transport_with_diagnostics() {{ record_failure 'restore cloudflared transport'; }}
+restore_cloudflared_transport_drop_in() {{ record_failure 'restore cloudflared transport files'; }}
 configure_ftp_home() {{ record_failure 'restore FTP home'; }}
 restore_unit_enablement() {{ record_failure 'restore updater timer enablement'; }}
 restore_unit_activity() {{ record_failure 'restore updater timer activity'; }}
@@ -1083,18 +1250,23 @@ rollback
                 with self.subTest(expected=expected):
                     self.assertIn(expected, actions)
                     self.assertIn(f"Rollback step failed: {expected}", diagnostic_text)
+            self.assertIn("reload restored systemd units", actions)
+            for unsafe_action in unsafe_actions:
+                self.assertNotIn(unsafe_action, actions)
             self.assertNotIn("unexpected current release move", actions)
             self.assertIn("Rollback was incomplete", completed.stderr)
             self.assertIn(str(backup), completed.stderr)
 
     def test_each_rollback_failure_independently_retains_diagnostics(self):
-        failure_classes = [
+        prerequisite_failure_classes = [
             "restore current release",
             "restore file-monitor.service",
             "restore gate-command-server.service",
             "restore gate-controller-updater.service",
             "restore gate-controller-updater.timer",
             "restore fixed updater helper",
+        ]
+        service_failure_classes = [
             "restore cloudflared transport",
             "restore FTP home",
             "restore updater timer enablement",
@@ -1103,8 +1275,21 @@ rollback
             "restore application activity",
             "restore legacy command activity",
         ]
+        prerequisite_actions = [
+            *prerequisite_failure_classes,
+            "reload restored systemd units",
+        ]
+        service_actions = [*service_failure_classes]
+        blocked_service_actions = [
+            "restore cloudflared transport",
+            "restore updater timer enablement",
+            "restore updater timer activity",
+            "restore application enablement",
+            "restore application activity",
+            "restore legacy command activity",
+        ]
 
-        for failure_class in failure_classes:
+        for failure_class in prerequisite_failure_classes + service_failure_classes:
             with self.subTest(failure_class=failure_class):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     root = Path(temporary_directory)
@@ -1126,6 +1311,7 @@ run_systemctl_bounded() {{
 }}
 restore_fixed_updater_helper() {{ record_step 'restore fixed updater helper'; }}
 restore_cloudflared_transport_with_diagnostics() {{ record_step 'restore cloudflared transport'; }}
+restore_cloudflared_transport_drop_in() {{ record_step 'restore cloudflared transport files'; }}
 configure_ftp_home() {{ record_step 'restore FTP home'; }}
 restore_unit_enablement() {{ record_step 'restore updater timer enablement'; }}
 restore_unit_activity() {{ record_step 'restore updater timer activity'; }}
@@ -1179,8 +1365,17 @@ rollback
                         diagnostics.read_text(encoding="utf-8"),
                     )
                     actions = action_log.read_text(encoding="utf-8").splitlines()
-                    for expected in failure_classes:
+                    for expected in prerequisite_actions:
                         self.assertIn(expected, actions)
+                    if failure_class in prerequisite_failure_classes:
+                        self.assertIn("restore cloudflared transport files", actions)
+                        self.assertIn("restore FTP home", actions)
+                        for unsafe_action in blocked_service_actions:
+                            self.assertNotIn(unsafe_action, actions)
+                    else:
+                        for expected in service_actions:
+                            self.assertIn(expected, actions)
+                        self.assertNotIn("restore cloudflared transport files", actions)
                     if failure_class == "restore current release":
                         self.assertNotIn("complete current release switch", actions)
 

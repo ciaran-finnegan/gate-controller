@@ -47,6 +47,7 @@ ROLLBACK_DIAGNOSTICS=
 ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
 ROLLBACK_STARTED=false
 ROLLBACK_STEP_SUCCEEDED=true
+ROLLBACK_PREREQUISITES_SUCCEEDED=true
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
 
@@ -725,9 +726,14 @@ restore_path() {
   local temporary=$SYSTEMD_ROOT/.$name.rollback.$$
 
   if [[ -e $backup || -L $backup ]]; then
-    [[ ! -d $destination ]] || fail "$destination must not be a directory"
-    [[ ! -e $temporary && ! -L $temporary ]] \
-      || fail "unit restore path already exists: $temporary"
+    if [[ -d $destination ]]; then
+      fail "$destination must not be a directory" || true
+      return 1
+    fi
+    if [[ -e $temporary || -L $temporary ]]; then
+      fail "unit restore path already exists: $temporary" || true
+      return 1
+    fi
     if ! cp -a -- "$backup" "$temporary"; then
       rm -f -- "$temporary"
       return 1
@@ -740,7 +746,8 @@ restore_path() {
   elif [[ -f $absent && ! -L $absent ]]; then
     rm -f -- "$destination"
   else
-    fail "unit backup is missing for $name"
+    fail "unit backup is missing for $name" || true
+    return 1
   fi
 }
 
@@ -865,9 +872,15 @@ run_rollback_step() {
   return 0
 }
 
+run_rollback_prerequisite() {
+  run_rollback_step "$@"
+  if [[ $ROLLBACK_STEP_SUCCEEDED == false ]]; then
+    ROLLBACK_PREREQUISITES_SUCCEEDED=false
+  fi
+}
+
 rollback() {
   local original_status=$?
-  local systemd_units_reloaded=false
   if [[ $# -gt 0 ]]; then
     original_status=$1
   fi
@@ -883,20 +896,23 @@ rollback() {
   set +e
   if [[ $ACTIVATION_STARTED == true && $INSTALL_SUCCEEDED == false ]]; then
     printf 'Managed startup failed; restoring the previous installation.\n' >&2
+    ROLLBACK_PREREQUISITES_SUCCEEDED=true
     prepare_rollback_diagnostics
-    run_rollback_step "restore current release" restore_current_release
-    run_rollback_step "restore $APP_SERVICE" restore_path "$APP_SERVICE"
-    run_rollback_step "restore $LEGACY_COMMAND_UNIT" restore_path "$LEGACY_COMMAND_UNIT"
-    run_rollback_step "restore $UPDATER_SERVICE" restore_path "$UPDATER_SERVICE"
-    run_rollback_step "restore $UPDATER_TIMER" restore_path "$UPDATER_TIMER"
-    run_rollback_step \
+    run_rollback_prerequisite "restore current release" restore_current_release
+    run_rollback_prerequisite "restore $APP_SERVICE" restore_path "$APP_SERVICE"
+    run_rollback_prerequisite \
+      "restore $LEGACY_COMMAND_UNIT" restore_path "$LEGACY_COMMAND_UNIT"
+    run_rollback_prerequisite \
+      "restore $UPDATER_SERVICE" restore_path "$UPDATER_SERVICE"
+    run_rollback_prerequisite \
+      "restore $UPDATER_TIMER" restore_path "$UPDATER_TIMER"
+    run_rollback_prerequisite \
       "reload restored systemd units" \
       run_systemctl_bounded daemon-reload
-    systemd_units_reloaded=$ROLLBACK_STEP_SUCCEEDED
-    run_rollback_step \
+    run_rollback_prerequisite \
       "restore fixed updater helper" \
       restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
-    if [[ $systemd_units_reloaded == true ]]; then
+    if [[ $ROLLBACK_PREREQUISITES_SUCCEEDED == true ]]; then
       run_rollback_step \
         "restore cloudflared transport" \
         restore_cloudflared_transport_with_diagnostics "$SYSTEMD_ROOT" "$BACKUP_DIR"
@@ -908,7 +924,7 @@ rollback() {
     run_rollback_step \
       "restore FTP home" \
       configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
-    if [[ $systemd_units_reloaded == true ]]; then
+    if [[ $ROLLBACK_PREREQUISITES_SUCCEEDED == true ]]; then
       run_rollback_step \
         "restore updater timer enablement" \
         restore_unit_enablement "$UPDATER_TIMER" "$UPDATER_WAS_ENABLED"
@@ -933,7 +949,7 @@ rollback() {
           "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
     else
       printf '%s\n' \
-        "Service-state restoration skipped because restored systemd units could not be reloaded." \
+        "Service-state restoration skipped because critical rollback prerequisites failed." \
         >&2
     fi
   fi
