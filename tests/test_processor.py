@@ -1179,17 +1179,20 @@ class GateProcessorTests(unittest.TestCase):
             results = []
             processing = Thread(target=lambda: results.append(processor.process((frame,))))
             processing.start()
-            self.assertTrue(recognising.wait(1.0))
-            processing.join(0.5)
+            try:
+                self.assertTrue(recognising.wait(1.0))
+                processing.join(0.5)
+                returned_while_ocr_blocked = not processing.is_alive()
+                ocr_finished_before_release = finished.is_set()
+            finally:
+                release.set()
+                processing.join(1.0)
 
-        returned_while_ocr_blocked = not processing.is_alive()
-        ocr_finished_before_release = finished.is_set()
-        release.set()
-        processing.join(1.0)
+        processing_stopped = not processing.is_alive()
 
         self.assertTrue(returned_while_ocr_blocked)
         self.assertFalse(ocr_finished_before_release)
-        self.assertFalse(processing.is_alive())
+        self.assertTrue(processing_stopped)
         self.assertEqual(results[0].reason, "decision_timeout")
         self.assertEqual(relay_calls, [])
         self.assertTrue(finished.wait(0.5))
@@ -2071,13 +2074,13 @@ class GateProcessorTests(unittest.TestCase):
             result = []
             processing = Thread(target=lambda: result.append(processor.process((frame,))))
             processing.start()
-            self.assertTrue(attach_started.wait(timeout=1))
-
-            self.assertEqual(outbox.run_once(), 0)
-            self.assertEqual(sent, [])
-
-            allow_attach.set()
-            processing.join(timeout=1)
+            try:
+                self.assertTrue(attach_started.wait(timeout=1))
+                self.assertEqual(outbox.run_once(), 0)
+                self.assertEqual(sent, [])
+            finally:
+                allow_attach.set()
+                processing.join(timeout=1)
             self.assertFalse(processing.is_alive())
             self.assertEqual(outbox.run_once(), 1)
 

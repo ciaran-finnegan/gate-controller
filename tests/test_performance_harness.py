@@ -147,7 +147,7 @@ class PerformanceHarnessTests(unittest.TestCase):
                 self.send_response(200)
                 self.end_headers()
 
-            def log_message(self, format, *args):
+            def log_message(self, format_string, *args):
                 pass
 
         with ThreadingHTTPServer(("127.0.0.1", 0), RecordingProxyHandler) as proxy:

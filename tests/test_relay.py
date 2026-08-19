@@ -75,6 +75,34 @@ class RelayControllerTests(unittest.TestCase):
         self.assertEqual(backend.calls, ["on", "off"])
         self.assertEqual(calls, ["started", "pulse", "finished"])
 
+    def test_shutdown_reports_the_first_physical_deactivation_exactly_once(self):
+        backend = RecordingBackend()
+        activated = Event()
+        callback_boundaries = []
+        results = []
+        controller = RelayController(backend, pulse_seconds=60)
+        backend.calls.clear()
+
+        worker = Thread(target=lambda: results.append(controller.trigger(
+            "ocr",
+            "image:shutdown-race",
+            on_activation=activated.set,
+            on_deactivation=lambda: callback_boundaries.append(tuple(backend.calls)),
+        )))
+        worker.start()
+        try:
+            self.assertTrue(activated.wait(1))
+            self.assertTrue(controller.begin_shutdown())
+            worker.join(1)
+        finally:
+            controller.begin_shutdown()
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(results[0].activated)
+        self.assertEqual(backend.calls, ["on", "off", "off", "off"])
+        self.assertEqual(callback_boundaries, [("on", "off")])
+
     def test_pi_gpio_high_cannot_follow_shutdown_latch_establishment(self):
         shutdown_progress = Event()
         high_edge_reached = Event()

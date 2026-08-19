@@ -15,6 +15,8 @@ running unchanged.
   `GATE_CLOUDFLARE_API_URL`, `GATE_CLOUDFLARE_ACCESS_CLIENT_ID`, and
   `GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET` as one Access-authenticated controller
   API group; a partial remote-control configuration fails bootstrap.
+- Set `GATE_TELEMETRY_RETENTION_DAYS` to an integer from 1 through 3650 when the
+  default 30-day local diagnostic retention window is unsuitable.
 - A dedicated `ftp-user` already created by the selected FTP server setup. The
   installer deliberately does not create or assign credentials to an FTP
   account.

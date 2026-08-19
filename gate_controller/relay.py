@@ -19,6 +19,7 @@ class RelayController:
         self._lock = Lock()
         self._activation_boundary = getattr(relay, "activation_boundary", None) or RLock()
         self._shutdown_requested = Event()
+        self._active_deactivation_callback = None
         safe = self._deenergize()
         self._latched = not safe
         self._last_outcome = "initialized_safe" if safe else "relay_deenergize_error"
@@ -71,6 +72,7 @@ class RelayController:
                                 latched=detail == "relay_latched",
                             )
                         self._relay.on()
+                    self._active_deactivation_callback = on_deactivation
                 activated_at = self._clock()
                 if on_activation is not None:
                     try:
@@ -89,7 +91,6 @@ class RelayController:
                         raise
                     return RelayResult(False, "relay_deenergize_error", idempotency_key,
                                        activated_at, True)
-                _notify(on_deactivation)
                 if not isinstance(error, Exception):
                     self._record_outcome("relay_error", activated_at)
                     raise
@@ -100,15 +101,18 @@ class RelayController:
                 self._record_outcome("relay_deenergize_error")
                 return RelayResult(False, "relay_deenergize_error", idempotency_key,
                                    activated_at, True)
-            _notify(on_deactivation)
             self._record_outcome("activated", activated_at)
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
     def begin_shutdown(self) -> bool:
+        callback = None
         with self._activation_boundary:
             self._shutdown_requested.set()
             self._latched = True
             safe = self._deenergize_at_boundary()
+            if safe:
+                callback = self._take_deactivation_callback_at_boundary()
+        _notify(callback)
         with self._lock:
             self._record_outcome("shutdown_safe" if safe else "relay_deenergize_error")
             return safe
@@ -129,8 +133,13 @@ class RelayController:
         self._last_outcome_at = observed_at or self._clock()
 
     def _deenergize(self) -> bool:
+        callback = None
         with self._activation_boundary:
-            return self._deenergize_at_boundary()
+            safe = self._deenergize_at_boundary()
+            if safe:
+                callback = self._take_deactivation_callback_at_boundary()
+        _notify(callback)
+        return safe
 
     def _deenergize_at_boundary(self) -> bool:
         for _ in range(self._max_off_attempts):
@@ -140,6 +149,11 @@ class RelayController:
             except Exception:
                 continue
         return False
+
+    def _take_deactivation_callback_at_boundary(self):
+        callback = self._active_deactivation_callback
+        self._active_deactivation_callback = None
+        return callback
 
 
 class PiRelayAdapter:

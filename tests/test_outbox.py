@@ -367,7 +367,11 @@ class OutboxWorkerTests(unittest.TestCase):
 
         worker = OutboxWorker(store, send=send)
 
-        self.assertEqual(worker.run_once(), 0)
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        combined = "\n".join(logs.output)
+        self.assertIn("error_type=RuntimeError", combined)
+        self.assertNotIn("offline", combined)
         self.assertEqual(sent[0]["telemetry"]["delivery"], {
             "outbox_attempt": 1,
             "state": "sending",
@@ -431,6 +435,22 @@ class OutboxWorkerTests(unittest.TestCase):
             combined,
         )
 
+    def test_ack_persistence_failure_logs_only_the_exception_type(self):
+        store, event_id = self._queued_store()
+        store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.attach_event_telemetry(event_id, _telemetry())
+        worker = OutboxWorker(store, send=lambda payload: None)
+
+        with mock.patch.object(
+            store, "complete_outbox_item", side_effect=OSError("private path")
+        ), self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_pipeline stage=cloud_ack_persist_failed", combined)
+        self.assertIn("error_type=OSError", combined)
+        self.assertNotIn("private path", combined)
+
     def test_invalid_send_timestamp_does_not_fabricate_cloud_ack_duration(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
@@ -475,6 +495,28 @@ class OutboxWorkerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0], datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc))
         self.assertEqual(calls[1], datetime(2026, 7, 17, 13, 1, tzinfo=timezone.utc))
+
+    def test_retention_uses_the_configured_number_of_days(self):
+        store, _ = self._queued_store()
+        cutoffs = []
+        store.purge_delivered_telemetry = cutoffs.append
+        now = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+        worker = OutboxWorker(
+            store,
+            send=lambda payload: None,
+            clock=lambda: now,
+            telemetry_retention_days=7,
+        )
+
+        worker.run_once()
+
+        self.assertEqual(cutoffs, [datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)])
+
+    def test_retention_days_must_be_positive(self):
+        store, _ = self._queued_store()
+
+        with self.assertRaisesRegex(ValueError, "telemetry_retention_days"):
+            OutboxWorker(store, send=lambda payload: None, telemetry_retention_days=0)
 
     def test_prepares_an_immutable_evidence_reference_without_a_local_path(self):
         with tempfile.TemporaryDirectory() as directory:

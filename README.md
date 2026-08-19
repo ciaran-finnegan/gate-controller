@@ -97,6 +97,11 @@ and fail closed when older than
 `GATE_AUTHORISATION_MAX_STALENESS_SECONDS`; recognition only reads that in-memory
 snapshot and never waits for a network request.
 
+Detailed local pipeline telemetry is retained for 30 days by default. Set
+`GATE_TELEMETRY_RETENTION_DAYS` to an integer from 1 through 3650 to change the
+window. `python -m gate_controller telemetry-export` produces a bounded JSON or
+CSV diagnostic export from a database snapshot and never initializes the relay.
+
 Remote commands are accepted only by the loopback command server hosted inside
 the main controller process at
 `POST /commands`, exposed through the authenticated Cloudflare Tunnel. Supported

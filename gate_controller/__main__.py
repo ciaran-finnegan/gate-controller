@@ -223,6 +223,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     camera_stale_seconds = float(environment.get("GATE_CAMERA_STALE_SECONDS", "60"))
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
+    telemetry_retention_days = _telemetry_retention_days(environment)
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
     if coordinator is not None:
@@ -240,6 +241,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             store,
             CloudflareOutboxSender(cloudflare_client, controller_id),
             controller_id=controller_id,
+            telemetry_retention_days=telemetry_retention_days,
         ))
         if authorised is not None:
             workers.append(AuthorisationRefreshWorker(
@@ -266,12 +268,28 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                 outbox_url, bearer_token=bearer_token, controller_id=controller_id,
             ),
             controller_id=controller_id,
+            telemetry_retention_days=telemetry_retention_days,
         ))
     return tuple(workers), prompt_player, lambda: _controller_status(
         store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
     )
+
+
+def _telemetry_retention_days(environment) -> int:
+    configured = environment.get("GATE_TELEMETRY_RETENTION_DAYS", "30")
+    try:
+        days = int(configured)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "GATE_TELEMETRY_RETENTION_DAYS must be an integer between 1 and 3650"
+        ) from error
+    if not 1 <= days <= 3650:
+        raise ValueError(
+            "GATE_TELEMETRY_RETENTION_DAYS must be an integer between 1 and 3650"
+        )
+    return days
 
 
 def _configured_prompts(environment) -> dict[str, Path]:

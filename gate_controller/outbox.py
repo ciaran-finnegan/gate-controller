@@ -250,7 +250,14 @@ class OutboxWorker:
     def __init__(self, store, send: Callable[..., None], poll_interval: float = 5.0, *,
                  evidence_spool: EvidenceSpool | None = None,
                  controller_id: str = "primary",
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None,
+                 telemetry_retention_days: int = 30):
+        if (
+            isinstance(telemetry_retention_days, bool)
+            or not isinstance(telemetry_retention_days, int)
+            or not 1 <= telemetry_retention_days <= 3650
+        ):
+            raise ValueError("telemetry_retention_days must be between 1 and 3650")
         self._store = store
         self._send = send
         self._poll_interval = poll_interval
@@ -259,6 +266,7 @@ class OutboxWorker:
         )
         self._controller_id = controller_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._telemetry_retention_days = telemetry_retention_days
         self._last_retention_at: datetime | None = None
         self._last_item_id: int | None = None
         try:
@@ -310,10 +318,11 @@ class OutboxWorker:
                     self._send(payload)
                 else:
                     self._send(payload, self._evidence_spool.load(image_digest))
-            except Exception:
+            except Exception as error:
                 LOGGER.warning(
-                    "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d",
-                    trace_id, item_id,
+                    "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d "
+                    "error_type=%s",
+                    trace_id, item_id, type(error).__name__,
                 )
                 try:
                     self._store.mark_outbox_retry(item_id)
@@ -325,7 +334,12 @@ class OutboxWorker:
                 self._store.complete_outbox_item(
                     item_id, acknowledged_at, prepared_payload=payload
                 )
-            except Exception:
+            except Exception as error:
+                LOGGER.warning(
+                    "gate_pipeline stage=cloud_ack_persist_failed trace_id=%s "
+                    "item_id=%d error_type=%s",
+                    trace_id, item_id, type(error).__name__,
+                )
                 continue
             LOGGER.info(
                 "gate_pipeline stage=cloud_acknowledged trace_id=%s item_id=%d "
@@ -351,7 +365,9 @@ class OutboxWorker:
             return
         self._last_retention_at = now
         try:
-            self._store.purge_delivered_telemetry(now - timedelta(days=30))
+            self._store.purge_delivered_telemetry(
+                now - timedelta(days=self._telemetry_retention_days)
+            )
         except Exception:
             pass
 
