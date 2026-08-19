@@ -1737,17 +1737,25 @@ class GateProcessorTests(unittest.TestCase):
     def test_timed_out_ocr_cleanup_is_bounded_when_abandon_hangs(self):
         release = Event()
         abandon_started = Event()
+        abandon_finished = Event()
+        recognition_finished = Event()
         processing_completed = Event()
 
         class BlockingCleanupRecognizer:
             def recognise(self, path, timeout=None):
-                release.wait(2)
-                return PlateObservation(None, 0.0)
+                try:
+                    release.wait(2)
+                    return PlateObservation(None, 0.0)
+                finally:
+                    recognition_finished.set()
 
             def abandon_in_flight(self):
                 abandon_started.set()
-                release.wait(2)
-                return False
+                try:
+                    release.wait(2)
+                    return False
+                finally:
+                    abandon_finished.set()
 
         results = []
         try:
@@ -1775,10 +1783,14 @@ class GateProcessorTests(unittest.TestCase):
         finally:
             release.set()
             processing_completed.wait(2.0)
+            recognition_finished.wait(2.0)
+            abandon_finished.wait(2.0)
             if "worker" in locals():
                 worker.join(1.0)
 
         self.assertFalse(worker.is_alive())
+        self.assertTrue(recognition_finished.is_set())
+        self.assertTrue(abandon_finished.is_set())
 
     def test_burst_that_becomes_stale_during_ocr_does_not_open(self):
         captured_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)

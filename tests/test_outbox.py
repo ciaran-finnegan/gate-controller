@@ -162,6 +162,69 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
+    def test_local_telemetry_retention_removes_expired_unqueued_rows(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        retention_worker = getattr(outbox_module, "TelemetryRetentionWorker", None)
+        self.assertIsNotNone(retention_worker)
+        worker = retention_worker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertIsNone(store.event_telemetry(event_id))
+
+    def test_local_telemetry_retention_preserves_rows_queued_for_delivery(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        retention_worker = getattr(outbox_module, "TelemetryRetentionWorker", None)
+        self.assertIsNotNone(retention_worker)
+        worker = retention_worker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 0)
+        self.assertIsNotNone(store.event_telemetry(event_id))
+
+    def test_local_telemetry_retention_removes_expired_delivered_rows(self):
+        store, event_id = self._queued_store()
+        store.attach_event_telemetry(event_id, _telemetry())
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        store.complete_outbox_item(
+            item_id, datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        )
+        with closing(sqlite3.connect(store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE event_telemetry SET created_at = ? WHERE event_id = ?",
+                ("2026-08-01T00:00:00+00:00", event_id),
+            )
+
+        worker = outbox_module.TelemetryRetentionWorker(
+            store,
+            retention_days=7,
+            clock=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertIsNone(store.event_telemetry(event_id))
+
     def test_legacy_v2_mid_send_attachment_remains_truthfully_pending(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})

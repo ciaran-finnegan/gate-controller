@@ -300,6 +300,20 @@ class MainConfigurationTests(unittest.TestCase):
                         }, latest_image={},
                     )
 
+    def test_local_only_configuration_still_builds_a_telemetry_retention_worker(self):
+        workers, _, _ = build_background_workers(
+            self.create_store(), relay=object(), environment={
+                "GATE_TELEMETRY_RETENTION_DAYS": "9",
+            },
+        )
+
+        retention_workers = [
+            worker for worker in workers
+            if type(worker).__name__ == "TelemetryRetentionWorker"
+        ]
+        self.assertEqual(len(retention_workers), 1)
+        self.assertEqual(retention_workers[0].retention_days, 9)
+
     def test_command_server_worker_uses_the_main_process_coordinator(self):
         store = self.create_store()
         coordinator = object()

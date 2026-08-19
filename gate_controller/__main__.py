@@ -19,7 +19,10 @@ from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
-from .outbox import CloudflareOutboxSender, HttpOutboxSender, OutboxWorker
+from .outbox import (
+    CloudflareOutboxSender, HttpOutboxSender, OutboxWorker,
+    TelemetryRetentionWorker,
+)
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
 from .store import LocalStore
@@ -269,6 +272,10 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             ),
             controller_id=controller_id,
             telemetry_retention_days=telemetry_retention_days,
+        ))
+    else:
+        workers.append(TelemetryRetentionWorker(
+            store, retention_days=telemetry_retention_days,
         ))
     return tuple(workers), prompt_player, lambda: _controller_status(
         store, prompt_player, latest_image, relay=relay,

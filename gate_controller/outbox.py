@@ -244,6 +244,46 @@ def _has_jpeg_signature(path: Path) -> bool:
         return False
 
 
+class TelemetryRetentionWorker:
+    """Bound local-only telemetry without touching rows queued for delivery."""
+
+    def __init__(self, store, *, retention_days: int = 30,
+                 poll_interval: float = 3600,
+                 clock: Callable[[], datetime] | None = None):
+        if (
+            isinstance(retention_days, bool)
+            or not isinstance(retention_days, int)
+            or not 1 <= retention_days <= 3650
+        ):
+            raise ValueError("retention_days must be between 1 and 3650")
+        self._store = store
+        self._retention_days = retention_days
+        self._poll_interval = poll_interval
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @property
+    def retention_days(self) -> int:
+        return self._retention_days
+
+    def run_once(self) -> int:
+        cutoff = self._clock() - timedelta(days=self._retention_days)
+        removed = 0
+        for purge in (
+            self._store.purge_delivered_telemetry,
+            self._store.purge_unqueued_telemetry,
+        ):
+            try:
+                removed += purge(cutoff)
+            except Exception:
+                pass
+        return removed
+
+    def run_forever(self, stop_event: Event) -> None:
+        while not stop_event.is_set():
+            self.run_once()
+            stop_event.wait(self._poll_interval)
+
+
 class OutboxWorker:
     """Persist remote work first, then retry it without affecting gate decisions."""
 

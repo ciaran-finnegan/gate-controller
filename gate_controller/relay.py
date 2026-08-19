@@ -1,6 +1,6 @@
 import inspect
 from datetime import datetime, timezone
-from threading import Event, Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from time import sleep
 
 from .models import RelayResult
@@ -17,6 +17,7 @@ class RelayController:
         self._max_off_attempts = max_off_attempts
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
+        self._outcome_lock = Lock()
         self._activation_boundary = getattr(relay, "activation_boundary", None) or RLock()
         self._shutdown_requested = Event()
         self._active_deactivation_callback = None
@@ -49,6 +50,10 @@ class RelayController:
                 self._record_outcome("relay_latched")
                 return RelayResult(False, "relay_latched", idempotency_key, latched=True)
             activated_at = None
+            activation_notified = Event()
+            deactivation_callback = _after_event(
+                activation_notified, on_deactivation
+            )
             try:
                 with self._activation_boundary:
                     if _accepts_keyword(self._relay.on, "pre_activation_inhibit"):
@@ -72,13 +77,16 @@ class RelayController:
                                 latched=detail == "relay_latched",
                             )
                         self._relay.on()
-                    self._active_deactivation_callback = on_deactivation
-                activated_at = self._clock()
-                if on_activation is not None:
-                    try:
-                        on_activation()
-                    except Exception:
-                        pass
+                    self._active_deactivation_callback = deactivation_callback
+                try:
+                    activated_at = self._clock()
+                    if on_activation is not None:
+                        try:
+                            on_activation()
+                        except Exception:
+                            pass
+                finally:
+                    activation_notified.set()
                 if self._sleeper is sleep:
                     self._shutdown_requested.wait(self._pulse_seconds)
                 else:
@@ -101,7 +109,12 @@ class RelayController:
                 self._record_outcome("relay_deenergize_error")
                 return RelayResult(False, "relay_deenergize_error", idempotency_key,
                                    activated_at, True)
-            self._record_outcome("activated", activated_at)
+            if deactivation_callback is not None:
+                deactivation_callback.wait_until_notified()
+            if self._shutdown_requested.is_set():
+                self._record_outcome("shutdown_safe")
+            else:
+                self._record_outcome("activated", activated_at)
             return RelayResult(True, "activated", idempotency_key, activated_at)
 
     def begin_shutdown(self) -> bool:
@@ -112,25 +125,28 @@ class RelayController:
             safe = self._deenergize_at_boundary()
             if safe:
                 callback = self._take_deactivation_callback_at_boundary()
-        _notify(callback)
-        with self._lock:
-            self._record_outcome("shutdown_safe" if safe else "relay_deenergize_error")
-            return safe
+        _notify_without_waiting(callback)
+        self._record_outcome("shutdown_safe" if safe else "relay_deenergize_error")
+        return safe
 
     def shutdown(self) -> bool:
         return self.begin_shutdown()
 
     def status(self) -> dict:
         with self._lock:
+            with self._outcome_lock:
+                last_outcome = self._last_outcome
+                last_outcome_at = self._last_outcome_at
             return {
                 "ready": not self._latched and not self._shutdown_requested.is_set(),
-                "last_outcome": self._last_outcome,
-                "last_outcome_at": self._last_outcome_at.isoformat(),
+                "last_outcome": last_outcome,
+                "last_outcome_at": last_outcome_at.isoformat(),
             }
 
     def _record_outcome(self, outcome: str, observed_at=None) -> None:
-        self._last_outcome = outcome
-        self._last_outcome_at = observed_at or self._clock()
+        with self._outcome_lock:
+            self._last_outcome = outcome
+            self._last_outcome_at = observed_at or self._clock()
 
     def _deenergize(self) -> bool:
         callback = None
@@ -192,3 +208,48 @@ def _notify(callback) -> None:
         callback()
     except Exception:
         pass
+
+
+def _after_event(event: Event, callback):
+    if callback is None:
+        return None
+    return _AfterEvent(event, callback)
+
+
+class _AfterEvent:
+    def __init__(self, event: Event, callback):
+        self._event = event
+        self._callback = callback
+        self._notified = Event()
+
+    @property
+    def ready(self) -> bool:
+        return self._event.is_set()
+
+    def __call__(self) -> None:
+        self._event.wait()
+        try:
+            self._callback()
+        finally:
+            self._notified.set()
+
+    def wait_until_notified(self) -> None:
+        self._notified.wait()
+
+    def skip(self) -> None:
+        self._notified.set()
+
+
+def _notify_without_waiting(callback) -> None:
+    if not isinstance(callback, _AfterEvent) or callback.ready:
+        _notify(callback)
+        return
+    try:
+        Thread(
+            target=_notify,
+            args=(callback,),
+            daemon=True,
+            name="relay-deactivation-report",
+        ).start()
+    except Exception:
+        callback.skip()

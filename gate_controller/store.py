@@ -586,6 +586,29 @@ class LocalStore:
         finally:
             connection.close()
 
+    def purge_unqueued_telemetry(self, cutoff: datetime) -> int:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            removed = connection.execute(
+                """
+                DELETE FROM event_telemetry
+                WHERE created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outbox
+                      WHERE outbox.event_id = event_telemetry.event_id
+                  )
+                """,
+                (_timestamp(cutoff),),
+            ).rowcount
+            connection.commit()
+            return removed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def pending_evidence_digests(self) -> set[str]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
