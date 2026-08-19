@@ -544,14 +544,30 @@ restore_media_artifacts() {
 
 quiesce_published_media() {
   local failed=0
+  local status unit
+  local -a media_units=(
+    gate-media-transcoder.service
+    gate-media-gateway.service
+    gate-media-auth.service
+  )
 
-  systemctl disable --now gate-media-transcoder.service \
-    gate-media-gateway.service gate-media-auth.service >/dev/null 2>&1 \
-    || failed=1
+  for unit in "${media_units[@]}"; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || failed=1
+  done
   systemctl disable --now "$MEDIA_TURN_REFRESH_TIMER" >/dev/null 2>&1 \
     || failed=1
   systemctl stop "$MEDIA_TURN_REFRESH_SERVICE" >/dev/null 2>&1 \
     || failed=1
+
+  for unit in "${media_units[@]}" \
+      "$MEDIA_TURN_REFRESH_TIMER" "$MEDIA_TURN_REFRESH_SERVICE"; do
+    if systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
+      failed=1
+    else
+      status=$?
+      [[ $status -eq 3 ]] || failed=1
+    fi
+  done
   [[ $failed -eq 0 ]]
 }
 
@@ -600,18 +616,19 @@ rollback_media_install_transaction() {
   if ! quiesce_published_media; then
     failed=1
     prerequisites_failed=1
-  fi
-  if ! restore_media_artifacts; then
-    failed=1
-    prerequisites_failed=1
-  fi
-  if ! systemctl daemon-reload; then
-    failed=1
-    prerequisites_failed=1
-  fi
-  if ! validate_restored_nginx; then
-    failed=1
-    prerequisites_failed=1
+  else
+    if ! restore_media_artifacts; then
+      failed=1
+      prerequisites_failed=1
+    fi
+    if ! systemctl daemon-reload; then
+      failed=1
+      prerequisites_failed=1
+    fi
+    if ! validate_restored_nginx; then
+      failed=1
+      prerequisites_failed=1
+    fi
   fi
   if [[ $prerequisites_failed -eq 0 ]]; then
     if ! restore_media_unit_states; then

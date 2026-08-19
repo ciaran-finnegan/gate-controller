@@ -146,7 +146,7 @@ class RelayControllerTests(unittest.TestCase):
         self.assertEqual([False], high_states)
         self.assertEqual(gpio.LOW, gpio_calls[-1][0])
 
-    def test_shutdown_request_at_gpio_boundary_prevents_activation(self):
+    def test_shutdown_waits_for_callback_backend_activation_boundary(self):
         boundary_reached = Event()
         release_boundary = Event()
 
@@ -175,14 +175,107 @@ class RelayControllerTests(unittest.TestCase):
         worker.start()
         self.assertTrue(boundary_reached.wait(1))
 
-        controller.begin_shutdown()
-        release_boundary.set()
-        worker.join(1)
+        shutdown = Thread(target=controller.begin_shutdown)
+        shutdown.start()
+        try:
+            release_boundary.set()
+            worker.join(1)
+            shutdown.join(1)
+        finally:
+            release_boundary.set()
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(backend.calls, ["off", "off"])
-        self.assertEqual(results[0].reason, "relay_latched")
-        self.assertTrue(results[0].latched)
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(backend.calls.count("on"), 1)
+        self.assertEqual(backend.calls.count("off"), 3)
+        self.assertTrue(results[0].activated)
+
+    def test_callback_backend_without_boundary_cannot_turn_on_after_shutdown_latch(self):
+        callback_returned = Event()
+        release_on = Event()
+        race_decided = Event()
+
+        class ObservedBoundary:
+            def __init__(self):
+                self._lock = RLock()
+                self._owner = None
+
+            def acquire(self):
+                if current_thread().name == "relay-shutdown" and self._owner is not None:
+                    race_decided.set()
+                acquired = self._lock.acquire()
+                self._owner = current_thread()
+                return acquired
+
+            def release(self):
+                self._owner = None
+                self._lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, _type, _value, _traceback):
+                self.release()
+
+        class ObservedShutdownEvent:
+            def __init__(self):
+                self._event = Event()
+
+            def set(self):
+                self._event.set()
+                race_decided.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                return self._event.wait(timeout)
+
+        class CallbackBackend:
+            def __init__(self):
+                self.calls = []
+
+            def on(self, *, pre_activation_inhibit=None):
+                inhibition = pre_activation_inhibit()
+                if inhibition is not None:
+                    return inhibition
+                callback_returned.set()
+                release_on.wait(1)
+                self.calls.append(("on", shutdown_event.is_set()))
+                return None
+
+            def off(self):
+                self.calls.append(("off", shutdown_event.is_set()))
+
+        shutdown_event = ObservedShutdownEvent()
+        backend = CallbackBackend()
+        controller = RelayController(backend, pulse_seconds=0, sleeper=lambda _: None)
+        controller._activation_boundary = ObservedBoundary()
+        controller._shutdown_requested = shutdown_event
+        backend.calls.clear()
+        trigger = Thread(
+            target=lambda: controller.trigger(
+                "remote_command", "command:callback-boundary"
+            )
+        )
+        shutdown = Thread(target=controller.begin_shutdown, name="relay-shutdown")
+
+        trigger.start()
+        self.assertTrue(callback_returned.wait(1))
+        shutdown.start()
+        try:
+            self.assertTrue(race_decided.wait(1))
+        finally:
+            release_on.set()
+            trigger.join(1)
+            shutdown.join(1)
+
+        self.assertFalse(trigger.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(
+            [False], [latched for action, latched in backend.calls if action == "on"]
+        )
 
     def test_expiry_inhibition_remains_authoritative_after_shutdown_is_requested(self):
         backend = RecordingBackend()

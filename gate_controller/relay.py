@@ -48,19 +48,19 @@ class RelayController:
                 return RelayResult(False, "relay_latched", idempotency_key, latched=True)
             activated_at = None
             try:
-                if _accepts_keyword(self._relay.on, "pre_activation_inhibit"):
-                    last_moment_inhibition = self._relay.on(
-                        pre_activation_inhibit=activation_inhibition
-                    )
-                    if last_moment_inhibition is not None:
-                        _, detail = last_moment_inhibition
-                        self._record_outcome(detail)
-                        return RelayResult(
-                            False, detail, idempotency_key,
-                            latched=detail == "relay_latched",
+                with self._activation_boundary:
+                    if _accepts_keyword(self._relay.on, "pre_activation_inhibit"):
+                        last_moment_inhibition = self._relay.on(
+                            pre_activation_inhibit=activation_inhibition
                         )
-                else:
-                    with self._activation_boundary:
+                        if last_moment_inhibition is not None:
+                            _, detail = last_moment_inhibition
+                            self._record_outcome(detail)
+                            return RelayResult(
+                                False, detail, idempotency_key,
+                                latched=detail == "relay_latched",
+                            )
+                    else:
                         last_moment_inhibition = activation_inhibition()
                         if last_moment_inhibition is not None:
                             _, detail = last_moment_inhibition

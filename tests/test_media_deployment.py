@@ -1785,6 +1785,105 @@ main {arguments}
     def test_first_install_timer_failure_restores_artifact_absence(self):
         self._assert_media_transaction_failure_restores("timer", existing_install=False)
 
+    def test_quiesce_attempts_and_verifies_every_unit_after_a_partial_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "events.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'disable --now gate-media-gateway.service') return 1 ;;
+    'is-active --quiet gate-media-gateway.service') return 0 ;;
+    is-active*) return 3 ;;
+    *) return 0 ;;
+  esac
+}}
+set +e
+quiesce_published_media
+status=$?
+set -e
+printf 'status=%s\n' "$status" >> {shlex.quote(str(log))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "systemctl disable --now gate-media-transcoder.service",
+                    "systemctl disable --now gate-media-gateway.service",
+                    "systemctl disable --now gate-media-auth.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl is-active --quiet gate-media-transcoder.service",
+                    "systemctl is-active --quiet gate-media-gateway.service",
+                    "systemctl is-active --quiet gate-media-auth.service",
+                    "systemctl is-active --quiet gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "status=1",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_partial_quiescence_failure_blocks_artifact_restoration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            backup = state / ".install-backup.test"
+            backup.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_INSTALL_BACKUP_DIR={shlex.quote(str(backup))}
+MEDIA_TRANSACTION_STARTED=1
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'disable --now gate-media-gateway.service') return 1 ;;
+    is-active*) return 3 ;;
+    *) return 0 ;;
+  esac
+}}
+restore_media_artifacts() {{ printf 'restore artifacts\n' >> {shlex.quote(str(log))}; }}
+validate_restored_nginx() {{ printf 'validate nginx\n' >> {shlex.quote(str(log))}; }}
+restore_media_unit_states() {{ printf 'restore states\n' >> {shlex.quote(str(log))}; }}
+flock() {{ printf 'flock %s\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "systemctl disable --now gate-media-transcoder.service",
+                    "systemctl disable --now gate-media-gateway.service",
+                    "systemctl disable --now gate-media-auth.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl is-active --quiet gate-media-transcoder.service",
+                    "systemctl is-active --quiet gate-media-gateway.service",
+                    "systemctl is-active --quiet gate-media-auth.service",
+                    "systemctl is-active --quiet gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertTrue(backup.is_dir())
+            self.assertIn("transaction backup was retained", completed.stderr)
+
     def test_unit_state_rollback_failure_requiesces_and_retains_the_backup(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
