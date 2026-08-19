@@ -1769,8 +1769,28 @@ restore_application_activity {shlex.quote(str(previous_unit))} true
             backup = root / "backup"
             systemd_root = root / "systemd"
             action_log = root / "actions.log"
+            rollback_systemctl_log = root / "rollback-systemctl.log"
+            host_systemctl_log = root / "host-systemctl.log"
+            fake_bin = root / "bin"
             backup.mkdir()
             systemd_root.mkdir()
+            fake_bin.mkdir()
+            fake_systemctl = fake_bin / "systemctl"
+            fake_systemctl.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >> {shlex.quote(str(host_systemctl_log))}\n"
+                "exit 97\n",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+            fake_timeout = fake_bin / "timeout"
+            fake_timeout.write_text(
+                "#!/bin/sh\n"
+                "shift 3\n"
+                "exec \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake_timeout.chmod(0o755)
             previous_unit = backup / "file-monitor.service"
             installed_unit = systemd_root / "file-monitor.service"
             previous_unit.write_text("previous unit\n", encoding="utf-8")
@@ -1778,6 +1798,10 @@ restore_application_activity {shlex.quote(str(previous_unit))} true
             command = f"""
 source deployment/install.sh
 restore_current_release() {{ printf 'restore current release\n' >> {shlex.quote(str(action_log))}; }}
+run_systemctl_bounded() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(rollback_systemctl_log))}
+  [[ "$*" == daemon-reload ]]
+}}
 restore_fixed_updater_helper() {{ :; }}
 restore_fixed_media_bootstrap() {{ :; }}
 restore_cloudflared_transport_with_diagnostics() {{ :; }}
@@ -1799,10 +1823,13 @@ trigger_nested_failure() {{
 }}
 trigger_nested_failure
 """
+            environment = dict(os.environ)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
             completed = subprocess.run(
                 ["bash", "-c", command],
                 cwd=REPOSITORY_ROOT,
+                env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1818,6 +1845,11 @@ trigger_nested_failure
                 ["restore current release"],
                 action_log.read_text(encoding="utf-8").splitlines(),
             )
+            self.assertEqual(
+                ["daemon-reload"],
+                rollback_systemctl_log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertFalse(host_systemctl_log.exists())
 
     def test_rollback_reloads_restored_units_before_cloud_or_service_actions(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
