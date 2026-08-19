@@ -332,7 +332,7 @@ install_fixed_trust_anchors {shlex.quote(str(handoff))} {shlex.quote(str(systemd
             self.assertEqual("trusted helper\n", helper.read_text())
             self.assertEqual(0o555, handoff.stat().st_mode & 0o777)
 
-    def test_fixed_media_bootstrap_includes_turn_refresh_helper_and_units(self):
+    def test_fixed_media_bootstrap_includes_turn_refresh_and_transcoder_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             bootstrap = Path(temporary_directory) / "gate-media-bootstrap"
             command = f"""
@@ -360,6 +360,20 @@ install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
             self.assertEqual(0o700, (bootstrap / "gate_media_turn_refresh.py").stat().st_mode & 0o777)
             for name in ("gate-media-turn-refresh.service", "gate-media-turn-refresh.timer"):
                 self.assertTrue((bootstrap / name).is_file(), name)
+            self.assertEqual(
+                (REPOSITORY_ROOT / "deployment/systemd/gate-media-transcoder.service").read_bytes(),
+                (bootstrap / "gate-media-transcoder.service").read_bytes(),
+            )
+            for name in ("__init__.py", "__main__.py"):
+                self.assertEqual(
+                    (REPOSITORY_ROOT / "gate_media_transcoder" / name).read_bytes(),
+                    (bootstrap / "gate_media_transcoder" / name).read_bytes(),
+                )
+            updater = (
+                REPOSITORY_ROOT / "deployment/gate_controller_updater.py"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("gate-media-transcoder", updater)
+            self.assertNotIn("gate_media_transcoder", updater)
 
     @unittest.skipUnless(shutil.which("flock"), "requires the Linux flock command")
     def test_bootstrap_uses_same_nonblocking_lock_as_updater(self):

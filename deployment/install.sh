@@ -547,9 +547,12 @@ install_fixed_media_bootstrap() {
   local source=$1
   local auth_source=$source/gate_media_auth
   local gateway_source=$source/gate_media_gateway
+  local transcoder_source=$source/gate_media_transcoder
 
   install -d -o root -g root -m 0755 \
-    "$MEDIA_BOOTSTRAP_ROOT/gate_media_auth" "$MEDIA_BOOTSTRAP_ROOT/gate_media_gateway"
+    "$MEDIA_BOOTSTRAP_ROOT/gate_media_auth" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate_media_gateway" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate_media_transcoder"
   install -o root -g root -m 0755 \
     "$source/deployment/install-media.sh" "$MEDIA_BOOTSTRAP_ROOT/install-media.sh"
   install -o root -g root -m 0644 \
@@ -563,6 +566,9 @@ install_fixed_media_bootstrap() {
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-gateway.service" \
     "$MEDIA_BOOTSTRAP_ROOT/gate-media-gateway.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-transcoder.service" \
+    "$MEDIA_BOOTSTRAP_ROOT/gate-media-transcoder.service"
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-turn-refresh.service" \
     "$MEDIA_BOOTSTRAP_ROOT/gate-media-turn-refresh.service"
@@ -581,6 +587,8 @@ install_fixed_media_bootstrap() {
   for name in __init__.py __main__.py; do
     install -o root -g root -m 0644 \
       "$gateway_source/$name" "$MEDIA_BOOTSTRAP_ROOT/gate_media_gateway/$name"
+    install -o root -g root -m 0644 \
+      "$transcoder_source/$name" "$MEDIA_BOOTSTRAP_ROOT/gate_media_transcoder/$name"
   done
 }
 
@@ -1093,6 +1101,8 @@ read -r REMOTE_BRANCH _ < <(
   || fail "source does not contain the media auth service"
 [[ -f $SOURCE/deployment/systemd/gate-media-gateway.service ]] \
   || fail "source does not contain the media gateway service"
+[[ -f $SOURCE/deployment/systemd/gate-media-transcoder.service ]] \
+  || fail "source does not contain the media transcoder service"
 [[ -f $SOURCE/deployment/systemd/gate-media-turn-refresh.service ]] \
   || fail "source does not contain the media TURN refresh service"
 [[ -f $SOURCE/deployment/systemd/gate-media-turn-refresh.timer ]] \
@@ -1104,6 +1114,9 @@ read -r REMOTE_BRANCH _ < <(
 [[ -f $SOURCE/gate_media_gateway/__init__.py \
     && -f $SOURCE/gate_media_gateway/__main__.py ]] \
   || fail "source does not contain the media gateway launcher"
+[[ -f $SOURCE/gate_media_transcoder/__init__.py \
+    && -f $SOURCE/gate_media_transcoder/__main__.py ]] \
+  || fail "source does not contain the media transcoder launcher"
 
 if ! id gate-controller >/dev/null 2>&1; then
   useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin gate-controller

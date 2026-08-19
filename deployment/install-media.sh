@@ -16,6 +16,7 @@ MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
 MEDIA_LIBRARY=/usr/local/lib/gate-media
 MEDIA_TURN_REFRESH_HELPER=$MEDIA_LIBRARY/gate_media_turn_refresh.py
 MEDIA_BINARY=/usr/local/bin/mediamtx
+FFMPEG_BINARY=/usr/bin/ffmpeg
 MEDIA_ARCHIVE_ROOT=$MEDIA_STATE_ROOT/archives
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_PROXY_CONFIG=/etc/nginx/conf.d/gate-media-whep.conf
@@ -97,6 +98,38 @@ media_environment_complete() {
     >/dev/null
 }
 
+preflight_ffmpeg() {
+  local output
+
+  [[ -f $FFMPEG_BINARY && ! -L $FFMPEG_BINARY && -x $FFMPEG_BINARY ]] \
+    || fail "ffmpeg is not installed at $FFMPEG_BINARY"
+  output=$($FFMPEG_BINARY -hide_banner -encoders 2>&1) \
+    || fail "ffmpeg cannot list encoders"
+  awk '$2 == "libopus" { found = 1 } END { exit !found }' <<<"$output" \
+    || fail "ffmpeg has no libopus encoder"
+  output=$($FFMPEG_BINARY -hide_banner -demuxers 2>&1) \
+    || fail "ffmpeg cannot list demuxers"
+  awk '$1 == "D" && $2 == "rtsp" { found = 1 } END { exit !found }' <<<"$output" \
+    || fail "ffmpeg has no RTSP demuxer"
+  output=$($FFMPEG_BINARY -hide_banner -muxers 2>&1) \
+    || fail "ffmpeg cannot list muxers"
+  awk '$1 == "E" && $2 == "rtsp" { found = 1 } END { exit !found }' <<<"$output" \
+    || fail "ffmpeg has no RTSP muxer"
+  output=$($FFMPEG_BINARY -hide_banner -h muxer=rtsp 2>&1) \
+    || fail "ffmpeg cannot load the RTSP muxer"
+  [[ $output == *RTSP* && $output == *tcp* ]] \
+    || fail "ffmpeg RTSP/TCP output is unavailable"
+  output=$($FFMPEG_BINARY -hide_banner -protocols 2>&1) \
+    || fail "ffmpeg cannot list protocols"
+  awk '
+    $0 == "Input:" { section = "input"; next }
+    $0 == "Output:" { section = "output"; next }
+    $1 == "tcp" && section == "input" { input_tcp = 1 }
+    $1 == "tcp" && section == "output" { output_tcp = 1 }
+    END { exit !(input_tcp && output_tcp) }
+  ' <<<"$output" || fail "ffmpeg TCP input/output protocols are unavailable"
+}
+
 prepare_gateway_environments() {
   local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
 
@@ -126,8 +159,45 @@ reject_gpio_membership() {
 }
 
 disable_media_services() {
-  systemctl disable --now gate-media-gateway.service gate-media-auth.service \
+  systemctl disable --now gate-media-transcoder.service \
+    gate-media-gateway.service gate-media-auth.service \
     >/dev/null 2>&1 || true
+}
+
+media_transcoder_is_running_or_retrying() {
+  local active_state sub_state
+
+  if systemctl is-active --quiet gate-media-transcoder.service; then
+    return 0
+  fi
+  active_state=$(systemctl show --property=ActiveState --value gate-media-transcoder.service) \
+    || return 1
+  [[ $active_state == activating ]] || return 1
+  sub_state=$(systemctl show --property=SubState --value gate-media-transcoder.service) \
+    || return 1
+  [[ $sub_state == auto-restart ]]
+}
+
+activate_media_services() {
+  if ! systemctl enable gate-media-auth.service gate-media-gateway.service gate-media-transcoder.service; then
+    disable_media_services
+    return 1
+  fi
+  if ! systemctl restart gate-media-auth.service gate-media-gateway.service gate-media-transcoder.service; then
+    disable_media_services
+    return 1
+  fi
+  local service
+  for service in gate-media-auth.service gate-media-gateway.service; do
+    if ! systemctl is-active --quiet "$service"; then
+      disable_media_services
+      return 1
+    fi
+  done
+  if ! media_transcoder_is_running_or_retrying; then
+    disable_media_services
+    return 1
+  fi
 }
 
 disable_turn_refresh_timer() {
@@ -320,12 +390,15 @@ install_fixed_media_files() {
   local source=$1
   local source_auth=$source/gate_media_auth
   local source_gateway=$source/gate_media_gateway
+  local source_transcoder=$source/gate_media_transcoder
 
   [[ -f $source/deployment/media/mediamtx.yml ]] || fail "MediaMTX config is missing"
   [[ -f $source/deployment/media/nginx-whep-locations.conf.template ]] \
     || fail "WHEP proxy template is missing"
   [[ -f $source/deployment/systemd/gate-media-auth.service ]] || fail "media auth unit is missing"
   [[ -f $source/deployment/systemd/gate-media-gateway.service ]] || fail "media gateway unit is missing"
+  [[ -f $source/deployment/systemd/gate-media-transcoder.service ]] \
+    || fail "media transcoder unit is missing"
   [[ -f $source/deployment/systemd/gate-media-turn-refresh.service ]] \
     || fail "media TURN refresh service is missing"
   [[ -f $source/deployment/systemd/gate-media-turn-refresh.timer ]] \
@@ -335,10 +408,13 @@ install_fixed_media_files() {
   [[ -d $source_auth ]] || fail "media auth package is missing"
   [[ -f $source_gateway/__init__.py && -f $source_gateway/__main__.py ]] \
     || fail "media gateway launcher is missing"
+  [[ -f $source_transcoder/__init__.py && -f $source_transcoder/__main__.py ]] \
+    || fail "media transcoder launcher is missing"
   [[ -f $source/gate_media_config.py ]] || fail "media config validator is missing"
   install -d -o root -g root -m 0755 "$MEDIA_CONFIG_ROOT" "$MEDIA_LIBRARY"
   install -d -o root -g root -m 0755 \
-    "$MEDIA_LIBRARY/gate_media_auth" "$MEDIA_LIBRARY/gate_media_gateway"
+    "$MEDIA_LIBRARY/gate_media_auth" "$MEDIA_LIBRARY/gate_media_gateway" \
+    "$MEDIA_LIBRARY/gate_media_transcoder"
   install -o root -g gate-media -m 0640 \
     "$source/deployment/media/mediamtx.yml" "$MEDIA_CONFIG"
   install -o root -g root -m 0640 \
@@ -347,6 +423,9 @@ install_fixed_media_files() {
     "$source/deployment/systemd/gate-media-auth.service" "$SYSTEMD_ROOT/gate-media-auth.service"
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-gateway.service" "$SYSTEMD_ROOT/gate-media-gateway.service"
+  install -o root -g root -m 0644 \
+    "$source/deployment/systemd/gate-media-transcoder.service" \
+    "$SYSTEMD_ROOT/gate-media-transcoder.service"
   install -o root -g root -m 0644 \
     "$source/deployment/systemd/gate-media-turn-refresh.service" \
     "$SYSTEMD_ROOT/gate-media-turn-refresh.service"
@@ -364,6 +443,10 @@ install_fixed_media_files() {
     "$source_gateway/__init__.py" "$MEDIA_LIBRARY/gate_media_gateway/__init__.py"
   install -o root -g root -m 0644 \
     "$source_gateway/__main__.py" "$MEDIA_LIBRARY/gate_media_gateway/__main__.py"
+  install -o root -g root -m 0644 \
+    "$source_transcoder/__init__.py" "$MEDIA_LIBRARY/gate_media_transcoder/__init__.py"
+  install -o root -g root -m 0644 \
+    "$source_transcoder/__main__.py" "$MEDIA_LIBRARY/gate_media_transcoder/__main__.py"
   install -o root -g root -m 0644 /dev/stdin "$MEDIA_TMPFILES" <<'EOF'
 d /run/gate-media 0775 root gate-media-auth -
 EOF
@@ -396,6 +479,7 @@ main() {
     systemctl systemd-tmpfiles tar uname useradd; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
   done
+  preflight_ffmpeg
   for account in gate-media gate-media-auth; do
     if ! id "$account" >/dev/null 2>&1; then
       useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin "$account"
@@ -419,8 +503,7 @@ main() {
   systemctl daemon-reload
   activate_proxy_config "$STAGED_MEDIA_PROXY_CONFIG"
   if media_environment_complete; then
-    systemctl enable gate-media-auth.service gate-media-gateway.service
-    systemctl restart gate-media-auth.service gate-media-gateway.service
+    activate_media_services
   else
     disable_media_services
     printf 'Media services remain disabled until split source and HMAC environment values exist.\n'

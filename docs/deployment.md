@@ -361,11 +361,12 @@ updates.
 
 ## Isolated Live Media Gateway
 
-Live media is an optional, separate MediaMTX service. It has its own
-`gate-media` and `gate-media-auth` accounts, neither of which belongs to the
-GPIO group or can write `/var/lib/gate-controller`. A failed MediaMTX process,
-authorization sidecar, camera RTSP source, or media health check cannot stop or
-delay the gate controller, its heartbeat, OCR, command worker, or relay.
+Live media is an optional, separate MediaMTX service. It has dedicated
+`gate-media` and `gate-media-auth` accounts plus a dynamic transcoder user. None
+belongs to the GPIO group or can write `/var/lib/gate-controller`. A failed
+MediaMTX process, authorization sidecar, camera RTSP source, transcoder, or media
+health check cannot stop or delay the gate controller, its heartbeat, OCR,
+command worker, or relay.
 
 The only integration is the nonsecret, atomically replaced
 `/run/gate-media/capabilities.json` snapshot. The controller treats a missing,
@@ -403,7 +404,7 @@ GATE_MEDIA_TALKBACK_CONFIGURED=false
 ```
 
 The static gateway environment contains exactly these MediaMTX 1.19.3 overrides.
-`MTX_PATHS_GATE_SOURCE` must use `rtsp` or `rtsps`. Both ICE listeners must use
+`MTX_PATHS_CAMERA_SOURCE` must use `rtsp` or `rtsps`. Both ICE listeners must use
 the same explicit, non-loopback, non-wildcard IP that is reachable on the Pi;
 hostnames are not accepted for binds. `MTX_WEBRTCADDITIONALHOSTS` must be that
 exact IP so MediaMTX can advertise the listeners while interface discovery is
@@ -411,7 +412,7 @@ disabled. It is one IP, not a comma-separated list. `CLIENTONLY=false` allows
 both MediaMTX and the browser to use the generated relay.
 
 ```text
-MTX_PATHS_GATE_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_PATH
+MTX_PATHS_CAMERA_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_PATH
 MTX_WEBRTCLOCALUDPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCLOCALTCPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCADDITIONALHOSTS=REPLACE_PI_IP
@@ -426,10 +427,12 @@ Cloudflare long-term TURN key. The non-root gateway launcher validates the
 combined effective `MTX_` values on every start and refuses to execute MediaMTX
 if source, ICE, or TURN validation fails.
 
-An installer rerun safely migrates the former eight-key combined gateway file:
-it writes the generated TURN file first, atomically replaces the gateway file
-with the five static keys, and can be rerun after any interruption. If a valid
-generated TURN file already exists, migration preserves it.
+An installer rerun safely migrates the former `MTX_PATHS_GATE_SOURCE` name and
+the former eight-key combined gateway file. It writes the generated TURN file
+first, atomically replaces the gateway file with the five canonical static
+keys, and can be rerun after any interruption. If a valid generated TURN file
+already exists, migration preserves it. Files containing both source names are
+rejected without replacement.
 
 ### Automatic Cloudflare TURN Credential Rotation
 
@@ -512,17 +515,37 @@ root-owned mode `0600` under
 `/var/lib/gate-media/archives`, then hashes and extracts that same stable file.
 It requires the extracted candidate to be a regular non-symlink executable,
 verifies the candidate's version, and only then atomically replaces
-`/usr/local/bin/mediamtx`. Every installer error disables both media services;
-missing required environment values also leave them disabled. The fixed
+`/usr/local/bin/mediamtx`. It also requires the existing `/usr/bin/ffmpeg` to
+provide the `libopus` encoder and RTSP/TCP output; it does not install a package.
+Activation enables, restarts, and verifies the auth, gateway, and transcoder
+services as one group. A transcoder in systemd's exact `activating/auto-restart`
+state is accepted so a temporary camera outage does not defeat its recovery
+policy. Any other installer or activation error disables all three.
+Missing required environment values also leave them disabled. The fixed
 application bootstrap may copy media scripts, units, and proxy templates as
-root-owned references, but it never installs the MediaMTX binary.
+root-owned references, but it never installs MediaMTX or ffmpeg. The ordinary
+controller updater cannot replace these privileged media artifacts.
 
-The pinned MediaMTX config disables its RTSP server and all RTSP transports,
-RTMP, HLS, SRT, playback, pprof, MoQ, interface-derived ICE addresses, and every
-unused inherited listener. API (`127.0.0.1:9997`), metrics
-(`127.0.0.1:9998`), WHEP HTTP (`127.0.0.1:8889`), and the authorization sidecar
-(`127.0.0.1:9189`) remain loopback-only. MediaMTX uses RTSP only as a client for
-the configured camera source.
+The pinned MediaMTX config disables RTMP, HLS, SRT, playback, pprof, MoQ,
+interface-derived ICE addresses, and every unused inherited listener. Its RTSP
+server is enabled only on `127.0.0.1:8554` and accepts TCP only. API
+(`127.0.0.1:9997`), metrics (`127.0.0.1:9998`), WHEP HTTP
+(`127.0.0.1:8889`), and the authorization sidecar (`127.0.0.1:9189`) also remain
+loopback-only.
+
+MediaMTX pulls the camera into the private `camera` path. The isolated ffmpeg
+service reads that path over loopback RTSP/TCP, copies H264 without video
+transcoding, converts optional camera audio to Opus, and publishes the browser-
+facing `gate` path over loopback RTSP/TCP. Camera credentials exist only in the
+root-owned gateway environment and never appear in ffmpeg arguments or its
+environment. Authorization grants exactly the blank-credential loopback RTSP
+operations `read camera` and `publish gate`; all other RTSP requests fail.
+Browser WHEP remains a tokenized `read gate` operation.
+
+If the camera or private RTSP path disappears, ffmpeg exits and systemd retries
+it every five seconds. Start-rate lockout is disabled for this isolated unit so
+an extended camera outage cannot leave audio permanently failed after MediaMTX
+recovers; the fixed delay still bounds retry cadence.
 
 The installer root-renders the exact allowed HTTPS origin into
 `/etc/gate-media/nginx-whep-locations.conf` and owns the nginx include
@@ -545,8 +568,10 @@ Before setting `GATE_MEDIA_VIDEO_CONFIGURED=true` or
 `GATE_MEDIA_VIDEO_VERIFIED=true`, complete a WHEP session from a separate
 non-loopback client, verify video delivery, verify a TURN `relay` candidate is
 usable from the intended remote network, and verify teardown. Test listen
-separately before enabling its configured/verified flags. Restart the auth
-service only after those checks. Talkback remains false and
+separately and confirm the published gate path reports Opus, G722, or G711
+before enabling its configured/verified flags; AAC and AC-3 do not count as
+browser-listen readiness. Restart the auth service only after those checks.
+Talkback remains false and
 `hardware_unverified` until the separate physical backchannel acceptance test.
 The sidecar requires every field in the MediaMTX 1.19.3 auth schema, protocol
 `webrtc`, action `read`, controller `primary`, and path `gate`; it does not log

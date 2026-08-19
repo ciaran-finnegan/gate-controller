@@ -18,9 +18,9 @@ pprofAddress: 127.0.0.1:9999
 playback: false
 playbackAddress: 127.0.0.1:9996
 
-# The camera is an RTSP client source. No RTSP server transport is exposed.
-rtsp: false
-rtspTransports: []
+# The RTSP server is TCP-only and loopback-only for the isolated transcoder.
+rtsp: true
+rtspTransports: ["tcp"]
 rtspAddress: 127.0.0.1:8554
 rtspsAddress: 127.0.0.1:8322
 rtpAddress: 127.0.0.1:8000
@@ -53,4 +53,7 @@ pathDefaults:
   sourceOnDemand: false
 
 paths:
-  gate: {}
+  camera: {}
+  gate:
+    source: publisher
+    overridePublisher: false

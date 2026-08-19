@@ -29,7 +29,7 @@ _AUTH_KEYS = frozenset({
     "GATE_MEDIA_TALKBACK_CONFIGURED",
 })
 _GATEWAY_STATIC_KEY_ORDER = (
-    "MTX_PATHS_GATE_SOURCE",
+    "MTX_PATHS_CAMERA_SOURCE",
     "MTX_WEBRTCLOCALUDPADDRESS",
     "MTX_WEBRTCLOCALTCPADDRESS",
     "MTX_WEBRTCADDITIONALHOSTS",
@@ -43,6 +43,7 @@ _RUNTIME_TURN_KEY_ORDER = (
 _GATEWAY_STATIC_KEYS = frozenset(_GATEWAY_STATIC_KEY_ORDER)
 _RUNTIME_TURN_KEYS = frozenset(_RUNTIME_TURN_KEY_ORDER)
 _GATEWAY_KEYS = _GATEWAY_STATIC_KEYS | _RUNTIME_TURN_KEYS
+_LEGACY_GATEWAY_SOURCE_KEY = "MTX_PATHS_GATE_SOURCE"
 _TURN_KEYS = frozenset({"TURN_KEY_ID", "TURN_KEY_API_TOKEN"})
 _BOOLEAN_AUTH_KEYS = _AUTH_KEYS - {"GATE_MEDIA_HMAC_SECRET"}
 
@@ -163,7 +164,7 @@ def validate_gateway_static_environment(values: Mapping[str, str]) -> dict[str, 
     _validate_effective_values(selected)
     if set(selected) != _GATEWAY_STATIC_KEYS:
         raise MediaConfigError("static gateway environment has missing or forbidden keys")
-    _validate_rtsp_source(selected["MTX_PATHS_GATE_SOURCE"])
+    _validate_rtsp_source(selected["MTX_PATHS_CAMERA_SOURCE"])
     udp_host, _ = _parse_ice_bind(selected["MTX_WEBRTCLOCALUDPADDRESS"])
     tcp_host, _ = _parse_ice_bind(selected["MTX_WEBRTCLOCALTCPADDRESS"])
     if udp_host != tcp_host:
@@ -214,6 +215,7 @@ def validate_split_gateway_environment(
 def migrate_gateway_environments(gateway_path, runtime_turn_path) -> None:
     """Atomically split a legacy combined gateway file, preserving current TURN data."""
     gateway_values = parse_trusted_environment(gateway_path)
+    gateway_values, source_key_migrated = _migrate_legacy_source_key(gateway_values)
     keys = set(gateway_values)
     if keys == _GATEWAY_KEYS:
         validate_gateway_environment(gateway_values)
@@ -245,6 +247,23 @@ def migrate_gateway_environments(gateway_path, runtime_turn_path) -> None:
         validate_split_gateway_environment(
             static_values, parse_trusted_environment(runtime_turn_path)
         )
+    if source_key_migrated:
+        _atomic_write_environment(
+            gateway_path,
+            _serialize_environment(static_values, _GATEWAY_STATIC_KEY_ORDER),
+        )
+
+
+def _migrate_legacy_source_key(values: Mapping[str, str]):
+    migrated = dict(values)
+    has_legacy = _LEGACY_GATEWAY_SOURCE_KEY in migrated
+    has_current = "MTX_PATHS_CAMERA_SOURCE" in migrated
+    if has_legacy and has_current:
+        raise MediaConfigError("gateway environment has conflicting source keys")
+    if not has_legacy:
+        return migrated, False
+    migrated["MTX_PATHS_CAMERA_SOURCE"] = migrated.pop(_LEGACY_GATEWAY_SOURCE_KEY)
+    return migrated, True
 
 
 def validate_turn_environment(values: Mapping[str, str]) -> dict[str, str]:

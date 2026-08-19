@@ -1,0 +1,47 @@
+[Unit]
+Description=Isolated gate camera audio transcoder
+After=network-online.target gate-media-gateway.service
+Requires=gate-media-gateway.service
+PartOf=gate-media-gateway.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=true
+ExecStart=/usr/bin/python3 -I /usr/local/lib/gate-media/gate_media_transcoder/__main__.py
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+MemoryMax=96M
+CPUQuota=20%
+Nice=10
+TasksMax=32
+UMask=0077
+StandardInput=null
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
+NoExecPaths=/run/gate-media /tmp /var/tmp /dev/shm
+
+[Install]
+WantedBy=multi-user.target

@@ -42,6 +42,8 @@ def read_flat_yaml(relative_path):
             value = False
         elif raw_value == "[]":
             value = []
+        elif raw_value.startswith('["'):
+            value = json.loads(raw_value)
         elif raw_value.startswith('"'):
             value = json.loads(raw_value)
         else:
@@ -62,12 +64,14 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("webrtcAddress: 127.0.0.1:8889", config)
         self.assertIn('webrtcLocalUDPAddress: ""', config)
         self.assertIn('webrtcLocalTCPAddress: ""', config)
+        self.assertIn("  camera: {}", config)
         self.assertIn("gate:", config)
+        self.assertIn("    source: publisher", config)
+        self.assertIn("    overridePublisher: false", config)
         self.assertNotIn("${", config)
-        self.assertNotIn("    source:", config)
         self.assertNotRegex(config, r"rtsp://[^\s]*@")
-        self.assertIn("rtsp: false", config)
-        self.assertIn("rtspTransports: []", config)
+        self.assertIn("rtsp: true", config)
+        self.assertIn('rtspTransports: ["tcp"]', config)
         self.assertIn("hls: false", config)
         self.assertIn("rtmp: false", config)
         self.assertIn("srt: false", config)
@@ -83,8 +87,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             "pprofAddress": "127.0.0.1:9999",
             "playback": False,
             "playbackAddress": "127.0.0.1:9996",
-            "rtsp": False,
-            "rtspTransports": [],
+            "rtsp": True,
+            "rtspTransports": ["tcp"],
             "rtspAddress": "127.0.0.1:8554",
             "rtspsAddress": "127.0.0.1:8322",
             "rtpAddress": "127.0.0.1:8000",
@@ -367,22 +371,195 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("nginx-whep-locations.conf.template", controller_installer)
         self.assertIn("gate_media_config.py", controller_installer)
         self.assertIn("gate_media_gateway", controller_installer)
+        self.assertIn("gate_media_transcoder", controller_installer)
         self.assertIn("gate_media_config.py", installer)
         self.assertIn("gate_media_gateway", installer)
+        self.assertIn("gate_media_transcoder", installer)
         self.assertNotIn("install_mediamtx_binary", controller_installer)
         self.assertNotIn("/usr/local/bin/mediamtx", controller_installer)
         self.assertIn(
-            "systemctl enable gate-media-auth.service gate-media-gateway.service",
+            "systemctl enable gate-media-auth.service gate-media-gateway.service "
+            "gate-media-transcoder.service",
             installer,
         )
         self.assertIn(
-            "systemctl restart gate-media-auth.service gate-media-gateway.service",
+            "systemctl restart gate-media-auth.service gate-media-gateway.service "
+            "gate-media-transcoder.service",
             installer,
         )
-        self.assertNotIn(
-            "systemctl enable --now gate-media-auth.service gate-media-gateway.service",
-            installer,
-        )
+        for package_manager in ("apt-get ", "apt ", "apk ", "dnf ", "yum "):
+            self.assertNotIn(package_manager, installer)
+
+    def test_installer_preflights_the_existing_ffmpeg_rtsp_and_libopus_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            ffmpeg = root / "ffmpeg"
+            ffmpeg.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  '-hide_banner -h encoder=libopus')\n"
+                "    if [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-encoder ]; then\n"
+                "      printf \"Codec 'libopus' is not recognized by FFmpeg.\\n\"\n"
+                "    else\n"
+                "      printf 'Encoder libopus [libopus Opus]:\\n'\n"
+                "    fi ;;\n"
+                "  '-hide_banner -h muxer=rtsp') printf 'RTSP muxer tcp\\n' ;;\n"
+                "  '-hide_banner -encoders')\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-encoder ] || "
+                "printf ' A..... libopus libopus Opus\\n' ;;\n"
+                "  '-hide_banner -demuxers')\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-demuxer ] || "
+                "printf ' D  rtsp RTSP input\\n' ;;\n"
+                "  '-hide_banner -muxers') printf ' E  rtsp RTSP output\\n' ;;\n"
+                "  '-hide_banner -protocols')\n"
+                "    printf 'Supported file protocols:\\nInput:\\n'\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-input-tcp ] || "
+                "printf '  tcp\\n'\n"
+                "    printf 'Output:\\n'\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-output-tcp ] || "
+                "printf '  tcp\\n' ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            ffmpeg.chmod(0o755)
+            command = (
+                "source deployment/install-media.sh; "
+                f"FFMPEG_BINARY={shlex.quote(str(ffmpeg))}; preflight_ffmpeg"
+            )
+
+            accepted = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+            for variant in (
+                "missing-encoder", "missing-demuxer",
+                "missing-input-tcp", "missing-output-tcp",
+            ):
+                with self.subTest(variant=variant):
+                    environment = dict(os.environ)
+                    environment["FAKE_FFMPEG_VARIANT"] = variant
+                    rejected = subprocess.run(
+                        ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                        env=environment, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, check=False,
+                    )
+                    self.assertNotEqual(0, rejected.returncode)
+
+    def test_failed_media_activation_rolls_back_to_all_services_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 != restart ]]
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_activation_requires_every_service_to_be_active(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  if [[ $1 == is-active ]]; then
+    shift
+    [[ ${{1:-}} == --quiet ]] && shift
+    local unit
+    for unit in "$@"; do
+      [[ $unit == gate-media-transcoder.service ]] || return 0
+    done
+    return 1
+  fi
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "is-active --quiet gate-media-auth.service",
+                    "is-active --quiet gate-media-gateway.service",
+                    "is-active --quiet gate-media-transcoder.service",
+                    "show --property=ActiveState --value gate-media-transcoder.service",
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_activation_preserves_transcoder_auto_restart_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'is-active --quiet gate-media-transcoder.service') return 3 ;;
+    'show --property=ActiveState --value gate-media-transcoder.service')
+      printf 'activating\n'
+      ;;
+    'show --property=SubState --value gate-media-transcoder.service')
+      printf 'auto-restart\n'
+      ;;
+  esac
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "is-active --quiet gate-media-auth.service",
+                    "is-active --quiet gate-media-gateway.service",
+                    "is-active --quiet gate-media-transcoder.service",
+                    "show --property=ActiveState --value gate-media-transcoder.service",
+                    "show --property=SubState --value gate-media-transcoder.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
 
     def test_proxy_renderer_substitutes_one_validated_exact_https_origin(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -660,7 +837,7 @@ finally:
             gateway_text = gateway.read_text(encoding="utf-8")
             runtime_turn_text = runtime_turn.read_text(encoding="utf-8")
 
-            auth.write_text(auth_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n")
+            auth.write_text(auth_text + "MTX_PATHS_CAMERA_SOURCE=rtsp://forbidden\n")
             auth.chmod(0o600)
             self.assertNotEqual(
                 0, self._validate_media_environments(
@@ -681,7 +858,7 @@ finally:
             gateway.write_text(gateway_text, encoding="utf-8")
             gateway.chmod(0o600)
             runtime_turn.write_text(
-                runtime_turn_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n",
+                runtime_turn_text + "MTX_PATHS_CAMERA_SOURCE=rtsp://forbidden\n",
                 encoding="utf-8",
             )
             runtime_turn.chmod(0o600)
@@ -758,7 +935,7 @@ finally:
             encoding="utf-8",
         )
         gateway.write_text(
-            "MTX_PATHS_GATE_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
+            "MTX_PATHS_CAMERA_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
@@ -802,7 +979,7 @@ finally:
             )
             self.assertEqual(0, complete.returncode, complete.stderr)
 
-            auth.write_text(auth.read_text() + "MTX_PATHS_GATE_SOURCE=forbidden\n")
+            auth.write_text(auth.read_text() + "MTX_PATHS_CAMERA_SOURCE=forbidden\n")
             contaminated = subprocess.run(
                 ["bash", "-c", base + "media_environment_complete"], cwd=REPOSITORY_ROOT,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
@@ -837,7 +1014,7 @@ prepare_gateway_environments
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertEqual(
                 {
-                    "MTX_PATHS_GATE_SOURCE",
+                    "MTX_PATHS_CAMERA_SOURCE",
                     "MTX_WEBRTCLOCALUDPADDRESS",
                     "MTX_WEBRTCLOCALTCPADDRESS",
                     "MTX_WEBRTCADDITIONALHOSTS",
@@ -856,6 +1033,64 @@ prepare_gateway_environments
             )
             self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
             self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
+
+    def test_installer_atomically_migrates_the_legacy_gate_source_key(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            camera_url = gateway.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1]
+            gateway.write_text(
+                gateway.read_text(encoding="utf-8").replace(
+                    "MTX_PATHS_CAMERA_SOURCE=", "MTX_PATHS_GATE_SOURCE=", 1
+                ),
+                encoding="utf-8",
+            )
+            gateway.chmod(0o600)
+            command = f"""
+source deployment/install-media.sh
+SOURCE={shlex.quote(str(REPOSITORY_ROOT))}
+MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}
+validate_root_file() {{ :; }}
+prepare_gateway_environments
+prepare_gateway_environments
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            migrated = gateway.read_text(encoding="utf-8")
+            self.assertIn(f"MTX_PATHS_CAMERA_SOURCE={camera_url}\n", migrated)
+            self.assertNotIn("MTX_PATHS_GATE_SOURCE", migrated)
+            self.assertNotIn(camera_url, completed.stdout + completed.stderr)
+            self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
+            self.assertEqual([], list(root.glob(".gate-media-gateway.env.new.*")))
+
+    def test_source_key_migration_rejects_conflicts_without_replacing_the_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            gateway.write_text(
+                gateway.read_text(encoding="utf-8")
+                + "MTX_PATHS_GATE_SOURCE=rtsp://other.example/stream\n",
+                encoding="utf-8",
+            )
+            gateway.chmod(0o600)
+            before = gateway.read_bytes()
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "gate_media_config", "split-gateway",
+                 "--gateway", str(gateway), "--runtime-turn", str(runtime_turn)],
+                cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(before, gateway.read_bytes())
+            self.assertEqual([], list(root.glob(".gate-media-gateway.env.new.*")))
 
     def test_installer_rejects_a_media_user_in_the_gpio_group(self):
         command = """
@@ -989,7 +1224,8 @@ main {arguments}
                 self.assertNotEqual(0, completed.returncode)
                 self.assertTrue(log.is_file())
                 self.assertIn(
-                    "disable --now gate-media-gateway.service gate-media-auth.service",
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
                     log.read_text(encoding="utf-8"),
                 )
 
@@ -1192,7 +1428,7 @@ class MediaCapabilityTests(unittest.TestCase):
         self.assertTrue(snapshot["media"]["video"]["configured"])
         self.assertTrue(snapshot["media"]["video"]["verified"])
         self.assertFalse(snapshot["media"]["listen"]["configured"])
-        self.assertNotIn("MTX_PATHS_GATE_SOURCE", snapshot)
+        self.assertNotIn("MTX_PATHS_CAMERA_SOURCE", snapshot)
 
 
 class MediaGatewayHealthTests(unittest.TestCase):
@@ -1202,9 +1438,11 @@ class MediaGatewayHealthTests(unittest.TestCase):
     def test_gate_path_reports_video_and_listen_readiness_by_recognized_track_type(self):
         cases = (
             (["H264"], {"video": True, "listen": False}),
-            (["MPEG-4 Audio"], {"video": False, "listen": True}),
-            (["AC-3"], {"video": False, "listen": True}),
+            (["MPEG-4 Audio"], {"video": False, "listen": False}),
+            (["AC-3"], {"video": False, "listen": False}),
             (["H264", "Opus"], {"video": True, "listen": True}),
+            (["H264", "G722"], {"video": True, "listen": True}),
+            (["H264", "G711"], {"video": True, "listen": True}),
         )
         environment = {
             "GATE_MEDIA_VIDEO_CONFIGURED": "true",
