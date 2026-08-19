@@ -42,6 +42,8 @@ def read_flat_yaml(relative_path):
             value = False
         elif raw_value == "[]":
             value = []
+        elif raw_value.startswith('["'):
+            value = json.loads(raw_value)
         elif raw_value.startswith('"'):
             value = json.loads(raw_value)
         else:
@@ -62,12 +64,14 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("webrtcAddress: 127.0.0.1:8889", config)
         self.assertIn('webrtcLocalUDPAddress: ""', config)
         self.assertIn('webrtcLocalTCPAddress: ""', config)
+        self.assertIn("  camera: {}", config)
         self.assertIn("gate:", config)
+        self.assertIn("    source: publisher", config)
+        self.assertIn("    overridePublisher: false", config)
         self.assertNotIn("${", config)
-        self.assertNotIn("    source:", config)
         self.assertNotRegex(config, r"rtsp://[^\s]*@")
-        self.assertIn("rtsp: false", config)
-        self.assertIn("rtspTransports: []", config)
+        self.assertIn("rtsp: true", config)
+        self.assertIn('rtspTransports: ["tcp"]', config)
         self.assertIn("hls: false", config)
         self.assertIn("rtmp: false", config)
         self.assertIn("srt: false", config)
@@ -83,8 +87,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             "pprofAddress": "127.0.0.1:9999",
             "playback": False,
             "playbackAddress": "127.0.0.1:9996",
-            "rtsp": False,
-            "rtspTransports": [],
+            "rtsp": True,
+            "rtspTransports": ["tcp"],
             "rtspAddress": "127.0.0.1:8554",
             "rtspsAddress": "127.0.0.1:8322",
             "rtpAddress": "127.0.0.1:8000",
@@ -126,12 +130,13 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertEqual(set(), configured_globals - set(schema["globalKeys"]))
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            _auth, gateway = self._write_valid_media_environments(
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(
                 Path(temporary_directory)
             )
             environment = dict(
                 line.split("=", 1)
-                for line in gateway.read_text(encoding="utf-8").splitlines()
+                for path in (gateway, runtime_turn)
+                for line in path.read_text(encoding="utf-8").splitlines()
             )
         udp_host = environment["MTX_WEBRTCLOCALUDPADDRESS"].rsplit(":", 1)[0]
         tcp_host = environment["MTX_WEBRTCLOCALTCPADDRESS"].rsplit(":", 1)[0]
@@ -183,7 +188,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
     def test_gateway_launcher_executes_only_with_complete_reachable_ice_and_turn(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             del auth
             fake_binary = root / "mediamtx"
             marker = root / "executed"
@@ -196,7 +201,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             fake_binary.chmod(0o755)
             valid_values = dict(
                 line.split("=", 1)
-                for line in gateway.read_text(encoding="utf-8").splitlines()
+                for path in (gateway, runtime_turn)
+                for line in path.read_text(encoding="utf-8").splitlines()
             )
             environment = dict(os.environ)
             environment.update(valid_values)
@@ -272,7 +278,10 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         proxy = path.read_text(encoding="utf-8")
 
         self.assertIn("location = /gate/whep", proxy)
-        self.assertRegex(proxy, r"location ~ \^/gate/whep/\[A-Za-z0-9_-\]")
+        self.assertIn(
+            'location ~ "^/gate/whep/[A-Za-z0-9_-]{1,128}$" {',
+            proxy,
+        )
         self.assertIn("__GATE_MEDIA_ALLOWED_ORIGIN__", proxy)
         self.assertIn("proxy_pass http://127.0.0.1:8889", proxy)
         self.assertNotRegex(proxy, r"location\s+/\s*\{[^}]*proxy_pass")
@@ -285,16 +294,33 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
     def test_services_receive_disjoint_root_owned_environment_files(self):
         auth = read_unit("deployment/systemd/gate-media-auth.service")
         gateway = read_unit("deployment/systemd/gate-media-gateway.service")
+        gateway_unit = (
+            REPOSITORY_ROOT / "deployment/systemd/gate-media-gateway.service"
+        ).read_text(encoding="utf-8")
 
         self.assertEqual("/etc/gate-media-auth.env", auth.get("EnvironmentFile"))
-        self.assertEqual("/etc/gate-media-gateway.env", gateway.get("EnvironmentFile"))
-        self.assertNotEqual(auth.get("EnvironmentFile"), gateway.get("EnvironmentFile"))
+        self.assertEqual(
+            [
+                "EnvironmentFile=/etc/gate-media-gateway.env",
+                "EnvironmentFile=/var/lib/gate-media/turn.env",
+            ],
+            [line for line in gateway_unit.splitlines()
+             if line.startswith("EnvironmentFile=")],
+        )
+        self.assertNotIn("EnvironmentFile=/etc/gate-media-auth.env", gateway_unit)
         self.assertEqual(
             "/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx "
             "/etc/gate-media/mediamtx.yml",
             gateway.get("ExecStart"),
         )
         self.assertEqual("PYTHONPATH=/usr/local/lib/gate-media", gateway.get("Environment"))
+
+    def test_gateway_allows_netlink_only_for_interface_discovery(self):
+        auth = read_unit("deployment/systemd/gate-media-auth.service")
+        gateway = read_unit("deployment/systemd/gate-media-gateway.service")
+
+        self.assertIn("AF_NETLINK", shlex.split(gateway.get("RestrictAddressFamilies", "")))
+        self.assertNotIn("AF_NETLINK", shlex.split(auth.get("RestrictAddressFamilies", "")))
 
     def test_media_units_are_restricted_nonroot_and_cannot_access_gpio_or_controller_state(self):
         for relative_path, user in (
@@ -321,8 +347,12 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 self.assertTrue(any("/opt/gate-controller-deploy" in path for path in inaccessible))
                 self.assertIn("-/opt/gate-controller", inaccessible)
                 self.assertTrue(any("gpio" in path for path in inaccessible))
-                self.assertEqual("/", service.get("NoExecPaths"))
-                self.assertTrue(service.get("ExecPaths"))
+                no_exec_paths = set(shlex.split(service.get("NoExecPaths", "")))
+                self.assertEqual(
+                    {"/run/gate-media", "/tmp", "/var/tmp", "/dev/shm"},
+                    no_exec_paths,
+                )
+                self.assertNotIn("ExecPaths", service)
 
     def test_media_installer_uses_an_operator_approved_version_architecture_checksum_map(self):
         installer = (REPOSITORY_ROOT / "deployment/install-media.sh").read_text(encoding="utf-8")
@@ -341,10 +371,744 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("nginx-whep-locations.conf.template", controller_installer)
         self.assertIn("gate_media_config.py", controller_installer)
         self.assertIn("gate_media_gateway", controller_installer)
+        self.assertIn("gate_media_transcoder", controller_installer)
         self.assertIn("gate_media_config.py", installer)
         self.assertIn("gate_media_gateway", installer)
+        self.assertIn("gate_media_transcoder", installer)
         self.assertNotIn("install_mediamtx_binary", controller_installer)
         self.assertNotIn("/usr/local/bin/mediamtx", controller_installer)
+        self.assertIn(
+            "systemctl enable gate-media-auth.service gate-media-gateway.service "
+            "gate-media-transcoder.service",
+            installer,
+        )
+        self.assertIn(
+            "systemctl restart gate-media-auth.service gate-media-gateway.service "
+            "gate-media-transcoder.service",
+            installer,
+        )
+        for package_manager in ("apt-get ", "apt ", "apk ", "dnf ", "yum "):
+            self.assertNotIn(package_manager, installer)
+
+    def test_installer_preflights_the_existing_ffmpeg_rtsp_and_libopus_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            ffmpeg = root / "ffmpeg"
+            ffmpeg.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  '-hide_banner -h encoder=libopus')\n"
+                "    if [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-encoder ]; then\n"
+                "      printf \"Codec 'libopus' is not recognized by FFmpeg.\\n\"\n"
+                "    else\n"
+                "      printf 'Encoder libopus [libopus Opus]:\\n'\n"
+                "    fi ;;\n"
+                "  '-hide_banner -h muxer=rtsp') printf 'RTSP muxer tcp\\n' ;;\n"
+                "  '-hide_banner -encoders')\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-encoder ] || "
+                "printf ' A..... libopus libopus Opus\\n' ;;\n"
+                "  '-hide_banner -demuxers')\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-demuxer ] || "
+                "printf ' D  rtsp RTSP input\\n' ;;\n"
+                "  '-hide_banner -muxers') printf ' E  rtsp RTSP output\\n' ;;\n"
+                "  '-hide_banner -protocols')\n"
+                "    printf 'Supported file protocols:\\nInput:\\n'\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-input-tcp ] || "
+                "printf '  tcp\\n'\n"
+                "    printf 'Output:\\n'\n"
+                "    [ \"${FAKE_FFMPEG_VARIANT:-}\" = missing-output-tcp ] || "
+                "printf '  tcp\\n' ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            ffmpeg.chmod(0o755)
+            command = (
+                "source deployment/install-media.sh; "
+                f"FFMPEG_BINARY={shlex.quote(str(ffmpeg))}; preflight_ffmpeg"
+            )
+
+            accepted = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+            for variant in (
+                "missing-encoder", "missing-demuxer",
+                "missing-input-tcp", "missing-output-tcp",
+            ):
+                with self.subTest(variant=variant):
+                    environment = dict(os.environ)
+                    environment["FAKE_FFMPEG_VARIANT"] = variant
+                    rejected = subprocess.run(
+                        ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                        env=environment, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, check=False,
+                    )
+                    self.assertNotEqual(0, rejected.returncode)
+
+    def test_failed_media_activation_rolls_back_to_all_services_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 != restart ]]
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_waits_for_an_active_turn_refresh_before_mutating(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runtime_directory = root / "gate-media-turn-refresh"
+            runtime_directory.mkdir(mode=0o700)
+            lock = runtime_directory / "refresh.lock"
+            lock.touch(mode=0o600)
+            release = root / "release"
+            acquired = root / "acquired"
+            lock_requested = root / "lock-requested"
+            unit_changed_while_waiting = root / "unit-changed-while-waiting"
+            unit_state_changed = root / "unit-state-changed"
+            systemctl_log = root / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
+systemctl() {{
+  touch {shlex.quote(str(unit_state_changed))}
+  printf '%s\\n' "$*" >> {shlex.quote(str(systemctl_log))}
+  if [[ $1 == show ]]; then printf 'loaded\\n'; return 0; fi
+  if [[ $1 == is-active ]]; then return 3; fi
+  return 0
+}}
+flock() {{
+  [[ $1 == -u ]] && return 0
+  [[ ! -e {shlex.quote(str(unit_state_changed))} ]] || touch {shlex.quote(str(unit_changed_while_waiting))}
+  touch {shlex.quote(str(lock_requested))}
+  while [[ ! -e {shlex.quote(str(release))} ]]; do sleep 0.01; done
+}}
+(prepare_turn_refresh_install && touch {shlex.quote(str(acquired))}) &
+installer_pid=$!
+while [[ ! -e {shlex.quote(str(lock_requested))} ]]; do
+  if ! kill -0 "$installer_pid" 2>/dev/null; then break; fi
+  sleep 0.01
+done
+sleep 0.1
+failed=0
+[[ ! -e {shlex.quote(str(acquired))} ]] || failed=1
+[[ ! -e {shlex.quote(str(unit_changed_while_waiting))} ]] || failed=1
+touch {shlex.quote(str(release))}
+wait "$installer_pid"
+exit "$failed"
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue(acquired.is_file())
+            self.assertEqual(
+                [
+                    "show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "show --property=LoadState --value gate-media-turn-refresh.service",
+                    "disable --now gate-media-turn-refresh.timer",
+                    "stop gate-media-turn-refresh.service",
+                    "is-active --quiet gate-media-turn-refresh.service",
+                ],
+                systemctl_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_refuses_symlinked_turn_refresh_lock_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.mkdir()
+            runtime_directory = root / "gate-media-turn-refresh"
+            runtime_directory.symlink_to(target)
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(runtime_directory / 'refresh.lock'))}
+acquire_turn_refresh_install_lock
+"""
+
+            runtime_link = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, runtime_link.returncode)
+            self.assertIn("state directory must not be a symlink", runtime_link.stderr)
+
+            runtime_directory.unlink()
+            runtime_directory.mkdir(mode=0o700)
+            lock_target = root / "lock-target"
+            lock_target.touch()
+            lock = runtime_directory / "refresh.lock"
+            lock.symlink_to(lock_target)
+            lock_command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_RUNTIME_DIR={shlex.quote(str(runtime_directory))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(lock))}
+acquire_turn_refresh_install_lock
+"""
+            lock_link = subprocess.run(
+                ["bash", "-c", lock_command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, lock_link.returncode)
+            self.assertIn("refresh lock must be a regular file", lock_link.stderr)
+
+    def test_media_install_keeps_turn_lock_through_timer_activation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+turn_refresh_environment_configured() {{ return 0; }}
+systemctl() {{ printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+finish_media_install
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "systemctl enable --now gate-media-turn-refresh.timer",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_transaction_hardens_state_root_before_backup_and_quiesce(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o755)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+install() {{
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -o|-g) shift 2 ;; *) forwarded+=("$1"); shift ;; esac
+  done
+  command install "${{forwarded[@]}}"
+  printf 'install\n' >> {shlex.quote(str(log))}
+}}
+acquire_turn_refresh_install_lock() {{
+  MEDIA_TURN_REFRESH_LOCK_HELD=1
+  printf 'acquire\n' >> {shlex.quote(str(log))}
+}}
+begin_media_install_transaction() {{
+  python3 - "$MEDIA_STATE_ROOT" >> {shlex.quote(str(log))} <<'PY'
+import os
+import stat
+import sys
+
+print(f"begin mode={{stat.S_IMODE(os.stat(sys.argv[1]).st_mode):o}}")
+PY
+}}
+quiesce_turn_refresh() {{ printf 'quiesce\n' >> {shlex.quote(str(log))}; }}
+prepare_media_install_transaction
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                ["install", "acquire", "begin mode=700", "quiesce"],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_empty_turn_runtime_is_bootstrapped_before_services_and_timer_under_lock(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runtime_turn = root / "turn.env"
+            runtime_turn.touch(mode=0o600)
+            log = root / "activation.log"
+            helper = root / "gate_media_turn_refresh.py"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}
+MEDIA_TURN_REFRESH_HELPER={shlex.quote(str(helper))}
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+turn_refresh_environment_configured() {{ return 0; }}
+python3() {{
+  printf 'bootstrap held=%s helper=%s\n' "$MEDIA_TURN_REFRESH_LOCK_HELD" "$1" \
+    >> {shlex.quote(str(log))}
+  printf '%s\n' \
+    'MTX_WEBRTCICESERVERS2_0_URL=turn:turn.example:3478?transport=udp' \
+    'MTX_WEBRTCICESERVERS2_0_USERNAME=initial-user' \
+    'MTX_WEBRTCICESERVERS2_0_PASSWORD=initial-password' \
+    > "$MEDIA_RUNTIME_TURN_ENV"
+}}
+media_environment_complete() {{
+  printf 'environment held=%s bytes=%s\n' "$MEDIA_TURN_REFRESH_LOCK_HELD" \
+    "$(wc -c < "$MEDIA_RUNTIME_TURN_ENV" | tr -d '[:space:]')" \
+    >> {shlex.quote(str(log))}
+  return 0
+}}
+activate_media_services() {{
+  printf 'services held=%s\n' "$MEDIA_TURN_REFRESH_LOCK_HELD" >> {shlex.quote(str(log))}
+}}
+configure_turn_refresh_timer() {{
+  printf 'timer held=%s\n' "$MEDIA_TURN_REFRESH_LOCK_HELD" >> {shlex.quote(str(log))}
+}}
+cleanup_media_install() {{
+  printf 'cleanup held=%s\n' "$MEDIA_TURN_REFRESH_LOCK_HELD" >> {shlex.quote(str(log))}
+  MEDIA_TURN_REFRESH_LOCK_HELD=0
+}}
+activate_media_runtime
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            events = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [
+                    f"bootstrap held=1 helper={helper}",
+                    f"environment held=1 bytes={runtime_turn.stat().st_size}",
+                    "services held=1",
+                    "timer held=1",
+                    "cleanup held=1",
+                ],
+                events,
+            )
+
+    def test_timer_activation_failure_disables_services_and_timer_before_unlocking(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+flock() {{ printf 'flock %s held=%s\\n' "$*" "$MEDIA_TURN_REFRESH_LOCK_HELD" >> {shlex.quote(str(log))}; }}
+turn_refresh_environment_configured() {{ return 0; }}
+systemctl() {{
+  printf 'systemctl %s held=%s\\n' "$*" "$MEDIA_TURN_REFRESH_LOCK_HELD" >> {shlex.quote(str(log))}
+  [[ $1 == enable ]] && return 1
+}}
+if finish_media_install; then exit 1; fi
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "systemctl enable --now gate-media-turn-refresh.timer held=1",
+                    "systemctl disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service held=1",
+                    "systemctl disable --now gate-media-turn-refresh.timer held=1",
+                    "systemctl stop gate-media-turn-refresh.service held=1",
+                    "flock -u 9 held=1",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_prepares_when_turn_refresh_units_are_not_installed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && printf 'not-found\\n' && return 0
+  return 99
+}}
+prepare_turn_refresh_install
+release_turn_refresh_install_lock
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_aborts_when_turn_refresh_load_state_probe_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && return 1
+  return 99
+}}
+set +e
+prepare_turn_refresh_install
+status=$?
+set -e
+release_turn_refresh_install_lock
+exit "$status"
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertIn(
+                "TURN refresh unit presence could not be determined: "
+                "gate-media-turn-refresh.timer",
+                completed.stderr,
+            )
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_turn_refresh_load_state_probe_accepts_known_installed_states(self):
+        for load_state in ("loaded", "masked", "bad-setting", "error", "merged"):
+            with self.subTest(load_state=load_state):
+                command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  [[ "$*" == 'show --property=LoadState --value gate-media-turn-refresh.timer' ]] \\
+    || return 99
+  printf '%s\\n' {shlex.quote(load_state)}
+}}
+set +e
+turn_refresh_unit_is_installed gate-media-turn-refresh.timer
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+
+                completed = subprocess.run(
+                    ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertEqual("status=0\n", completed.stdout)
+
+    def test_turn_refresh_load_state_probe_rejects_unknown_or_ambiguous_output(self):
+        for load_state in ("future-state", "loaded\nnot-found"):
+            with self.subTest(load_state=load_state):
+                command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\\n' {shlex.quote(load_state)}
+}}
+set +e
+turn_refresh_unit_is_installed gate-media-turn-refresh.timer
+status=$?
+set -e
+printf 'status=%s\\n' "$status"
+"""
+
+                completed = subprocess.run(
+                    ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                self.assertEqual("status=2\n", completed.stdout)
+                self.assertIn("unexpected load state", completed.stderr)
+
+    def test_media_install_aborts_and_cleans_up_when_an_installed_turn_refresh_service_stop_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && printf 'loaded\\n' && return 0
+  [[ "$*" == 'disable --now gate-media-turn-refresh.timer' ]] && return 0
+  [[ "$*" == 'stop gate-media-turn-refresh.service' ]] && return 1
+  return 99
+}}
+if prepare_turn_refresh_install; then exit 1; fi
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_install_aborts_when_legacy_turn_refresh_service_is_still_active(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(state / 'turn-refresh.lock'))}
+flock() {{ printf 'flock %s\\n' "$*" >> {shlex.quote(str(log))}; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(log))}
+  [[ $1 == show ]] && printf 'loaded\\n' && return 0
+  [[ "$*" == 'is-active --quiet gate-media-turn-refresh.service' ]] && return 0
+  return 0
+}}
+if prepare_turn_refresh_install; then exit 1; fi
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "flock 9",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.timer",
+                    "systemctl show --property=LoadState --value gate-media-turn-refresh.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "systemctl disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                    "systemctl disable --now gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_interrupted_waiting_media_install_does_not_change_services_or_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            events = root / "events.log"
+            archive_root = root / "archives"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(root / 'state'))}
+MEDIA_TURN_REFRESH_LOCK={shlex.quote(str(root / 'state' / 'turn-refresh.lock'))}
+MEDIA_ARCHIVE_ROOT={shlex.quote(str(archive_root))}
+EXTRACTED_MEDIA_DIR={shlex.quote(str(archive_root / '.extract.waiting'))}
+systemctl() {{ printf 'systemctl %s\\n' "$*" >> {shlex.quote(str(events))}; }}
+rm() {{ printf 'rm %s\\n' "$*" >> {shlex.quote(str(events))}; }}
+flock() {{
+  [[ $1 == -u ]] && return 0
+  on_media_install_failure
+}}
+trap on_media_install_failure ERR INT TERM
+prepare_turn_refresh_install
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                timeout=5,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertFalse(events.exists(), events.read_text(encoding="utf-8") if events.exists() else "")
+
+    def test_media_install_failure_stops_and_disables_turn_refresh_timer_and_service(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+systemctl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                    "disable --now gate-media-turn-refresh.timer",
+                    "stop gate-media-turn-refresh.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_activation_requires_every_service_to_be_active(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  if [[ $1 == is-active ]]; then
+    shift
+    [[ ${{1:-}} == --quiet ]] && shift
+    local unit
+    for unit in "$@"; do
+      [[ $unit == gate-media-transcoder.service ]] || return 0
+    done
+    return 1
+  fi
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "is-active --quiet gate-media-auth.service",
+                    "is-active --quiet gate-media-gateway.service",
+                    "is-active --quiet gate-media-transcoder.service",
+                    "show --property=ActiveState --value gate-media-transcoder.service",
+                    "disable --now gate-media-transcoder.service "
+                    "gate-media-gateway.service gate-media-auth.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_media_activation_preserves_transcoder_auto_restart_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'is-active --quiet gate-media-transcoder.service') return 3 ;;
+    'show --property=ActiveState --value gate-media-transcoder.service')
+      printf 'activating\n'
+      ;;
+    'show --property=SubState --value gate-media-transcoder.service')
+      printf 'auto-restart\n'
+      ;;
+  esac
+}}
+activate_media_services
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "enable gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "restart gate-media-auth.service gate-media-gateway.service "
+                    "gate-media-transcoder.service",
+                    "is-active --quiet gate-media-auth.service",
+                    "is-active --quiet gate-media-gateway.service",
+                    "is-active --quiet gate-media-transcoder.service",
+                    "show --property=ActiveState --value gate-media-transcoder.service",
+                    "show --property=SubState --value gate-media-transcoder.service",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
 
     def test_proxy_renderer_substitutes_one_validated_exact_https_origin(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -374,6 +1138,111 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, rejected.returncode)
+
+    def test_proxy_activation_owns_validates_enables_and_reloads_nginx(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "gate-media.conf"
+            proxy = root / "gate-media.conf.new"
+            proxy.write_text("server { first; }\n", encoding="utf-8")
+            next_proxy = root / "gate-media.conf.next"
+            next_proxy.write_text("server { second; }\n", encoding="utf-8")
+            enabled = root / "nginx-enabled.conf"
+            nginx_log = root / "nginx.log"
+            nginx = root / "nginx"
+            nginx.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NGINX_LOG\"\n",
+                encoding="utf-8",
+            )
+            nginx.chmod(0o755)
+            systemctl_log = root / "systemctl.log"
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
+systemctl() {{ printf '%s\n' "$*" >> {shlex.quote(str(systemctl_log))}; }}
+activate_proxy_config {shlex.quote(str(proxy))}
+activate_proxy_config {shlex.quote(str(next_proxy))}
+"""
+            environment = dict(os.environ)
+            environment["NGINX_LOG"] = str(nginx_log)
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertTrue(enabled.is_symlink())
+            self.assertEqual(config.resolve(), enabled.resolve())
+            self.assertEqual("server { second; }\n", config.read_text(encoding="utf-8"))
+            self.assertEqual("-t\n-t\n", nginx_log.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [
+                    "enable nginx.service", "reload-or-restart nginx.service",
+                    "enable nginx.service", "reload-or-restart nginx.service",
+                ],
+                systemctl_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_proxy_activation_restores_existing_config_and_link_when_nginx_validation_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "gate-media.conf"
+            config.write_bytes(b"known-good config\n")
+            candidate = root / "gate-media.conf.new"
+            candidate.write_bytes(b"broken candidate config\n")
+            enabled = root / "nginx-enabled.conf"
+            enabled.symlink_to(config)
+            original_link_target = os.readlink(enabled)
+            nginx = root / "nginx"
+            nginx.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            nginx.chmod(0o755)
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
+activate_proxy_config {shlex.quote(str(candidate))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(b"known-good config\n", config.read_bytes())
+            self.assertTrue(enabled.is_symlink())
+            self.assertEqual(original_link_target, os.readlink(enabled))
+
+    def test_proxy_activation_leaves_no_config_or_link_when_nginx_validation_fails_initially(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = root / "gate-media.conf"
+            candidate = root / "gate-media.conf.new"
+            candidate.write_bytes(b"broken candidate config\n")
+            enabled = root / "nginx-enabled.conf"
+            nginx = root / "nginx"
+            nginx.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            nginx.chmod(0o755)
+            command = f"""
+source deployment/install-media.sh
+NGINX_BINARY={shlex.quote(str(nginx))}
+NGINX_PROXY_CONFIG={shlex.quote(str(enabled))}
+MEDIA_PROXY_CONFIG={shlex.quote(str(config))}
+activate_proxy_config {shlex.quote(str(candidate))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertFalse(config.exists())
+            self.assertFalse(enabled.is_symlink())
+            self.assertFalse(candidate.exists())
 
     def test_checksum_lookup_requires_an_exact_approved_version_and_architecture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -482,8 +1351,8 @@ finally:
     def test_environment_parser_accepts_only_unique_exact_assignments(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
-            accepted = self._validate_media_environments(auth, gateway)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            accepted = self._validate_media_environments(auth, gateway, runtime_turn)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
 
             malformed_values = (
@@ -497,25 +1366,32 @@ finally:
                 with self.subTest(malformed=malformed):
                     auth.write_text(original + malformed, encoding="utf-8")
                     auth.chmod(0o600)
-                    rejected = self._validate_media_environments(auth, gateway)
+                    rejected = self._validate_media_environments(
+                        auth, gateway, runtime_turn
+                    )
                     self.assertNotEqual(0, rejected.returncode)
 
             auth.write_bytes(original.replace("\n", "\r\n").encode("utf-8"))
             auth.chmod(0o600)
-            rejected_crlf = self._validate_media_environments(auth, gateway)
+            rejected_crlf = self._validate_media_environments(
+                auth, gateway, runtime_turn
+            )
             self.assertNotEqual(0, rejected_crlf.returncode)
 
     def test_environment_parser_rejects_cross_secrets_and_validates_hmac_bytes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             auth_text = auth.read_text(encoding="utf-8")
             gateway_text = gateway.read_text(encoding="utf-8")
+            runtime_turn_text = runtime_turn.read_text(encoding="utf-8")
 
-            auth.write_text(auth_text + "MTX_PATHS_GATE_SOURCE=rtsp://forbidden\n")
+            auth.write_text(auth_text + "MTX_PATHS_CAMERA_SOURCE=rtsp://forbidden\n")
             auth.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             auth.write_text(auth_text, encoding="utf-8")
@@ -523,55 +1399,81 @@ finally:
             gateway.write_text(gateway_text + "GATE_MEDIA_HMAC_SECRET=forbidden\n")
             gateway.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             gateway.write_text(gateway_text, encoding="utf-8")
             gateway.chmod(0o600)
+            runtime_turn.write_text(
+                runtime_turn_text + "MTX_PATHS_CAMERA_SOURCE=rtsp://forbidden\n",
+                encoding="utf-8",
+            )
+            runtime_turn.chmod(0o600)
+            self.assertNotEqual(
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
+            )
+
+            runtime_turn.write_text(runtime_turn_text, encoding="utf-8")
+            runtime_turn.chmod(0o600)
             auth.write_text(auth_text.replace("x" * 32, "x" * 31), encoding="utf-8")
             auth.chmod(0o600)
             self.assertNotEqual(
-                0, self._validate_media_environments(auth, gateway).returncode
+                0, self._validate_media_environments(
+                    auth, gateway, runtime_turn
+                ).returncode
             )
 
             auth.write_text(auth_text.replace("x" * 32, "é" * 16), encoding="utf-8")
             auth.chmod(0o600)
-            accepted_multibyte = self._validate_media_environments(auth, gateway)
+            accepted_multibyte = self._validate_media_environments(
+                auth, gateway, runtime_turn
+            )
             self.assertEqual(0, accepted_multibyte.returncode, accepted_multibyte.stderr)
 
     def test_environment_parser_validates_rtsp_ice_and_mediamtx_turn_values(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             valid_gateway = gateway.read_text(encoding="utf-8")
-            accepted = self._validate_media_environments(auth, gateway)
+            valid_runtime_turn = runtime_turn.read_text(encoding="utf-8")
+            accepted = self._validate_media_environments(auth, gateway, runtime_turn)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
             additional_host = "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5"
             replacements = (
-                ("rtsp://", "https://"),
-                ("10.0.0.5:8189", "0.0.0.0:8189"),
-                ("10.0.0.5:8189", "127.0.0.1:8189"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.6"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5,10.0.0.6"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=0.0.0.0"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=127.0.0.1"),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS="),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5 "),
-                (additional_host, "MTX_WEBRTCADDITIONALHOSTS" + "_0=10.0.0.5"),
-                ("turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
-                ("MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
-                ("MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
+                (gateway, valid_gateway, "rtsp://", "https://"),
+                (gateway, valid_gateway, "10.0.0.5:8189", "0.0.0.0:8189"),
+                (gateway, valid_gateway, "10.0.0.5:8189", "127.0.0.1:8189"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.6"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5,10.0.0.6"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=0.0.0.0"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=127.0.0.1"),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS="),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5 "),
+                (gateway, valid_gateway, additional_host, "MTX_WEBRTCADDITIONALHOSTS" + "_0=10.0.0.5"),
+                (runtime_turn, valid_runtime_turn, "turns:turn.example.com:5349?transport=tcp", "stun:turn.example.com:3478"),
+                (runtime_turn, valid_runtime_turn, "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n", ""),
+                (gateway, valid_gateway, "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false", "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=true"),
             )
-            for old, new in replacements:
+            for target, original, old, new in replacements:
                 with self.subTest(replacement=(old, new)):
-                    gateway.write_text(valid_gateway.replace(old, new, 1), encoding="utf-8")
+                    gateway.write_text(valid_gateway, encoding="utf-8")
+                    runtime_turn.write_text(valid_runtime_turn, encoding="utf-8")
+                    target.write_text(original.replace(old, new, 1), encoding="utf-8")
                     gateway.chmod(0o600)
-                    rejected = self._validate_media_environments(auth, gateway)
+                    runtime_turn.chmod(0o600)
+                    rejected = self._validate_media_environments(
+                        auth, gateway, runtime_turn
+                    )
                     self.assertNotEqual(0, rejected.returncode)
 
     def _write_valid_media_environments(self, root):
         auth = root / "gate-media-auth.env"
         gateway = root / "gate-media-gateway.env"
+        runtime_turn = root / "turn.env"
         auth.write_text(
             "GATE_MEDIA_HMAC_SECRET=" + "x" * 32 + "\n"
             "GATE_MEDIA_VIDEO_CONFIGURED=true\n"
@@ -582,24 +1484,29 @@ finally:
             encoding="utf-8",
         )
         gateway.write_text(
-            "MTX_PATHS_GATE_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
+            "MTX_PATHS_CAMERA_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
+            "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            encoding="utf-8",
+        )
+        runtime_turn.write_text(
             "MTX_WEBRTCICESERVERS2_0_URL=turns:turn.example.com:5349?transport=tcp\n"
             "MTX_WEBRTCICESERVERS2_0_USERNAME=turn-user\n"
-            "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n"
-            "MTX_WEBRTCICESERVERS2_0_CLIENTONLY=false\n",
+            "MTX_WEBRTCICESERVERS2_0_PASSWORD=turn-password\n",
             encoding="utf-8",
         )
         auth.chmod(0o600)
         gateway.chmod(0o600)
-        return auth, gateway
+        runtime_turn.chmod(0o600)
+        return auth, gateway, runtime_turn
 
-    def _validate_media_environments(self, auth, gateway):
+    def _validate_media_environments(self, auth, gateway, runtime_turn):
         return subprocess.run(
             [sys.executable, "-m", "gate_media_config", "environment",
-             "--auth", str(auth), "--gateway", str(gateway)],
+             "--auth", str(auth), "--gateway", str(gateway),
+             "--runtime-turn", str(runtime_turn)],
             cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, check=False,
         )
@@ -607,11 +1514,12 @@ finally:
     def test_media_environment_files_reject_cross_contaminated_secrets(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            auth, gateway = self._write_valid_media_environments(root)
+            auth, gateway, runtime_turn = self._write_valid_media_environments(root)
             base = (
                 "source deployment/install-media.sh; "
                 f"MEDIA_AUTH_ENV={shlex.quote(str(auth))}; "
                 f"MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}; "
+                f"MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}; "
             )
 
             complete = subprocess.run(
@@ -620,12 +1528,118 @@ finally:
             )
             self.assertEqual(0, complete.returncode, complete.stderr)
 
-            auth.write_text(auth.read_text() + "MTX_PATHS_GATE_SOURCE=forbidden\n")
+            auth.write_text(auth.read_text() + "MTX_PATHS_CAMERA_SOURCE=forbidden\n")
             contaminated = subprocess.run(
                 ["bash", "-c", base + "media_environment_complete"], cwd=REPOSITORY_ROOT,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertNotEqual(0, contaminated.returncode)
+
+    def test_installer_migrates_legacy_combined_gateway_environment_idempotently(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            legacy = gateway.read_text(encoding="utf-8") + runtime_turn.read_text(
+                encoding="utf-8"
+            )
+            gateway.write_text(legacy, encoding="utf-8")
+            gateway.chmod(0o600)
+            runtime_turn.unlink()
+            command = f"""
+source deployment/install-media.sh
+SOURCE={shlex.quote(str(REPOSITORY_ROOT))}
+MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}
+validate_root_file() {{ :; }}
+prepare_gateway_environments
+prepare_gateway_environments
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                {
+                    "MTX_PATHS_CAMERA_SOURCE",
+                    "MTX_WEBRTCLOCALUDPADDRESS",
+                    "MTX_WEBRTCLOCALTCPADDRESS",
+                    "MTX_WEBRTCADDITIONALHOSTS",
+                    "MTX_WEBRTCICESERVERS2_0_CLIENTONLY",
+                },
+                {line.split("=", 1)[0] for line in gateway.read_text().splitlines()},
+            )
+            self.assertEqual(
+                {
+                    "MTX_WEBRTCICESERVERS2_0_URL",
+                    "MTX_WEBRTCICESERVERS2_0_USERNAME",
+                    "MTX_WEBRTCICESERVERS2_0_PASSWORD",
+                },
+                {line.split("=", 1)[0]
+                 for line in runtime_turn.read_text().splitlines()},
+            )
+            self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
+            self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
+
+    def test_installer_atomically_migrates_the_legacy_gate_source_key(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            camera_url = gateway.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1]
+            gateway.write_text(
+                gateway.read_text(encoding="utf-8").replace(
+                    "MTX_PATHS_CAMERA_SOURCE=", "MTX_PATHS_GATE_SOURCE=", 1
+                ),
+                encoding="utf-8",
+            )
+            gateway.chmod(0o600)
+            command = f"""
+source deployment/install-media.sh
+SOURCE={shlex.quote(str(REPOSITORY_ROOT))}
+MEDIA_GATEWAY_ENV={shlex.quote(str(gateway))}
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(runtime_turn))}
+validate_root_file() {{ :; }}
+prepare_gateway_environments
+prepare_gateway_environments
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            migrated = gateway.read_text(encoding="utf-8")
+            self.assertIn(f"MTX_PATHS_CAMERA_SOURCE={camera_url}\n", migrated)
+            self.assertNotIn("MTX_PATHS_GATE_SOURCE", migrated)
+            self.assertNotIn(camera_url, completed.stdout + completed.stderr)
+            self.assertEqual(0o600, gateway.stat().st_mode & 0o777)
+            self.assertEqual([], list(root.glob(".gate-media-gateway.env.new.*")))
+
+    def test_source_key_migration_rejects_conflicts_without_replacing_the_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+            gateway.write_text(
+                gateway.read_text(encoding="utf-8")
+                + "MTX_PATHS_GATE_SOURCE=rtsp://other.example/stream\n",
+                encoding="utf-8",
+            )
+            gateway.chmod(0o600)
+            before = gateway.read_bytes()
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "gate_media_config", "split-gateway",
+                 "--gateway", str(gateway), "--runtime-turn", str(runtime_turn)],
+                cwd=REPOSITORY_ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(before, gateway.read_bytes())
+            self.assertEqual([], list(root.glob(".gate-media-gateway.env.new.*")))
 
     def test_installer_rejects_a_media_user_in_the_gpio_group(self):
         command = """
@@ -741,7 +1755,7 @@ install_mediamtx_binary {shlex.quote(str(archive))} {PINNED_MEDIAMTX_VERSION} {s
             self.assertNotEqual(0, completed.returncode)
             self.assertEqual("existing-binary\n", binary.read_text(encoding="utf-8"))
 
-    def test_every_installer_failure_disables_media_services(self):
+    def test_prelock_installer_failures_do_not_change_media_services(self):
         for arguments in ("--unknown-option", "--source"):
             with (self.subTest(arguments=arguments),
                   tempfile.TemporaryDirectory() as temporary_directory):
@@ -757,11 +1771,570 @@ main {arguments}
                 )
 
                 self.assertNotEqual(0, completed.returncode)
-                self.assertTrue(log.is_file())
-                self.assertIn(
-                    "disable --now gate-media-gateway.service gate-media-auth.service",
-                    log.read_text(encoding="utf-8"),
+                self.assertFalse(log.exists())
+
+    def test_proxy_publication_failure_restores_prior_artifacts_and_unit_state(self):
+        self._assert_media_transaction_failure_restores("proxy", existing_install=True)
+
+    def test_media_service_activation_failure_restores_prior_artifacts_and_unit_state(self):
+        self._assert_media_transaction_failure_restores("media", existing_install=True)
+
+    def test_timer_activation_failure_restores_prior_artifacts_and_unit_state(self):
+        self._assert_media_transaction_failure_restores("timer", existing_install=True)
+
+    def test_first_install_timer_failure_restores_artifact_absence(self):
+        self._assert_media_transaction_failure_restores("timer", existing_install=False)
+
+    def test_quiesce_attempts_and_verifies_every_unit_after_a_partial_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log = Path(temporary_directory) / "events.log"
+            command = f"""
+source deployment/install-media.sh
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'stop gate-media-gateway.service') return 1 ;;
+    'is-active --quiet gate-media-gateway.service') return 0 ;;
+    is-active*) return 3 ;;
+    is-enabled*) return 1 ;;
+    *) return 0 ;;
+  esac
+}}
+set +e
+quiesce_published_media
+status=$?
+set -e
+printf 'status=%s\n' "$status" >> {shlex.quote(str(log))}
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [
+                    "systemctl stop gate-media-transcoder.service",
+                    "systemctl stop gate-media-gateway.service",
+                    "systemctl stop gate-media-auth.service",
+                    "systemctl stop gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl disable gate-media-transcoder.service",
+                    "systemctl disable gate-media-gateway.service",
+                    "systemctl disable gate-media-auth.service",
+                    "systemctl disable gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-transcoder.service",
+                    "systemctl is-active --quiet gate-media-gateway.service",
+                    "systemctl is-active --quiet gate-media-auth.service",
+                    "systemctl is-active --quiet gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "systemctl is-enabled --quiet gate-media-transcoder.service",
+                    "systemctl is-enabled --quiet gate-media-gateway.service",
+                    "systemctl is-enabled --quiet gate-media-auth.service",
+                    "systemctl is-enabled --quiet gate-media-turn-refresh.timer",
+                    "status=1",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+
+    def test_partial_quiescence_failure_blocks_artifact_restoration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            backup = state / ".install-backup.test"
+            backup.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_INSTALL_BACKUP_DIR={shlex.quote(str(backup))}
+MEDIA_TRANSACTION_STARTED=1
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  case "$*" in
+    'stop gate-media-gateway.service') return 1 ;;
+    is-active*) return 3 ;;
+    is-enabled*) return 1 ;;
+    *) return 0 ;;
+  esac
+}}
+restore_media_artifacts() {{ printf 'restore artifacts\n' >> {shlex.quote(str(log))}; }}
+validate_restored_nginx() {{ printf 'validate nginx\n' >> {shlex.quote(str(log))}; }}
+restore_media_unit_states() {{ printf 'restore states\n' >> {shlex.quote(str(log))}; }}
+flock() {{ printf 'flock %s\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "systemctl stop gate-media-transcoder.service",
+                    "systemctl stop gate-media-gateway.service",
+                    "systemctl stop gate-media-auth.service",
+                    "systemctl stop gate-media-turn-refresh.timer",
+                    "systemctl stop gate-media-turn-refresh.service",
+                    "systemctl disable gate-media-transcoder.service",
+                    "systemctl disable gate-media-gateway.service",
+                    "systemctl disable gate-media-auth.service",
+                    "systemctl disable gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-transcoder.service",
+                    "systemctl is-active --quiet gate-media-gateway.service",
+                    "systemctl is-active --quiet gate-media-auth.service",
+                    "systemctl is-active --quiet gate-media-turn-refresh.timer",
+                    "systemctl is-active --quiet gate-media-turn-refresh.service",
+                    "systemctl is-enabled --quiet gate-media-transcoder.service",
+                    "systemctl is-enabled --quiet gate-media-gateway.service",
+                    "systemctl is-enabled --quiet gate-media-auth.service",
+                    "systemctl is-enabled --quiet gate-media-turn-refresh.timer",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertTrue(backup.is_dir())
+            self.assertIn("transaction backup was retained", completed.stderr)
+
+    def test_rollback_disables_candidate_after_partial_disable_now_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            backup = state / ".install-backup.test"
+            backup.mkdir(mode=0o700)
+            unit_state = root / "unit-state"
+            unit_state.mkdir(mode=0o700)
+            log = root / "events.log"
+            enableable_units = (
+                "gate-media-transcoder.service",
+                "gate-media-gateway.service",
+                "gate-media-auth.service",
+                "gate-media-turn-refresh.timer",
+            )
+            active_units = (*enableable_units, "gate-media-turn-refresh.service")
+            for unit in active_units:
+                (unit_state / f"{unit}.active").write_text("1", encoding="utf-8")
+            for unit in enableable_units:
+                (unit_state / f"{unit}.enabled").write_text("1", encoding="utf-8")
+
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_INSTALL_BACKUP_DIR={shlex.quote(str(backup))}
+MEDIA_TRANSACTION_STARTED=1
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+UNIT_STATE_ROOT={shlex.quote(str(unit_state))}
+PARTIAL_DISABLE_MARKER={shlex.quote(str(root / "partial-disable"))}
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}
+  local command=$1
+  shift
+  case "$command" in
+    disable)
+      local disable_now=0
+      if [[ ${{1-}} == --now ]]; then
+        disable_now=1
+        shift
+      fi
+      local unit=$1
+      if [[ $disable_now -eq 1 ]]; then
+        printf '0' > "$UNIT_STATE_ROOT/$unit.active"
+      fi
+      if [[ $unit == gate-media-gateway.service \
+          && ! -e $PARTIAL_DISABLE_MARKER ]]; then
+        : > "$PARTIAL_DISABLE_MARKER"
+        return 1
+      fi
+      printf '0' > "$UNIT_STATE_ROOT/$unit.enabled"
+      ;;
+    stop)
+      printf '0' > "$UNIT_STATE_ROOT/$1.active"
+      ;;
+    is-active)
+      [[ $1 == --quiet ]]
+      [[ $(<"$UNIT_STATE_ROOT/$2.active") == 1 ]] && return 0
+      return 3
+      ;;
+    is-enabled)
+      [[ $1 == --quiet ]]
+      [[ $(<"$UNIT_STATE_ROOT/$2.enabled") == 1 ]] && return 0
+      return 1
+      ;;
+    daemon-reload)
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}}
+restore_media_artifacts() {{
+  printf 'restore artifacts\n' >> {shlex.quote(str(log))}
+}}
+validate_restored_nginx() {{ printf 'validate nginx\n' >> {shlex.quote(str(log))}; }}
+restore_media_unit_states() {{ printf 'restore states\n' >> {shlex.quote(str(log))}; }}
+flock() {{ printf 'flock %s\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            for unit in active_units:
+                self.assertEqual(
+                    "0", (unit_state / f"{unit}.active").read_text(encoding="utf-8"),
+                    unit,
                 )
+            for unit in enableable_units:
+                self.assertEqual(
+                    "0", (unit_state / f"{unit}.enabled").read_text(encoding="utf-8"),
+                    unit,
+                )
+            events = log.read_text(encoding="utf-8").splitlines()
+            for unit in enableable_units:
+                self.assertIn(f"systemctl is-enabled --quiet {unit}", events)
+            self.assertGreaterEqual(
+                events.count(
+                    "systemctl is-enabled --quiet gate-media-gateway.service"
+                ),
+                2,
+            )
+            self.assertNotIn("restore artifacts", events)
+            self.assertNotIn(
+                "systemctl disable gate-media-turn-refresh.service", events,
+            )
+            self.assertNotIn(
+                "systemctl is-enabled --quiet gate-media-turn-refresh.service", events,
+            )
+            self.assertTrue(backup.is_dir())
+            self.assertIn("transaction backup was retained", completed.stderr)
+
+    def test_unit_state_rollback_failure_requiesces_and_retains_the_backup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            backup = state / ".install-backup.test"
+            backup.mkdir(mode=0o700)
+            log = root / "events.log"
+            command = f"""
+source deployment/install-media.sh
+MEDIA_STATE_ROOT={shlex.quote(str(state))}
+MEDIA_INSTALL_BACKUP_DIR={shlex.quote(str(backup))}
+MEDIA_TRANSACTION_STARTED=1
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
+quiesce_published_media() {{ printf 'quiesce\n' >> {shlex.quote(str(log))}; }}
+restore_media_artifacts() {{ printf 'restore artifacts\n' >> {shlex.quote(str(log))}; }}
+systemctl() {{ printf 'systemctl %s\n' "$*" >> {shlex.quote(str(log))}; }}
+validate_restored_nginx() {{ printf 'validate nginx\n' >> {shlex.quote(str(log))}; }}
+restore_media_unit_states() {{
+  printf 'restore states\n' >> {shlex.quote(str(log))}
+  return 1
+}}
+flock() {{ printf 'flock %s\n' "$*" >> {shlex.quote(str(log))}; }}
+on_media_install_failure
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual(
+                [
+                    "quiesce",
+                    "restore artifacts",
+                    "systemctl daemon-reload",
+                    "validate nginx",
+                    "restore states",
+                    "quiesce",
+                    "flock -u 9",
+                ],
+                log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertTrue(backup.is_dir())
+            self.assertIn("transaction backup was retained", completed.stderr)
+
+    def _assert_media_transaction_failure_restores(self, stage, *, existing_install):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            layout = self._media_transaction_layout(root)
+            directory_artifacts = (
+                layout["config_root"], layout["library"], layout["archive_root"],
+            )
+            file_artifacts = (
+                layout["auth_env"], layout["gateway_env"], layout["runtime_turn"],
+                layout["tmpfiles"], layout["binary"], *layout["units"],
+            )
+            old_bytes = {}
+            old_proxy_target = layout["config_root"] / "prior-proxy.conf"
+            for path in directory_artifacts:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            for path in file_artifacts:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            layout["nginx_proxy"].parent.mkdir(parents=True, exist_ok=True)
+            if existing_install:
+                for path in directory_artifacts:
+                    path.mkdir()
+                    (path / "prior.marker").write_bytes(
+                        f"prior-directory:{path.name}".encode("utf-8")
+                    )
+                old_proxy_target.write_bytes(b"prior nginx config\n")
+                for path in file_artifacts:
+                    body = f"prior-file:{path.name}\n".encode("utf-8")
+                    path.write_bytes(body)
+                    old_bytes[path] = body
+                layout["nginx_proxy"].symlink_to(old_proxy_target)
+
+            nginx = root / "sbin/nginx"
+            nginx.parent.mkdir(parents=True)
+            nginx.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'nginx %s\\n' \"$*\" >> \"$MEDIA_TEST_LOG\"\n",
+                encoding="utf-8",
+            )
+            nginx.chmod(0o755)
+            state_root = root / "unit-state"
+            state_root.mkdir()
+            log = root / "transaction.log"
+            initial_states = {
+                "nginx.service": (False, True),
+                "gate-media-auth.service": (True, True) if existing_install else (False, False),
+                "gate-media-gateway.service": (False, False),
+                "gate-media-transcoder.service": (True, False) if existing_install else (False, False),
+                "gate-media-turn-refresh.timer": (True, True) if existing_install else (False, False),
+                "gate-media-turn-refresh.service": (False, True) if existing_install else (False, False),
+            }
+            for unit, (enabled, active) in initial_states.items():
+                key = unit.replace(".", "_").replace("-", "_")
+                (state_root / f"{key}.enabled").write_text(
+                    "1" if enabled else "0", encoding="utf-8"
+                )
+                (state_root / f"{key}.active").write_text(
+                    "1" if active else "0", encoding="utf-8"
+                )
+
+            artifact_words = " ".join(
+                shlex.quote(str(path))
+                for path in (*file_artifacts, *directory_artifacts, layout["nginx_proxy"])
+            )
+            command = f"""
+source deployment/install-media.sh
+MEDIA_AUTH_ENV={shlex.quote(str(layout['auth_env']))}
+MEDIA_GATEWAY_ENV={shlex.quote(str(layout['gateway_env']))}
+MEDIA_STATE_ROOT={shlex.quote(str(layout['state_root']))}
+MEDIA_RUNTIME_TURN_ENV={shlex.quote(str(layout['runtime_turn']))}
+MEDIA_CONFIG_ROOT={shlex.quote(str(layout['config_root']))}
+MEDIA_LIBRARY={shlex.quote(str(layout['library']))}
+MEDIA_ARCHIVE_ROOT={shlex.quote(str(layout['archive_root']))}
+MEDIA_BINARY={shlex.quote(str(layout['binary']))}
+MEDIA_TMPFILES={shlex.quote(str(layout['tmpfiles']))}
+SYSTEMD_ROOT={shlex.quote(str(layout['systemd_root']))}
+NGINX_PROXY_CONFIG={shlex.quote(str(layout['nginx_proxy']))}
+NGINX_BINARY={shlex.quote(str(nginx))}
+MEDIA_TURN_REFRESH_LOCK_HELD=1
+MEDIA_TEST_LOG={shlex.quote(str(log))}
+UNIT_STATE_ROOT={shlex.quote(str(state_root))}
+MEDIA_TEST_PRIOR_INSTALL={'1' if existing_install else '0'}
+MEDIA_TEST_FAILURE_STAGE={shlex.quote(stage)}
+MEDIA_TEST_FAILURE_MARKER={shlex.quote(str(root / 'failure-injected'))}
+MEDIA_ARTIFACT_PATHS=({artifact_words})
+
+unit_key() {{
+  local key=${{1//./_}}
+  printf '%s\n' "${{key//-/_}}"
+}}
+set_unit_state() {{
+  local key
+  key=$(unit_key "$1")
+  printf '%s' "$2" > "$UNIT_STATE_ROOT/$key.enabled"
+  printf '%s' "$3" > "$UNIT_STATE_ROOT/$key.active"
+}}
+read_unit_state() {{
+  local key
+  key=$(unit_key "$1")
+  cat "$UNIT_STATE_ROOT/$key.$2"
+}}
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> "$MEDIA_TEST_LOG"
+  local command=$1 unit enabled active now=0
+  shift
+  case "$command" in
+    show)
+      unit=${{!#}}
+      if [[ $unit == nginx.service || $MEDIA_TEST_PRIOR_INSTALL -eq 1 ]]; then
+        printf 'loaded\n'
+      else
+        printf 'not-found\n'
+      fi
+      ;;
+    is-enabled)
+      unit=${{!#}}
+      enabled=$(read_unit_state "$unit" enabled)
+      [[ $enabled == 1 ]]
+      ;;
+    is-active)
+      unit=${{!#}}
+      active=$(read_unit_state "$unit" active)
+      [[ $active == 1 ]] && return 0
+      return 3
+      ;;
+    enable|disable)
+      if [[ ${{1:-}} == --now ]]; then now=1; shift; fi
+      for unit in "$@"; do
+        active=$(read_unit_state "$unit" active)
+        if [[ $command == enable ]]; then enabled=1; else enabled=0; fi
+        [[ $now -eq 0 ]] || active=$enabled
+        set_unit_state "$unit" "$enabled" "$active"
+      done
+      if [[ $MEDIA_TEST_FAILURE_STAGE == timer && $command == enable \
+          && $now -eq 1 && ${{1:-}} == gate-media-turn-refresh.timer \
+          && ! -e $MEDIA_TEST_FAILURE_MARKER ]]; then
+        : > "$MEDIA_TEST_FAILURE_MARKER"
+        return 1
+      fi
+      ;;
+    restart|reload-or-restart)
+      for unit in "$@"; do
+        enabled=$(read_unit_state "$unit" enabled)
+        set_unit_state "$unit" "$enabled" 1
+      done
+      if [[ $MEDIA_TEST_FAILURE_STAGE == proxy && $command == reload-or-restart \
+          && ${{1:-}} == nginx.service && ! -e $MEDIA_TEST_FAILURE_MARKER ]]; then
+        : > "$MEDIA_TEST_FAILURE_MARKER"
+        return 1
+      fi
+      if [[ $MEDIA_TEST_FAILURE_STAGE == media && $command == restart \
+          && ${{1:-}} == gate-media-auth.service \
+          && ! -e $MEDIA_TEST_FAILURE_MARKER ]]; then
+        : > "$MEDIA_TEST_FAILURE_MARKER"
+        return 1
+      fi
+      ;;
+    stop)
+      for unit in "$@"; do
+        enabled=$(read_unit_state "$unit" enabled)
+        set_unit_state "$unit" "$enabled" 0
+      done
+      ;;
+    daemon-reload) ;;
+    *) return 99 ;;
+  esac
+}}
+flock() {{ printf 'flock %s\n' "$*" >> "$MEDIA_TEST_LOG"; }}
+publish_candidate_artifacts() {{
+  local artifact
+  for artifact in "${{MEDIA_ARTIFACT_PATHS[@]}}"; do
+    rm -rf -- "$artifact"
+    case "$artifact" in
+      "$MEDIA_CONFIG_ROOT"|"$MEDIA_LIBRARY"|"$MEDIA_ARCHIVE_ROOT")
+        mkdir -p -- "$artifact"
+        printf 'candidate\n' > "$artifact/candidate.marker"
+        ;;
+      "$NGINX_PROXY_CONFIG")
+        mkdir -p -- "${{artifact%/*}}"
+        ln -s -- "$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf" "$artifact"
+        ;;
+      *)
+        mkdir -p -- "${{artifact%/*}}"
+        printf 'candidate:%s\n' "$artifact" > "$artifact"
+        ;;
+    esac
+  done
+}}
+if ! declare -F begin_media_install_transaction >/dev/null; then
+  begin_media_install_transaction() {{ :; }}
+fi
+trap on_media_install_failure ERR
+begin_media_install_transaction
+quiesce_turn_refresh
+publish_candidate_artifacts
+printf 'published {stage}\n' >> "$MEDIA_TEST_LOG"
+systemctl enable nginx.service
+systemctl reload-or-restart nginx.service
+activate_media_services
+turn_refresh_environment_configured() {{ return 0; }}
+configure_turn_refresh_timer
+fail 'failure injection did not run'
+"""
+            environment = dict(os.environ)
+            environment["MEDIA_TEST_LOG"] = str(log)
+            completed = subprocess.run(
+                ["bash", "-c", command], cwd=REPOSITORY_ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertNotEqual(0, completed.returncode)
+            events = log.read_text(encoding="utf-8").splitlines()
+            self.assertIn(f"published {stage}", events)
+            if existing_install:
+                for path in directory_artifacts:
+                    self.assertTrue(path.is_dir(), f"prior directory was not restored: {path}")
+                    self.assertTrue(
+                        (path / "prior.marker").is_file(),
+                        f"prior directory bytes were not restored: {path}",
+                    )
+                    self.assertEqual(
+                        f"prior-directory:{path.name}".encode("utf-8"),
+                        (path / "prior.marker").read_bytes(),
+                    )
+                    self.assertFalse((path / "candidate.marker").exists())
+                for path, body in old_bytes.items():
+                    self.assertTrue(path.is_file(), f"prior file was not restored: {path}")
+                    self.assertEqual(body, path.read_bytes(), str(path))
+                self.assertTrue(layout["nginx_proxy"].is_symlink())
+                self.assertEqual(str(old_proxy_target), os.readlink(layout["nginx_proxy"]))
+            else:
+                for path in (*directory_artifacts, *file_artifacts, layout["nginx_proxy"]):
+                    self.assertFalse(path.exists() or path.is_symlink(), str(path))
+
+            for unit, expected in initial_states.items():
+                key = unit.replace(".", "_").replace("-", "_")
+                actual = (
+                    (state_root / f"{key}.enabled").read_text(encoding="utf-8") == "1",
+                    (state_root / f"{key}.active").read_text(encoding="utf-8") == "1",
+                )
+                self.assertEqual(expected, actual, unit)
+            self.assertEqual("flock -u 9", events[-1])
+            self.assertEqual([], list(layout["state_root"].glob(".install-backup.*")))
+
+    @staticmethod
+    def _media_transaction_layout(root):
+        state_root = root / "state"
+        state_root.mkdir(mode=0o700)
+        systemd_root = root / "systemd"
+        return {
+            "auth_env": root / "etc/gate-media-auth.env",
+            "gateway_env": root / "etc/gate-media-gateway.env",
+            "state_root": state_root,
+            "runtime_turn": state_root / "turn.env",
+            "config_root": root / "etc/gate-media",
+            "library": root / "lib/gate-media",
+            "archive_root": state_root / "archives",
+            "binary": root / "bin/mediamtx",
+            "tmpfiles": root / "tmpfiles/gate-media.conf",
+            "systemd_root": systemd_root,
+            "units": tuple(systemd_root / name for name in (
+                "gate-media-auth.service",
+                "gate-media-gateway.service",
+                "gate-media-transcoder.service",
+                "gate-media-turn-refresh.service",
+                "gate-media-turn-refresh.timer",
+            )),
+            "nginx_proxy": root / "nginx/gate-media-whep.conf",
+        }
 
     def _make_mediamtx_archive(self, root, reported_version):
         executable = root / "mediamtx"
@@ -962,7 +2535,7 @@ class MediaCapabilityTests(unittest.TestCase):
         self.assertTrue(snapshot["media"]["video"]["configured"])
         self.assertTrue(snapshot["media"]["video"]["verified"])
         self.assertFalse(snapshot["media"]["listen"]["configured"])
-        self.assertNotIn("MTX_PATHS_GATE_SOURCE", snapshot)
+        self.assertNotIn("MTX_PATHS_CAMERA_SOURCE", snapshot)
 
 
 class MediaGatewayHealthTests(unittest.TestCase):
@@ -972,9 +2545,11 @@ class MediaGatewayHealthTests(unittest.TestCase):
     def test_gate_path_reports_video_and_listen_readiness_by_recognized_track_type(self):
         cases = (
             (["H264"], {"video": True, "listen": False}),
-            (["MPEG-4 Audio"], {"video": False, "listen": True}),
-            (["AC-3"], {"video": False, "listen": True}),
+            (["MPEG-4 Audio"], {"video": False, "listen": False}),
+            (["AC-3"], {"video": False, "listen": False}),
             (["H264", "Opus"], {"video": True, "listen": True}),
+            (["H264", "G722"], {"video": True, "listen": True}),
+            (["H264", "G711"], {"video": True, "listen": True}),
         )
         environment = {
             "GATE_MEDIA_VIDEO_CONFIGURED": "true",

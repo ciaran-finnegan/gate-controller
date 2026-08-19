@@ -103,16 +103,35 @@ def authorize_body(body: bytes, secret: str, *, now: int) -> int:
         return 401
     if not isinstance(payload, dict) or set(payload) != _ALLOWED_FIELDS:
         return 401
-    return 200 if _allows_read(payload, secret, now=now) else 401
+    return 200 if _allows_request(payload, secret, now=now) else 401
 
 
-def _allows_read(payload: dict, secret: str, *, now: int) -> bool:
+def _allows_request(payload: dict, secret: str, *, now: int) -> bool:
+    if any(not isinstance(payload.get(field), str) for field in payload):
+        return False
+    if _allows_local_rtsp(payload):
+        return True
+    return _allows_viewer_read(payload, secret, now=now)
+
+
+def _allows_local_rtsp(payload: dict) -> bool:
+    if payload["protocol"] != "rtsp" or payload["ip"] != LOOPBACK_HOST:
+        return False
+    if any(payload[field] for field in ("user", "password", "token", "query")):
+        return False
+    return (payload["action"], payload["path"]) in {
+        ("read", "camera"),
+        ("publish", "gate"),
+    }
+
+
+def _allows_viewer_read(payload: dict, secret: str, *, now: int) -> bool:
     token = payload.get("token")
     if not isinstance(token, str) or not token:
         return False
     if token.startswith("Bearer "):
         token = token[len("Bearer "):]
-    if not token or any(not isinstance(payload.get(field), str) for field in payload):
+    if not token:
         return False
     if payload.get("action") != "read" or payload.get("path") != "gate":
         return False

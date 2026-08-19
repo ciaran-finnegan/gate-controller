@@ -55,6 +55,21 @@ def valid_auth_request(now):
     }
 
 
+def local_rtsp_request(action, path):
+    return {
+        "user": "",
+        "password": "",
+        "token": "",
+        "ip": "127.0.0.1",
+        "action": action,
+        "path": path,
+        "protocol": "rtsp",
+        "id": "local-transcoder",
+        "query": "",
+        "userAgent": "Lavf",
+    }
+
+
 class MediaTokenTests(unittest.TestCase):
     def test_accepts_a_current_read_token_for_the_primary_gate(self):
         claims = valid_claims()
@@ -118,6 +133,46 @@ class MediaAuthServerTests(unittest.TestCase):
         status = authorize_body(payload.encode("utf-8"), SECRET, now=int(time.time()))
 
         self.assertEqual(200, status)
+
+    def test_allows_only_the_two_blank_credential_loopback_rtsp_operations(self):
+        now = int(time.time())
+
+        for action, path in (("read", "camera"), ("publish", "gate")):
+            with self.subTest(action=action, path=path):
+                body = json.dumps(local_rtsp_request(action, path)).encode("utf-8")
+                self.assertEqual(200, authorize_body(body, SECRET, now=now))
+
+    def test_rejects_every_near_miss_local_rtsp_operation(self):
+        now = int(time.time())
+        mutations = (
+            ("user", "transcoder"),
+            ("password", "secret"),
+            ("token", "secret"),
+            ("query", "token=secret"),
+            ("ip", "::1"),
+            ("ip", "127.0.0.2"),
+            ("protocol", "webrtc"),
+            ("action", "playback"),
+            ("path", "other"),
+        )
+        allowed = (("read", "camera"), ("publish", "gate"))
+
+        for action, path in allowed:
+            for field, value in mutations:
+                payload = local_rtsp_request(action, path)
+                payload[field] = value
+                with self.subTest(action=action, path=path, field=field, value=value):
+                    self.assertEqual(
+                        401,
+                        authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
+                    )
+        for action, path in (("read", "gate"), ("publish", "camera")):
+            with self.subTest(action=action, path=path):
+                payload = local_rtsp_request(action, path)
+                self.assertEqual(
+                    401,
+                    authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
+                )
 
     def test_rejects_removal_of_every_required_mediamtx_auth_field(self):
         now = int(time.time())
@@ -196,7 +251,7 @@ class MediaAuthConfigurationTests(unittest.TestCase):
 
         self.assertEqual(valid, media_auth_main.validated_auth_environment(valid))
         for extra in (
-            {"MTX_PATHS_GATE_SOURCE": "rtsp://camera.example/stream"},
+            {"MTX_PATHS_CAMERA_SOURCE": "rtsp://camera.example/stream"},
             {"GATE_MEDIA_VIDEO_CONFIGURED": " false"},
         ):
             with self.subTest(extra=extra), self.assertRaises(MediaConfigError):
@@ -209,6 +264,7 @@ class IsolationTests(unittest.TestCase):
         sources = [root / "gate_media_config.py"]
         sources.extend((root / "gate_media_auth").glob("*.py"))
         sources.extend((root / "gate_media_gateway").glob("*.py"))
+        sources.extend((root / "gate_media_transcoder").glob("*.py"))
         forbidden = ("gate_controller.relay", "gate_controller.actuation", "PiRelay")
         for source in sources:
             contents = source.read_text(encoding="utf-8")

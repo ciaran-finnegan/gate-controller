@@ -1,0 +1,33 @@
+[Unit]
+Description=Refresh isolated Gate MediaMTX Cloudflare TURN credentials
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PYTHONPATH=/usr/local/lib/gate-media
+ExecStart=/usr/bin/flock --wait 10 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
+TimeoutStartSec=150s
+UMask=0077
+StateDirectory=gate-media
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/gate-media
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

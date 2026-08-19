@@ -1,10 +1,12 @@
 import argparse
 import ipaddress
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
 from urllib.parse import urlparse
 
 from .audio import PromptPlayer
@@ -29,6 +31,11 @@ from .worker import (
 from .runtime import require_python_version
 
 
+MIN_QUIET_WINDOW_SECONDS = 0.1
+MAX_QUIET_WINDOW_SECONDS = 2.0
+DEFAULT_QUIET_WINDOW_SECONDS = 0.2
+
+
 def main() -> None:
     require_python_version()
     logging.basicConfig(
@@ -46,7 +53,9 @@ def main() -> None:
                         default=authorised_default)
     parser.add_argument("--database", type=Path,
                         default=database_default)
-    parser.add_argument("--quiet-window", type=float, default=0.5)
+    parser.add_argument(
+        "--quiet-window", type=_quiet_window, default=DEFAULT_QUIET_WINDOW_SECONDS
+    )
     arguments = parser.parse_args()
     token = os.environ.get("PLATE_RECOGNIZER_API_TOKEN")
     if not token:
@@ -106,16 +115,50 @@ def main() -> None:
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
+    def shutdown():
+        return _shutdown_controller(processor, relay)
+
     run_worker(
         arguments.directory, process, quiet_window=arguments.quiet_window,
         background_workers=background_workers,
         max_image_age=max_image_age,
         on_skipped=record_skipped,
         on_error=record_error,
-        shutdown=relay.shutdown,
+        shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
     )
+
+
+def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
+                         processor_timeout: float = 1.0) -> bool:
+    begin_shutdown = getattr(relay, "begin_shutdown", None)
+    relay_latched = False
+    if callable(begin_shutdown):
+        latch_completed, latch_result = _bounded_shutdown_call(begin_shutdown, relay_timeout)
+        relay_latched = latch_completed and latch_result is not False
+    processor_completed = False
+    relay_completed = False
+    relay_safe = False
+    if relay_latched:
+        processor_completed, _ = _bounded_shutdown_call(processor.close, processor_timeout)
+        relay_completed, relay_safe = _bounded_shutdown_call(relay.shutdown, relay_timeout)
+    return relay_latched and processor_completed and relay_completed and relay_safe is True
+
+
+def _bounded_shutdown_call(operation, timeout: float) -> tuple[bool, object | None]:
+    result = []
+
+    def invoke():
+        try:
+            result.append(operation())
+        except BaseException:
+            result.append(False)
+
+    worker = Thread(target=invoke, name="gate-controller-shutdown", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return not worker.is_alive(), result[0] if result else None
 
 
 def _run_telemetry_export(arguments: list[str]) -> None:
@@ -142,6 +185,22 @@ def _iso8601(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise argparse.ArgumentTypeError("must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _quiet_window(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "quiet window must be between 0.1 and 2 seconds"
+        ) from error
+    if not math.isfinite(seconds) or not (
+        MIN_QUIET_WINDOW_SECONDS <= seconds <= MAX_QUIET_WINDOW_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            "quiet window must be between 0.1 and 2 seconds"
+        )
+    return seconds
 
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,

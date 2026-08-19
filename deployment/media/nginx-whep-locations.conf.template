@@ -21,7 +21,7 @@ location = /gate/whep {
     proxy_pass http://127.0.0.1:8889;
 }
 
-location ~ ^/gate/whep/[A-Za-z0-9_-]{1,128}$ {
+location ~ "^/gate/whep/[A-Za-z0-9_-]{1,128}$" {
     limit_except DELETE OPTIONS { deny all; }
     if ($request_method = OPTIONS) {
         add_header Access-Control-Allow-Origin "__GATE_MEDIA_ALLOWED_ORIGIN__" always;

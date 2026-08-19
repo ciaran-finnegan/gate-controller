@@ -1,16 +1,23 @@
+import argparse
 import unittest
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, Thread
+from time import monotonic
 from unittest.mock import patch
 
 import gate_controller.__main__ as gate_main
-from gate_controller.__main__ import build_background_workers, default_runtime_paths
+from gate_controller.__main__ import (
+    _quiet_window, _shutdown_controller, build_background_workers,
+    default_runtime_paths,
+)
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
 from gate_controller.outbox import OutboxWorker
+from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
 
 
@@ -19,6 +26,40 @@ class MainConfigurationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         return LocalStore(Path(directory.name) / "gate.db")
+
+    def test_quiet_window_accepts_the_bounded_production_value(self):
+        self.assertEqual(0.2, _quiet_window("0.2"))
+
+    def test_quiet_window_rejects_nonfinite_or_unsafe_values(self):
+        for value in ("-1", "0", "0.05", "2.1", "nan", "inf", "-inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                argparse.ArgumentTypeError, "quiet window must be between 0.1 and 2 seconds"
+            ):
+                _quiet_window(value)
+
+    def test_candidate_release_defaults_to_200ms_without_a_refreshed_service_argument(self):
+        with patch.dict(
+            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker") as run_worker:
+            gate_main.main()
+
+        self.assertEqual(0.2, run_worker.call_args.kwargs["quiet_window"])
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -43,8 +84,13 @@ class MainConfigurationTests(unittest.TestCase):
         calls = []
 
         class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
             def shutdown(self):
                 calls.append("relay_shutdown")
+                return True
 
         class Store:
             path = Path("gate.db")
@@ -56,8 +102,13 @@ class MainConfigurationTests(unittest.TestCase):
             def get(self):
                 return ()
 
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
         relay = Relay()
         store = Store()
+        processor = Processor()
 
         def create_relay(_adapter):
             calls.append("relay")
@@ -84,12 +135,118 @@ class MainConfigurationTests(unittest.TestCase):
         ), patch.object(
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
-            gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker"):
+            gate_main, "GateProcessor", return_value=processor
+        ), patch.object(
+            gate_main, "run_worker", side_effect=lambda *args, **kwargs: kwargs["shutdown"]()
+        ):
             gate_main.main()
 
         self.assertLess(calls.index("relay"), calls.index("store"))
         self.assertLess(calls.index("store"), calls.index("recover"))
+        self.assertLess(calls.index("relay_begin_shutdown"), calls.index("processor_close"))
+        self.assertLess(calls.index("processor_close"), calls.index("relay_shutdown"))
+
+    def test_shutdown_reaches_processor_close_when_relay_shutdown_hangs(self):
+        release = Event()
+        calls = []
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                release.wait(2)
+                return True
+
+        try:
+            started = monotonic()
+            safe = _shutdown_controller(Processor(), Relay(), relay_timeout=0.05)
+            elapsed = monotonic() - started
+
+            self.assertFalse(safe)
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(
+                calls,
+                ["relay_begin_shutdown", "processor_close", "relay_shutdown"],
+            )
+        finally:
+            release.set()
+
+    def test_shutdown_requests_the_relay_latch_before_processor_cleanup(self):
+        calls = []
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                return True
+
+        safe = _shutdown_controller(Processor(), Relay())
+
+        self.assertTrue(safe)
+        self.assertEqual(
+            calls,
+            ["relay_begin_shutdown", "processor_close", "relay_shutdown"],
+        )
+
+    def test_shutdown_waits_for_an_inflight_gpio_boundary_before_processor_cleanup(self):
+        boundary_checked = Event()
+        release_gpio = Event()
+        processor_started = Event()
+        calls = []
+
+        class BoundaryBackend:
+            def off(self):
+                calls.append("off")
+
+            def on(self, *, pre_activation_inhibit=None):
+                inhibition = pre_activation_inhibit()
+                boundary_checked.set()
+                release_gpio.wait(1)
+                if inhibition is not None:
+                    return inhibition
+                calls.append("on")
+                return None
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+                processor_started.set()
+
+        relay = RelayController(BoundaryBackend(), pulse_seconds=10)
+        trigger = Thread(target=lambda: relay.trigger(
+            "remote_command", "command:shutdown-barrier"
+        ))
+        trigger.start()
+        self.assertTrue(boundary_checked.wait(1))
+
+        shutdown_results = []
+        shutdown = Thread(target=lambda: shutdown_results.append(
+            _shutdown_controller(Processor(), relay)
+        ))
+        shutdown.start()
+
+        self.assertFalse(processor_started.wait(0.05))
+        release_gpio.set()
+        trigger.join(1)
+        shutdown.join(1)
+
+        self.assertFalse(trigger.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(shutdown_results, [True])
+        self.assertLess(calls.index("off", 1), calls.index("processor_close"))
 
     def test_partial_cloudflare_configuration_fails_closed(self):
         configurations = (

@@ -21,6 +21,7 @@ _AUDIO_TRACKS = frozenset({
     "Opus", "FLAC", "Vorbis", "MPEG-4 Audio", "MPEG-4 Audio LATM",
     "MPEG-1/2 Audio", "AC-3", "Speex", "G726", "G722", "G711", "LPCM",
 })
+_WEBRTC_AUDIO_TRACKS = frozenset({"Opus", "G722", "G711"})
 _MEDIA_TRACKS = _VIDEO_TRACKS | _AUDIO_TRACKS
 
 
@@ -153,7 +154,7 @@ def gateway_status_readiness(body: bytes) -> dict:
         return _unready_gateway()
     return {
         "video": any(track in _VIDEO_TRACKS for track in tracks),
-        "listen": any(track in _AUDIO_TRACKS for track in tracks),
+        "listen": any(track in _WEBRTC_AUDIO_TRACKS for track in tracks),
     }
 
 

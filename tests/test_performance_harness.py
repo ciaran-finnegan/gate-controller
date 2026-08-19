@@ -23,12 +23,26 @@ class PerformanceHarnessTests(unittest.TestCase):
 
         self.assertFalse(result.actuate)
 
-    def test_performance_harness_outputs_json_summary(self):
+    def test_performance_harness_rejects_actuation_when_network_is_skipped(self):
         harness = load_harness()
 
-        summary = harness.build_summary(samples=[{"latency_ms": 12.5}], skipped_pi=True)
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as exit_error:
+            harness.parse_args(["--skip-network", "--actuate"])
 
-        self.assertEqual(summary["pi_ssh_tests"], "skipped_until_tailscale_or_home_wifi")
+        self.assertEqual(exit_error.exception.code, 2)
+
+    def test_performance_harness_records_passive_on_device_validation(self):
+        harness = load_harness()
+
+        summary = harness.build_summary(
+            samples=[{"latency_ms": 12.5}],
+            run_mode="passive_endpoint_probe",
+            actuation_requested=False,
+        )
+
+        self.assertEqual(summary["run_mode"], "passive_endpoint_probe")
+        self.assertFalse(summary["actuation_requested"])
+        self.assertNotIn("pi_ssh_tests", summary)
 
     def test_host_metrics_include_bounded_network_interface_counters(self):
         harness = load_harness()
@@ -71,9 +85,11 @@ class PerformanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             harness, "measure_request", side_effect=measure_request
         ), mock.patch.object(harness, "collect_host_metrics", return_value={}):
-            harness.main(["--output", str(Path(directory) / "summary.json")])
+            summary = harness.main(["--output", str(Path(directory) / "summary.json")])
 
         self.assertEqual([method for _, method in calls], ["GET", "GET"])
+        self.assertEqual("passive_endpoint_probe", summary["run_mode"])
+        self.assertFalse(summary["actuation_requested"])
 
     def test_skip_network_execution_issues_no_requests(self):
         harness = load_harness()
@@ -83,9 +99,13 @@ class PerformanceHarnessTests(unittest.TestCase):
         ) as measure_request, mock.patch.object(
             harness, "collect_host_metrics", return_value={}
         ):
-            harness.main(["--skip-network", "--output", str(Path(directory) / "summary.json")])
+            summary = harness.main([
+                "--skip-network", "--output", str(Path(directory) / "summary.json")
+            ])
 
         measure_request.assert_not_called()
+        self.assertEqual("host_metrics_only", summary["run_mode"])
+        self.assertFalse(summary["actuation_requested"])
 
     def test_explicit_actuation_execution_issues_the_only_post(self):
         harness = load_harness()
@@ -98,9 +118,13 @@ class PerformanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             harness, "measure_request", side_effect=measure_request
         ), mock.patch.object(harness, "collect_host_metrics", return_value={}):
-            harness.main(["--actuate", "--output", str(Path(directory) / "summary.json")])
+            summary = harness.main([
+                "--actuate", "--output", str(Path(directory) / "summary.json")
+            ])
 
         self.assertEqual([method for _, method in calls], ["GET", "GET", "POST"])
+        self.assertEqual("actuating_endpoint_probe", summary["run_mode"])
+        self.assertTrue(summary["actuation_requested"])
 
 
 if __name__ == "__main__":

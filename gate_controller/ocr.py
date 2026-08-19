@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from math import isfinite
 from pathlib import Path
+from threading import Lock
 
 from .matching import normalise_plate
 from .models import PlateObservation
@@ -19,13 +20,44 @@ class PlateRecognizerClient:
                  timeout: tuple[int, int] = DEFAULT_TIMEOUT):
         self._token = token
         self._session = session
+        self._session_generation = 0
+        self._session_lock = Lock()
+        self._closed = False
         self._endpoint = endpoint
         self._timeout = timeout
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
-        if self._session is None:
-            self._session = self._create_session()
-        session = self._session
+        with self._session_lock:
+            if self._closed:
+                raise RuntimeError("OCR client is closed")
+            generation = self._session_generation
+            session = self._session
+        if session is None:
+            created = self._create_session()
+            discard_created = False
+            error = None
+            with self._session_lock:
+                if self._closed:
+                    discard_created = True
+                    error = RuntimeError("OCR client is closed")
+                elif generation != self._session_generation:
+                    discard_created = True
+                    error = OcrResponseError("OCR request was abandoned")
+                elif self._session is None:
+                    self._session = created
+                    session = created
+                else:
+                    discard_created = True
+                    session = self._session
+            if discard_created:
+                self._close_session(created)
+            if error is not None:
+                raise error
+        with self._session_lock:
+            if self._closed:
+                raise RuntimeError("OCR client is closed")
+            if generation != self._session_generation:
+                raise OcrResponseError("OCR request was abandoned")
         with path.open("rb") as image:
             response = session.post(
                 self._endpoint,
@@ -63,6 +95,34 @@ class PlateRecognizerClient:
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
+
+    def abandon_in_flight(self) -> bool:
+        """Detach a timed-out request so later work receives a fresh session."""
+        with self._session_lock:
+            session = self._session
+            self._session_generation += 1
+            self._session = None
+        self._close_session(session)
+        return False
+
+    def close(self) -> None:
+        with self._session_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._session_generation += 1
+            session = self._session
+            self._session = None
+        self._close_session(session)
+
+    @staticmethod
+    def _close_session(session) -> None:
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     @staticmethod
     def _create_session():

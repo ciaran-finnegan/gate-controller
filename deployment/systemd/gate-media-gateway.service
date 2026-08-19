@@ -11,6 +11,7 @@ Type=simple
 User=gate-media
 Group=gate-media
 EnvironmentFile=/etc/gate-media-gateway.env
+EnvironmentFile=/var/lib/gate-media/turn.env
 Environment=PYTHONPATH=/usr/local/lib/gate-media
 ExecStart=/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml
 Restart=always
@@ -35,11 +36,10 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
-NoExecPaths=/
-ExecPaths=/usr/bin/python3 /usr/local/bin/mediamtx
+NoExecPaths=/run/gate-media /tmp /var/tmp /dev/shm
 
 [Install]
 WantedBy=multi-user.target

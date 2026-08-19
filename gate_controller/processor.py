@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import math
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
 from .actuation import ActuationCoordinator
@@ -17,14 +20,40 @@ from .telemetry import OcrAttemptTelemetry, ProcessingTrace
 
 
 MAX_OCR_FRAMES = 3
+DEFAULT_ACTIVATION_GUARD_SECONDS = 0.1
+FINAL_INHIBITION_REASONS = frozenset({
+    "stale_burst", "authorisation_error", "authorisation_revoked",
+    "decision_timeout", "processor_closed",
+})
+
+
+class _OcrBusy(TimeoutError):
+    pass
+
+
+class _OcrDeadlineExceeded(TimeoutError):
+    pass
 
 
 class GateProcessor:
     def __init__(self, recognizer, store, relay, authorised: Iterable[str],
                  cooldown: timedelta = timedelta(seconds=20), outbox=None, clock=None,
                  coordinator=None, max_image_age: timedelta = timedelta(seconds=8),
-                 decision_timeout: float = 4.0, decision_clock=None,
+                 decision_timeout: float = 4.0,
+                 activation_guard_seconds: float | None = None,
+                 decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None):
+        if not math.isfinite(decision_timeout) or decision_timeout <= 0:
+            raise ValueError("decision timeout must be finite and greater than zero")
+        if activation_guard_seconds is None:
+            activation_guard_seconds = min(
+                DEFAULT_ACTIVATION_GUARD_SECONDS, decision_timeout / 10,
+            )
+        if (not math.isfinite(activation_guard_seconds)
+                or not 0 <= activation_guard_seconds < decision_timeout):
+            raise ValueError(
+                "activation guard must be finite, non-negative, and below the decision timeout"
+            )
         self._recognizer = recognizer
         self._store = store
         self._authorised = authorised if callable(authorised) else lambda: tuple(authorised)
@@ -33,6 +62,7 @@ class GateProcessor:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_image_age = max_image_age
         self._decision_timeout = decision_timeout
+        self._activation_guard_seconds = activation_guard_seconds
         self._decision_clock = decision_clock or monotonic
         self._telemetry_clock = telemetry_clock or monotonic
         self._telemetry_wall_clock = telemetry_wall_clock or (
@@ -40,10 +70,19 @@ class GateProcessor:
         )
         self._trace_factory = trace_factory or ProcessingTrace
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
+        self._ocr_slot = BoundedSemaphore(1)
+        self._ocr_slot_lock = Lock()
+        self._actuation_lock = Lock()
+        self._ocr_worker = None
+        self._closed = False
+        self._recognise_call = self._recognizer.recognise
+        self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None) -> ProcessingResult:
         started = self._decision_clock() if decision_started_at is None else decision_started_at
+        deadline = started + self._decision_timeout
+        activation_deadline = deadline - self._activation_guard_seconds
         candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
@@ -80,7 +119,7 @@ class GateProcessor:
                 idempotency_key=idempotency_key,
             )
         observations = []
-        saw_ocr_error = False
+        ocr_failure_reason = None
         decision = None
         timed_out = False
         for sequence, path in enumerate(paths[:MAX_OCR_FRAMES]):
@@ -109,14 +148,29 @@ class GateProcessor:
                 ocr_started = True
 
             try:
-                observation = self._recognise(path, remaining, mark_ocr_start)
+                observation = self._recognise(path, deadline, mark_ocr_start)
+            except _OcrBusy:
+                trace.add_ocr_rejection(OcrAttemptTelemetry(
+                    frame_sequence=sequence,
+                    status="ocr_busy",
+                ))
+                ocr_failure_reason = "ocr_busy"
+                break
+            except _OcrDeadlineExceeded:
+                if ocr_started:
+                    trace.add_ocr_attempt(OcrAttemptTelemetry(
+                        frame_sequence=sequence,
+                        status="ocr_timeout",
+                    ))
+                timed_out = True
+                break
             except Exception:
                 if ocr_started:
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_error",
                     ))
-                saw_ocr_error = True
+                ocr_failure_reason = "ocr_error"
                 continue
             trace.add_ocr_attempt(OcrAttemptTelemetry(
                 frame_sequence=sequence,
@@ -136,7 +190,7 @@ class GateProcessor:
         if not (decision and decision.allowed) and self._decision_clock() - started >= self._decision_timeout:
             timed_out = True
         if decision is None:
-            reason = "decision_timeout" if timed_out else ("ocr_error" if saw_ocr_error else "no_match")
+            reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
             return self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -165,7 +219,7 @@ class GateProcessor:
             ocr_confidence=decision.confidence,
         )
         if not decision.allowed:
-            if saw_ocr_error:
+            if ocr_failure_reason == "ocr_error":
                 event = _denied_event(idempotency_key, received_at, decision_at, "ocr_error",
                                       decision)
             trace.mark_decision("denied", event.reason)
@@ -187,6 +241,9 @@ class GateProcessor:
                 trace, ProcessingResult(False, "stale_burst", event_id, decision)
             )
         def activation_inhibition():
+            with self._ocr_slot_lock:
+                if self._closed:
+                    return "failed", "processor_closed"
             if not _is_fresh(self._clock(), received_at, self._max_image_age):
                 return "failed", "stale_burst"
             try:
@@ -197,6 +254,8 @@ class GateProcessor:
                 return "failed", "authorisation_error"
             if normalise_plate(decision.authorised_plate) not in current_authorised:
                 return "failed", "authorisation_revoked"
+            if self._decision_clock() >= activation_deadline:
+                return "failed", "decision_timeout"
             return None
 
         actuation_kwargs = {
@@ -205,7 +264,10 @@ class GateProcessor:
         }
         if _accepts_keyword(self._coordinator.actuate, "on_activation"):
             actuation_kwargs["on_activation"] = trace.mark_relay_activation
-        execution = self._coordinator.actuate(event, **actuation_kwargs)
+        with self._actuation_lock:
+            execution = self._coordinator.actuate(event, **actuation_kwargs)
+        if execution.reason in FINAL_INHIBITION_REASONS:
+            trace.revise_decision("denied", execution.reason)
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._finish_result(
             trace,
@@ -280,17 +342,119 @@ class GateProcessor:
             return {"event_id": None}
         return prepare_payload(paths[0] if paths else None)
 
-    def _recognise(self, path: Path, remaining: float, on_start=None):
-        parameters = inspect.signature(self._recognizer.recognise).parameters
-        if "timeout" not in parameters:
-            if on_start is not None:
-                on_start()
-            return self._recognizer.recognise(path)
+    def _recognise(self, path: Path, deadline: float, on_start=None):
+        remaining = deadline - self._decision_clock()
+        if remaining <= 0:
+            raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
+        operation = lambda: self._recognise_call(path)
+        if not self._recognizer_accepts_timeout:
+            return self._run_ocr_bounded(operation, deadline, on_start)
         connect = min(1.0, max(0.1, remaining / 3))
         read = min(2.0, max(0.1, remaining - connect))
+        operation = lambda: self._recognise_call(path, timeout=(connect, read))
+        return self._run_ocr_bounded(operation, deadline, on_start)
+
+    def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
+        with self._ocr_slot_lock:
+            if self._closed:
+                raise _OcrBusy("OCR processor is closed")
+            slot = self._ocr_slot
+            if not slot.acquire(blocking=False):
+                raise _OcrBusy("previous OCR request is still running")
         if on_start is not None:
             on_start()
-        return self._recognizer.recognise(path, timeout=(connect, read))
+        result = Queue(maxsize=1)
+
+        def invoke():
+            try:
+                outcome = (True, operation())
+            except Exception as error:
+                outcome = (False, error)
+            finally:
+                slot.release()
+            result.put(outcome)
+
+        worker = Thread(target=invoke, name="gate-ocr-request", daemon=True)
+        with self._ocr_slot_lock:
+            if self._closed:
+                slot.release()
+                raise _OcrBusy("OCR processor is closed")
+            self._ocr_worker = worker
+            try:
+                worker.start()
+            except BaseException:
+                if self._ocr_worker is worker:
+                    self._ocr_worker = None
+                slot.release()
+                raise
+        remaining = deadline - self._decision_clock()
+        if remaining <= 0:
+            self._cancel_and_reap_ocr_worker(worker)
+            raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
+        try:
+            succeeded, value = result.get(timeout=max(remaining, 0.0))
+        except Empty as error:
+            self._cancel_and_reap_ocr_worker(worker)
+            raise _OcrDeadlineExceeded(
+                "OCR request exceeded the decision deadline"
+            ) from error
+        worker.join(0.5)
+        with self._ocr_slot_lock:
+            if self._ocr_worker is worker and not worker.is_alive():
+                self._ocr_worker = None
+        if succeeded:
+            return value
+        raise value
+
+    def _cancel_and_reap_ocr_worker(self, worker) -> None:
+        abandon = getattr(self._recognizer, "abandon_in_flight", None)
+        if not callable(abandon):
+            return
+        outcome = []
+
+        def abandon_recognizer():
+            try:
+                outcome.append(abandon() is True)
+            except Exception:
+                outcome.append(False)
+
+        cleanup = Thread(
+            target=abandon_recognizer, name="gate-ocr-abandon", daemon=True,
+        )
+        cleanup.start()
+        cleanup.join(0.05)
+        if not cleanup.is_alive() and outcome and outcome[0]:
+            worker.join(0.5)
+        with self._ocr_slot_lock:
+            if self._ocr_worker is worker and not worker.is_alive():
+                self._ocr_worker = None
+
+    def close(self) -> None:
+        with self._ocr_slot_lock:
+            if self._closed:
+                return
+            self._closed = True
+            worker = self._ocr_worker
+        with self._actuation_lock:
+            pass
+        close = getattr(self._recognizer, "close", None)
+        if callable(close):
+            def close_recognizer():
+                try:
+                    close()
+                except Exception:
+                    pass
+
+            cleanup = Thread(
+                target=close_recognizer, name="gate-ocr-close", daemon=True,
+            )
+            cleanup.start()
+            cleanup.join(0.5)
+        if worker is not None:
+            worker.join(0.5)
+            with self._ocr_slot_lock:
+                if self._ocr_worker is worker and not worker.is_alive():
+                    self._ocr_worker = None
 
 
 class _BestEffortTrace:
@@ -340,8 +504,22 @@ class _BestEffortTrace:
     def add_ocr_attempt(self, attempt) -> None:
         self._call("add_ocr_attempt", attempt)
 
+    def add_ocr_rejection(self, attempt) -> None:
+        self._call("add_ocr_rejection", attempt)
+
     def mark_decision(self, outcome: str, reason: str) -> None:
         self._call("mark_decision", outcome, reason)
+
+    def revise_decision(self, outcome: str, reason: str) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "revise_decision", None)
+        if not callable(operation):
+            return
+        try:
+            operation(outcome, reason)
+        except Exception:
+            self.disable()
 
     def mark_relay_activation(self) -> None:
         self._call("mark_relay_activation")
@@ -417,7 +595,9 @@ def _actuation_telemetry(execution) -> tuple[str, bool, str]:
         return "cooldown", False, "not_attempted"
     if execution.reason == "actuation_inhibit_error":
         return "claim_error", False, "not_attempted"
-    if execution.reason in {"stale_burst", "authorisation_error", "authorisation_revoked"}:
+    if execution.reason == "relay_latched":
+        return "claimed", False, "relay_latched"
+    if execution.reason in FINAL_INHIBITION_REASONS:
         return "claimed", False, "inhibited"
     if execution.reason == "indeterminate_claim":
         return "claimed", True, "indeterminate"

@@ -34,6 +34,40 @@ class FailingMarkStore(LocalStore):
 
 
 class ActuationCoordinatorTests(unittest.TestCase):
+    def test_relay_latch_does_not_persist_a_nonexistent_activation_attempt(self):
+        now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            first = ActuationCoordinator(
+                LocalStore(database),
+                RecordingRelay(RelayResult(False, "relay_latched", latched=True)),
+                clock=lambda: now,
+                monotonic_clock=lambda: 100.0,
+                boot_id="boot-1",
+            ).actuate(GateEvent(
+                source="remote_command", reason="remote_command", opened=False,
+                idempotency_key="command:shutdown", received_at=now, decision_at=now,
+            ))
+            healthy_relay = RecordingRelay()
+            second = ActuationCoordinator(
+                LocalStore(database), healthy_relay,
+                clock=lambda: now + timedelta(seconds=1),
+                monotonic_clock=lambda: 101.0,
+                boot_id="boot-1",
+            ).actuate(GateEvent(
+                source="remote_command", reason="remote_command", opened=False,
+                idempotency_key="command:after-restart",
+                received_at=now + timedelta(seconds=1),
+                decision_at=now + timedelta(seconds=1),
+            ))
+
+        self.assertEqual(first.reason, "relay_latched")
+        self.assertTrue(second.opened)
+        self.assertEqual(
+            healthy_relay.calls,
+            [("remote_command", "command:after-restart")],
+        )
+
     def test_forwards_activation_hook_without_delaying_finalization(self):
         now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         calls = []

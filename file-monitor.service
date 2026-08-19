@@ -16,7 +16,7 @@ EnvironmentFile=/etc/gate-controller.env
 Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/gate-controller-deploy/current
 ExecStartPre=/opt/gate-controller-deploy/current/.venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), "gate-controller requires Python 3.10+"'
 ExecStartPre=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller.relay_safe
-ExecStart=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller
+ExecStart=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller --quiet-window 0.2
 ExecStopPost=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_controller.relay_safe
 Restart=always
 RestartSec=5s

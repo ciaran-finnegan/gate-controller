@@ -458,6 +458,9 @@ git commit -m "refactor: remove Supabase and S3 controller runtime"
 
 ### Task 7: Add Pi Performance Harness Without Running Pi Tests
 
+> Historical note: the summary schema below was updated after on-device
+> validation; the original task sequence and checklist are otherwise preserved.
+
 **Files:**
 - Create: `scripts/pi-cloudflare-performance-harness.py`
 - Create: `docs/pi-cloudflare-performance.md`
@@ -475,8 +478,13 @@ def test_performance_harness_refuses_to_actuate_without_explicit_flag(self):
     self.assertFalse(result.actuate)
 
 def test_performance_harness_outputs_json_summary(self):
-    summary = build_summary(samples=[{"latency_ms": 12.5}], skipped_pi=True)
-    self.assertEqual(summary["pi_ssh_tests"], "skipped_until_tailscale_or_home_wifi")
+    summary = build_summary(
+        samples=[{"latency_ms": 12.5}],
+        run_mode="host_metrics_only",
+        actuation_requested=False,
+    )
+    self.assertEqual(summary["run_mode"], "host_metrics_only")
+    self.assertFalse(summary["actuation_requested"])
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -498,7 +506,8 @@ Run:
 .venv/bin/python scripts/pi-cloudflare-performance-harness.py --skip-network --output /tmp/gate-pi-perf.json
 ```
 
-Expected: unit tests pass and the local command writes JSON with `"pi_ssh_tests": "skipped_until_tailscale_or_home_wifi"`.
+Expected: unit tests pass and the local command writes JSON with
+`"run_mode": "host_metrics_only"` and `"actuation_requested": false`.
 
 - [ ] **Step 5: Commit**
 

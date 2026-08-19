@@ -116,7 +116,10 @@ class ActuationCoordinator:
 
                 relay_kwargs["on_activation"] = notify_activation
             relay_result = self._relay.trigger(event.source, **relay_kwargs)
-            if inhibition is None:
+            activation_attempted = (
+                inhibition is None and relay_result.reason != "relay_latched"
+            )
+            if activation_attempted:
                 self._last_attempt_monotonic = self._monotonic_clock()
             finalized = GateEvent(
                 source=event.source,
@@ -140,7 +143,7 @@ class ActuationCoordinator:
                 event_id = self._store.finalize_actuation(
                     claim, finalized, terminal_status=status, terminal_detail=detail,
                     outbox_payload=outbox_payload, command_ack=command_ack,
-                    retain_activation_attempt=inhibition is None,
+                    retain_activation_attempt=activation_attempted,
                 )
             except Exception:
                 return ActuationExecution(False, "indeterminate_claim", None, "failed", "indeterminate_claim")
