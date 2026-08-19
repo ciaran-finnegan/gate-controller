@@ -79,6 +79,32 @@ class WorkerTests(unittest.TestCase):
 
         self.assertEqual(emitted, [(second, first)])
 
+    def test_200ms_window_resets_after_the_latest_completed_upload(self):
+        clock = MutableClock()
+        ranked_inputs = []
+        emitted = []
+
+        def ranker(paths):
+            ranked_inputs.append(tuple(paths))
+            return tuple(reversed(paths))
+
+        collector = BurstCollector(
+            emitted.append, quiet_window=0.2, ranker=ranker, clock=clock,
+        )
+        first = Path("first.jpg")
+        second = Path("second.jpg")
+
+        collector.add(first)
+        clock.value = 0.15
+        collector.add(second)
+        clock.value = 0.34
+        self.assertFalse(collector.flush_due())
+        clock.value = 0.351
+        self.assertTrue(collector.flush_due())
+
+        self.assertEqual(ranked_inputs, [(first, second)])
+        self.assertEqual(emitted, [(second, first)])
+
     def test_burst_collector_keeps_only_the_freshest_candidate_limit(self):
         clock = MutableClock()
         ranked_inputs = []

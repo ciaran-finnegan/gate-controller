@@ -1,6 +1,7 @@
 import argparse
 import ipaddress
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,10 @@ from .worker import (
 from .runtime import require_python_version
 
 
+MIN_QUIET_WINDOW_SECONDS = 0.1
+MAX_QUIET_WINDOW_SECONDS = 2.0
+
+
 def main() -> None:
     require_python_version()
     logging.basicConfig(
@@ -46,7 +51,7 @@ def main() -> None:
                         default=authorised_default)
     parser.add_argument("--database", type=Path,
                         default=database_default)
-    parser.add_argument("--quiet-window", type=float, default=0.5)
+    parser.add_argument("--quiet-window", type=_quiet_window, default=0.5)
     arguments = parser.parse_args()
     token = os.environ.get("PLATE_RECOGNIZER_API_TOKEN")
     if not token:
@@ -142,6 +147,22 @@ def _iso8601(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise argparse.ArgumentTypeError("must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _quiet_window(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "quiet window must be between 0.1 and 2 seconds"
+        ) from error
+    if not math.isfinite(seconds) or not (
+        MIN_QUIET_WINDOW_SECONDS <= seconds <= MAX_QUIET_WINDOW_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            "quiet window must be between 0.1 and 2 seconds"
+        )
+    return seconds
 
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,

@@ -139,6 +139,12 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertEqual("always", service.get("Restart"))
         self.assertEqual("512M", service.get("MemoryMax"))
 
+    def test_application_service_uses_the_bounded_low_latency_quiet_window(self):
+        service = read_unit("file-monitor.service")["Service"]
+        command = shlex.split(service["ExecStart"])
+
+        self.assertEqual(["--quiet-window", "0.2"], command[-2:])
+
     def test_root_updater_executes_only_fixed_bootstrap_helper(self):
         unit = read_unit("deployment/systemd/gate-controller-updater.service")
         command = shlex.split(unit["Service"]["ExecStart"])

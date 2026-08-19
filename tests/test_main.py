@@ -1,3 +1,4 @@
+import argparse
 import unittest
 import os
 import tempfile
@@ -6,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import gate_controller.__main__ as gate_main
-from gate_controller.__main__ import build_background_workers, default_runtime_paths
+from gate_controller.__main__ import (
+    _quiet_window, build_background_workers, default_runtime_paths,
+)
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
@@ -19,6 +22,16 @@ class MainConfigurationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         return LocalStore(Path(directory.name) / "gate.db")
+
+    def test_quiet_window_accepts_the_bounded_production_value(self):
+        self.assertEqual(0.2, _quiet_window("0.2"))
+
+    def test_quiet_window_rejects_nonfinite_or_unsafe_values(self):
+        for value in ("-1", "0", "0.05", "2.1", "nan", "inf", "-inf", "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                argparse.ArgumentTypeError, "quiet window must be between 0.1 and 2 seconds"
+            ):
+                _quiet_window(value)
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
