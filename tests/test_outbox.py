@@ -162,6 +162,31 @@ class EvidenceSpoolTests(unittest.TestCase):
 
 
 class OutboxWorkerTests(unittest.TestCase):
+    def test_completion_keeps_the_payload_sent_when_telemetry_attaches_mid_send(self):
+        store, event_id = self._queued_store()
+        item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
+        sent = []
+
+        def send(payload):
+            sent.append(dict(payload))
+            store.attach_event_telemetry(event_id, _telemetry())
+
+        completed = OutboxWorker(store, send=send).run_once()
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(sent[0]["schema_version"], 2)
+        self.assertNotIn("telemetry", sent[0])
+        with closing(sqlite3.connect(store.path)) as connection:
+            saved, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved), sent[0])
+        self.assertIsNotNone(completed_at)
+        self.assertEqual(
+            store.event_telemetry(event_id)["delivery"],
+            {"outbox_attempt": 0, "state": "delivered"},
+        )
+
     def test_malformed_telemetry_falls_back_to_the_original_v2_delivery(self):
         store, event_id = self._queued_store()
         item_id = store.queue_outbox(event_id, {

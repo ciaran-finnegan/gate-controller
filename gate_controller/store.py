@@ -617,13 +617,20 @@ class LocalStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM command_ack_outbox WHERE command_id = ?", (command_id,))
 
-    def complete_outbox_item(self, item_id: int, completed_at: datetime | None = None) -> None:
+    def complete_outbox_item(
+        self, item_id: int, completed_at: datetime | None = None, *,
+        prepared_payload: dict | None = None,
+    ) -> None:
         self._set_outbox_delivery_state(
-            item_id, "delivered", completed_at or datetime.now(timezone.utc)
+            item_id,
+            "delivered",
+            completed_at or datetime.now(timezone.utc),
+            prepared_payload=prepared_payload,
         )
 
     def _set_outbox_delivery_state(self, item_id: int, state: str,
-                                   completed_at: datetime | None = None) -> None:
+                                   completed_at: datetime | None = None, *,
+                                   prepared_payload: dict | None = None) -> None:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -635,16 +642,25 @@ class LocalStore:
                 connection.commit()
                 return
             event_id, payload_text = row
-            payload = json.loads(payload_text)
+            payload = (
+                json.loads(payload_text)
+                if prepared_payload is None else dict(prepared_payload)
+            )
             fallback = _v2_outbox_payload(payload)
-            payload = fallback
+            if prepared_payload is None:
+                payload = fallback
             telemetry_row = connection.execute(
                 "SELECT payload FROM event_telemetry WHERE event_id = ?", (event_id,)
             ).fetchone()
             if telemetry_row is not None:
                 connection.execute("SAVEPOINT telemetry_delivery_state")
                 try:
-                    telemetry = _decode_telemetry_payload(telemetry_row[0])
+                    prepared_telemetry = payload.get("telemetry")
+                    telemetry_source = (
+                        _encode_json(prepared_telemetry)
+                        if prepared_telemetry is not None else telemetry_row[0]
+                    )
+                    telemetry = _decode_telemetry_payload(telemetry_source)
                     telemetry["delivery"] = {
                         "outbox_attempt": _telemetry_attempt(telemetry),
                         "state": state,
@@ -667,9 +683,10 @@ class LocalStore:
                                 "cloud_send_to_ack_ms"
                             ] = send_to_ack_ms
                     self._write_telemetry_payload(connection, event_id, telemetry)
-                    payload = dict(fallback)
-                    payload["schema_version"] = 3
-                    payload["telemetry"] = telemetry
+                    if prepared_payload is None:
+                        payload = dict(fallback)
+                        payload["schema_version"] = 3
+                        payload["telemetry"] = telemetry
                 except _MalformedTelemetry:
                     connection.execute("ROLLBACK TO telemetry_delivery_state")
                     _log_telemetry_fallback("malformed")

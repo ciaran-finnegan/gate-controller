@@ -93,6 +93,7 @@ class BurstCollector:
             decision_started_at = self._clock()
             if self._deadline is None or decision_started_at < self._deadline:
                 return False
+            processing_started_at = self._wall_clock()
             pending = tuple(self._pending)
             received_at = self._received_at
             first_seen = self._first_seen
@@ -112,7 +113,7 @@ class BurstCollector:
         LOGGER.info(
             "gate_pipeline stage=burst_processing_started observed_at=%s "
             "candidate_count=%d ingress_wait_ms=%s",
-            self._wall_clock().astimezone(timezone.utc).isoformat(),
+            processing_started_at.astimezone(timezone.utc).isoformat(),
             len(ranked),
             wait_ms if wait_ms is not None else "unavailable",
         )

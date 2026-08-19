@@ -201,6 +201,33 @@ class WorkerTests(unittest.TestCase):
 
         self.assertEqual(emitted, [((path,), received_at, 1.0)])
 
+    def test_burst_log_pairs_pre_ranking_wall_and_monotonic_boundaries(self):
+        clock = MutableClock()
+        wall_clock = [datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)]
+
+        def delayed_ranker(paths):
+            clock.value += 4.0
+            wall_clock[0] += timedelta(seconds=4)
+            return paths
+
+        collector = BurstCollector(
+            lambda _: None,
+            quiet_window=0.5,
+            ranker=delayed_ranker,
+            clock=clock,
+            wall_clock=lambda: wall_clock[0],
+        )
+        collector.add(Path("frame.jpg"))
+        clock.value = 1.0
+
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            collector.flush_due()
+
+        combined = "\n".join(logs.output)
+        self.assertIn("observed_at=2026-08-14T10:00:00+00:00", combined)
+        self.assertIn("ingress_wait_ms=1000", combined)
+        self.assertNotIn("observed_at=2026-08-14T10:00:04+00:00", combined)
+
     def test_created_file_fallback_adds_only_a_readable_completed_upload(self):
         collector = RecordingCollector()
         handler = CompletedImageHandler(collector)

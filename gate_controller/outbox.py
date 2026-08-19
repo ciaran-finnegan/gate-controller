@@ -318,7 +318,9 @@ class OutboxWorker:
                 continue
             try:
                 acknowledged_at = self._clock()
-                self._store.complete_outbox_item(item_id, acknowledged_at)
+                self._store.complete_outbox_item(
+                    item_id, acknowledged_at, prepared_payload=payload
+                )
             except Exception:
                 continue
             LOGGER.info(
