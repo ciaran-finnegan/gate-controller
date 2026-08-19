@@ -1143,32 +1143,54 @@ class GateProcessorTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_blocked_ocr_wait_is_bounded_without_waiting_for_the_request(self):
+        recognising = Event()
+        release = Event()
         finished = Event()
 
         class BlockingRecognizer:
             def recognise(self, path, timeout=None):
                 try:
-                    Event().wait(0.4)
+                    recognising.set()
+                    release.wait()
                     return PlateObservation("12D3456", 0.99)
                 finally:
                     finished.set()
+
+        class FastStore:
+            def event_exists(self, idempotency_key):
+                return False
+
+            def record_event_with_outbox(self, event, outbox_payload=None):
+                return 1
+
+            def attach_event_telemetry(self, event_id, telemetry):
+                return True
 
         relay_calls = []
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "blocked.jpg")
             processor = self._processor(
-                LocalStore(Path(directory) / "gate.db"),
+                FastStore(),
                 RecordingRelay(relay_calls),
                 BlockingRecognizer(),
                 decision_timeout=0.1,
             )
 
-            started = monotonic()
-            result = processor.process((frame,))
-            elapsed = monotonic() - started
+            results = []
+            processing = Thread(target=lambda: results.append(processor.process((frame,))))
+            processing.start()
+            self.assertTrue(recognising.wait(1.0))
+            processing.join(0.5)
 
-        self.assertLess(elapsed, 0.25)
-        self.assertEqual(result.reason, "decision_timeout")
+        returned_while_ocr_blocked = not processing.is_alive()
+        ocr_finished_before_release = finished.is_set()
+        release.set()
+        processing.join(1.0)
+
+        self.assertTrue(returned_while_ocr_blocked)
+        self.assertFalse(ocr_finished_before_release)
+        self.assertFalse(processing.is_alive())
+        self.assertEqual(results[0].reason, "decision_timeout")
         self.assertEqual(relay_calls, [])
         self.assertTrue(finished.wait(0.5))
 
