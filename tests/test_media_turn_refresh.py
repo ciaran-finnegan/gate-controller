@@ -81,6 +81,10 @@ class MediaTurnRefreshTests(unittest.TestCase):
             __import__("json").loads(request.data.decode("ascii")),
         )
         self.assertEqual("Bearer api-token", request.get_header("Authorization"))
+        self.assertEqual(
+            "gate-mate-turn-refresh/1.0",
+            request.get_header("User-agent"),
+        )
 
     def test_rotation_units_keep_long_term_secret_outside_gateway_and_refresh_on_boot(self):
         service = self._read_unit("deployment/systemd/gate-media-turn-refresh.service")

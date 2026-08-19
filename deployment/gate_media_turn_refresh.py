@@ -31,6 +31,7 @@ CLOUDFLARE_TURN_ENDPOINT = (
     "generate-ice-servers"
 )
 REQUEST_TIMEOUT_SECONDS = 15
+USER_AGENT = "gate-mate-turn-refresh/1.0"
 SYSTEMCTL_TIMEOUT_SECONDS = 10
 GATEWAY_HEALTH_CHECK_ATTEMPTS = 3
 GATEWAY_HEALTH_CHECK_INTERVAL_SECONDS = 2
@@ -99,6 +100,7 @@ def fetch_ice_servers(key_id: str, api_token: str):
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )
