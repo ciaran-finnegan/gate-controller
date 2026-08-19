@@ -25,6 +25,7 @@ from .outbox import (
 )
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
+from .reolink_snapshots import load_reolink_snapshot_config
 from .store import LocalStore
 from .telemetry_export import export_telemetry
 from .worker import (
@@ -71,6 +72,9 @@ def main() -> None:
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
+    snapshot_sampling = load_reolink_snapshot_config(
+        os.environ, arguments.directory, max_candidate_bytes=max_candidate_bytes
+    )
     authorisation_staleness = timedelta(
         seconds=float(os.environ.get("GATE_AUTHORISATION_MAX_STALENESS_SECONDS", "300"))
     )
@@ -142,6 +146,7 @@ def main() -> None:
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
+        snapshot_sampling=snapshot_sampling,
     )
 
 

@@ -11,6 +11,9 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .images import rank_images, wait_until_readable
+from .reolink_snapshots import (
+    MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS, ReolinkSnapshotSampler,
+)
 
 
 DEFAULT_MAX_BURST_CANDIDATES = 8
@@ -72,11 +75,12 @@ class BurstCollector:
         self._deadline: float | None = None
         self._lock = Lock()
 
-    def add(self, path: Path, received_at: datetime | None = None) -> None:
+    def add(self, path: Path, received_at: datetime | None = None) -> bool:
         path = Path(path)
         dropped = None
         with self._lock:
-            if not self._pending:
+            first_candidate = not self._pending
+            if first_candidate:
                 self._received_at = received_at or self._arrival_clock()
                 self._first_seen = self._clock()
             elif received_at is not None and received_at < self._received_at:
@@ -89,6 +93,7 @@ class BurstCollector:
             self._deadline = self._clock() + self._quiet_window
         if dropped is not None:
             _remove_upload(dropped)
+        return first_candidate
 
     def flush_due(self) -> bool:
         with self._lock:
@@ -135,7 +140,8 @@ class CompletedImageHandler(FileSystemEventHandler):
                  max_attempts: int = 20, max_age: float = 30.0, clock=monotonic,
                  on_rejected=None, arrival_clock=None,
                  max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
-                 max_pending_candidates: int = DEFAULT_MAX_BURST_CANDIDATES):
+                 max_pending_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
+                 on_first_completed=None, ignored_roots=()):
         super().__init__()
         if not 1 <= max_candidate_bytes <= MAX_CANDIDATE_BYTES:
             raise ValueError("max_candidate_bytes exceeds the safe range")
@@ -150,6 +156,8 @@ class CompletedImageHandler(FileSystemEventHandler):
         self._on_rejected = on_rejected
         self._max_candidate_bytes = max_candidate_bytes
         self._max_pending_candidates = max_pending_candidates
+        self._on_first_completed = on_first_completed
+        self._ignored_roots = tuple(Path(root).resolve() for root in ignored_roots)
         self._retry_at: dict[Path, tuple[float, float, int, datetime]] = {}
         self._lock = Lock()
 
@@ -163,7 +171,7 @@ class CompletedImageHandler(FileSystemEventHandler):
         self.schedule_candidate(Path(event.src_path), event.is_directory)
 
     def schedule_candidate(self, path: Path, is_directory: bool = False) -> None:
-        if is_directory or path.suffix.lower() not in {".jpg", ".jpeg"}:
+        if is_directory or self.ignores(path) or path.suffix.lower() not in {".jpg", ".jpeg"}:
             return
         dropped = []
         first_observation = None
@@ -192,6 +200,13 @@ class CompletedImageHandler(FileSystemEventHandler):
         with self._lock:
             return len(self._retry_at)
 
+    def ignores(self, path: Path) -> bool:
+        candidate = Path(path).resolve()
+        return any(
+            candidate == root or candidate.is_relative_to(root)
+            for root in self._ignored_roots
+        )
+
     def retry_pending(self) -> int:
         now = self._clock()
         with self._lock:
@@ -218,9 +233,11 @@ class CompletedImageHandler(FileSystemEventHandler):
                 self._reject(path, "image_too_large")
                 continue
             if wait_until_readable(path, timeout=0, poll_interval=0):
-                self._collector.add(path, received_at)
+                first_candidate = self._collector.add(path, received_at)
                 with self._lock:
                     self._retry_at.pop(path, None)
+                if first_candidate:
+                    self._request_augmentation(received_at)
                 completed += 1
             else:
                 with self._lock:
@@ -228,6 +245,26 @@ class CompletedImageHandler(FileSystemEventHandler):
                         self._retry_at[path] = (first_seen, self._clock() + self._retry_interval,
                                                 attempts + 1, received_at)
         return completed
+
+    def _request_augmentation(self, received_at: datetime) -> None:
+        request = "disabled"
+        if self._on_first_completed is not None:
+            try:
+                request = (
+                    "skipped"
+                    if self._on_first_completed(received_at) is False
+                    else "accepted"
+                )
+            except Exception:
+                LOGGER.warning(
+                    "gate_camera source=camera_ftp subtype=unverified "
+                    "augmentation_request=failed reason=request_error"
+                )
+                return
+        LOGGER.info(
+            "gate_camera source=camera_ftp subtype=unverified augmentation_request=%s",
+            request,
+        )
 
     def _too_large(self, path: Path) -> bool:
         try:
@@ -263,6 +300,9 @@ class StartupReconciler:
             if entry is None:
                 return False
             path = Path(entry.path)
+            ignores = getattr(self._handler, "ignores", None)
+            if callable(ignores) and ignores(path):
+                continue
             if entry.is_dir(follow_symlinks=False):
                 self._entries.append(os.scandir(path))
                 continue
@@ -324,7 +364,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                max_image_age: float = 8.0, on_skipped=None, on_error=None,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
-               on_timed_skipped=None) -> None:
+               on_timed_skipped=None, snapshot_sampling=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
     bursts = BoundedBurstQueue(max_pending_bursts)
 
@@ -343,18 +383,32 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             finally:
                 _remove_uploads(dropped[0])
 
-    collector = BurstCollector(
-        enqueue, quiet_window=quiet_window,
-        ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
-        include_received_at=True, include_decision_started_at=True,
-        include_processing_started_at=True,
-        max_candidates=max_burst_candidates,
-    )
+    collector_options = {
+        "quiet_window": quiet_window,
+        "ranker": lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
+        "include_received_at": True,
+        "include_decision_started_at": True,
+        "include_processing_started_at": True,
+        "max_candidates": max_burst_candidates,
+    }
+    collector = BurstCollector(enqueue, **collector_options)
+    sampler = None
+    augmentation_collector = None
+    sampling_enabled = bool(snapshot_sampling is not None and snapshot_sampling.enabled)
+    if snapshot_sampling is not None:
+        if sampling_enabled:
+            augmentation_collector = BurstCollector(enqueue, **collector_options)
+            add_snapshot_candidate = augmentation_collector.add
+        else:
+            add_snapshot_candidate = lambda *_: None
+        sampler = ReolinkSnapshotSampler(snapshot_sampling, add_snapshot_candidate)
     handler = CompletedImageHandler(
         collector,
         on_rejected=(lambda path, reason: on_skipped((path,), reason, None)) if on_skipped else None,
         max_candidate_bytes=max_candidate_bytes,
         max_pending_candidates=max_burst_candidates,
+        on_first_completed=sampler.request if sampling_enabled else None,
+        ignored_roots=(sampler.output_directory,) if sampler is not None else (),
     )
     observer = Observer()
     observer.schedule(handler, str(directory), recursive=True)
@@ -365,6 +419,14 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         args=("GateBurstProcessor", _process_bursts, (bursts, emit, on_error),
               stop_event, failures),
         daemon=True, name="GateBurstProcessor",
+    )
+    sampling_thread = (
+        Thread(
+            target=_supervise_worker,
+            args=("ReolinkSnapshotSampler", sampler.run_forever, (stop_event,),
+                  stop_event, failures),
+            daemon=True, name="ReolinkSnapshotSampler",
+        ) if sampling_enabled else None
     )
     background_threads = [
         Thread(
@@ -382,6 +444,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     startup_reconciler = None
     startup_reconciliation_pending = False
     processing_started = False
+    sampling_started = False
     started_background_threads = []
     try:
         observer.start()
@@ -395,6 +458,9 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         startup_reconciliation_pending = startup_reconciler.run_batch()
         processing_thread.start()
         processing_started = True
+        if sampling_thread is not None:
+            sampling_thread.start()
+            sampling_started = True
         for thread in background_threads:
             thread.start()
             started_background_threads.append(thread)
@@ -406,6 +472,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 startup_reconciliation_pending = startup_reconciler.run_batch()
             handler.retry_pending()
             collector.flush_due()
+            if augmentation_collector is not None:
+                augmentation_collector.flush_due()
             sleep(poll_interval)
     except KeyboardInterrupt:
         pass
@@ -421,6 +489,12 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 if observer_started:
                     observer.stop()
                     observer.join()
+                if sampling_started:
+                    sampling_thread.join(
+                        timeout=MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS + 0.5
+                    )
+                if sampler is not None:
+                    sampler.close()
                 if processing_started:
                     dropped = bursts.put(None)
                     if dropped is not None:

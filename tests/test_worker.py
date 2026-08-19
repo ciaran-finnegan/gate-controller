@@ -246,6 +246,66 @@ class WorkerTests(unittest.TestCase):
 
             self.assertEqual(collector.paths, [path])
 
+    def test_first_completed_ftp_candidate_requests_one_unverified_augmentation(self):
+        clock = MutableClock()
+        sample_requests = []
+        collector = BurstCollector(
+            lambda _: None, quiet_window=0.5, ranker=lambda paths: paths, clock=clock,
+        )
+        handler = CompletedImageHandler(
+            collector,
+            on_first_completed=lambda received_at: sample_requests.append(received_at),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "private-first.jpg"
+            second = Path(directory) / "private-second.jpg"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            with patch("gate_controller.worker.wait_until_readable", return_value=True), self.assertLogs(
+                "gate_controller.worker", level="INFO"
+            ) as logs:
+                handler.schedule_candidate(first)
+                handler.retry_pending()
+                handler.schedule_candidate(second)
+                handler.retry_pending()
+
+            combined = "\n".join(logs.output)
+            self.assertEqual(len(sample_requests), 1)
+            self.assertIn("source=camera_ftp subtype=unverified", combined)
+            self.assertIn("augmentation_request=accepted", combined)
+            self.assertNotIn(str(first), combined)
+            self.assertNotIn(str(second), combined)
+
+    def test_augmentation_request_failure_keeps_the_first_ftp_candidate(self):
+        clock = MutableClock()
+        emitted = []
+        collector = BurstCollector(
+            emitted.append, quiet_window=0.5, ranker=lambda paths: paths, clock=clock,
+        )
+        handler = CompletedImageHandler(
+            collector,
+            on_first_completed=lambda received_at: (_ for _ in ()).throw(
+                RuntimeError("private failure")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.jpg"
+            first.write_bytes(b"first")
+            with patch("gate_controller.worker.wait_until_readable", return_value=True), self.assertLogs(
+                "gate_controller.worker", level="WARNING"
+            ) as logs:
+                handler.schedule_candidate(first)
+                self.assertEqual(handler.retry_pending(), 1)
+            clock.value = 1
+            self.assertTrue(collector.flush_due())
+
+        self.assertEqual(emitted, [(first,)])
+        combined = "\n".join(logs.output)
+        self.assertIn("augmentation_request=failed", combined)
+        self.assertIn("reason=request_error", combined)
+        self.assertNotIn("private failure", combined)
+
     def test_created_file_fallback_retries_without_blocking_or_dropping_the_path(self):
         collector = RecordingCollector()
         clock = MutableClock()
@@ -634,6 +694,154 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(configured["collector"]["include_processing_started_at"])
         self.assertEqual(configured["handler"]["max_candidate_bytes"], 1024)
         self.assertEqual(configured["handler"]["max_pending_candidates"], 5)
+
+    def test_run_worker_never_defers_the_initial_ftp_burst_for_snapshot_sampling(self):
+        configured = {}
+        lifecycle = []
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                configured.setdefault("collectors", []).append(kwargs)
+
+            def add(self, path, received_at=None):
+                return True
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                configured["handler"] = kwargs
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class Sampler:
+            output_directory = Path("private-snapshots")
+
+            def __init__(self, config, add_candidate):
+                configured["sampler_config"] = config
+
+            def request(self, received_at=None):
+                return True
+
+            def run_forever(self, stop_event):
+                pass
+
+            def close(self):
+                lifecycle.append("sampler_close")
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                lifecycle.append(f"thread_start:{self.name}")
+
+            def join(self, timeout=None):
+                lifecycle.append(f"thread_join:{self.name}")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ):
+            run_worker(
+                Path(directory), lambda *_: None,
+                snapshot_sampling=type("Config", (), {"enabled": True})(),
+            )
+
+        self.assertEqual(len(configured["collectors"]), 2)
+        self.assertTrue(all(
+            "defer_flush" not in options for options in configured["collectors"]
+        ))
+        self.assertIsInstance(
+            configured["handler"]["on_first_completed"].__self__, Sampler
+        )
+        self.assertLess(
+            lifecycle.index("thread_join:ReolinkSnapshotSampler"),
+            lifecycle.index("sampler_close"),
+        )
+
+    def test_disabled_sampling_cleans_and_ignores_private_files_without_a_thread(self):
+        configured = {}
+        lifecycle = []
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                pass
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                configured["handler"] = kwargs
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class Sampler:
+            def __init__(self, config, add_candidate):
+                self.output_directory = config.output_directory
+                lifecycle.append("sampler_init")
+
+            def close(self):
+                lifecycle.append("sampler_close")
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                lifecycle.append(f"thread_start:{self.name}")
+
+            def join(self, timeout=None):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ):
+            output_directory = Path(directory) / ".reolink-snapshots"
+            config = type("Config", (), {
+                "enabled": False,
+                "output_directory": output_directory,
+            })()
+            run_worker(Path(directory), lambda *_: None, snapshot_sampling=config)
+
+        self.assertEqual(lifecycle.count("sampler_init"), 1)
+        self.assertEqual(lifecycle.count("sampler_close"), 1)
+        self.assertNotIn("thread_start:ReolinkSnapshotSampler", lifecycle)
+        self.assertEqual(configured["handler"]["ignored_roots"], (output_directory,))
+        self.assertIsNone(configured["handler"]["on_first_completed"])
 
     def test_queue_coalesced_callback_receives_exact_collector_boundaries(self):
         configured = {}

@@ -13,7 +13,7 @@ Use a dedicated `ftp-user` with a home or upload directory at
 `/var/lib/gate-controller/uploads`. Limit the FTP service to the camera VLAN
 and the camera address where possible. Use FTPS when both camera firmware and
 the FTP server support it. The controller only accepts completed `.jpg` or
-`.jpeg` files and does not need RTSP for normal operation.
+`.jpeg` files. Its recognition burst does not depend on RTSP.
 
 Create `ftp-user` before running the gate-controller bootstrap. Bootstrap adds
 it to the `gate-controller` group and creates the upload directory with setgid
@@ -36,6 +36,53 @@ Surveillance > FTP**:
    headlight changes do not create recognition bursts.
 4. Leave overwrite disabled. The Pi groups the short burst of unique completed
    JPEGs, validates them, then ranks frames by sharpness.
+
+Every first completed FTP JPEG is released to ranking and OCR after the normal
+quiet window. It is logged as `source=camera_ftp subtype=unverified`: an FTP
+upload alone does not prove whether the camera used generic AI vehicle, line
+crossing, manual/test, or another alarm subtype. Do not label it as line
+crossing without a separate authenticated event signal.
+
+## Optional HTTPS Snapshot Augmentation
+
+The controller can use the Reolink HTTPS Snap API to collect a later bounded
+sample without delaying the first FTP OCR attempt. Put these settings in the
+root-readable `/etc/gate-controller.env` file:
+
+```sh
+GATE_REOLINK_SNAPSHOT_BASE_URL=https://192.168.0.54
+GATE_REOLINK_SNAPSHOT_USERNAME=
+GATE_REOLINK_SNAPSHOT_PASSWORD=
+GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true
+GATE_REOLINK_SNAPSHOT_COUNT=2
+GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS=2.25
+GATE_REOLINK_SNAPSHOT_MAX_BYTES=4194304
+```
+
+Use the camera's current reserved private address and a dedicated least-privilege
+camera account where the firmware supports one. The origin must be HTTPS with a
+private or loopback IP literal and no credentials, path, query, or fragment.
+Self-signed TLS must be opted into explicitly. Counts above four, timeouts above
+three seconds, and response limits above the controller image ceiling are
+rejected at startup.
+
+The default takes two additional 4K snapshots sequentially under one global
+2.25-second deadline. They are written temporarily beneath the upload root in
+an ignored owner-only `.reolink-snapshots` directory, validated as bounded
+JPEGs, and added together to a separate progressive OCR burst with the original
+FTP `received_at`. Generated files cannot recursively request another sample.
+They use the existing ranking, recognition, authorization, durable actuation
+claim, and cooldown path; a camera trigger or snapshot never actuates the relay
+by itself. Failure or unavailable configuration leaves the first FTP attempt
+and its normal quiet window unchanged.
+
+Do not configure on-demand ffmpeg sampling from
+`rtsp://127.0.0.1:8554/camera` for this feature. Live Pi measurements took
+4.88-5.44 seconds for three frames because capture waited for the roughly
+five-second upstream H.264 keyframe interval. Sequential HTTPS snapshots took
+about 0.78-0.96 seconds each, while concurrent requests serialized and produced
+duplicates. RTSP remains available to the separately isolated media gateway;
+it is not the recognition augmentation source.
 
 The exact labels vary by firmware. The RLC-811A supports vehicle detection,
 FTP upload, optical zoom, and two-way audio; firmware should be current before
