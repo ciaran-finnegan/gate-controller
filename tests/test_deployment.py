@@ -65,18 +65,18 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("restore the previous release before removing", deployment)
         self.assertIn("decommissioning the prior service", deployment)
 
-    def test_camera_docs_defer_pi_validation_to_safe_non_actuating_harness(self):
+    def test_camera_docs_run_pi_validation_with_a_safe_non_actuating_harness(self):
         camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn(
-            "Real Pi SSH,\nrelay, and media load validation remains deferred",
-            camera,
-        )
+        self.assertIn("local-network SSH or directly on the Pi", camera)
+        self.assertIn("Tailscale availability is not a\ndeployment prerequisite", camera)
         self.assertIn("default non-actuating command", camera)
+        self.assertIn("run mode and whether actuation was requested", camera)
         self.assertIn("--skip-network", camera)
         self.assertIn("--actuate", camera)
+        self.assertNotIn("skipped_until_tailscale_or_home_wifi", camera)
 
 
 class SystemdTrustBoundaryTests(unittest.TestCase):

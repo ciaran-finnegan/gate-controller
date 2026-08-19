@@ -105,17 +105,16 @@ Control-plane heartbeats include the latest completed image path, SQLite outbox
 queue depth, and whether a fixed local prompt is configured. They are health
 signals, not an authority to bypass local recognition or relay safeguards.
 
-## Deferred Pi Performance Validation
+## On-device Pi Performance Validation
 
 The Cloudflare performance harness is available at
 `scripts/pi-cloudflare-performance-harness.py` and is documented in
-[`pi-cloudflare-performance.md`](pi-cloudflare-performance.md). Real Pi SSH,
-relay, and media load validation remains deferred until Tailscale is reliable or
-the operator is on the home Wi-Fi. This task does not treat that network access
-as a deployment prerequisite.
+[`pi-cloudflare-performance.md`](pi-cloudflare-performance.md). Run it through
+local-network SSH or directly on the Pi; Tailscale availability is not a
+deployment prerequisite.
 
 For a safe opportunistic check on the Pi, run the default non-actuating command
-or use `--skip-network` when services are unavailable. The harness records
-`pi_ssh_tests` as `skipped_until_tailscale_or_home_wifi`; it sends an
-`open_gate` command only when `--actuate` is explicitly supplied while the
-operator is physically present and prepared for the gate to open.
+or use `--skip-network` when services are unavailable. The harness records its
+run mode and whether actuation was requested. It sends an `open_gate` command
+only when `--actuate` is explicitly supplied while the operator is physically
+present and prepared for the gate to open.

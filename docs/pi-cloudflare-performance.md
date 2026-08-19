@@ -24,13 +24,16 @@ for local development and any environment where local services are unavailable:
   --skip-network --output /tmp/gate-pi-perf.json
 ```
 
-The JSON summary always records:
+The JSON summary records how it was collected. The safe default is:
 
 ```json
-"pi_ssh_tests": "skipped_until_tailscale_or_home_wifi"
+"run_mode": "passive_endpoint_probe",
+"actuation_requested": false
 ```
 
-This task deliberately does not execute Pi SSH, relay, or media load tests.
+`--skip-network` reports `host_metrics_only`. An explicitly actuating run reports
+`actuating_endpoint_probe` and `actuation_requested: true`. Running the harness
+through SSH does not change its schema; the probes themselves execute on the Pi.
 
 ## Actuation Guardrail
 

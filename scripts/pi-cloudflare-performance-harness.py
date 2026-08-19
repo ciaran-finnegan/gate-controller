@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 
-DEFERRED_PI_STATUS = "skipped_until_tailscale_or_home_wifi"
 MAX_PROC_NET_DEV_BYTES = 64 * 1024
 MAX_NETWORK_INTERFACES = 32
 
@@ -119,12 +118,19 @@ def collect_host_metrics():
     return metrics
 
 
-def build_summary(*, samples, skipped_pi, host_metrics=None):
+def build_summary(*, samples, run_mode, actuation_requested, host_metrics=None):
+    if run_mode not in {
+        "host_metrics_only",
+        "passive_endpoint_probe",
+        "actuating_endpoint_probe",
+    }:
+        raise ValueError("invalid performance harness run mode")
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "samples": samples,
         "host_metrics": host_metrics if host_metrics is not None else collect_host_metrics(),
-        "pi_ssh_tests": DEFERRED_PI_STATUS if skipped_pi else "not_requested",
+        "run_mode": run_mode,
+        "actuation_requested": bool(actuation_requested),
     }
 
 
@@ -156,9 +162,13 @@ def main(arguments=None):
                 body=_actuation_body(args.controller_id),
                 timeout_seconds=args.timeout_seconds,
             ))
+    run_mode = "host_metrics_only" if args.skip_network else (
+        "actuating_endpoint_probe" if args.actuate else "passive_endpoint_probe"
+    )
     summary = build_summary(
         samples=samples,
-        skipped_pi=True,
+        run_mode=run_mode,
+        actuation_requested=args.actuate,
         host_metrics=collect_host_metrics(),
     )
     write_json(args.output, summary)
