@@ -51,6 +51,7 @@ class BurstCollector:
     def __init__(self, emit, quiet_window: float = 0.5, ranker=rank_images, clock=monotonic,
                  arrival_clock=None, include_received_at: bool = False,
                  include_decision_started_at: bool = False,
+                 include_processing_started_at: bool = False,
                  max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                  wall_clock=None):
         if not 1 <= max_candidates <= MAX_BURST_CANDIDATES:
@@ -63,6 +64,7 @@ class BurstCollector:
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._include_received_at = include_received_at
         self._include_decision_started_at = include_decision_started_at
+        self._include_processing_started_at = include_processing_started_at
         self._max_candidates = max_candidates
         self._pending: list[Path] = []
         self._received_at: datetime | None = None
@@ -122,6 +124,8 @@ class BurstCollector:
             details.append(received_at)
         if self._include_decision_started_at:
             details.append(decision_started_at)
+        if self._include_processing_started_at:
+            details.append(processing_started_at)
         self._emit(tuple(details) if len(details) > 1 else ranked)
         return True
 
@@ -336,6 +340,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         enqueue, quiet_window=quiet_window,
         ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
         include_received_at=True, include_decision_started_at=True,
+        include_processing_started_at=True,
         max_candidates=max_burst_candidates,
     )
     handler = CompletedImageHandler(

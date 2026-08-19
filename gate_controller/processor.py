@@ -80,7 +80,8 @@ class GateProcessor:
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
-                decision_started_at: float | None = None) -> ProcessingResult:
+                decision_started_at: float | None = None,
+                processing_started_at: datetime | None = None) -> ProcessingResult:
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
         activation_deadline = deadline - self._activation_guard_seconds
@@ -96,8 +97,14 @@ class GateProcessor:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
             return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
         trace = self._new_trace()
-        if received_at is not None or decision_started_at is not None:
-            trace.seed_upstream(received_at, decision_started_at)
+        if (
+            received_at is not None
+            or decision_started_at is not None
+            or processing_started_at is not None
+        ):
+            trace.seed_upstream(
+                received_at, decision_started_at, processing_started_at
+            )
         if decision_started_at is None:
             trace.mark_burst()
         received_at = received_at or self._clock()
@@ -495,9 +502,12 @@ class _BestEffortTrace:
         self._call("mark_burst")
 
     def seed_upstream(
-        self, received_at: datetime | None, decision_started_at: float | None
+        self, received_at: datetime | None, decision_started_at: float | None,
+        processing_started_at: datetime | None = None,
     ) -> None:
-        self._call("seed_upstream", received_at, decision_started_at)
+        self._call(
+            "seed_upstream", received_at, decision_started_at, processing_started_at
+        )
 
     def add_frame(self, frame) -> None:
         self._call("add_frame", frame)

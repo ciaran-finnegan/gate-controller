@@ -273,6 +273,7 @@ class ProcessingTrace:
         self._captured = self._monotonic_anchor
         self._filesystem_ingress_at: datetime | None = None
         self._burst: float | None = None
+        self._burst_processing_started_at: datetime | None = None
         self._first_ocr_start: float | None = None
         self._pending_ocr_start: float | None = None
         self._last_ocr_end: float | None = None
@@ -295,6 +296,7 @@ class ProcessingTrace:
         self,
         received_at: datetime | None,
         decision_started_at: float | None,
+        processing_started_at: datetime | None = None,
     ) -> None:
         """Anchor upstream wall and monotonic boundaries to this trace."""
         capture = _wall_to_monotonic(
@@ -309,6 +311,8 @@ class ProcessingTrace:
             self._filesystem_ingress_at = received_at
         if decision_started_at is not None:
             self._burst = burst
+        if _wire_timestamp(processing_started_at) is not None:
+            self._burst_processing_started_at = processing_started_at
 
         if capture is None or burst is None or capture <= burst:
             return
@@ -426,7 +430,9 @@ class ProcessingTrace:
             delivery_state=delivery_state,
             stage_timestamps=StageTimestamps(
                 filesystem_ingress_at=self._filesystem_ingress_at,
-                burst_processing_started_at=self._wall_at(self._burst),
+                burst_processing_started_at=(
+                    self._burst_processing_started_at or self._wall_at(self._burst)
+                ),
                 ocr_started_at=self._wall_at(self._first_ocr_start),
                 ocr_finished_at=self._wall_at(self._last_ocr_end),
                 decision_at=self._wall_at(self._decision),

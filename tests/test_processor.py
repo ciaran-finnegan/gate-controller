@@ -122,8 +122,10 @@ class FailingTelemetryTrace:
     def mark_burst(self):
         return self._call("mark_burst")
 
-    def seed_upstream(self, received_at, decision_started_at):
-        return self._call("seed_upstream", received_at, decision_started_at)
+    def seed_upstream(self, received_at, decision_started_at, processing_started_at=None):
+        return self._call(
+            "seed_upstream", received_at, decision_started_at, processing_started_at
+        )
 
     def add_frame(self, frame):
         return self._call("add_frame", frame)
@@ -321,6 +323,38 @@ class GateProcessorTests(unittest.TestCase):
             "filesystem_ingress_to_decision_ms": 1_150,
             "filesystem_ingress_to_relay_ms": 1_150,
         })
+
+    def test_pre_ranking_wall_boundary_survives_clock_step_in_persisted_telemetry(self):
+        processing_started_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+        stepped_wall = processing_started_at - timedelta(minutes=5)
+        monotonic_clock = MutableClock()
+        monotonic_clock.value = 104.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "wall-step.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(
+                store,
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("NOPE", 0.95)),
+                outbox=object(),
+                clock=lambda: processing_started_at + timedelta(seconds=4),
+                decision_clock=monotonic_clock,
+                telemetry_clock=monotonic_clock,
+                telemetry_wall_clock=lambda: stepped_wall,
+            ).process(
+                (frame,),
+                received_at=processing_started_at - timedelta(seconds=1),
+                decision_started_at=100.0,
+                processing_started_at=processing_started_at,
+            )
+
+            persisted = store.event_telemetry(result.event_id)
+
+        self.assertEqual(
+            persisted["stage_timestamps"]["burst_processing_started_at"],
+            processing_started_at.isoformat(),
+        )
 
     def test_upstream_seed_failure_is_best_effort(self):
         captured_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)

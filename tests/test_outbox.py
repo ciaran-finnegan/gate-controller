@@ -310,9 +310,10 @@ class OutboxWorkerTests(unittest.TestCase):
             "state": "delivered",
         })
         with closing(sqlite3.connect(store.path)) as connection:
-            completed_at = connection.execute(
-                "SELECT completed_at FROM outbox WHERE id = ?", (item_id,)
-            ).fetchone()[0]
+            saved_payload, completed_at = connection.execute(
+                "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
+            ).fetchone()
+        self.assertEqual(json.loads(saved_payload), sent[1])
         self.assertIsNotNone(completed_at)
 
     def test_cloud_queue_send_and_ack_boundaries_are_persisted_and_logged(self):

@@ -299,7 +299,7 @@ class LocalStore:
                 "SELECT 1 FROM events WHERE id = ?", (event_id,)
             ).fetchone() is None:
                 raise KeyError(f"unknown event {event_id}")
-            _enrich_cloud_enqueued(connection, event_id, payload)
+            _enrich_outbox_delivery(connection, event_id, payload)
             encoded = _encode_json(payload)
             existing = connection.execute(
                 "SELECT trace_id, payload FROM event_telemetry WHERE event_id = ?",
@@ -328,7 +328,7 @@ class LocalStore:
                     """,
                     (event_id, payload["trace_id"], encoded, created_at),
                 )
-            self._promote_pending_outbox(connection, event_id, payload)
+            self._promote_outbox(connection, event_id, payload)
             connection.commit()
             cloud_enqueued_at = payload.get("stage_timestamps", {}).get(
                 "cloud_enqueued_at"
@@ -722,20 +722,26 @@ class LocalStore:
         )
 
     @staticmethod
-    def _promote_pending_outbox(connection: sqlite3.Connection, event_id: int,
-                                telemetry: dict) -> None:
+    def _promote_outbox(connection: sqlite3.Connection, event_id: int,
+                        telemetry: dict) -> None:
         row = connection.execute(
-            "SELECT id, payload FROM outbox WHERE event_id = ? AND completed_at IS NULL",
+            "SELECT id, payload, completed_at FROM outbox WHERE event_id = ?",
             (event_id,),
         ).fetchone()
         if row is None:
             return
-        outbox_id, payload_text = row
+        outbox_id, payload_text, completed_at = row
         payload = json.loads(payload_text)
+        if completed_at is not None:
+            if telemetry.get("delivery", {}).get("state") != "pending":
+                return
+            payload = _v2_outbox_payload(payload)
+            if payload.pop("image_sha256", None) is not None:
+                payload["image_status"] = "delivered_before_telemetry"
         payload["schema_version"] = 3
         payload["telemetry"] = telemetry
         connection.execute(
-            "UPDATE outbox SET payload = ? WHERE id = ? AND completed_at IS NULL",
+            "UPDATE outbox SET payload = ?, completed_at = NULL WHERE id = ?",
             (_encode_json(payload), outbox_id),
         )
 
@@ -1202,11 +1208,11 @@ def _decode_telemetry_payload(encoded: object) -> dict:
     return telemetry
 
 
-def _enrich_cloud_enqueued(
+def _enrich_outbox_delivery(
     connection: sqlite3.Connection, event_id: int, telemetry: dict
 ) -> None:
     row = connection.execute(
-        "SELECT created_at FROM outbox WHERE event_id = ? AND completed_at IS NULL",
+        "SELECT created_at FROM outbox WHERE event_id = ?",
         (event_id,),
     ).fetchone()
     if row is None:

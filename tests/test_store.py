@@ -174,30 +174,62 @@ class LocalStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.attach_event_telemetry(second, _telemetry(reason="no_match"))
 
-    def test_attach_does_not_rewrite_a_completed_v2_outbox_row(self):
+    def test_attach_after_v2_completion_queues_a_v3_follow_up_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             store = LocalStore(Path(directory) / "gate.db")
+            queued_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+            sent_at = queued_at + timedelta(seconds=1)
+            acknowledged_at = sent_at + timedelta(milliseconds=125)
             event_id = store.record_event(GateEvent(
                 source="ocr", reason="no_match", opened=False,
-                idempotency_key="already-sent", received_at=datetime.now(timezone.utc),
+                idempotency_key="already-sent", received_at=queued_at,
             ))
-            item_id = store.queue_outbox(event_id, {"controller_id": "pi-front-gate"})
-            store.complete_outbox_item(item_id)
+            item_id = store.queue_outbox(event_id, {
+                "controller_id": "pi-front-gate",
+                "image_sha256": "a" * 64,
+            })
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                connection.execute(
+                    "UPDATE outbox SET created_at = ? WHERE id = ?",
+                    (queued_at.isoformat(), item_id),
+                )
+            prepared = store.prepare_outbox_attempt(item_id, sent_at)
+            store.complete_outbox_item(
+                item_id, acknowledged_at, prepared_payload=prepared
+            )
             with closing(sqlite3.connect(store.path)) as connection:
-                before = connection.execute(
+                completed_payload, completed_at = connection.execute(
                     "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
                 ).fetchone()
+            self.assertEqual(json.loads(completed_payload), prepared)
+            self.assertEqual(completed_at, acknowledged_at.isoformat())
 
             self.assertTrue(store.attach_event_telemetry(
                 event_id, _telemetry(reason="no_match")
             ))
 
             with closing(sqlite3.connect(store.path)) as connection:
-                after = connection.execute(
+                promoted_payload, promoted_completed_at = connection.execute(
                     "SELECT payload, completed_at FROM outbox WHERE id = ?", (item_id,)
                 ).fetchone()
-            self.assertEqual(after, before)
-            self.assertIsNotNone(store.event_telemetry(event_id))
+            saved = store.event_telemetry(event_id)
+            self.assertIsNone(promoted_completed_at)
+            self.assertEqual(store.pending_outbox_count(), 1)
+            follow_up_base = dict(prepared)
+            follow_up_base.pop("image_sha256")
+            follow_up_base["image_status"] = "delivered_before_telemetry"
+            self.assertEqual(json.loads(promoted_payload), {
+                **follow_up_base,
+                "schema_version": 3,
+                "telemetry": saved,
+            })
+            self.assertEqual(saved["delivery"], {
+                "outbox_attempt": 0,
+                "state": "pending",
+            })
+            self.assertEqual(saved["stage_timestamps"], {
+                "cloud_enqueued_at": queued_at.isoformat(),
+            })
 
     def test_retention_removes_only_old_telemetry_with_completed_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
