@@ -289,7 +289,8 @@ class LocalStoreTests(unittest.TestCase):
                     DELETE FROM schema_migrations
                     WHERE name IN (
                         'outbox_incompatible_followup_v1',
-                        'outbox_incompatible_followup_v2'
+                        'outbox_incompatible_followup_v2',
+                        'outbox_incompatible_followup_v3'
                     )
                     """
                 )
@@ -345,7 +346,8 @@ class LocalStoreTests(unittest.TestCase):
                     DELETE FROM schema_migrations
                     WHERE name IN (
                         'outbox_incompatible_followup_v1',
-                        'outbox_incompatible_followup_v2'
+                        'outbox_incompatible_followup_v2',
+                        'outbox_incompatible_followup_v3'
                     )
                     """
                 )
@@ -365,6 +367,100 @@ class LocalStoreTests(unittest.TestCase):
             self.assertEqual(json.loads(payload_text), legacy_follow_up)
             self.assertIsNone(completed_at)
             self.assertEqual(send_state, "local_only")
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migrations (name)
+                    VALUES ('outbox_incompatible_followup_v2')
+                    """
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name = 'outbox_incompatible_followup_v3'
+                    """
+                )
+
+            remigrated = LocalStore(path)
+
+            self.assertEqual(remigrated.pending_outbox_count(), 0)
+            self.assertEqual(remigrated.pending_outbox_items(), [])
+            with closing(sqlite3.connect(path)) as connection:
+                remigrated_payload, remigrated_state = connection.execute(
+                    "SELECT payload, send_state FROM outbox WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+            self.assertEqual(json.loads(remigrated_payload), legacy_follow_up)
+            self.assertEqual(remigrated_state, "local_only")
+
+    def test_migration_keeps_pre_provenance_prepared_image_free_v3_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.db"
+            store = LocalStore(path)
+            event_id = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key="pre-provenance-prepared-image-free-v3",
+                received_at=datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc),
+            ))
+            store.attach_event_telemetry(
+                event_id, _telemetry(reason="no_match")
+            )
+            item_id = store.queue_outbox(
+                event_id, {"controller_id": "pi-front-gate"}
+            )
+            prepared = store.prepare_outbox_attempt(
+                item_id,
+                datetime(2026, 8, 15, 10, 0, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(prepared["schema_version"], 3)
+            self.assertEqual(
+                prepared["telemetry"]["delivery"],
+                {"outbox_attempt": 1, "state": "sending"},
+            )
+            self.assertNotIn("image_sha256", prepared)
+            self.assertNotIn("image_status", prepared)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                payload_text, completed_at, send_state = connection.execute(
+                    "SELECT payload, completed_at, send_state FROM outbox WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+                self.assertEqual(json.loads(payload_text), prepared)
+                self.assertIsNone(completed_at)
+                self.assertEqual(send_state, "ready")
+                connection.execute(
+                    "UPDATE outbox SET send_state = 'local_only' WHERE id = ?",
+                    (item_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migrations (name)
+                    VALUES ('outbox_incompatible_followup_v2')
+                    """
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schema_migrations
+                    WHERE name = 'outbox_incompatible_followup_v3'
+                    """
+                )
+
+            self.assertEqual(store.pending_outbox_count(), 0)
+            self.assertEqual(store.pending_outbox_items(), [])
+
+            migrated = LocalStore(path)
+
+            queued = migrated.pending_outbox_items()
+            self.assertEqual(migrated.pending_outbox_count(), 1)
+            self.assertEqual(queued, [(item_id, prepared)])
+            self.assertEqual(migrated.event_telemetry(event_id), prepared["telemetry"])
+            with closing(sqlite3.connect(path)) as connection:
+                payload_text, completed_at, send_state = connection.execute(
+                    "SELECT payload, completed_at, send_state FROM outbox WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+            self.assertEqual(json.loads(payload_text), prepared)
+            self.assertIsNone(completed_at)
+            self.assertEqual(send_state, "ready")
 
     def test_migration_keeps_current_image_free_v3_event_sendable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -390,7 +486,8 @@ class LocalStoreTests(unittest.TestCase):
                     DELETE FROM schema_migrations
                     WHERE name IN (
                         'outbox_incompatible_followup_v1',
-                        'outbox_incompatible_followup_v2'
+                        'outbox_incompatible_followup_v2',
+                        'outbox_incompatible_followup_v3'
                     )
                     """
                 )
@@ -431,7 +528,8 @@ class LocalStoreTests(unittest.TestCase):
                     DELETE FROM schema_migrations
                     WHERE name IN (
                         'outbox_incompatible_followup_v1',
-                        'outbox_incompatible_followup_v2'
+                        'outbox_incompatible_followup_v2',
+                        'outbox_incompatible_followup_v3'
                     )
                     """
                 )

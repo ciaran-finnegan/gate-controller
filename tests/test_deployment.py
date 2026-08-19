@@ -81,9 +81,10 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("local-network SSH or directly on the Pi", camera)
         self.assertIn("Tailscale availability is not a\ndeployment prerequisite", camera)
         self.assertIn("default non-actuating command", camera)
-        self.assertIn("run mode and whether actuation was requested", camera)
+        self.assertIn("passive endpoint probes", camera)
         self.assertIn("--skip-network", camera)
-        self.assertIn("--actuate", camera)
+        self.assertNotIn("--actuate", camera)
+        self.assertNotIn("open_gate", camera)
         self.assertNotIn("skipped_until_tailscale_or_home_wifi", camera)
 
     def test_historical_plan_uses_the_current_performance_summary_schema(self):
@@ -93,16 +94,19 @@ class CloudflareDocumentationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn('"run_mode": "host_metrics_only"', plan)
-        self.assertIn('"actuation_requested": false', plan)
+        self.assertNotIn("actuation_requested", plan)
         self.assertNotIn("pi_ssh_tests", plan)
         self.assertNotIn("skipped_until_tailscale_or_home_wifi", plan)
 
-    def test_performance_docs_reject_actuation_when_network_is_skipped(self):
+    def test_performance_docs_describe_only_non_actuating_modes(self):
         performance = (
             REPOSITORY_ROOT / "docs/pi-cloudflare-performance.md"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("cannot be combined with `--actuate`", performance)
+        self.assertIn("only passive `GET` requests", performance)
+        self.assertIn("never sends a command", performance)
+        self.assertNotIn("--actuate", performance)
+        self.assertNotIn("open_gate", performance)
 
 
 class SystemdTrustBoundaryTests(unittest.TestCase):

@@ -1038,7 +1038,7 @@ class LocalStore:
             incompatible_followup = connection.execute(
                 """
                 SELECT 1 FROM schema_migrations
-                WHERE name = 'outbox_incompatible_followup_v2'
+                WHERE name = 'outbox_incompatible_followup_v3'
                 """
             ).fetchone()
             if not incompatible_followup:
@@ -1046,24 +1046,35 @@ class LocalStore:
                     """
                     SELECT id, payload, send_state FROM outbox
                     WHERE completed_at IS NULL
-                      AND send_state IN (?, ?)
+                      AND send_state IN (?, ?, ?)
                     """,
-                    (_OUTBOX_READY, _OUTBOX_TELEMETRY_READY),
+                    (
+                        _OUTBOX_READY,
+                        _OUTBOX_TELEMETRY_READY,
+                        _OUTBOX_LOCAL_ONLY,
+                    ),
                 ).fetchall():
                     try:
                         payload = json.loads(payload_text)
                     except (TypeError, ValueError):
                         continue
-                    if not _is_incompatible_v3_followup(payload, send_state):
+                    if _is_incompatible_v3_followup(payload, send_state):
+                        next_state = _OUTBOX_LOCAL_ONLY
+                    elif (
+                        send_state == _OUTBOX_LOCAL_ONLY
+                        and _is_image_free_v3_telemetry_payload(payload)
+                    ):
+                        next_state = _OUTBOX_READY
+                    else:
                         continue
                     connection.execute(
                         "UPDATE outbox SET send_state = ? WHERE id = ?",
-                        (_OUTBOX_LOCAL_ONLY, outbox_id),
+                        (next_state, outbox_id),
                     )
                 connection.execute(
                     """
                     INSERT INTO schema_migrations (name)
-                    VALUES ('outbox_incompatible_followup_v2')
+                    VALUES ('outbox_incompatible_followup_v3')
                     """
                 )
     def _recover_interrupted_actuations(self, connection: sqlite3.Connection) -> int:
@@ -1292,8 +1303,21 @@ def _is_incompatible_v3_followup(payload: object, send_state: str) -> bool:
         return False
     if payload.get("image_status") == "delivered_before_telemetry":
         return True
+    if not _is_image_free_v3_telemetry_payload(payload):
+        return False
+    delivery = payload["telemetry"].get("delivery")
     return (
-        send_state == _OUTBOX_READY
+        send_state in (_OUTBOX_READY, _OUTBOX_LOCAL_ONLY)
+        and isinstance(delivery, dict)
+        and delivery.get("state") == "pending"
+    )
+
+
+def _is_image_free_v3_telemetry_payload(payload: object) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 3
+        and isinstance(payload.get("telemetry"), dict)
         and "image_sha256" not in payload
         and "image_status" not in payload
     )

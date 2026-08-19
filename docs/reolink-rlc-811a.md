@@ -115,6 +115,5 @@ deployment prerequisite.
 
 For a safe opportunistic check on the Pi, run the default non-actuating command
 or use `--skip-network` when services are unavailable. The harness records its
-run mode and whether actuation was requested. It sends an `open_gate` command
-only when `--actuate` is explicitly supplied while the operator is physically
-present and prepared for the gate to open.
+run mode. Its network collection consists only of passive endpoint probes and
+never submits a controller command.
