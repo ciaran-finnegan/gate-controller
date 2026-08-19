@@ -1632,7 +1632,7 @@ verify_candidate_release {shlex.quote(str(release))}
             uploads = state_root / "uploads"
             daily_uploads = uploads / "2026" / "08" / "18"
             daily_uploads.mkdir(parents=True)
-            daily_uploads.chmod(0o2755)
+            daily_uploads.chmod(0o755)
             stale_upload = daily_uploads / "old.jpg"
             stale_upload.write_bytes(b"jpeg")
             stale_upload.chmod(0o600)
@@ -1669,6 +1669,14 @@ usermod() {{
 chown() {{
   printf 'chown %s\n' "$*" >> {shlex.quote(str(account_log))}
 }}
+find() {{
+  printf 'find %s\n' "$*" >> {shlex.quote(str(account_log))}
+  local -a forwarded=("$@")
+  if [[ $3 == d && $6 == g+rwx,g+s,o-rwx ]]; then
+    forwarded[5]=g+rwx,o-rwx
+  fi
+  command find "${{forwarded[@]}}"
+}}
 runuser() {{
   local user=
   if [[ $1 == --user ]]; then
@@ -1704,7 +1712,7 @@ configure_ftp_home ftp-user {shlex.quote(str(uploads))}
             self.assertTrue(uploads.is_dir())
             self.assertEqual(0o710, state_root.stat().st_mode & 0o7777)
             self.assertEqual(0o770, uploads.stat().st_mode & 0o777)
-            self.assertEqual(0o2770, daily_uploads.stat().st_mode & 0o7777)
+            self.assertEqual(0o770, daily_uploads.stat().st_mode & 0o7777)
             self.assertEqual(0o660, stale_upload.stat().st_mode & 0o777)
             account_actions = account_log.read_text(encoding="utf-8")
             self.assertIn(
@@ -1713,6 +1721,10 @@ configure_ftp_home ftp-user {shlex.quote(str(uploads))}
             )
             self.assertIn(
                 f"chown -R ftp-user:gate-controller {uploads}",
+                account_actions,
+            )
+            self.assertIn(
+                f"find {uploads} -type d -exec chmod g+rwx,g+s,o-rwx {{}} +",
                 account_actions,
             )
             self.assertIn("usermod -aG gate-controller ftp-user", account_actions)
