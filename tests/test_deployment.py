@@ -787,6 +787,304 @@ restore_application_activity {shlex.quote(str(previous_unit))} true
                 installer,
             )
 
+    def test_complete_rollback_aggregates_failures_and_retains_the_backup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            backup = root / "backup"
+            backup.mkdir()
+            (backup / "recovery-marker").write_text("retain\n", encoding="utf-8")
+            action_log = root / "actions.log"
+            expected_failures = [
+                "restore current release",
+                "restore file-monitor.service",
+                "restore gate-command-server.service",
+                "restore gate-controller-updater.service",
+                "restore gate-controller-updater.timer",
+                "restore fixed updater helper",
+                "restore cloudflared transport",
+                "restore FTP home",
+                "restore updater timer enablement",
+                "restore application enablement",
+                "restore application activity",
+                "restore legacy command activity",
+            ]
+            command = f"""
+source deployment/install.sh
+record_failure() {{
+  printf '%s\n' "$1" >> {shlex.quote(str(action_log))}
+  return 1
+}}
+ln() {{ record_failure 'restore current release'; }}
+mv() {{ record_failure 'unexpected current release move'; }}
+restore_path() {{ record_failure "restore $1"; }}
+restore_fixed_updater_helper() {{ record_failure 'restore fixed updater helper'; }}
+restore_cloudflared_transport_with_diagnostics() {{ record_failure 'restore cloudflared transport'; }}
+configure_ftp_home() {{ record_failure 'restore FTP home'; }}
+systemctl() {{
+  case "$*" in
+    'disable --now gate-controller-updater.timer')
+      record_failure 'restore updater timer enablement'
+      ;;
+    'disable file-monitor.service')
+      record_failure 'restore application enablement'
+      ;;
+    *) return 99 ;;
+  esac
+}}
+restore_application_activity() {{ record_failure 'restore application activity'; }}
+restore_legacy_command_activity() {{ record_failure 'restore legacy command activity'; }}
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+BACKUP_DIR={shlex.quote(str(backup))}
+STAGING=
+CURRENT_LINK={shlex.quote(str(root / 'current'))}
+PREVIOUS_CURRENT={shlex.quote(str(root / 'previous'))}
+SYSTEMD_ROOT={shlex.quote(str(root / 'systemd'))}
+UPDATER_HELPER={shlex.quote(str(root / 'updater-helper'))}
+FTP_USER=ftp-user
+FTP_PREVIOUS_HOME={shlex.quote(str(root / 'ftp-home'))}
+UPDATER_WAS_ENABLED=false
+APP_WAS_ENABLED=false
+APP_WAS_ACTIVE=true
+LEGACY_COMMAND_WAS_ENABLED=true
+LEGACY_COMMAND_WAS_ACTIVE=true
+set +e
+false
+rollback
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertTrue(backup.is_dir())
+            self.assertTrue((backup / "recovery-marker").is_file())
+            diagnostics = backup / "rollback-error.log"
+            self.assertTrue(diagnostics.is_file())
+            diagnostic_text = diagnostics.read_text(encoding="utf-8")
+            actions = action_log.read_text(encoding="utf-8").splitlines()
+            for expected in expected_failures:
+                with self.subTest(expected=expected):
+                    self.assertIn(expected, actions)
+                    self.assertIn(f"Rollback step failed: {expected}", diagnostic_text)
+            self.assertNotIn("unexpected current release move", actions)
+            self.assertIn("Rollback was incomplete", completed.stderr)
+            self.assertIn(str(backup), completed.stderr)
+
+    def test_each_rollback_failure_independently_retains_diagnostics(self):
+        failure_classes = [
+            "restore current release",
+            "restore file-monitor.service",
+            "restore gate-command-server.service",
+            "restore gate-controller-updater.service",
+            "restore gate-controller-updater.timer",
+            "restore fixed updater helper",
+            "restore cloudflared transport",
+            "restore FTP home",
+            "restore updater timer enablement",
+            "restore application enablement",
+            "restore application activity",
+            "restore legacy command activity",
+        ]
+
+        for failure_class in failure_classes:
+            with self.subTest(failure_class=failure_class):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    backup = root / "backup"
+                    backup.mkdir()
+                    action_log = root / "actions.log"
+                    command = f"""
+source deployment/install.sh
+FAIL_STEP={shlex.quote(failure_class)}
+record_step() {{
+  printf '%s\n' "$1" >> {shlex.quote(str(action_log))}
+  [[ $1 != "$FAIL_STEP" ]]
+}}
+ln() {{ record_step 'restore current release'; }}
+mv() {{ printf '%s\n' 'complete current release switch' >> {shlex.quote(str(action_log))}; }}
+restore_path() {{ record_step "restore $1"; }}
+restore_fixed_updater_helper() {{ record_step 'restore fixed updater helper'; }}
+restore_cloudflared_transport_with_diagnostics() {{ record_step 'restore cloudflared transport'; }}
+configure_ftp_home() {{ record_step 'restore FTP home'; }}
+systemctl() {{
+  case "$*" in
+    'disable --now gate-controller-updater.timer')
+      record_step 'restore updater timer enablement'
+      ;;
+    'disable file-monitor.service')
+      record_step 'restore application enablement'
+      ;;
+    *) return 99 ;;
+  esac
+}}
+restore_application_activity() {{ record_step 'restore application activity'; }}
+restore_legacy_command_activity() {{ record_step 'restore legacy command activity'; }}
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+BACKUP_DIR={shlex.quote(str(backup))}
+STAGING=
+CURRENT_LINK={shlex.quote(str(root / 'current'))}
+PREVIOUS_CURRENT={shlex.quote(str(root / 'previous'))}
+SYSTEMD_ROOT={shlex.quote(str(root / 'systemd'))}
+UPDATER_HELPER={shlex.quote(str(root / 'updater-helper'))}
+FTP_USER=ftp-user
+FTP_PREVIOUS_HOME={shlex.quote(str(root / 'ftp-home'))}
+UPDATER_WAS_ENABLED=false
+APP_WAS_ENABLED=false
+APP_WAS_ACTIVE=true
+LEGACY_COMMAND_WAS_ENABLED=true
+LEGACY_COMMAND_WAS_ACTIVE=true
+set +e
+false
+rollback
+"""
+
+                    completed = subprocess.run(
+                        ["bash", "-c", command],
+                        cwd=REPOSITORY_ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(1, completed.returncode, completed.stderr)
+                    self.assertTrue(backup.is_dir())
+                    diagnostics = backup / "rollback-error.log"
+                    self.assertTrue(diagnostics.is_file())
+                    self.assertIn(
+                        f"Rollback step failed: {failure_class}",
+                        diagnostics.read_text(encoding="utf-8"),
+                    )
+                    actions = action_log.read_text(encoding="utf-8").splitlines()
+                    for expected in failure_classes:
+                        self.assertIn(expected, actions)
+                    if failure_class == "restore current release":
+                        self.assertNotIn("complete current release switch", actions)
+
+    def test_unwritable_diagnostics_do_not_skip_rollback_steps(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            backup = root / "backup"
+            backup.mkdir()
+            action_log = root / "actions.log"
+            expected_actions = [
+                "restore current release",
+                "restore file-monitor.service",
+                "restore gate-command-server.service",
+                "restore gate-controller-updater.service",
+                "restore gate-controller-updater.timer",
+                "restore fixed updater helper",
+                "restore cloudflared transport",
+                "restore FTP home",
+                "restore updater timer enablement",
+                "restore application enablement",
+                "restore application activity",
+                "restore legacy command activity",
+            ]
+            command = f"""
+source deployment/install.sh
+record_step() {{ printf '%s\n' "$1" >> {shlex.quote(str(action_log))}; }}
+prepare_rollback_diagnostics() {{
+  ROLLBACK_DIAGNOSTICS={shlex.quote(str(root / 'missing' / 'rollback-error.log'))}
+}}
+restore_current_release() {{ record_step 'restore current release'; }}
+restore_path() {{ record_step "restore $1"; }}
+restore_fixed_updater_helper() {{ record_step 'restore fixed updater helper'; }}
+restore_cloudflared_transport_with_diagnostics() {{ record_step 'restore cloudflared transport'; }}
+configure_ftp_home() {{ record_step 'restore FTP home'; }}
+systemctl() {{
+  case "$*" in
+    'disable --now gate-controller-updater.timer')
+      record_step 'restore updater timer enablement'
+      ;;
+    'disable file-monitor.service')
+      record_step 'restore application enablement'
+      ;;
+    *) return 99 ;;
+  esac
+}}
+restore_application_activity() {{ record_step 'restore application activity'; }}
+restore_legacy_command_activity() {{ record_step 'restore legacy command activity'; }}
+ACTIVATION_STARTED=true
+INSTALL_SUCCEEDED=false
+BACKUP_DIR={shlex.quote(str(backup))}
+STAGING=
+SYSTEMD_ROOT={shlex.quote(str(root / 'systemd'))}
+UPDATER_HELPER={shlex.quote(str(root / 'updater-helper'))}
+FTP_USER=ftp-user
+FTP_PREVIOUS_HOME={shlex.quote(str(root / 'ftp-home'))}
+UPDATER_WAS_ENABLED=false
+APP_WAS_ENABLED=false
+APP_WAS_ACTIVE=true
+LEGACY_COMMAND_WAS_ENABLED=true
+LEGACY_COMMAND_WAS_ACTIVE=true
+set +e
+false
+rollback
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertEqual(
+                expected_actions,
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+            self.assertNotIn("Rollback step failed", completed.stderr)
+
+    def test_legacy_activity_reports_enablement_failure_after_restoring_activity(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            previous_unit = Path(temporary_directory) / "gate-command-server.service"
+            previous_unit.touch()
+            action_log = Path(temporary_directory) / "actions.log"
+            command = f"""
+source deployment/install.sh
+systemctl() {{
+  printf '%s\n' "$*" >> {shlex.quote(str(action_log))}
+  [[ $1 != enable ]]
+}}
+set +e
+restore_legacy_command_activity \
+  {shlex.quote(str(previous_unit))} true true
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("status=1\n", completed.stdout)
+            self.assertEqual(
+                [
+                    "enable gate-command-server.service",
+                    "restart gate-command-server.service",
+                ],
+                action_log.read_text(encoding="utf-8").splitlines(),
+            )
+
 
 class CloudflaredTransportLifecycleTests(unittest.TestCase):
     def run_shell(self, script):
@@ -881,6 +1179,27 @@ printf '%s %s %s\n' \
                 ],
                 action_log.read_text(encoding="utf-8").splitlines(),
             )
+
+    def test_enabled_state_inspection_failure_is_not_masked_under_set_plus_e(self):
+        script = """
+source deployment/install.sh
+run_systemctl_bounded() { return 124; }
+CLOUDFLARED_WAS_ENABLED=false
+set +e
+verify_cloudflared_enabled_state
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+"""
+
+        completed = self.run_shell(script)
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("status=1\n", completed.stdout)
+        self.assertIn(
+            "could not verify whether cloudflared.service is enabled",
+            completed.stderr,
+        )
 
     def test_inactive_service_keeps_enabled_state_without_starting(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

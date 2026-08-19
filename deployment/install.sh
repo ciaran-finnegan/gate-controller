@@ -42,6 +42,7 @@ CLOUDFLARED_JOB_TIMEOUT_SECONDS=30
 CLOUDFLARED_QUIESCE_TIMEOUT_SECONDS=10
 CLOUDFLARED_POLL_SECONDS=1
 ROLLBACK_FAILED=false
+ROLLBACK_DIAGNOSTICS=
 TRUST_ANCHOR_HANDOFF=
 FTP_PREVIOUS_HOME=
 
@@ -415,11 +416,15 @@ verify_cloudflared_enabled_state() {
     currently_enabled=true
   else
     status=$?
-    [[ $status -eq 1 ]] \
-      || fail "could not verify whether $CLOUDFLARED_SERVICE is enabled"
+    if [[ $status -ne 1 ]]; then
+      fail "could not verify whether $CLOUDFLARED_SERVICE is enabled" || true
+      return 1
+    fi
   fi
-  [[ $currently_enabled == "$CLOUDFLARED_WAS_ENABLED" ]] \
-    || fail "$CLOUDFLARED_SERVICE enabled state changed during bootstrap"
+  if [[ $currently_enabled != "$CLOUDFLARED_WAS_ENABLED" ]]; then
+    fail "$CLOUDFLARED_SERVICE enabled state changed during bootstrap" || true
+    return 1
+  fi
 }
 
 restore_cloudflared_transport_drop_in() {
@@ -660,17 +665,165 @@ restore_legacy_command_activity() {
   local previous_unit=$1
   local was_enabled=$2
   local was_active=$3
+  local restoration_failed=false
 
   if [[ -f $previous_unit && $was_enabled == true ]]; then
-    systemctl enable "$LEGACY_COMMAND_UNIT"
+    if ! systemctl enable "$LEGACY_COMMAND_UNIT"; then
+      restoration_failed=true
+    fi
   else
-    systemctl disable "$LEGACY_COMMAND_UNIT"
+    if ! systemctl disable "$LEGACY_COMMAND_UNIT"; then
+      restoration_failed=true
+    fi
   fi
   if [[ -f $previous_unit && $was_active == true ]]; then
-    systemctl restart "$LEGACY_COMMAND_UNIT"
+    if ! systemctl restart "$LEGACY_COMMAND_UNIT"; then
+      restoration_failed=true
+    fi
   else
-    systemctl stop "$LEGACY_COMMAND_UNIT"
+    if ! systemctl stop "$LEGACY_COMMAND_UNIT"; then
+      restoration_failed=true
+    fi
   fi
+  [[ $restoration_failed == false ]]
+}
+
+cleanup() {
+  if [[ -n $STAGING && -d $STAGING ]]; then
+    rm -rf -- "$STAGING"
+  fi
+  if [[ $ROLLBACK_FAILED == false \
+        && -n $BACKUP_DIR && -d $BACKUP_DIR ]]; then
+    rm -rf -- "$BACKUP_DIR"
+  fi
+}
+
+restore_path() {
+  local name=$1
+  local destination=$SYSTEMD_ROOT/$name
+  if [[ -f $BACKUP_DIR/$name ]]; then
+    install -m 0644 "$BACKUP_DIR/$name" "$destination"
+  else
+    rm -f -- "$destination"
+  fi
+}
+
+restore_current_release() {
+  if [[ -n $PREVIOUS_CURRENT ]]; then
+    ln -sfn "$PREVIOUS_CURRENT" "$CURRENT_LINK.rollback" || return 1
+    mv -Tf "$CURRENT_LINK.rollback" "$CURRENT_LINK" || return 1
+  else
+    rm -f -- "$CURRENT_LINK"
+  fi
+}
+
+prepare_rollback_diagnostics() {
+  ROLLBACK_DIAGNOSTICS=$BACKUP_DIR/rollback-error.log
+  if ! (umask 077 && : >"$ROLLBACK_DIAGNOSTICS"); then
+    ROLLBACK_FAILED=true
+    ROLLBACK_DIAGNOSTICS=
+    printf '%s\n' \
+      "Rollback diagnostics could not be created; backup retained at $BACKUP_DIR." \
+      >&2
+  fi
+  return 0
+}
+
+run_rollback_step() {
+  local description=$1
+  local status
+  local message
+  local step_diagnostics=
+  shift
+
+  if [[ -n $ROLLBACK_DIAGNOSTICS ]]; then
+    step_diagnostics=$(mktemp "$BACKUP_DIR/.rollback-step.XXXXXX") || true
+  fi
+  if [[ -n $step_diagnostics ]]; then
+    if "$@" 2>"$step_diagnostics"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [[ -s $step_diagnostics ]]; then
+      cat -- "$step_diagnostics" >&2 || true
+    fi
+  elif "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ $status -eq 0 ]]; then
+    [[ -z $step_diagnostics ]] || rm -f -- "$step_diagnostics"
+    return 0
+  fi
+
+  ROLLBACK_FAILED=true
+  message="Rollback step failed: $description (status $status)."
+  printf '%s\n' "$message" >&2
+  if [[ -n $step_diagnostics ]] \
+      && ! cat -- "$step_diagnostics" >>"$ROLLBACK_DIAGNOSTICS"; then
+    printf '%s\n' \
+      "Rollback diagnostics could not be updated; backup retained at $BACKUP_DIR." \
+      >&2
+  fi
+  if [[ -n $ROLLBACK_DIAGNOSTICS ]] \
+      && ! printf '%s\n' "$message" >>"$ROLLBACK_DIAGNOSTICS"; then
+    printf '%s\n' \
+      "Rollback diagnostics could not be updated; backup retained at $BACKUP_DIR." \
+      >&2
+  fi
+  [[ -z $step_diagnostics ]] || rm -f -- "$step_diagnostics"
+  return 0
+}
+
+rollback() {
+  local original_status=$?
+  set +e
+  if [[ $ACTIVATION_STARTED == true && $INSTALL_SUCCEEDED == false ]]; then
+    printf 'Managed startup failed; restoring the previous installation.\n' >&2
+    prepare_rollback_diagnostics
+    run_rollback_step "restore current release" restore_current_release
+    run_rollback_step "restore $APP_SERVICE" restore_path "$APP_SERVICE"
+    run_rollback_step "restore $LEGACY_COMMAND_UNIT" restore_path "$LEGACY_COMMAND_UNIT"
+    run_rollback_step "restore $UPDATER_SERVICE" restore_path "$UPDATER_SERVICE"
+    run_rollback_step "restore $UPDATER_TIMER" restore_path "$UPDATER_TIMER"
+    run_rollback_step \
+      "restore fixed updater helper" \
+      restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
+    run_rollback_step \
+      "restore cloudflared transport" \
+      restore_cloudflared_transport_with_diagnostics "$SYSTEMD_ROOT" "$BACKUP_DIR"
+    run_rollback_step \
+      "restore FTP home" \
+      configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
+    if [[ $UPDATER_WAS_ENABLED == false ]]; then
+      run_rollback_step \
+        "restore updater timer enablement" \
+        systemctl disable --now "$UPDATER_TIMER"
+    fi
+    if [[ $APP_WAS_ENABLED == false ]]; then
+      run_rollback_step \
+        "restore application enablement" \
+        systemctl disable "$APP_SERVICE"
+    fi
+    run_rollback_step \
+      "restore application activity" \
+      restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
+    run_rollback_step \
+      "restore legacy command activity" \
+      restore_legacy_command_activity \
+        "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
+        "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
+  fi
+  if [[ $ROLLBACK_FAILED == true ]]; then
+    printf '%s\n' \
+      "Rollback was incomplete; backup and diagnostics retained at $BACKUP_DIR." \
+      >&2
+    [[ $original_status -ne 0 ]] || original_status=1
+  fi
+  cleanup
+  exit "$original_status"
 }
 
 migrate_legacy_authorised_plates() {
@@ -845,65 +998,6 @@ install -d -o root -g root -m 0755 "$INSTALL_ROOT" "$RELEASES_ROOT"
 RELEASE=$RELEASES_ROOT/$SHA
 STAGING=$(mktemp -d "$RELEASES_ROOT/.bootstrap-$SHA.XXXXXX")
 BACKUP_DIR=$(mktemp -d /run/gate-controller-install.XXXXXX)
-
-cleanup() {
-  if [[ -n $STAGING && -d $STAGING ]]; then
-    rm -rf -- "$STAGING"
-  fi
-  if [[ $ROLLBACK_FAILED == false \
-        && -n $BACKUP_DIR && -d $BACKUP_DIR ]]; then
-    rm -rf -- "$BACKUP_DIR"
-  fi
-}
-
-restore_path() {
-  local name=$1
-  local destination=$SYSTEMD_ROOT/$name
-  if [[ -f $BACKUP_DIR/$name ]]; then
-    install -m 0644 "$BACKUP_DIR/$name" "$destination"
-  else
-    rm -f -- "$destination"
-  fi
-}
-
-rollback() {
-  local original_status=$?
-  set +e
-  if [[ $ACTIVATION_STARTED == true && $INSTALL_SUCCEEDED == false ]]; then
-    printf 'Managed startup failed; restoring the previous installation.\n' >&2
-    if [[ -n $PREVIOUS_CURRENT ]]; then
-      ln -sfn "$PREVIOUS_CURRENT" "$CURRENT_LINK.rollback"
-      mv -Tf "$CURRENT_LINK.rollback" "$CURRENT_LINK"
-    else
-      rm -f -- "$CURRENT_LINK"
-    fi
-    restore_path "$APP_SERVICE"
-    restore_path "$LEGACY_COMMAND_UNIT"
-    restore_path "$UPDATER_SERVICE"
-    restore_path "$UPDATER_TIMER"
-    restore_fixed_updater_helper "$UPDATER_HELPER" "$BACKUP_DIR"
-    if ! restore_cloudflared_transport_with_diagnostics \
-      "$SYSTEMD_ROOT" "$BACKUP_DIR"; then
-      ROLLBACK_FAILED=true
-      printf '%s\n' \
-        "Cloudflared rollback was incomplete; exact backup and diagnostics retained at $BACKUP_DIR." \
-        >&2
-    fi
-    configure_ftp_home "$FTP_USER" "$FTP_PREVIOUS_HOME"
-    if [[ $UPDATER_WAS_ENABLED == false ]]; then
-      systemctl disable --now "$UPDATER_TIMER"
-    fi
-    if [[ $APP_WAS_ENABLED == false ]]; then
-      systemctl disable "$APP_SERVICE"
-    fi
-    restore_application_activity "$BACKUP_DIR/$APP_SERVICE" "$APP_WAS_ACTIVE"
-    restore_legacy_command_activity \
-      "$BACKUP_DIR/$LEGACY_COMMAND_UNIT" \
-      "$LEGACY_COMMAND_WAS_ENABLED" "$LEGACY_COMMAND_WAS_ACTIVE"
-  fi
-  cleanup
-  exit "$original_status"
-}
 
 trap rollback ERR INT TERM
 trap cleanup EXIT
