@@ -26,6 +26,10 @@ from .outbox import (
 )
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
+from .reolink_events import (
+    ReolinkEventCorrelator, ReolinkWebhookWorker,
+    load_reolink_webhook_config,
+)
 from .reolink_snapshots import load_reolink_snapshot_config
 from .store import LocalStore
 from .telemetry_export import export_telemetry
@@ -90,6 +94,8 @@ def main() -> None:
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
     )
+    trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(os.environ)
+    background_workers = tuple(background_workers) + tuple(trigger_workers)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
         recognizer=PlateRecognizerClient(token),
@@ -105,7 +111,7 @@ def main() -> None:
 
     def process(paths, received_at=None, decision_started_at=None,
                 processing_started_at=None, *, idempotency_key=None, final=True,
-                provisional_result=None):
+                provisional_result=None, augmentation=None, trigger=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
@@ -116,10 +122,12 @@ def main() -> None:
             idempotency_key=idempotency_key,
             final=final,
             provisional_result=provisional_result,
+            augmentation=augmentation,
+            trigger=trigger,
         )
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
-                       processing_started_at=None):
+                       processing_started_at=None, *, trigger=None):
         logging.getLogger(__name__).warning("image_burst_skipped reason=%s count=%d", reason,
                                             len(paths))
         return processor.record_skipped(
@@ -128,15 +136,18 @@ def main() -> None:
             received_at,
             decision_started_at=decision_started_at,
             processing_started_at=processing_started_at,
+            trigger=trigger,
         )
 
-    def record_error(paths, error, received_at):
+    def record_error(paths, error, received_at, *, trigger=None):
         logging.getLogger(__name__).exception(
             "image_burst_failed count=%d error=%s", len(paths), error,
             exc_info=(type(error), error, error.__traceback__),
         )
         try:
-            processor.record_skipped(paths, "processing_error", received_at)
+            processor.record_skipped(
+                paths, "processing_error", received_at, trigger=trigger,
+            )
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
@@ -154,7 +165,19 @@ def main() -> None:
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
         snapshot_sampling=snapshot_sampling,
+        trigger_resolver=trigger_correlator.correlate,
     )
+
+
+def build_reolink_trigger_pipeline(environment=None):
+    environment = os.environ if environment is None else environment
+    correlator = ReolinkEventCorrelator()
+    config = load_reolink_webhook_config(environment)
+    workers = (
+        (ReolinkWebhookWorker(config, correlator),)
+        if config.enabled else ()
+    )
+    return correlator, workers
 
 
 def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
