@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
+from unittest.mock import patch
 from urllib.error import HTTPError
 
 from PIL import Image
@@ -453,6 +454,31 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
                 self.assertIn(f"reason={reason}", "\n".join(logs.output))
                 self.assertEqual(list(sampler.output_directory.glob("*.jpg")), [])
 
+    def test_cleanup_error_does_not_replace_the_original_store_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = FakeClient((SnapshotResponse(jpeg_bytes(), "image/jpeg"),))
+            sampler = ReolinkSnapshotSampler(
+                self.create_config(root, GATE_REOLINK_SNAPSHOT_COUNT="1"),
+                lambda *_: self.fail("failed sample reached the collector"),
+                client_factory=lambda _: client, run_id=lambda: "capture",
+            )
+            self.assertTrue(sampler.request())
+
+            with patch(
+                "gate_controller.reolink_snapshots.os.replace",
+                side_effect=SnapshotFailure("store_failed"),
+            ), patch(
+                "gate_controller.reolink_snapshots.os.unlink",
+                side_effect=PermissionError("private cleanup detail"),
+            ), self.assertLogs(
+                "gate_controller.reolink_snapshots", level="WARNING",
+            ) as logs:
+                self.assertTrue(sampler.run_once(Event()))
+
+            self.assertIn("outcome=failed", "\n".join(logs.output))
+            self.assertIn("reason=store_failed", "\n".join(logs.output))
+
     def test_generated_snapshot_directory_is_ignored_and_shutdown_cleans_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -514,19 +540,20 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
             config.output_directory.symlink_to(protected, target_is_directory=True)
             collected = []
 
+            sampler = ReolinkSnapshotSampler(
+                config, lambda path, received_at: collected.append(path),
+                client_factory=lambda _: self.fail("camera client must not be opened"),
+            )
+            self.assertTrue(sampler.request())
             with self.assertLogs("gate_controller.reolink_snapshots", level="WARNING") as logs:
-                sampler = ReolinkSnapshotSampler(
-                    config, lambda path, received_at: collected.append(path),
-                    client_factory=lambda _: self.fail("camera client must not be opened"),
-                )
-                self.assertTrue(sampler.request())
                 self.assertTrue(sampler.run_once(Event()))
 
             self.assertEqual(collected, [])
             self.assertTrue(keep.exists())
+            self.assertIn("outcome=failed", "\n".join(logs.output))
             self.assertIn("reason=io_error", "\n".join(logs.output))
 
-    def test_trigger_only_exposes_candidates_to_ocr_and_has_no_actuation_path(self):
+    def test_sampler_exposes_candidates_to_ocr_without_a_direct_actuation_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ocr_candidates = []

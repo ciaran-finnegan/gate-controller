@@ -68,6 +68,11 @@ Self-signed TLS must be opted into explicitly. Counts above four, timeouts above
 three seconds, and response limits above the controller image ceiling are
 rejected at startup.
 
+Setting `GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true` disables certificate and
+hostname verification. A hostile device on the camera LAN could then impersonate
+the camera and capture its credentials. Enable it only when the camera cannot use
+a certificate verifiable by the Pi, and keep the camera network tightly scoped.
+
 The default takes two additional 4K snapshots sequentially under one global
 2.25-second deadline. They are written temporarily beneath the upload root in
 an ignored owner-only `.reolink-snapshots` directory, validated as bounded
@@ -75,8 +80,10 @@ JPEGs, and added together to a separate progressive OCR burst with the original
 FTP `received_at`. Generated files cannot recursively request another sample.
 They use the existing ranking, recognition, authorization, durable actuation
 claim, and cooldown path; a camera trigger or snapshot never actuates the relay
-by itself. Failure or unavailable configuration leaves the first FTP attempt
-and its normal quiet window unchanged.
+by itself. A plate recognized from either the primary FTP image or a later
+snapshot can open the gate only after the same authorization, claim, cooldown,
+and relay-safety checks succeed. Failure or unavailable configuration leaves the
+first FTP attempt and its normal quiet window unchanged.
 
 Do not configure on-demand ffmpeg sampling from
 `rtsp://127.0.0.1:8554/camera` for this feature. Live Pi measurements took
@@ -171,8 +178,9 @@ Each local event records `received_at`, `decision_at`, and, when opened,
   latency and should be monitored against the two-second median and
   four-second 95th-percentile targets.
 - A long first interval points to uploads, OCR, image quality, or networking.
-  A short first interval with no relay time indicates a rejected policy,
-  cooldown, duplicate, or relay error rather than a slow camera.
+  A short first interval with no relay time can indicate an OCR no-match,
+  authorization rejection, cooldown, duplicate, or relay error. Use the
+  recorded outcome and reason to distinguish these cases from slow capture.
 
 Control-plane heartbeats include the latest completed image path, SQLite outbox
 queue depth, and whether a fixed local prompt is configured. They are health

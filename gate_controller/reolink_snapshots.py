@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .images import wait_until_readable
+from .images import is_decodable_jpeg
 
 
 DEFAULT_REOLINK_SNAPSHOT_COUNT = 2
@@ -464,6 +464,8 @@ class ReolinkSnapshotSampler:
             raise SnapshotFailure("invalid_content")
         if len(response.data) > self._config.max_response_bytes:
             raise SnapshotFailure("output_limit")
+        if not is_decodable_jpeg(response.data):
+            raise SnapshotFailure("invalid_jpeg")
         final_name = f"{prefix}-{sequence:02d}.jpg"
         temporary_name = f"{prefix}-{sequence:02d}.part"
         final_path = self._config.output_directory / final_name
@@ -478,13 +480,11 @@ class ReolinkSnapshotSampler:
                 temporary_name, final_name,
                 src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
             )
-            if not wait_until_readable(final_path, timeout=0, poll_interval=0):
-                raise SnapshotFailure("invalid_jpeg")
         except Exception:
             for name in (temporary_name, final_name):
                 try:
                     os.unlink(name, dir_fd=directory_fd)
-                except FileNotFoundError:
+                except OSError:
                     pass
             raise
         return final_path

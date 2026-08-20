@@ -509,10 +509,13 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 if observer_started:
                     observer.stop()
                     observer.join()
+                sampling_finished = not sampling_started
                 if sampling_started:
                     sampling_thread.join(
                         timeout=MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS + 0.5
                     )
+                    is_alive = getattr(sampling_thread, "is_alive", None)
+                    sampling_finished = not callable(is_alive) or not is_alive()
                 processing_finished = not processing_started
                 if processing_started:
                     dropped = bursts.put(None)
@@ -524,14 +527,26 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                     processing_thread.join(timeout=5)
                     is_alive = getattr(processing_thread, "is_alive", None)
                     processing_finished = not callable(is_alive) or not is_alive()
-                if sampler is not None and processing_finished:
+                if sampler is not None and sampling_finished and processing_finished:
                     sampler.close()
                 elif sampler is not None:
                     LOGGER.warning(
                         "gate_camera source=camera_ftp subtype=unverified "
                         "augmentation=reolink_snapshot outcome=cleanup_deferred "
-                        "reason=processor_active"
+                        "reason=worker_active"
                     )
+
+                    def close_sampler_after_workers_finish():
+                        if sampling_started:
+                            sampling_thread.join()
+                        if processing_started:
+                            processing_thread.join()
+                        sampler.close()
+
+                    Thread(
+                        target=close_sampler_after_workers_finish,
+                        daemon=True, name="ReolinkSnapshotCleanup",
+                    ).start()
                 for thread in started_background_threads:
                     thread.join(timeout=1)
             finally:

@@ -950,6 +950,89 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(configured["handler"]["ignored_roots"], (output_directory,))
         self.assertIsNone(configured["handler"]["on_first_completed"])
 
+    def test_deferred_snapshot_cleanup_waits_for_an_overlong_processor(self):
+        lifecycle = []
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                pass
+
+            def add(self, path, received_at=None):
+                return True
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                pass
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class Sampler:
+            output_directory = Path("private-snapshots")
+
+            def __init__(self, config, add_candidate):
+                pass
+
+            def request(self, received_at=None):
+                return True
+
+            def run_forever(self, stop_event):
+                pass
+
+            def close(self):
+                lifecycle.append("sampler_close")
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.target = kwargs.get("target", args[0] if args else None)
+                self.args = kwargs.get("args", ())
+                self.name = kwargs.get("name")
+
+            def start(self):
+                lifecycle.append(f"thread_start:{self.name}")
+                if self.name == "ReolinkSnapshotCleanup":
+                    self.target(*self.args)
+
+            def join(self, timeout=None):
+                lifecycle.append(f"thread_join:{self.name}:{timeout}")
+
+            def is_alive(self):
+                return self.name == "GateBurstProcessor"
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ), self.assertLogs("gate_controller.worker", level="WARNING") as logs:
+            run_worker(
+                Path(directory), lambda *_: None,
+                snapshot_sampling=type("Config", (), {"enabled": True})(),
+            )
+
+        self.assertIn("outcome=cleanup_deferred", "\n".join(logs.output))
+        self.assertIn("thread_start:ReolinkSnapshotCleanup", lifecycle)
+        self.assertLess(
+            lifecycle.index("thread_join:GateBurstProcessor:None"),
+            lifecycle.index("sampler_close"),
+        )
+        self.assertEqual(lifecycle.count("sampler_close"), 1)
+
     def test_queue_coalesced_callback_receives_exact_collector_boundaries(self):
         configured = {}
         received_at = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
