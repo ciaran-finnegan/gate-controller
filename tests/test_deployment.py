@@ -74,7 +74,7 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("decommissioning the prior service", deployment)
 
     def test_camera_docs_run_pi_validation_with_a_safe_non_actuating_harness(self):
-        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(
             encoding="utf-8"
         )
 

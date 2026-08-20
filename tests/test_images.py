@@ -16,6 +16,18 @@ class ImageTests(unittest.TestCase):
         self.assertIsNotNone(measure, "measure_frame_quality is not implemented")
         return measure(path)
 
+    def test_validates_decodable_jpeg_bytes_without_a_filesystem_path(self):
+        validator = getattr(image_tools, "is_decodable_jpeg", None)
+        self.assertIsNotNone(validator, "byte-based JPEG validation is not implemented")
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "frame.jpg"
+            Image.new("RGB", (16, 8), color="blue").save(frame, format="JPEG")
+            encoded = frame.read_bytes()
+
+        self.assertTrue(validator(encoded))
+        self.assertFalse(validator(encoded[:4]))
+        self.assertFalse(validator(b"not a jpeg"))
+
     def test_measure_frame_quality_reports_dimensions_and_bounded_luma_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = Path(directory) / "split.jpg"

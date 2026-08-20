@@ -149,6 +149,35 @@ still stop the burst immediately. `GATE_MAX_BURST_CANDIDATES` defaults to 8 and
 `GATE_MAX_CANDIDATE_IMAGE_BYTES` defaults to 8 MiB. Startup rejects values above
 the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
 bounded set, the newest candidates are retained and then ranked by image quality.
+
+Optional Reolink HTTPS Snap augmentation is best effort and never delays the
+initial FTP recognition path. Configure `GATE_REOLINK_SNAPSHOT_BASE_URL`,
+`GATE_REOLINK_SNAPSHOT_USERNAME`, and `GATE_REOLINK_SNAPSHOT_PASSWORD` together.
+The base URL must be a bare HTTPS origin whose host is a private or loopback IP
+literal; credentials, paths, queries, fragments, redirects, and public hosts are
+rejected. Set `GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true` only for a camera
+with a deliberately accepted self-signed certificate on that private address.
+
+The default captures two sequential additional snapshots under one 2.25-second
+global deadline. `GATE_REOLINK_SNAPSHOT_COUNT` is limited to 1-4,
+`GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS` is limited to 3 seconds, and
+`GATE_REOLINK_SNAPSHOT_MAX_BYTES` cannot exceed the configured candidate-image
+limit. Generated JPEGs live in an ignored owner-only subdirectory and enter the
+same ranking and OCR path as a separate progressive burst carrying the original
+FTP `received_at`; they never authorize directly. A login, snapshot, validation,
+timeout, or cleanup failure leaves the already-released FTP burst unchanged.
+Logs record `source=camera_ftp subtype=unverified` and
+`augmentation=reolink_snapshot` without camera credentials or token values.
+
+On-demand ffmpeg capture from the local MediaMTX RTSP path is deliberately not
+used for recognition augmentation. Production Pi measurements took 4.88-5.44
+seconds for three frames because a new reader waited for the upstream keyframe,
+which is unsuitable for the four-second decision budget. After configuring the
+installed RLC-810A Clear stream for 4K/10 fps/H.265 at 6144 Kbit/s, two
+sequential HTTPS Snap requests measured 625 ms and 677 ms. Concurrent Snap
+requests are avoided because the camera serializes them and can return duplicate
+frames.
+
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
 camera recognition events: each contained one 3840x2160 frame, with no second
@@ -159,7 +188,7 @@ finite and between 100 ms and 2 seconds.
 
 ## Camera Deployment
 
-See [RLC-811A deployment and night calibration](docs/reolink-rlc-811a.md).
+See [RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md).
 The Pi performance harness is documented in
 [Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
 is intentionally deferred until reliable on-site network access is available.

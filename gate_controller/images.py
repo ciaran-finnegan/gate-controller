@@ -1,5 +1,6 @@
 import hashlib
 import warnings
+from io import BytesIO
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -12,6 +13,24 @@ MAX_IMAGE_PIXELS = 16_000_000
 QUALITY_SIZE = (320, 180)
 QUALITY_UNAVAILABLE_DIGEST = hashlib.sha256(b"quality_unavailable").hexdigest()
 Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
+
+
+def is_decodable_jpeg(data: bytes) -> bool:
+    """Validate bounded in-memory JPEG data without resolving a filesystem path."""
+    if not isinstance(data, bytes) or data[:3] != b"\xff\xd8\xff":
+        return False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(data)) as image:
+                if image.format != "JPEG":
+                    return False
+                image.verify()
+        return True
+    except (
+        OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
+    ):
+        return False
 
 
 def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTelemetry:
