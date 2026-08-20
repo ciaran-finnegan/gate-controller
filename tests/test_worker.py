@@ -569,6 +569,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(dropped, (Path("first.jpg"),))
         self.assertEqual(queue.get(), (Path("second.jpg"),))
 
+    def test_optional_queue_admission_never_evicts_primary_work(self):
+        queue = BoundedBurstQueue(max_pending=1)
+        primary = (Path("primary-ftp.jpg"),)
+        augmentation = (Path("optional-snapshot.jpg"),)
+
+        queue.put(primary)
+        accepted = queue.try_put(augmentation)
+
+        self.assertFalse(accepted)
+        self.assertEqual(queue.get(), primary)
+
     def test_burst_received_at_uses_first_filesystem_arrival_not_image_mtime(self):
         monotonic_clock = MutableClock()
         arrivals = iter([
@@ -775,6 +786,97 @@ class WorkerTests(unittest.TestCase):
             lifecycle.index("thread_join:ReolinkSnapshotSampler"),
             lifecycle.index("sampler_close"),
         )
+
+    def test_run_worker_uses_non_evicting_admission_for_snapshot_augmentation(self):
+        configured = {"emits": [], "queue_calls": []}
+
+        class BurstQueue:
+            def __init__(self, max_pending):
+                pass
+
+            def put(self, item):
+                configured["queue_calls"].append(("evicting", item))
+                return None
+
+            def try_put(self, item):
+                configured["queue_calls"].append(("non_evicting", item))
+                return False
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                configured["emits"].append(emit)
+
+            def add(self, path, received_at=None):
+                return True
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                pass
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class Sampler:
+            output_directory = Path("private-snapshots")
+
+            def __init__(self, config, add_candidate):
+                pass
+
+            def request(self, received_at=None):
+                return True
+
+            def run_forever(self, stop_event):
+                pass
+
+            def close(self):
+                pass
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BoundedBurstQueue", BurstQueue
+        ), patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ):
+            run_worker(
+                Path(directory), lambda *_: None,
+                snapshot_sampling=type("Config", (), {"enabled": True})(),
+            )
+
+        primary = ((Path("primary-ftp.jpg"),), None)
+        augmentation = ((Path("optional-snapshot.jpg"),), None)
+        configured["emits"][0](primary)
+        configured["emits"][1](augmentation)
+
+        self.assertIn(("evicting", primary), configured["queue_calls"])
+        self.assertIn(("non_evicting", augmentation), configured["queue_calls"])
+        self.assertNotIn(("evicting", augmentation), configured["queue_calls"])
 
     def test_disabled_sampling_cleans_and_ignores_private_files_without_a_thread(self):
         configured = {}

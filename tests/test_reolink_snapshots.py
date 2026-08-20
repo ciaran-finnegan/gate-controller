@@ -483,6 +483,49 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
             self.assertFalse(generated.exists())
             self.assertEqual(handler.pending_count, 0)
 
+    def test_startup_cleanup_refuses_a_symlinked_snapshot_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            uploads = root / "uploads"
+            uploads.mkdir()
+            protected = root / "protected"
+            protected.mkdir()
+            keep = protected / "keep.jpg"
+            keep.write_bytes(jpeg_bytes())
+            config = self.create_config(root)
+            config.output_directory.symlink_to(protected, target_is_directory=True)
+
+            sampler = ReolinkSnapshotSampler(config, lambda *_: None)
+            sampler.close()
+
+            self.assertTrue(keep.exists())
+            self.assertTrue(config.output_directory.is_symlink())
+
+    def test_capture_refuses_a_symlinked_snapshot_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            uploads = root / "uploads"
+            uploads.mkdir()
+            protected = root / "protected"
+            protected.mkdir()
+            keep = protected / "keep.jpg"
+            keep.write_bytes(jpeg_bytes())
+            config = self.create_config(root, GATE_REOLINK_SNAPSHOT_COUNT="1")
+            config.output_directory.symlink_to(protected, target_is_directory=True)
+            collected = []
+
+            with self.assertLogs("gate_controller.reolink_snapshots", level="WARNING") as logs:
+                sampler = ReolinkSnapshotSampler(
+                    config, lambda path, received_at: collected.append(path),
+                    client_factory=lambda _: self.fail("camera client must not be opened"),
+                )
+                self.assertTrue(sampler.request())
+                self.assertTrue(sampler.run_once(Event()))
+
+            self.assertEqual(collected, [])
+            self.assertTrue(keep.exists())
+            self.assertIn("reason=io_error", "\n".join(logs.output))
+
     def test_trigger_only_exposes_candidates_to_ocr_and_has_no_actuation_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -8,6 +8,7 @@ import math
 import os
 import secrets
 import ssl
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -396,10 +397,10 @@ class ReolinkSnapshotSampler:
         reason = None
         client = None
         prefix = None
+        directory_fd = None
         try:
             prefix = self._run_id()
-            self._config.output_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-            os.chmod(self._config.output_directory, 0o700)
+            directory_fd = self._open_output_directory(create=True)
             client = self._client_factory(self._config)
             token = client.login(self._remaining(deadline, stop_event))
             for sequence in range(1, self._config.candidate_count + 1):
@@ -407,7 +408,7 @@ class ReolinkSnapshotSampler:
                     token, sequence, self._remaining(deadline, stop_event)
                 )
                 self._remaining(deadline, stop_event)
-                path = self._store_candidate(prefix, sequence, response)
+                path = self._store_candidate(directory_fd, prefix, sequence, response)
                 accepted.append(path)
         except SnapshotFailure as error:
             reason = error.reason
@@ -431,8 +432,12 @@ class ReolinkSnapshotSampler:
                         client.logout(token, remaining)
                 except Exception:
                     pass
-            if prefix is not None:
-                self._cleanup_prefix(prefix, keep=set(published))
+            if prefix is not None and directory_fd is not None:
+                self._cleanup_prefix(
+                    prefix, keep=set(published), directory_fd=directory_fd,
+                )
+            if directory_fd is not None:
+                os.close(directory_fd)
             with self._lock:
                 self._active = False
                 self._started_at = None
@@ -453,23 +458,34 @@ class ReolinkSnapshotSampler:
             raise SnapshotFailure("timeout")
         return remaining
 
-    def _store_candidate(self, prefix: str, sequence: int,
+    def _store_candidate(self, directory_fd: int, prefix: str, sequence: int,
                          response: SnapshotResponse) -> Path:
         if response.content_type.lower() != "image/jpeg":
             raise SnapshotFailure("invalid_content")
         if len(response.data) > self._config.max_response_bytes:
             raise SnapshotFailure("output_limit")
-        final_path = self._config.output_directory / f"{prefix}-{sequence:02d}.jpg"
-        temporary_path = final_path.with_suffix(".part")
+        final_name = f"{prefix}-{sequence:02d}.jpg"
+        temporary_name = f"{prefix}-{sequence:02d}.part"
+        final_path = self._config.output_directory / final_name
         try:
-            temporary_path.write_bytes(response.data)
-            os.chmod(temporary_path, 0o600)
-            temporary_path.replace(final_path)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            file_descriptor = os.open(
+                temporary_name, flags, 0o600, dir_fd=directory_fd,
+            )
+            with os.fdopen(file_descriptor, "wb") as destination:
+                destination.write(response.data)
+            os.replace(
+                temporary_name, final_name,
+                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            )
             if not wait_until_readable(final_path, timeout=0, poll_interval=0):
                 raise SnapshotFailure("invalid_jpeg")
         except Exception:
-            temporary_path.unlink(missing_ok=True)
-            final_path.unlink(missing_ok=True)
+            for name in (temporary_name, final_name):
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
             raise
         return final_path
 
@@ -479,28 +495,72 @@ class ReolinkSnapshotSampler:
             self._active = False
         self._cleanup_all()
 
-    def _cleanup_prefix(self, prefix: str, *, keep: set[Path]) -> None:
+    def _open_output_directory(self, *, create: bool) -> int:
+        output_directory = self._config.output_directory
+        if create:
+            output_directory.parent.mkdir(parents=True, exist_ok=True)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        parent_fd = os.open(output_directory.parent, flags)
         try:
-            for path in self._config.output_directory.glob(f"{prefix}-*"):
-                if path not in keep:
-                    path.unlink(missing_ok=True)
+            if create:
+                try:
+                    os.mkdir(output_directory.name, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+            directory_fd = os.open(output_directory.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        if create:
+            os.fchmod(directory_fd, 0o700)
+        return directory_fd
+
+    def _cleanup_prefix(self, prefix: str, *, keep: set[Path],
+                        directory_fd: int | None = None) -> None:
+        close_directory = directory_fd is None
+        try:
+            if directory_fd is None:
+                directory_fd = self._open_output_directory(create=False)
+            keep_names = {path.name for path in keep}
+            for name in os.listdir(directory_fd):
+                if name.startswith(f"{prefix}-") and name not in keep_names:
+                    self._unlink_file_entry(directory_fd, name)
+        except FileNotFoundError:
+            return
         except OSError:
             LOGGER.warning(
                 "gate_camera source=camera_ftp subtype=unverified "
                 "augmentation=reolink_snapshot outcome=cleanup_failed reason=io_error"
             )
+        finally:
+            if close_directory and directory_fd is not None:
+                os.close(directory_fd)
 
     def _cleanup_all(self) -> None:
+        directory_fd = None
         try:
-            if self._config.output_directory.is_dir():
-                for path in self._config.output_directory.iterdir():
-                    if path.is_file() or path.is_symlink():
-                        path.unlink(missing_ok=True)
+            directory_fd = self._open_output_directory(create=False)
+            for name in os.listdir(directory_fd):
+                self._unlink_file_entry(directory_fd, name)
+        except FileNotFoundError:
+            return
         except OSError:
             LOGGER.warning(
                 "gate_camera source=camera_ftp subtype=unverified "
                 "augmentation=reolink_snapshot outcome=cleanup_failed reason=io_error"
             )
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    @staticmethod
+    def _unlink_file_entry(directory_fd: int, name: str) -> None:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            os.unlink(name, dir_fd=directory_fd)
 
     @staticmethod
     def _log(outcome: str, count: int, reason: str, duration_ms: int) -> None:

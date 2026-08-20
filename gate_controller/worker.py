@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import signal
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -48,6 +48,14 @@ class BoundedBurstQueue:
 
     def get(self):
         return self._queue.get()
+
+    def try_put(self, item) -> bool:
+        """Admit optional work only when it cannot displace queued work."""
+        try:
+            self._queue.put_nowait(item)
+            return True
+        except Full:
+            return False
 
 
 class BurstCollector:
@@ -375,13 +383,21 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         elif on_skipped is not None:
             on_skipped(paths, reason, received_at)
 
-    def enqueue(item):
+    def enqueue_primary(item):
         dropped = bursts.put(item)
         if dropped is not None:
             try:
                 report_dropped(dropped, "queue_coalesced")
             finally:
                 _remove_uploads(dropped[0])
+
+    def enqueue_augmentation(item):
+        if bursts.try_put(item):
+            return
+        try:
+            report_dropped(item, "augmentation_queue_full")
+        finally:
+            _remove_uploads(item[0])
 
     collector_options = {
         "quiet_window": quiet_window,
@@ -391,13 +407,15 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         "include_processing_started_at": True,
         "max_candidates": max_burst_candidates,
     }
-    collector = BurstCollector(enqueue, **collector_options)
+    collector = BurstCollector(enqueue_primary, **collector_options)
     sampler = None
     augmentation_collector = None
     sampling_enabled = bool(snapshot_sampling is not None and snapshot_sampling.enabled)
     if snapshot_sampling is not None:
         if sampling_enabled:
-            augmentation_collector = BurstCollector(enqueue, **collector_options)
+            augmentation_collector = BurstCollector(
+                enqueue_augmentation, **collector_options,
+            )
             add_snapshot_candidate = augmentation_collector.add
         else:
             add_snapshot_candidate = lambda *_: None
