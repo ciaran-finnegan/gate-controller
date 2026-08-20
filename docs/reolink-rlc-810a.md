@@ -4,10 +4,12 @@
 
 Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
 VLAN. Give the camera a DHCP reservation and allow it to initiate FTP uploads
-to the Pi only. Do not forward RTSP, ONVIF, the Reolink web interface, FTP, or
-the Pi GPIO interface to the internet. Remote users use the authenticated web
-application, which sends an Access-protected request through Cloudflare Tunnel
-to the Pi's loopback command server. The Pi applies the local safety policy.
+to the Pi only. When snapshot augmentation is enabled, also allow only the Pi
+to initiate HTTPS (TCP/443) requests to the camera's reserved private address.
+Do not forward RTSP, ONVIF, the Reolink web interface, FTP, HTTPS, or the Pi GPIO
+interface to the internet. Remote users use the authenticated web application,
+which sends an Access-protected request through Cloudflare Tunnel to the Pi's
+loopback command server. The Pi applies the local safety policy.
 
 Use a dedicated `ftp-user` with a home or upload directory at
 `/var/lib/gate-controller/uploads`. Limit the FTP service to the camera VLAN

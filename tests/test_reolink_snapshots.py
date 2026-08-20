@@ -460,14 +460,14 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
             uploads.mkdir()
             config = self.create_config(root)
             config.output_directory.mkdir(mode=0o700)
-            generated = config.output_directory / "old.jpg"
-            generated.write_bytes(jpeg_bytes())
             ftp = uploads / "camera.jpg"
             ftp.write_bytes(jpeg_bytes())
             collected = []
             sample_requests = []
             collector = BurstCollector(lambda paths: collected.append(paths))
             sampler = ReolinkSnapshotSampler(config, collector.add)
+            generated = config.output_directory / "old.jpg"
+            generated.write_bytes(jpeg_bytes())
             handler = CompletedImageHandler(
                 collector, on_first_completed=lambda received_at: sample_requests.append(received_at),
                 ignored_roots=(config.output_directory,),
@@ -530,7 +530,6 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ocr_candidates = []
-            relay_calls = []
             client = FakeClient((SnapshotResponse(jpeg_bytes(), "image/jpeg"),))
             sampler = ReolinkSnapshotSampler(
                 self.create_config(root, GATE_REOLINK_SNAPSHOT_COUNT="1"),
@@ -544,7 +543,6 @@ class ReolinkSnapshotSamplerTests(unittest.TestCase):
             sampler.run_once(Event())
 
             self.assertEqual(len(ocr_candidates), 1)
-            self.assertEqual(relay_calls, [])
 
 
 if __name__ == "__main__":

@@ -418,7 +418,9 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             )
             add_snapshot_candidate = augmentation_collector.add
         else:
-            add_snapshot_candidate = lambda *_: None
+            def add_snapshot_candidate(*_):
+                """Discard candidates while retaining startup cleanup behavior."""
+                return None
         sampler = ReolinkSnapshotSampler(snapshot_sampling, add_snapshot_candidate)
     handler = CompletedImageHandler(
         collector,
@@ -511,8 +513,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                     sampling_thread.join(
                         timeout=MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS + 0.5
                     )
-                if sampler is not None:
-                    sampler.close()
+                processing_finished = not processing_started
                 if processing_started:
                     dropped = bursts.put(None)
                     if dropped is not None:
@@ -521,6 +522,16 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                         finally:
                             _remove_uploads(dropped[0])
                     processing_thread.join(timeout=5)
+                    is_alive = getattr(processing_thread, "is_alive", None)
+                    processing_finished = not callable(is_alive) or not is_alive()
+                if sampler is not None and processing_finished:
+                    sampler.close()
+                elif sampler is not None:
+                    LOGGER.warning(
+                        "gate_camera source=camera_ftp subtype=unverified "
+                        "augmentation=reolink_snapshot outcome=cleanup_deferred "
+                        "reason=processor_active"
+                    )
                 for thread in started_background_threads:
                     thread.join(timeout=1)
             finally:

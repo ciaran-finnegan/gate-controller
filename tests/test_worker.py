@@ -712,12 +712,14 @@ class WorkerTests(unittest.TestCase):
 
         class Collector:
             def __init__(self, emit, **kwargs):
+                self.index = len(configured.setdefault("collectors", []))
                 configured.setdefault("collectors", []).append(kwargs)
 
             def add(self, path, received_at=None):
                 return True
 
             def flush_due(self):
+                configured.setdefault("flushes", []).append(self.index)
                 return False
 
         class Handler:
@@ -776,14 +778,17 @@ class WorkerTests(unittest.TestCase):
             )
 
         self.assertEqual(len(configured["collectors"]), 2)
-        self.assertTrue(all(
-            "defer_flush" not in options for options in configured["collectors"]
-        ))
+        self.assertEqual(configured["collectors"][0], configured["collectors"][1])
+        self.assertEqual(configured["flushes"], [0, 1])
         self.assertIsInstance(
             configured["handler"]["on_first_completed"].__self__, Sampler
         )
         self.assertLess(
             lifecycle.index("thread_join:ReolinkSnapshotSampler"),
+            lifecycle.index("sampler_close"),
+        )
+        self.assertLess(
+            lifecycle.index("thread_join:GateBurstProcessor"),
             lifecycle.index("sampler_close"),
         )
 
