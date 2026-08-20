@@ -425,6 +425,80 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertEqual("gateway_unhealthy", status["media"]["video"]["reason"])
         self.assertEqual(0, status["queue_depth"])
 
+    def test_managed_release_sha_resolves_the_module_path_to_its_release_ancestor(self):
+        release_sha = "0123456789abcdef0123456789abcdef01234567"
+        root = Path(self.create_store().path).parent
+        module = root / "releases" / release_sha / "gate_controller" / "__main__.py"
+        module.parent.mkdir(parents=True)
+        module.touch()
+        current = root / "current"
+        current.symlink_to(module.parent.parent, target_is_directory=True)
+
+        self.assertEqual(
+            release_sha,
+            gate_main._managed_release_sha(
+                current / "gate_controller" / "__main__.py",
+                releases_root=root / "releases",
+            ),
+        )
+
+    def test_managed_release_sha_rejects_a_canonical_sha_outside_the_releases_root(self):
+        release_sha = "0123456789abcdef0123456789abcdef01234567"
+        root = Path(self.create_store().path).parent
+        releases_root = root / "managed" / "releases"
+        releases_root.mkdir(parents=True)
+        module = root / "unmanaged" / release_sha / "gate_controller" / "__main__.py"
+        module.parent.mkdir(parents=True)
+        module.touch()
+
+        self.assertIsNone(
+            gate_main._managed_release_sha(module, releases_root=releases_root)
+        )
+
+    def test_managed_release_sha_rejects_noncanonical_or_unmanaged_paths(self):
+        root = Path(self.create_store().path).parent
+        invalid_ancestors = (
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456",
+            "0123456789abcdef0123456789abcdef012345678",
+            "g123456789abcdef0123456789abcdef01234567",
+            "checkout",
+        )
+
+        for ancestor in invalid_ancestors:
+            with self.subTest(ancestor=ancestor):
+                module = root / ancestor / "gate_controller" / "__main__.py"
+                module.parent.mkdir(parents=True)
+                module.touch()
+                self.assertIsNone(
+                    gate_main._managed_release_sha(
+                        module, releases_root=root / "releases"
+                    )
+                )
+
+    def test_controller_status_includes_only_a_valid_nested_software_release(self):
+        store = self.create_store()
+        release_sha = "fedcba9876543210fedcba9876543210fedcba98"
+        module = (
+            store.path.parent / "releases" / release_sha
+            / "gate_controller" / "__main__.py"
+        )
+        module.parent.mkdir(parents=True)
+        module.touch()
+        prompt = type("Prompt", (), {"available": False})()
+
+        managed = gate_main._controller_status(
+            store, prompt, {}, module_path=module,
+            managed_releases_root=store.path.parent / "releases",
+        )
+        unmanaged = gate_main._controller_status(
+            store, prompt, {}, module_path=store.path.parent / "checkout" / "__main__.py",
+            managed_releases_root=store.path.parent / "releases",
+        )
+
+        self.assertEqual({"release_sha": release_sha}, managed["software"])
+        self.assertNotIn("software", unmanaged)
+
     def test_outbox_url_requires_a_nonempty_bearer_token(self):
         store = self.create_store()
 
