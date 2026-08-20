@@ -1,8 +1,8 @@
-# Reolink RLC-811A Deployment and Night Calibration
+# Reolink RLC-810A Deployment and Night Calibration
 
 ## Network Boundary
 
-Connect the RLC-811A and Raspberry Pi to the private LAN or a dedicated camera
+Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
 VLAN. Give the camera a DHCP reservation and allow it to initiate FTP uploads
 to the Pi only. Do not forward RTSP, ONVIF, the Reolink web interface, FTP, or
 the Pi GPIO interface to the internet. Remote users use the authenticated web
@@ -79,15 +79,37 @@ and its normal quiet window unchanged.
 Do not configure on-demand ffmpeg sampling from
 `rtsp://127.0.0.1:8554/camera` for this feature. Live Pi measurements took
 4.88-5.44 seconds for three frames because capture waited for the roughly
-five-second upstream H.264 keyframe interval. Sequential HTTPS snapshots took
-about 0.78-0.96 seconds each, while concurrent requests serialized and produced
-duplicates. RTSP remains available to the separately isolated media gateway;
-it is not the recognition augmentation source.
+five-second upstream H.264 keyframe interval. Two sequential HTTPS snapshots
+measured 625 ms and 677 ms on the installed RLC-810A after the Clear stream was
+changed to 10 fps. Concurrent requests are avoided because the camera serializes
+them and can return duplicate frames. RTSP remains available to the separately
+isolated media gateway; it is not the recognition augmentation source until a
+fresh measured RTSP configuration is faster than HTTPS Snap.
 
-The exact labels vary by firmware. The RLC-811A supports vehicle detection,
-FTP upload, optical zoom, and two-way audio; firmware should be current before
-commissioning. Live media and talkback still require the separate authenticated
-media gateway because camera credentials must never be sent to the browser.
+The exact labels vary by firmware. The installed RLC-810A has a fixed 4 mm lens,
+supports vehicle detection and FTP upload, and has no optical zoom. Firmware
+should be current before commissioning. Live media still uses the separate
+authenticated media gateway because camera credentials must never be sent to
+the browser.
+
+## Stream and Image Settings
+
+Use the following measured starting point for rapid vehicle recognition:
+
+- **Clear/main:** 3840x2160, 10 fps, H.265, 6144 Kbit/s.
+- **Fluent/sub:** 640x360, 10 fps, H.264, 256 Kbit/s.
+- **Frame Rate Mode:** Constant.
+
+Ten frames per second bounds detector sampling delay to about 100 ms. The
+controller does not continuously decode or OCR every 4K frame: Fluent is the
+continuous low-cost detector feed, while selected 4K JPEGs are used for OCR.
+Keeping 6144 Kbit/s at 10 fps preserves more detail per Clear frame. Frame rate
+does not freeze a moving plate by itself; exposure time controls motion blur.
+
+The privacy mask may black out irrelevant scenery, but it must leave the whole
+vehicle approach, plate capture corridor, and position variance unobscured.
+Masked pixels cannot be recovered later. Do not treat the mask as the OCR crop;
+software crops are taken from the remaining 4K image after capture.
 
 ## Detection Zone and Position
 
@@ -97,17 +119,19 @@ Set a minimum object size that includes a car at the farthest intended trigger
 point but excludes distant traffic. Start with moderate vehicle sensitivity;
 raise it only after confirming approaching vehicles are not missed.
 
-For this entrance, mount the camera beside the outdoor cabinet on the right as
-a vehicle approaches from the road, roughly 1-1.5 metres high. Aim across the
-final part of the curve at one repeatable capture point before the gate rather
-than along the whole driveway. This position should reduce direct headlight
-glare, but confirm it after dark before fixing the bracket permanently.
+Keep the lens forward of the fence plane so nearby timber, rain droplets, and
+integrated IR cannot dominate exposure or reflect into the cover. A practical
+starting height is 1.5-2 metres, above most headlights, with the camera pointed
+slightly down at one repeatable capture point roughly 4-6 metres inside the
+entrance after the vehicle has straightened.
 
-Use the optical zoom to frame the capture point tightly. A useful commissioning
-target is a plate around 150-250 pixels wide in the uploaded JPEG, with modest
-horizontal and vertical angles. Keep the motion light itself outside the frame
-and avoid aiming it directly at the plate or camera cover. Capture sample bursts
-at the closest and farthest expected positions before enabling relay output.
+Because the RLC-810A lens is fixed, frame the capture point by physically aiming
+or relocating the camera and use a software crop only after capture. A useful
+commissioning target is a plate around 150-250 pixels wide in the 4K JPEG, with
+combined horizontal and vertical plate angle below 30 degrees and ideally
+10-20 degrees. Keep the motion light outside the frame and avoid aiming it at
+the plate or camera cover. Capture samples at the closest and farthest expected
+positions before enabling relay output.
 
 ## Night Calibration
 

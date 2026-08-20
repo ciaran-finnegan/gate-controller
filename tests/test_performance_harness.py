@@ -203,7 +203,7 @@ class PerformanceHarnessTests(unittest.TestCase):
                 REPOSITORY_ROOT / "docs/pi-cloudflare-performance.md"
             ).read_text(encoding="utf-8"),
             "camera docs": (
-                REPOSITORY_ROOT / "docs/reolink-rlc-811a.md"
+                REPOSITORY_ROOT / "docs/reolink-rlc-810a.md"
             ).read_text(encoding="utf-8"),
             "media config": (
                 REPOSITORY_ROOT / "deployment/media/mediamtx.yml"

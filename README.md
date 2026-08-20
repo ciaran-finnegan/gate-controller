@@ -171,11 +171,12 @@ Logs record `source=camera_ftp subtype=unverified` and
 
 On-demand ffmpeg capture from the local MediaMTX RTSP path is deliberately not
 used for recognition augmentation. Production Pi measurements took 4.88-5.44
-seconds for three frames because the upstream H.264 keyframe interval is about
-five seconds, which is unsuitable for the four-second decision budget. The
-sequential HTTPS Snap path measured roughly 0.78-0.96 seconds per 4K image;
-concurrent Snap requests are avoided because the camera serialized them and
-returned duplicate frames.
+seconds for three frames because a new reader waited for the upstream keyframe,
+which is unsuitable for the four-second decision budget. After configuring the
+installed RLC-810A Clear stream for 4K/10 fps/H.265 at 6144 Kbit/s, two
+sequential HTTPS Snap requests measured 625 ms and 677 ms. Concurrent Snap
+requests are avoided because the camera serializes them and can return duplicate
+frames.
 
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
@@ -187,7 +188,7 @@ finite and between 100 ms and 2 seconds.
 
 ## Camera Deployment
 
-See [RLC-811A deployment and night calibration](docs/reolink-rlc-811a.md).
+See [RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md).
 The Pi performance harness is documented in
 [Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
 is intentionally deferred until reliable on-site network access is available.
