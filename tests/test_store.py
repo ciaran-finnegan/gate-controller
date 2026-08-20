@@ -10,7 +10,9 @@ from pathlib import Path
 
 from gate_controller.models import GateEvent
 from gate_controller.store import LocalStore
-from gate_controller.telemetry import EventTelemetry, FrameTelemetry, StageDurations
+from gate_controller.telemetry import (
+    EventTelemetry, FrameTelemetry, StageDurations, TriggerTelemetry,
+)
 
 
 def _telemetry(trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2", *, reason="exact_match"):
@@ -30,6 +32,37 @@ def _telemetry(trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2", *, reason="exact
 
 
 class LocalStoreTests(unittest.TestCase):
+    def test_trigger_summary_survives_sqlite_and_outbox_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            event_id = store.record_event_with_outbox(
+                GateEvent(
+                    source="ocr", reason="no_match", opened=False,
+                    idempotency_key="trigger-summary",
+                    received_at=datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc),
+                ),
+                {"controller_id": "pi-front-gate"},
+            )
+            trigger = TriggerTelemetry(
+                source="reolink_webhook", event_type="vehicle",
+                rule_id="vehicle_alert", correlation="matched", delta_ms=50,
+            )
+            telemetry = EventTelemetry(
+                trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+                stage_durations=StageDurations(end_to_end_ms=125),
+                frames=(), ocr_attempts=(), decision_outcome="denied",
+                decision_reason="no_match", actuation_claim="not_requested",
+                actuation_attempted=False, relay_outcome="not_attempted",
+                outbox_attempt=0, delivery_state="pending", trigger=trigger,
+            )
+
+            store.attach_event_telemetry(event_id, telemetry)
+            persisted = store.event_telemetry(event_id)
+            _, queued = store.pending_outbox_items()[0]
+
+            self.assertEqual(persisted["trigger"], trigger.to_wire())
+            self.assertEqual(queued["telemetry"]["trigger"], trigger.to_wire())
+
     def test_frame_quality_status_survives_persistence_and_outbox_attachment(self):
         with tempfile.TemporaryDirectory() as directory:
             store = LocalStore(Path(directory) / "gate.db")
