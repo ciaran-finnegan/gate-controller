@@ -16,6 +16,7 @@ from .images import rank_images, wait_until_readable
 from .reolink_snapshots import (
     MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS, ReolinkSnapshotSampler,
 )
+from .telemetry import ftp_fallback_trigger
 
 
 DEFAULT_MAX_BURST_CANDIDATES = 8
@@ -24,6 +25,7 @@ MAX_BURST_CANDIDATES = 16
 MAX_CANDIDATE_BYTES = 16 * 1024 * 1024
 MAX_STARTUP_ENTRIES = 128
 MAX_FINAL_OCR_CANDIDATES = 3
+_TRIGGER_UNSET = object()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -144,6 +146,8 @@ class ProgressiveTrigger:
     augmentation_started_at: float | None = None
     augmentation_reason: str | None = None
     terminalizer: object | None = None
+    trigger_summary: object | None = None
+    trigger_resolved: bool = False
     _lock: Lock = field(default_factory=Lock, repr=False)
     _released: bool = False
 
@@ -503,7 +507,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                max_image_age: float = 8.0, on_skipped=None, on_error=None,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
-               on_timed_skipped=None, snapshot_sampling=None) -> None:
+               on_timed_skipped=None, snapshot_sampling=None,
+               trigger_resolver=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
     bursts = BoundedBurstQueue(
         max_pending_bursts,
@@ -514,10 +519,21 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         if isinstance(item, BurstWork):
             item = item.item
         paths, received_at, *timing = item
+        options = {}
+        if trigger_resolver is not None:
+            options["trigger"] = ftp_fallback_trigger()
         if on_timed_skipped is not None and timing:
-            on_timed_skipped(paths, reason, received_at, *timing)
+            on_timed_skipped(paths, reason, received_at, *timing, **options)
         elif on_skipped is not None:
-            on_skipped(paths, reason, received_at)
+            on_skipped(paths, reason, received_at, **options)
+
+    def report_pre_ocr_skip(paths, reason, received_at=None):
+        if on_skipped is None:
+            return
+        options = {}
+        if trigger_resolver is not None:
+            options["trigger"] = ftp_fallback_trigger()
+        on_skipped(paths, reason, received_at, **options)
 
     def enqueue(item):
         work = (
@@ -597,7 +613,9 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
     handler = CompletedImageHandler(
         collector,
-        on_rejected=(lambda path, reason: on_skipped((path,), reason, None)) if on_skipped else None,
+        on_rejected=(
+            lambda path, reason: report_pre_ocr_skip((path,), reason)
+        ) if on_skipped else None,
         max_candidate_bytes=max_candidate_bytes,
         max_pending_candidates=max_burst_candidates,
         on_first_completed=request_augmentation if sampling_enabled else None,
@@ -607,12 +625,15 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     observer.schedule(handler, str(directory), recursive=True)
     stop_event = Event()
     failures = Queue()
+    processing_args = (
+        bursts, emit, on_error,
+        lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
+    )
+    if trigger_resolver is not None:
+        processing_args += (trigger_resolver,)
     processing_thread = Thread(
         target=_supervise_worker,
-        args=("GateBurstProcessor", _process_bursts, (
-              bursts, emit, on_error,
-              lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
-        ),
+        args=("GateBurstProcessor", _process_bursts, processing_args,
               stop_event, failures),
         daemon=True, name="GateBurstProcessor",
     )
@@ -648,7 +669,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         startup_reconciler = StartupReconciler(
             directory, handler, max_image_age=max_image_age,
             on_skipped=(
-                lambda path: on_skipped((path,), "stale_startup", None)
+                lambda path: report_pre_ocr_skip((path,), "stale_startup")
             ) if on_skipped else None,
         )
         startup_reconciliation_pending = startup_reconciler.run_batch()
@@ -706,26 +727,40 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     raise WorkerFailure(f"critical worker {name} failed: {error}") from error
 
 
-def _process_bursts(bursts, emit, on_error=None, ranker=None) -> None:
+def _process_bursts(
+    bursts, emit, on_error=None, ranker=None, trigger_resolver=None,
+) -> None:
     ranker = ranker or rank_images
     while True:
         item = bursts.get()
         if item is None:
             return
         if isinstance(item, BurstWork):
-            _process_progressive_work(item, emit, on_error, bursts, ranker)
+            _process_progressive_work(
+                item, emit, on_error, bursts, ranker, trigger_resolver,
+            )
             continue
         paths, received_at, *timing = item
+        trigger_summary = _TRIGGER_UNSET
         try:
-            emit(paths, received_at, *timing)
+            options = {}
+            if trigger_resolver is not None:
+                trigger_summary = _resolve_trigger(
+                    trigger_resolver, received_at,
+                )
+                options["trigger"] = trigger_summary
+            emit(paths, received_at, *timing, **options)
         except Exception as error:
-            if on_error is not None:
-                on_error(paths, error, received_at)
+            _report_processing_error(
+                on_error, paths, error, received_at, trigger_summary,
+            )
         finally:
             _remove_uploads(paths)
 
 
-def _process_progressive_work(work: BurstWork, emit, on_error, bursts, ranker) -> None:
+def _process_progressive_work(
+    work: BurstWork, emit, on_error, bursts, ranker, trigger_resolver=None,
+) -> None:
     trigger = work.trigger
     paths, received_at, *timing = work.item
     paths = tuple(paths)
@@ -749,11 +784,20 @@ def _process_progressive_work(work: BurstWork, emit, on_error, bursts, ranker) -
         trigger.terminalizer = lambda: _finalize_progressive_trigger(
             trigger, emit, on_error, ranker,
         )
+    options = {"final": False}
+    if trigger_resolver is not None:
+        trigger_summary = _resolve_trigger(trigger_resolver, received_at)
+        with trigger._lock:
+            trigger.trigger_summary = trigger_summary
+            trigger.trigger_resolved = True
+        options["trigger"] = trigger_summary
     try:
-        result = emit(paths, received_at, *timing, final=False)
+        result = emit(paths, received_at, *timing, **options)
     except Exception as error:
-        if on_error is not None:
-            on_error(paths, error, received_at)
+        _report_processing_error(
+            on_error, paths, error, received_at,
+            trigger.trigger_summary if trigger.trigger_resolved else _TRIGGER_UNSET,
+        )
         _remove_uploads(paths)
         _abandon_progressive_trigger(trigger, bursts)
         return
@@ -804,7 +848,11 @@ def _finalize_progressive_trigger(trigger: ProgressiveTrigger, emit, on_error, r
             try:
                 selected = tuple(ranker(combined))[:MAX_FINAL_OCR_CANDIDATES]
             except Exception as error:
-                _report_processing_error(on_error, combined, error, received_at)
+                _report_processing_error(
+                    on_error, combined, error, received_at,
+                    trigger.trigger_summary
+                    if trigger.trigger_resolved else _TRIGGER_UNSET,
+                )
                 augmentation_failed = True
                 augmentation_reason = "selection_error"
             else:
@@ -813,6 +861,8 @@ def _finalize_progressive_trigger(trigger: ProgressiveTrigger, emit, on_error, r
             "idempotency_key": result.idempotency_key,
             "final": True,
         }
+        if trigger.trigger_resolved:
+            options["trigger"] = trigger.trigger_summary
         if augmentation_failed:
             selected = tuple(primary_paths)
             options["provisional_result"] = result
@@ -835,12 +885,24 @@ def _finalize_progressive_trigger(trigger: ProgressiveTrigger, emit, on_error, r
         try:
             emit(selected, received_at, *timing, **options)
         except Exception as error:
-            _report_processing_error(on_error, combined, error, received_at)
+            _report_processing_error(
+                on_error, combined, error, received_at,
+                trigger.trigger_summary
+                if trigger.trigger_resolved else _TRIGGER_UNSET,
+            )
     finally:
         _cleanup_progressive_trigger(trigger, cleanup_paths)
         with trigger._lock:
             trigger.finalizing = False
             trigger.finalized = True
+
+
+def _resolve_trigger(trigger_resolver, received_at):
+    try:
+        return trigger_resolver(received_at)
+    except Exception:
+        LOGGER.warning("gate_camera trigger_correlation=failed", exc_info=True)
+        return ftp_fallback_trigger()
 
 
 def _abandon_progressive_trigger(
@@ -880,11 +942,16 @@ def _augmentation_duration_ms(started_at: float | None) -> int:
     return max(0, round((monotonic() - started_at) * 1_000))
 
 
-def _report_processing_error(on_error, paths, error, received_at) -> None:
+def _report_processing_error(
+    on_error, paths, error, received_at, trigger=_TRIGGER_UNSET,
+) -> None:
     if on_error is None:
         return
     try:
-        on_error(paths, error, received_at)
+        if trigger is _TRIGGER_UNSET:
+            on_error(paths, error, received_at)
+        else:
+            on_error(paths, error, received_at, trigger=trigger)
     except Exception:
         LOGGER.exception("gate_burst_error_handler_failed")
 

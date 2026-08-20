@@ -1266,6 +1266,8 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
         payload["stage_timestamps"] = dict(raw["stage_timestamps"])
     if "augmentation" in raw:
         payload["augmentation"] = dict(raw["augmentation"])
+    if "trigger" in raw:
+        payload["trigger"] = dict(raw["trigger"])
     return payload
 
 
