@@ -19,6 +19,7 @@ from gate_controller.worker import (
     run_worker,
 )
 from gate_controller.models import ProcessingResult
+from gate_controller.telemetry import TriggerTelemetry
 
 
 class MutableClock:
@@ -46,6 +47,9 @@ class SequenceQueue:
     def get(self):
         return next(self._items)
 
+    def cancel_augmentation_reservation(self):
+        pass
+
 
 class Event:
     def __init__(self, path):
@@ -69,6 +73,156 @@ class PassiveObserver:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_trigger_correlation_does_not_wait_before_initial_ftp_recognition(self):
+        received_at = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+        calls = []
+        snapshot_still_running = ThreadEvent()
+        snapshot_still_running.set()
+        progressive = worker_module.ProgressiveTrigger(received_at)
+        primary = worker_module.BurstWork(
+            "primary", ((Path("ftp.jpg"),), received_at), progressive,
+        )
+
+        def resolve_trigger(candidate_received_at):
+            calls.append(("correlate", candidate_received_at))
+            return "sanitized-trigger"
+
+        def recognise(paths, candidate_received_at, *, final=True, trigger=None):
+            calls.append((
+                "recognise", paths, candidate_received_at, final, trigger,
+            ))
+            self.assertTrue(snapshot_still_running.is_set())
+            return ProcessingResult(False, "no_match", terminal=True)
+
+        _process_bursts(
+            SequenceQueue(primary, None),
+            recognise,
+            trigger_resolver=resolve_trigger,
+        )
+
+        self.assertEqual(calls, [
+            ("correlate", received_at),
+            (
+                "recognise", (Path("ftp.jpg"),), received_at, False,
+                "sanitized-trigger",
+            ),
+        ])
+
+    def test_failed_recognition_reports_the_same_sanitized_trigger(self):
+        received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
+        failures = []
+
+        def recognise(*_args, **_kwargs):
+            raise RuntimeError("recognition failed")
+
+        def report_error(paths, error, candidate_received_at, *, trigger=None):
+            failures.append((paths, error, candidate_received_at, trigger))
+
+        _process_bursts(
+            SequenceQueue(((Path("ftp.jpg"),), received_at), None),
+            recognise,
+            on_error=report_error,
+            trigger_resolver=lambda _: "sanitized-trigger",
+        )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0][0], (Path("ftp.jpg"),))
+        self.assertIsInstance(failures[0][1], RuntimeError)
+        self.assertEqual(failures[0][2:], (received_at, "sanitized-trigger"))
+
+    def test_trigger_resolver_exception_uses_the_exact_ftp_fallback(self):
+        received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
+        observed = []
+
+        def fail_to_resolve(_received_at):
+            raise RuntimeError("correlator unavailable")
+
+        def recognise(_paths, _received_at, *, trigger=None):
+            observed.append(None if trigger is None else trigger.to_wire())
+            return ProcessingResult(False, "no_match", terminal=True)
+
+        with self.assertLogs("gate_controller.worker", level="WARNING"):
+            _process_bursts(
+                SequenceQueue(((Path("ftp.jpg"),), received_at), None),
+                recognise,
+                trigger_resolver=fail_to_resolve,
+            )
+
+        self.assertEqual(observed, [{
+            "source": "camera_ftp",
+            "event_type": "unverified",
+            "correlation": "unverified",
+        }])
+
+    def test_pre_ocr_rejection_reports_the_exact_ftp_fallback_trigger(self):
+        configured = {}
+        skipped = []
+
+        class Collector:
+            def __init__(self, _emit, **_kwargs):
+                pass
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, _collector, **kwargs):
+                configured["on_rejected"] = kwargs["on_rejected"]
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *_args):
+                pass
+
+        class WorkerThread:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        def reject_then_stop(_interval):
+            configured["on_rejected"](
+                Path("oversized.jpg"), "image_too_large",
+            )
+            raise KeyboardInterrupt
+
+        matched = TriggerTelemetry(
+            source="reolink_webhook", event_type="line_crossing",
+            rule_id="line_crossing_inbound", correlation="matched",
+            delta_ms=25,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "gate_controller.worker.BurstCollector", Collector
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Handler
+        ), patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=reject_then_stop
+        ):
+            run_worker(
+                Path(directory), lambda *_args, **_kwargs: None,
+                on_skipped=lambda *_args, trigger=None, **_kwargs: skipped.append(
+                    None if trigger is None else trigger.to_wire()
+                ),
+                trigger_resolver=lambda _received_at: matched,
+            )
+
+        self.assertEqual(skipped, [{
+            "source": "camera_ftp",
+            "event_type": "unverified",
+            "correlation": "unverified",
+        }])
+
     def test_filesystem_ingress_is_logged_without_exposing_the_image_path(self):
         collector = RecordingCollector()
         observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
