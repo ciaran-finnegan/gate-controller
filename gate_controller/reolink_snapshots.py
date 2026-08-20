@@ -12,13 +12,13 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .images import is_decodable_jpeg
+from .images import wait_until_readable
 
 
 DEFAULT_REOLINK_SNAPSHOT_COUNT = 2
@@ -54,7 +54,7 @@ class SnapshotResponse:
 @dataclass(frozen=True)
 class ReolinkSnapshotConfig:
     base_url: str | None
-    username: str | None
+    username: str | None = field(repr=False)
     password: str | None = field(repr=False)
     allow_self_signed: bool = False
     candidate_count: int = DEFAULT_REOLINK_SNAPSHOT_COUNT
@@ -326,14 +326,200 @@ def _transport_failure_reason(error: BaseException, fallback: str) -> str:
     return fallback
 
 
+class _SnapshotSpool:
+    """Own a private directory without ever traversing a replacement symlink."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        parent_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(self.path.parent, parent_flags)
+        try:
+            try:
+                entry = os.stat(
+                    self.path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                entry = None
+            if entry is not None and stat.S_ISLNK(entry.st_mode):
+                raise OSError(errno.ELOOP, "snapshot spool must not be a symlink")
+            if entry is not None and not stat.S_ISDIR(entry.st_mode):
+                raise OSError(errno.ENOTDIR, "snapshot spool is not a directory")
+            if entry is None:
+                os.mkdir(self.path.name, mode=0o700, dir_fd=parent_fd)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= (
+                getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            self._directory_fd = os.open(
+                self.path.name, directory_flags, dir_fd=parent_fd
+            )
+        finally:
+            os.close(parent_fd)
+        if not stat.S_ISDIR(os.fstat(self._directory_fd).st_mode):
+            os.close(self._directory_fd)
+            raise OSError(errno.ENOTDIR, "snapshot spool is not a directory")
+        os.fchmod(self._directory_fd, 0o700)
+        self._closed = False
+
+    def store(self, filename: str, data: bytes):
+        temporary = f"{filename}.part"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=self._directory_fd)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "snapshot spool write made no progress")
+                view = view[written:]
+            os.fchmod(descriptor, 0o600)
+        except BaseException:
+            self._unlink(temporary)
+            raise
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(
+                temporary, filename,
+                src_dir_fd=self._directory_fd, dst_dir_fd=self._directory_fd,
+            )
+        except BaseException:
+            self._unlink(temporary)
+            raise
+        return _AnchoredSnapshot(
+            self._directory_fd, filename, self.path / filename
+        )
+
+    def cleanup_prefix(self, prefix: str, *, keep: set[Path]) -> None:
+        keep_names = {path.name for path in keep}
+        for name in os.listdir(self._directory_fd):
+            if name.startswith(f"{prefix}-") and name not in keep_names:
+                self._unlink_non_directory(name)
+
+    def cleanup_all(self) -> None:
+        for name in os.listdir(self._directory_fd):
+            self._unlink_non_directory(name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        os.close(self._directory_fd)
+        self._closed = True
+
+    def _unlink_non_directory(self, name: str) -> None:
+        try:
+            entry = os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            self._unlink(name)
+
+    def _unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self._directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+class _AnchoredSnapshot:
+    """A snapshot whose reads and deletion stay pinned to its spool directory."""
+
+    _descriptor_anchored = True
+
+    def __init__(self, directory_fd: int, filename: str, display_path: Path):
+        self._directory_fd = os.dup(directory_fd)
+        self._filename = filename
+        self._display_path = Path(display_path)
+        self._lock = Lock()
+        self._closed = False
+
+    @property
+    def name(self) -> str:
+        return self._filename
+
+    @property
+    def suffix(self) -> str:
+        return Path(self._filename).suffix
+
+    def open(self, mode: str = "rb"):
+        if mode not in {"rb", "br"}:
+            raise ValueError("anchored snapshots are read-only")
+        with self._lock:
+            if self._closed:
+                raise OSError(errno.EBADF, "snapshot candidate is closed")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                self._filename, flags, dir_fd=self._directory_fd
+            )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise OSError(errno.EINVAL, "snapshot candidate is not a file")
+        return os.fdopen(descriptor, "rb")
+
+    def stat(self):
+        with self._lock:
+            if self._closed:
+                raise OSError(errno.EBADF, "snapshot candidate is closed")
+            result = os.stat(
+                self._filename,
+                dir_fd=self._directory_fd,
+                follow_symlinks=False,
+            )
+        if not stat.S_ISREG(result.st_mode):
+            raise OSError(errno.EINVAL, "snapshot candidate is not a file")
+        return result
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        try:
+            with self._lock:
+                if self._closed:
+                    if missing_ok:
+                        return
+                    raise OSError(errno.EBADF, "snapshot candidate is closed")
+                try:
+                    entry = os.stat(
+                        self._filename,
+                        dir_fd=self._directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if not missing_ok:
+                        raise
+                else:
+                    if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+                        os.unlink(self._filename, dir_fd=self._directory_fd)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            os.close(self._directory_fd)
+            self._closed = True
+
+    def __str__(self) -> str:
+        return str(self._display_path)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class ReolinkSnapshotSampler:
     """Serially augment one FTP burst without participating in authorization."""
 
-    def __init__(self, config: ReolinkSnapshotConfig, add_candidate, *,
+    def __init__(self, config: ReolinkSnapshotConfig, complete, *,
                  client_factory=ReolinkSnapshotClient, clock=monotonic,
                  run_id=lambda: secrets.token_hex(8)):
         self._config = config
-        self._add_candidate = add_candidate
+        self._complete = complete
         self._client_factory = client_factory
         self._clock = clock
         self._run_id = run_id
@@ -342,8 +528,23 @@ class ReolinkSnapshotSampler:
         self._active = False
         self._started_at: float | None = None
         self._deadline: float | None = None
+        self._wall_deadline: float | None = None
+        self._operation_thread: Thread | None = None
+        self._operation_done: Event | None = None
+        self._operation_cancel: Event | None = None
+        self._cancel_reason: str | None = None
+        self._completion_reported = False
+        self._completion_delivered = False
         self._closed = False
-        self._cleanup_all()
+        self._resources_closed = False
+        self._spool = None
+        if config.enabled:
+            try:
+                self._spool = _SnapshotSpool(config.output_directory)
+            except OSError:
+                pass
+        if self._spool is not None:
+            self._cleanup_all()
 
     @property
     def output_directory(self) -> Path:
@@ -366,17 +567,25 @@ class ReolinkSnapshotSampler:
                 self._active = True
                 self._started_at = started_at
                 self._deadline = started_at + self._config.timeout_seconds
+                self._wall_deadline = monotonic() + self._config.timeout_seconds
+                self._completion_delivered = False
                 self._requests.put_nowait(received_at)
                 return True
         self._log("skipped", 0, reason, 0)
         return False
 
     def run_forever(self, stop_event) -> None:
-        while not stop_event.is_set():
+        while True:
+            if stop_event.is_set():
+                self._complete_queued_shutdown()
+                return
             try:
                 received_at = self._requests.get(timeout=SAMPLER_POLL_SECONDS)
             except Empty:
                 continue
+            if stop_event.is_set():
+                self._complete_without_capture(received_at, "shutdown")
+                return
             self._capture(stop_event, received_at)
 
     def run_once(self, stop_event) -> bool:
@@ -384,31 +593,121 @@ class ReolinkSnapshotSampler:
             received_at = self._requests.get_nowait()
         except Empty:
             return False
+        if stop_event.is_set():
+            self._complete_without_capture(received_at, "shutdown")
+            return True
         self._capture(stop_event, received_at)
         return True
+
+    def _complete_queued_shutdown(self) -> bool:
+        try:
+            received_at = self._requests.get_nowait()
+        except Empty:
+            return False
+        self._complete_without_capture(received_at, "shutdown")
+        return True
+
+    def _complete_without_capture(self, received_at, reason: str) -> None:
+        started_at = self._clock()
+        with self._lock:
+            if self._started_at is not None:
+                started_at = self._started_at
+        try:
+            self._deliver_completion((), received_at)
+        except Exception:
+            reason = "collector_error"
+        finally:
+            with self._lock:
+                self._active = False
+                self._started_at = None
+                self._deadline = None
+                self._wall_deadline = None
+                self._operation_thread = None
+                self._operation_done = None
+                self._operation_cancel = None
+                self._cancel_reason = None
+        duration_ms = max(0, round((self._clock() - started_at) * 1000))
+        self._log("failed", 0, reason, duration_ms)
 
     def _capture(self, stop_event, received_at) -> None:
         with self._lock:
             started_at = self._started_at if self._started_at is not None else self._clock()
             deadline = self._deadline if self._deadline is not None else started_at
-        accepted: list[Path] = []
-        published: list[Path] = []
+            wall_deadline = (
+                self._wall_deadline
+                if self._wall_deadline is not None
+                else monotonic()
+            )
+            operation_done = Event()
+            operation_cancel = Event()
+            self._operation_done = operation_done
+            self._operation_cancel = operation_cancel
+            self._cancel_reason = None
+            self._completion_reported = False
+            operation_thread = Thread(
+                target=self._capture_operation,
+                args=(
+                    stop_event, received_at, started_at, deadline, wall_deadline,
+                    operation_done, operation_cancel,
+                ),
+                name="gate-reolink-operation",
+                daemon=True,
+            )
+            self._operation_thread = operation_thread
+        operation_thread.start()
+
+        while True:
+            if stop_event.is_set():
+                self._cancel_active_operation("shutdown")
+                break
+            remaining = min(deadline - self._clock(), wall_deadline - monotonic())
+            if remaining <= 0:
+                self._cancel_active_operation("timeout")
+                break
+            if operation_done.wait(min(SAMPLER_POLL_SECONDS, remaining)):
+                return
+
+        try:
+            self._deliver_completion((), received_at)
+        except Exception:
+            pass
+        duration_ms = max(0, round((monotonic() - (
+            wall_deadline - self._config.timeout_seconds
+        )) * 1000))
+        reason = "shutdown" if stop_event.is_set() else "timeout"
+        self._log("failed", 0, reason, duration_ms)
+
+    def _capture_operation(self, stop_event, received_at, started_at: float,
+                           deadline: float, wall_deadline: float,
+                           operation_done: Event, operation_cancel: Event) -> None:
+        accepted = []
+        published = []
         token = None
         reason = None
         client = None
         prefix = None
-        directory_fd = None
         try:
             prefix = self._run_id()
-            directory_fd = self._open_output_directory(create=True)
+            if self._spool is None:
+                raise SnapshotFailure("io_error")
             client = self._client_factory(self._config)
-            token = client.login(self._remaining(deadline, stop_event))
+            token = client.login(self._remaining(
+                deadline, wall_deadline, stop_event, operation_cancel
+            ))
+            self._remaining(deadline, wall_deadline, stop_event, operation_cancel)
             for sequence in range(1, self._config.candidate_count + 1):
                 response = client.snapshot(
-                    token, sequence, self._remaining(deadline, stop_event)
+                    token, sequence, self._remaining(
+                        deadline, wall_deadline, stop_event, operation_cancel
+                    )
                 )
-                self._remaining(deadline, stop_event)
-                path = self._store_candidate(directory_fd, prefix, sequence, response)
+                self._remaining(
+                    deadline, wall_deadline, stop_event, operation_cancel
+                )
+                path = self._store_candidate(prefix, sequence, response)
+                self._remaining(
+                    deadline, wall_deadline, stop_event, operation_cancel
+                )
                 accepted.append(path)
         except SnapshotFailure as error:
             reason = error.reason
@@ -417,150 +716,159 @@ class ReolinkSnapshotSampler:
         except Exception:
             reason = "internal_error"
         finally:
-            if reason != "shutdown":
-                for path in accepted:
-                    try:
-                        self._add_candidate(path, received_at)
-                    except Exception:
-                        reason = reason or "collector_error"
-                        break
-                    published.append(path)
-            if token is not None and client is not None and not stop_event.is_set():
+            if token is not None and client is not None:
                 try:
-                    remaining = deadline - self._clock()
-                    if remaining > 0:
-                        client.logout(token, remaining)
+                    client.logout(token, self._remaining(
+                        deadline, wall_deadline, stop_event, operation_cancel
+                    ))
+                    self._remaining(
+                        deadline, wall_deadline, stop_event, operation_cancel
+                    )
+                except SnapshotFailure as error:
+                    if error.reason in {"timeout", "shutdown"}:
+                        reason = error.reason
                 except Exception:
                     pass
-            if prefix is not None and directory_fd is not None:
-                self._cleanup_prefix(
-                    prefix, keep=set(published), directory_fd=directory_fd,
-                )
-            if directory_fd is not None:
-                os.close(directory_fd)
+            completion_paths = (
+                () if reason in {"shutdown", "timeout"} else tuple(accepted)
+            )
+            try:
+                if completion_paths:
+                    self._remaining(
+                        deadline, wall_deadline, stop_event, operation_cancel
+                    )
+                delivered = self._deliver_completion(completion_paths, received_at)
+            except Exception:
+                delivered = False
+            if delivered:
+                published.extend(completion_paths)
+            elif delivered is False:
+                reason = reason or "collector_error"
+            for candidate in accepted:
+                if candidate not in published:
+                    candidate.close()
+            if prefix is not None:
+                self._cleanup_prefix(prefix, keep=set(published))
             with self._lock:
+                reported = self._completion_reported
+                if self._closed:
+                    self._close_resources_locked()
                 self._active = False
                 self._started_at = None
                 self._deadline = None
+                self._wall_deadline = None
+                self._operation_thread = None
+                self._operation_done = None
+                self._operation_cancel = None
+                self._cancel_reason = None
+                operation_done.set()
             duration_ms = max(0, round((self._clock() - started_at) * 1000))
             if reason is None and len(published) != self._config.candidate_count:
                 reason = "incomplete"
-            self._log(
-                "completed" if reason is None else "failed",
-                len(published), reason or "none", duration_ms,
-            )
+            if not reported:
+                self._log(
+                    "completed" if reason is None else "failed",
+                    len(published), reason or "none", duration_ms,
+                )
 
-    def _remaining(self, deadline: float, stop_event) -> float:
+    def _remaining(self, deadline: float, wall_deadline: float, stop_event,
+                   operation_cancel: Event) -> float:
         if stop_event.is_set():
             raise SnapshotFailure("shutdown")
-        remaining = deadline - self._clock()
+        if operation_cancel.is_set():
+            with self._lock:
+                reason = self._cancel_reason or "shutdown"
+            raise SnapshotFailure(reason)
+        remaining = min(deadline - self._clock(), wall_deadline - monotonic())
         if remaining <= 0:
             raise SnapshotFailure("timeout")
         return remaining
 
-    def _store_candidate(self, directory_fd: int, prefix: str, sequence: int,
-                         response: SnapshotResponse) -> Path:
+    def _cancel_active_operation(self, reason: str) -> None:
+        with self._lock:
+            if self._cancel_reason is None:
+                self._cancel_reason = reason
+            self._completion_reported = True
+            operation_cancel = self._operation_cancel
+        if operation_cancel is not None:
+            operation_cancel.set()
+
+    def _deliver_completion(self, paths: tuple, received_at) -> bool | None:
+        with self._lock:
+            if self._completion_delivered:
+                return None
+            self._completion_delivered = True
+        self._complete(paths, received_at)
+        return True
+
+    def _store_candidate(self, prefix: str, sequence: int,
+                         response: SnapshotResponse):
         if response.content_type.lower() != "image/jpeg":
             raise SnapshotFailure("invalid_content")
         if len(response.data) > self._config.max_response_bytes:
             raise SnapshotFailure("output_limit")
-        if not is_decodable_jpeg(response.data):
-            raise SnapshotFailure("invalid_jpeg")
-        final_name = f"{prefix}-{sequence:02d}.jpg"
-        temporary_name = f"{prefix}-{sequence:02d}.part"
-        final_path = self._config.output_directory / final_name
+        filename = f"{prefix}-{sequence:02d}.jpg"
+        candidate = None
+        if self._spool is None:
+            raise SnapshotFailure("disabled")
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            file_descriptor = os.open(
-                temporary_name, flags, 0o600, dir_fd=directory_fd,
-            )
-            with os.fdopen(file_descriptor, "wb") as destination:
-                destination.write(response.data)
-            os.replace(
-                temporary_name, final_name,
-                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-            )
+            candidate = self._spool.store(filename, response.data)
+            if not wait_until_readable(candidate, timeout=0, poll_interval=0):
+                raise SnapshotFailure("invalid_jpeg")
         except Exception:
-            for name in (temporary_name, final_name):
-                try:
-                    os.unlink(name, dir_fd=directory_fd)
-                except OSError:
-                    pass
+            if candidate is not None:
+                candidate.close()
+            self._spool.cleanup_prefix(prefix, keep=set())
             raise
-        return final_path
+        return candidate
 
     def close(self) -> None:
+        complete_queued = False
         with self._lock:
             self._closed = True
-            self._active = False
-        self._cleanup_all()
+            if self._operation_thread is not None:
+                if self._cancel_reason is None:
+                    self._cancel_reason = "shutdown"
+                if self._operation_cancel is not None:
+                    self._operation_cancel.set()
+                return
+            complete_queued = self._active
+        if complete_queued:
+            self._complete_queued_shutdown()
+        with self._lock:
+            self._close_resources_locked()
 
-    def _open_output_directory(self, *, create: bool) -> int:
-        output_directory = self._config.output_directory
-        if create:
-            output_directory.parent.mkdir(parents=True, exist_ok=True)
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        parent_fd = os.open(output_directory.parent, flags)
-        try:
-            if create:
-                try:
-                    os.mkdir(output_directory.name, mode=0o700, dir_fd=parent_fd)
-                except FileExistsError:
-                    pass
-            directory_fd = os.open(output_directory.name, flags, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
-        if create:
-            os.fchmod(directory_fd, 0o700)
-        return directory_fd
-
-    def _cleanup_prefix(self, prefix: str, *, keep: set[Path],
-                        directory_fd: int | None = None) -> None:
-        close_directory = directory_fd is None
-        try:
-            if directory_fd is None:
-                directory_fd = self._open_output_directory(create=False)
-            keep_names = {path.name for path in keep}
-            for name in os.listdir(directory_fd):
-                if name.startswith(f"{prefix}-") and name not in keep_names:
-                    self._unlink_file_entry(directory_fd, name)
-        except FileNotFoundError:
+    def _close_resources_locked(self) -> None:
+        if self._resources_closed:
             return
+        try:
+            self._cleanup_all()
+        finally:
+            if self._spool is not None:
+                self._spool.close()
+            self._resources_closed = True
+
+    def _cleanup_prefix(self, prefix: str, *, keep: set[Path]) -> None:
+        if self._spool is None:
+            return
+        try:
+            self._spool.cleanup_prefix(prefix, keep=keep)
         except OSError:
             LOGGER.warning(
                 "gate_camera source=camera_ftp subtype=unverified "
                 "augmentation=reolink_snapshot outcome=cleanup_failed reason=io_error"
             )
-        finally:
-            if close_directory and directory_fd is not None:
-                os.close(directory_fd)
 
     def _cleanup_all(self) -> None:
-        directory_fd = None
-        try:
-            directory_fd = self._open_output_directory(create=False)
-            for name in os.listdir(directory_fd):
-                self._unlink_file_entry(directory_fd, name)
-        except FileNotFoundError:
+        if self._spool is None:
             return
+        try:
+            self._spool.cleanup_all()
         except OSError:
             LOGGER.warning(
                 "gate_camera source=camera_ftp subtype=unverified "
                 "augmentation=reolink_snapshot outcome=cleanup_failed reason=io_error"
             )
-        finally:
-            if directory_fd is not None:
-                os.close(directory_fd)
-
-    @staticmethod
-    def _unlink_file_entry(directory_fd: int, name: str) -> None:
-        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
-            os.unlink(name, dir_fd=directory_fd)
 
     @staticmethod
     def _log(outcome: str, count: int, reason: str, duration_ms: int) -> None:

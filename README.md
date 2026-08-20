@@ -159,13 +159,16 @@ rejected. Set `GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true` only for a camera
 with a deliberately accepted self-signed certificate on that private address.
 
 The default captures two sequential additional snapshots under one 2.25-second
-global deadline. `GATE_REOLINK_SNAPSHOT_COUNT` is limited to 1-4,
+end-to-end wall-clock deadline. `GATE_REOLINK_SNAPSHOT_COUNT` is limited to 1-4,
 `GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS` is limited to 3 seconds, and
 `GATE_REOLINK_SNAPSHOT_MAX_BYTES` cannot exceed the configured candidate-image
-limit. Generated JPEGs live in an ignored owner-only subdirectory and enter the
-same ranking and OCR path as a separate progressive burst carrying the original
-FTP `received_at`; they never authorize directly. A login, snapshot, validation,
-timeout, or cleanup failure leaves the already-released FTP burst unchanged.
+limit. Generated JPEGs live in an ignored owner-only directory beneath the FTP
+upload root. The first FTP image enters recognition immediately and establishes
+one durable trigger identity. An authorizing result finalizes immediately; only
+an improvable denial waits for snapshots, which reuse that identity and its
+single actuation claim. Login, snapshot, validation, timeout, and shutdown
+failures terminally record the original FTP result. Snapshot sampling itself has
+no actuation path.
 Logs record `source=camera_ftp subtype=unverified` and
 `augmentation=reolink_snapshot` without camera credentials or token values.
 

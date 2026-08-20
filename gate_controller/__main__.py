@@ -101,7 +101,8 @@ def main() -> None:
     )
 
     def process(paths, received_at=None, decision_started_at=None,
-                processing_started_at=None):
+                processing_started_at=None, *, idempotency_key=None, final=True,
+                provisional_result=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
@@ -109,6 +110,9 @@ def main() -> None:
             received_at=received_at,
             decision_started_at=decision_started_at,
             processing_started_at=processing_started_at,
+            idempotency_key=idempotency_key,
+            final=final,
+            provisional_result=provisional_result,
         )
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,

@@ -1264,6 +1264,8 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
     }
     if "stage_timestamps" in raw:
         payload["stage_timestamps"] = dict(raw["stage_timestamps"])
+    if "augmentation" in raw:
+        payload["augmentation"] = dict(raw["augmentation"])
     return payload
 
 
@@ -1372,6 +1374,15 @@ def _decode_telemetry_payload(encoded: object) -> dict:
         or any(not isinstance(value, str) for value in stage_timestamps.values())
     ):
         raise _MalformedTelemetry("telemetry stage timestamps are invalid")
+    augmentation = telemetry.get("augmentation")
+    if augmentation is not None and (
+        not isinstance(augmentation, dict)
+        or not isinstance(augmentation.get("outcome"), str)
+        or not isinstance(augmentation.get("reason"), str)
+        or not isinstance(augmentation.get("candidate_count"), int)
+        or not isinstance(augmentation.get("duration_ms"), int)
+    ):
+        raise _MalformedTelemetry("telemetry augmentation is invalid")
     return telemetry
 
 
