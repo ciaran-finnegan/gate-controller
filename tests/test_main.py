@@ -6,12 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Thread
 from time import monotonic
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import (
     _quiet_window, _shutdown_controller, build_background_workers,
-    default_runtime_paths,
+    build_reolink_trigger_pipeline, default_runtime_paths,
 )
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
@@ -22,6 +22,53 @@ from gate_controller.store import LocalStore
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def test_reolink_trigger_pipeline_has_no_relay_or_authorisation_dependency(self):
+        correlator, workers = build_reolink_trigger_pipeline({
+            "GATE_REOLINK_WEBHOOK_SECRET": "correct-horse-battery-staple",
+        })
+
+        self.assertEqual(len(workers), 1)
+        self.assertTrue(callable(correlator.correlate))
+        self.assertFalse(hasattr(workers[0], "relay"))
+        self.assertFalse(hasattr(workers[0], "authorised"))
+
+    def test_main_wires_webhook_worker_and_correlation_into_the_existing_worker(self):
+        webhook_worker = object()
+        correlator = Mock()
+        base_worker = object()
+        with patch.dict(
+            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_reolink_trigger_pipeline",
+            return_value=(correlator, (webhook_worker,)),
+        ), patch.object(
+            gate_main, "build_background_workers",
+            return_value=((base_worker,), object(), object()),
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker") as run_worker:
+            gate_main.main()
+
+        self.assertEqual(
+            run_worker.call_args.kwargs["background_workers"],
+            (base_worker, webhook_worker),
+        )
+        self.assertIs(
+            run_worker.call_args.kwargs["trigger_resolver"], correlator.correlate,
+        )
+
     def create_store(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
