@@ -205,12 +205,32 @@ class GateProcessorTests(unittest.TestCase):
                 matched.to_wire(),
             )
 
-    def test_skipped_ftp_event_persists_the_exact_fallback_trigger(self):
+    def test_record_skipped_preserves_a_supplied_matched_trigger_without_a_trace(self):
         matched = TriggerTelemetry(
             source="reolink_webhook", event_type="line_crossing",
             rule_id="line_crossing_inbound", correlation="matched",
             delta_ms=25,
         )
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "failed-after-correlation.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(
+                store, RecordingRelay([]), SequenceRecognizer([]),
+            )
+
+            result = processor.record_skipped(
+                (frame,), "processing_error", trigger=matched,
+            )
+
+            self.assertEqual(store.event_telemetry(result.event_id)["trigger"], {
+                "source": "reolink_webhook",
+                "event_type": "line_crossing",
+                "rule_id": "line_crossing_inbound",
+                "correlation": "matched",
+                "delta_ms": 25,
+            })
+
+    def test_direct_pre_ocr_skip_persists_the_exact_fallback_trigger(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "rejected-before-ocr.jpg")
             store = LocalStore(Path(directory) / "gate.db")
@@ -218,9 +238,7 @@ class GateProcessorTests(unittest.TestCase):
                 store, RecordingRelay([]), SequenceRecognizer([]),
             )
 
-            result = processor.record_skipped(
-                (frame,), "image_too_large", trigger=matched,
-            )
+            result = processor.record_skipped((frame,), "image_too_large")
 
             self.assertEqual(store.event_telemetry(result.event_id)["trigger"], {
                 "source": "camera_ftp",
