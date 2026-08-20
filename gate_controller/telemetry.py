@@ -22,6 +22,10 @@ MAX_CLOCK_SKEW_SECONDS = 0.1
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_TRIGGER_EVENT_TYPES = frozenset({
+    "line_crossing", "vehicle", "manual_test", "other", "unverified",
+})
+_MATCHED_TRIGGER_EVENT_TYPES = _TRIGGER_EVENT_TYPES - {"unverified"}
 
 
 def _rounded_int(value: object, minimum: int, maximum: int, fallback: int) -> int:
@@ -38,6 +42,15 @@ def _duration(value: object | None) -> int | None:
     if value is None:
         return None
     return _rounded_int(value, 0, MAX_DURATION_MS, 0)
+
+
+def _required_duration(value: object | None) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    return min(math.floor(number + 0.5), MAX_DURATION_MS)
 
 
 def _ratio(value: object) -> float:
@@ -151,6 +164,51 @@ class AugmentationTelemetry:
 
 
 @dataclass(frozen=True)
+class TriggerTelemetry:
+    source: str
+    event_type: str
+    correlation: str
+    rule_id: str | None = None
+    event_at: datetime | None = None
+    delta_ms: float | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        rule_id = _token(self.rule_id, fallback="")
+        delta_ms = _required_duration(self.delta_ms)
+        if not (
+            self.source == "reolink_webhook"
+            and self.event_type in _MATCHED_TRIGGER_EVENT_TYPES
+            and self.correlation == "matched"
+            and rule_id
+            and delta_ms is not None
+        ):
+            return {
+                "source": "camera_ftp",
+                "event_type": "unverified",
+                "correlation": "unverified",
+            }
+        payload: dict[str, object] = {
+            "source": "reolink_webhook",
+            "event_type": self.event_type,
+            "rule_id": rule_id,
+            "correlation": "matched",
+        }
+        event_at = _wire_timestamp(self.event_at)
+        if event_at is not None:
+            payload["event_at"] = event_at
+        payload["delta_ms"] = delta_ms
+        return payload
+
+
+def ftp_fallback_trigger() -> TriggerTelemetry:
+    return TriggerTelemetry(
+        source="camera_ftp",
+        event_type="unverified",
+        correlation="unverified",
+    )
+
+
+@dataclass(frozen=True)
 class StageTimestamps:
     filesystem_ingress_at: datetime | None = None
     burst_processing_started_at: datetime | None = None
@@ -228,6 +286,7 @@ class EventTelemetry:
     delivery_state: str
     stage_timestamps: StageTimestamps = field(default_factory=StageTimestamps)
     augmentation: AugmentationTelemetry | None = None
+    trigger: TriggerTelemetry | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
@@ -278,6 +337,8 @@ class EventTelemetry:
             payload["stage_timestamps"] = timestamps
         if self.augmentation is not None:
             payload["augmentation"] = self.augmentation.to_wire()
+        if self.trigger is not None:
+            payload["trigger"] = self.trigger.to_wire()
         return payload
 
 
@@ -317,6 +378,7 @@ class ProcessingTrace:
         self._actuation_attempted = False
         self._relay_outcome = "not_attempted"
         self._augmentation: AugmentationTelemetry | None = None
+        self._trigger: TriggerTelemetry | None = None
         self._finished_telemetry: EventTelemetry | None = None
 
     def seed_upstream(
@@ -354,6 +416,9 @@ class ProcessingTrace:
 
     def set_augmentation(self, augmentation: AugmentationTelemetry | None) -> None:
         self._augmentation = augmentation
+
+    def set_trigger(self, trigger: TriggerTelemetry | None) -> None:
+        self._trigger = trigger
 
     def add_frame(self, frame: FrameTelemetry) -> None:
         if len(self._frames) < MAX_ITEMS:
@@ -471,6 +536,7 @@ class ProcessingTrace:
                 processing_finished_at=self._wall_at(self._finished),
             ),
             augmentation=self._augmentation,
+            trigger=self._trigger,
         )
         return self._finished_telemetry
 
