@@ -35,7 +35,7 @@ def is_decodable_jpeg(data: bytes) -> bool:
 
 def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTelemetry:
     """Return bounded, downsampled quality proxies without exposing image paths."""
-    path = Path(path)
+    path = _image_source(path)
     if digest is None:
         try:
             digest = _content_digest(path)
@@ -47,14 +47,15 @@ def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTele
             raise ValueError("invalid image signature")
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(path) as image:
-                if image.format != "JPEG":
-                    raise ValueError("invalid image format")
-                width, height = image.size
-                image.draft("L", QUALITY_SIZE)
-                image.load()
-                image.thumbnail(QUALITY_SIZE, Image.Resampling.BILINEAR)
-                grayscale = image.convert("L")
+            with path.open("rb") as source:
+                with Image.open(source) as image:
+                    if image.format != "JPEG":
+                        raise ValueError("invalid image format")
+                    width, height = image.size
+                    image.draft("L", QUALITY_SIZE)
+                    image.load()
+                    image.thumbnail(QUALITY_SIZE, Image.Resampling.BILINEAR)
+                    grayscale = image.convert("L")
 
         histogram = grayscale.histogram()
         pixel_count = max(sum(histogram), 1)
@@ -110,7 +111,7 @@ def _sharpness_proxy(grayscale: Image.Image) -> float:
 
 def wait_until_readable(path: Path, timeout: float, poll_interval: float = 0.1) -> bool:
     """Wait for a complete, decodable image without treating partial uploads as valid."""
-    path = Path(path)
+    path = _image_source(path)
     deadline = monotonic() + max(timeout, 0)
     while True:
         if _is_valid_image(path):
@@ -124,7 +125,7 @@ def rank_images(paths, *, max_bytes: int | None = None) -> list[Path]:
     """Return valid images ordered from sharpest to least sharp."""
     scored_paths = []
     for path in paths:
-        path = Path(path)
+        path = _image_source(path)
         try:
             if max_bytes is not None and path.stat().st_size > max_bytes:
                 continue
@@ -132,13 +133,14 @@ def rank_images(paths, *, max_bytes: int | None = None) -> list[Path]:
                 continue
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(path) as image:
-                    if image.format != "JPEG":
-                        continue
-                    image.load()
-                    grayscale = image.convert("L")
-                    edges = grayscale.filter(ImageFilter.FIND_EDGES)
-                    sharpness = ImageStat.Stat(edges).var[0]
+                with path.open("rb") as source:
+                    with Image.open(source) as image:
+                        if image.format != "JPEG":
+                            continue
+                        image.load()
+                        grayscale = image.convert("L")
+                        edges = grayscale.filter(ImageFilter.FIND_EDGES)
+                        sharpness = ImageStat.Stat(edges).var[0]
         except (
             OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
         ):
@@ -149,6 +151,7 @@ def rank_images(paths, *, max_bytes: int | None = None) -> list[Path]:
 
 def _content_digest(path: Path) -> str:
     digest = hashlib.sha256()
+    path = _image_source(path)
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -156,15 +159,17 @@ def _content_digest(path: Path) -> str:
 
 
 def _is_valid_image(path: Path) -> bool:
+    path = _image_source(path)
     if not _has_jpeg_signature(path):
         return False
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(path) as image:
-                if image.format != "JPEG":
-                    return False
-                image.verify()
+            with path.open("rb") as source:
+                with Image.open(source) as image:
+                    if image.format != "JPEG":
+                        return False
+                    image.verify()
         return True
     except (
         OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
@@ -174,7 +179,13 @@ def _is_valid_image(path: Path) -> bool:
 
 def _has_jpeg_signature(path: Path) -> bool:
     try:
-        with Path(path).open("rb") as source:
+        with _image_source(path).open("rb") as source:
             return source.read(3) == b"\xff\xd8\xff"
     except OSError:
         return False
+
+
+def _image_source(path):
+    if getattr(path, "_descriptor_anchored", False):
+        return path
+    return Path(path)

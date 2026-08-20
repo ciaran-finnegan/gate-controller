@@ -2,10 +2,13 @@ import unittest
 import tempfile
 import os
 import signal
+import gate_controller.worker as worker_module
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event as ThreadEvent, Thread
 from unittest.mock import patch
+
+from PIL import Image
 
 from gate_controller.worker import (
     BoundedBurstQueue, BurstCollector, CompletedImageHandler, StartupReconciler,
@@ -15,6 +18,7 @@ from gate_controller.worker import (
     _install_sigterm_handler,
     run_worker,
 )
+from gate_controller.models import ProcessingResult
 
 
 class MutableClock:
@@ -33,6 +37,14 @@ class RecordingCollector:
     def add(self, path, received_at=None):
         self.paths.append(path)
         self.received_at.append(received_at)
+
+
+class SequenceQueue:
+    def __init__(self, *items):
+        self._items = iter(items)
+
+    def get(self):
+        return next(self._items)
 
 
 class Event:
@@ -179,6 +191,61 @@ class WorkerTests(unittest.TestCase):
 
             self.assertFalse(rejected.exists())
             self.assertTrue(accepted.exists())
+
+    def test_empty_ranked_burst_abandons_its_exact_context_before_the_next_burst(self):
+        clock = MutableClock()
+        emitted = []
+        abandoned = []
+        rank_calls = []
+
+        def ranker(paths):
+            rank_calls.append(paths)
+            return () if len(rank_calls) == 1 else paths
+
+        collector = BurstCollector(
+            emitted.append,
+            quiet_window=0.5,
+            ranker=ranker,
+            clock=clock,
+            include_received_at=True,
+            on_abandoned=abandoned.append,
+        )
+        received_a = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+        received_b = received_a + timedelta(seconds=1)
+        collector.add(Path("a.jpg"), received_a)
+        collector.bind_context("trigger-a")
+        clock.value = 0.5
+
+        self.assertFalse(collector.flush_due())
+
+        collector.add(Path("b.jpg"), received_b)
+        collector.bind_context("trigger-b")
+        clock.value = 1.0
+        self.assertTrue(collector.flush_due())
+
+        self.assertEqual(abandoned, ["trigger-a"])
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0].context, "trigger-b")
+        self.assertEqual(emitted[0].item[:2], ((Path("b.jpg"),), received_b))
+
+    def test_abandoning_trigger_releases_unsubmitted_reservation_and_snapshot_files(self):
+        queue = BoundedBurstQueue(max_pending=1)
+        released = []
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshot.jpg"
+            snapshot.write_bytes(b"snapshot")
+            trigger = worker_module.ProgressiveTrigger(
+                datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc),
+                release=lambda: released.append(True),
+                snapshots=(snapshot,),
+            )
+            self.assertTrue(queue.reserve_augmentation())
+
+            worker_module._abandon_progressive_trigger(trigger, queue)
+
+            self.assertFalse(snapshot.exists())
+            self.assertEqual(released, [True])
+            self.assertTrue(queue.reserve_augmentation())
 
     def test_burst_decision_clock_starts_before_ranking(self):
         clock = MutableClock()
@@ -569,16 +636,231 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(dropped, (Path("first.jpg"),))
         self.assertEqual(queue.get(), (Path("second.jpg"),))
 
-    def test_optional_queue_admission_never_evicts_primary_work(self):
+    def test_reserved_augmentation_never_evicts_or_precedes_ftp_work(self):
         queue = BoundedBurstQueue(max_pending=1)
-        primary = (Path("primary-ftp.jpg"),)
-        augmentation = (Path("optional-snapshot.jpg"),)
+        ftp = ((Path("ftp.jpg"),), "ftp")
+        snapshots = ((Path("snapshot.jpg"),), "augmentation")
 
-        queue.put(primary)
-        accepted = queue.try_put(augmentation)
+        self.assertTrue(queue.reserve_augmentation())
+        self.assertIsNone(queue.put(ftp))
+        self.assertIsNone(queue.put_augmentation(snapshots))
 
-        self.assertFalse(accepted)
-        self.assertEqual(queue.get(), primary)
+        self.assertEqual(queue.get(), ftp)
+        self.assertEqual(queue.get(), snapshots)
+
+    def test_final_progressive_selection_can_include_an_anchored_snapshot(self):
+        class AnchoredSnapshot:
+            _descriptor_anchored = True
+
+            def __init__(self):
+                self.unlinked = 0
+
+            def unlink(self, missing_ok=False):
+                self.unlinked += 1
+
+        received_at = datetime(2026, 8, 20, 11, 0, tzinfo=timezone.utc)
+        ftp = tuple(Path(f"ftp-{index}.jpg") for index in range(4))
+        snapshot = AnchoredSnapshot()
+        trigger = worker_module.ProgressiveTrigger(received_at)
+        primary = worker_module.BurstWork(
+            "primary", (ftp, received_at), trigger,
+        )
+        augmentation = worker_module.BurstWork(
+            "augmentation", ((snapshot,), received_at), trigger,
+        )
+        calls = []
+
+        def emit(paths, captured_at, *timing, **options):
+            calls.append((paths, captured_at, options))
+            return ProcessingResult(
+                False, "no_match", idempotency_key="progressive-event",
+                terminal=False,
+            )
+
+        with patch(
+            "gate_controller.worker.rank_images",
+            return_value=(snapshot, ftp[3], ftp[2], ftp[1], ftp[0]),
+        ):
+            _process_bursts(SequenceQueue(primary, augmentation, None), emit)
+
+        self.assertEqual(calls[0], (ftp, received_at, {"final": False}))
+        self.assertEqual(calls[1][0], (snapshot, ftp[3], ftp[2]))
+        self.assertIs(calls[1][0][0], snapshot)
+        self.assertEqual(calls[1][2], {
+            "idempotency_key": "progressive-event",
+            "final": True,
+            "augmentation": {
+                "outcome": "completed",
+                "reason": "completed",
+                "candidate_count": 1,
+                "duration_ms": 0,
+                "correlation": "progressive-event",
+            },
+        })
+        self.assertEqual(snapshot.unlinked, 1)
+
+    def test_shutdown_discards_reserved_and_future_work_idempotently(self):
+        discarded = []
+        queue = BoundedBurstQueue(
+            max_pending=1,
+            on_discard=lambda stopped_queue, item: discarded.append(item),
+        )
+        augmentation = ((Path("snapshot.jpg"),), "augmentation")
+        future_primary = ((Path("future-ftp.jpg"),), "ftp")
+        future_augmentation = ((Path("future-snapshot.jpg"),), "augmentation")
+
+        self.assertTrue(queue.reserve_augmentation())
+        queue.put_augmentation(augmentation)
+        queue.put(None)
+        queue.put(future_primary)
+        queue.put_augmentation(future_augmentation)
+        queue.put(None)
+
+        self.assertIsNone(queue.get())
+        self.assertFalse(queue.reserve_augmentation())
+        self.assertEqual(
+            discarded, [augmentation, future_primary, future_augmentation]
+        )
+
+    def test_shutdown_does_not_emit_queued_primary_or_augmentation_work(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        received_at = datetime(2026, 8, 20, 11, 0, tzinfo=timezone.utc)
+        emitted = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ordinary = root / "ordinary.jpg"
+            progressive = root / "progressive.jpg"
+            snapshot = root / "snapshot.jpg"
+            for path in (ordinary, progressive, snapshot):
+                path.write_bytes(b"candidate")
+            trigger = worker_module.ProgressiveTrigger(
+                received_at, snapshots=(snapshot,), augmentation_submitted=True,
+            )
+            queue.put(((ordinary,), received_at))
+            queue.put(worker_module.BurstWork(
+                "primary", ((progressive,), received_at), trigger,
+            ))
+            self.assertTrue(queue.reserve_augmentation())
+            queue.put_augmentation(worker_module.BurstWork(
+                "augmentation", ((snapshot,), received_at), trigger,
+            ))
+            queue.put(None)
+
+            def emit(paths, captured_at, *timing, **options):
+                emitted.append((paths, captured_at, options))
+                return ProcessingResult(
+                    False, "no_match", idempotency_key="queued-trigger",
+                    terminal=False,
+                )
+
+            _process_bursts(queue, emit)
+
+        self.assertEqual(emitted, [])
+
+    def test_shutdown_cleanup_removes_paths_and_abandons_shared_trigger_once(self):
+        received_at = datetime(2026, 8, 20, 11, 5, tzinfo=timezone.utc)
+        released = []
+        queue = BoundedBurstQueue(
+            max_pending=2,
+            on_discard=lambda stopped_queue, item: (
+                worker_module._discard_burst_work(item, stopped_queue)
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ordinary = root / "ordinary.jpg"
+            progressive = root / "progressive.jpg"
+            snapshot = root / "snapshot.jpg"
+            future = root / "future.jpg"
+            for path in (ordinary, progressive, snapshot, future):
+                path.write_bytes(b"candidate")
+            trigger = worker_module.ProgressiveTrigger(
+                received_at,
+                release=lambda: released.append(True),
+                snapshots=(snapshot,),
+                augmentation_submitted=True,
+            )
+            queue.put(((ordinary,), received_at))
+            queue.put(worker_module.BurstWork(
+                "primary", ((progressive,), received_at), trigger,
+            ))
+            self.assertTrue(queue.reserve_augmentation())
+            queue.put_augmentation(worker_module.BurstWork(
+                "augmentation", ((snapshot,), received_at), trigger,
+            ))
+
+            queue.put(None)
+            queue.put(((future,), received_at))
+            queue.put(None)
+
+            self.assertFalse(any(
+                path.exists() for path in (ordinary, progressive, snapshot, future)
+            ))
+            self.assertTrue(trigger.abandoned)
+            self.assertEqual(released, [True])
+            self.assertIsNone(queue.get())
+
+    def test_shutdown_terminalizes_a_computed_provisional_result_when_sampler_completes(self):
+        received_at = datetime(2026, 8, 20, 11, 10, tzinfo=timezone.utc)
+        initial_processed = ThreadEvent()
+        calls = []
+        terminal_candidate_existence = []
+        queue = BoundedBurstQueue(
+            max_pending=1,
+            on_discard=lambda stopped_queue, item: (
+                worker_module._discard_burst_work(item, stopped_queue)
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "ftp.jpg"
+            snapshot = root / "snapshot.jpg"
+            primary.write_bytes(b"ftp")
+            snapshot.write_bytes(b"snapshot")
+            trigger = worker_module.ProgressiveTrigger(received_at)
+            queue.put(worker_module.BurstWork(
+                "primary", ((primary,), received_at), trigger,
+            ))
+
+            def emit(paths, captured_at, *timing, **options):
+                calls.append((paths, captured_at, options))
+                if not options.get("final"):
+                    initial_processed.set()
+                    return ProcessingResult(
+                        False, "no_match", idempotency_key="shutdown-event",
+                        terminal=False,
+                    )
+                terminal_candidate_existence.append((
+                    primary.exists(), snapshot.exists(),
+                ))
+                return ProcessingResult(
+                    False, "no_match", idempotency_key="shutdown-event",
+                )
+
+            processor = Thread(target=_process_bursts, args=(queue, emit))
+            processor.start()
+            self.assertTrue(initial_processed.wait(timeout=1))
+            queue.put(None)
+            processor.join(timeout=1)
+            self.assertFalse(processor.is_alive())
+
+            with trigger._lock:
+                trigger.snapshots = (snapshot,)
+                trigger.augmentation_submitted = True
+            queue.put_augmentation(worker_module.BurstWork(
+                "augmentation", ((snapshot,), received_at), trigger,
+            ))
+
+            self.assertFalse(primary.exists())
+            self.assertFalse(snapshot.exists())
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][2], {"final": False})
+        self.assertEqual(calls[1][2]["final"], True)
+        self.assertEqual(calls[1][2]["provisional_result"], ProcessingResult(
+            False, "no_match", idempotency_key="shutdown-event", terminal=False,
+        ))
+        self.assertEqual(terminal_candidate_existence, [(True, True)])
 
     def test_burst_received_at_uses_first_filesystem_arrival_not_image_mtime(self):
         monotonic_clock = MutableClock()
@@ -610,15 +892,12 @@ class WorkerTests(unittest.TestCase):
         )
 
     def test_processing_exception_is_forwarded_to_observable_error_handler(self):
-        queue = BoundedBurstQueue(max_pending=2)
         received_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         paths = (Path("failed.jpg"),)
         errors = []
-        queue.put((paths, received_at))
-        queue.put(None)
 
         _process_bursts(
-            queue,
+            SequenceQueue((paths, received_at), None),
             lambda *_: (_ for _ in ()).throw(RuntimeError("processor failed")),
             lambda caught_paths, error, caught_at: errors.append(
                 (caught_paths, str(error), caught_at)
@@ -628,27 +907,194 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(errors, [(paths, "processor failed", received_at)])
 
     def test_processed_upload_is_removed_after_emit_returns(self):
-        queue = BoundedBurstQueue(max_pending=2)
         received_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "processed.jpg"
             path.write_bytes(b"camera upload")
-            queue.put(((path,), received_at))
-            queue.put(None)
 
-            _process_bursts(queue, lambda *_: None)
+            _process_bursts(
+                SequenceQueue(((path,), received_at), None), lambda *_: None
+            )
 
             self.assertFalse(path.exists())
 
+    def test_progressive_work_reuses_ftp_identity_and_retains_it_until_terminal_result(self):
+        received_at = datetime(2026, 8, 19, 18, 30, tzinfo=timezone.utc)
+        released = []
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            ftp = Path(directory) / "ftp.jpg"
+            snapshot = Path(directory) / "snapshot.jpg"
+            Image.new("RGB", (32, 24), color="red").save(ftp, format="JPEG")
+            Image.new("RGB", (32, 24), color="blue").save(snapshot, format="JPEG")
+            trigger = worker_module.ProgressiveTrigger(
+                received_at, release=lambda: released.append(True)
+            )
+            items = iter((
+                worker_module.BurstWork("primary", ((ftp,), received_at), trigger),
+                worker_module.BurstWork(
+                    "augmentation", ((snapshot,), received_at), trigger
+                ),
+                None,
+            ))
+
+            class WorkQueue:
+                def get(self):
+                    return next(items)
+
+            def emit(paths, captured_at, *timing, **options):
+                calls.append((paths, captured_at, options))
+                if len(calls) == 1:
+                    return ProcessingResult(
+                        False, "no_match", idempotency_key="ftp-trigger",
+                        terminal=False,
+                    )
+                return ProcessingResult(
+                    True, "activated", event_id=1,
+                    idempotency_key="ftp-trigger", terminal=True,
+                )
+
+            _process_bursts(WorkQueue(), emit, ranker=lambda candidates: candidates)
+
+            self.assertEqual(calls[0][0], (ftp,))
+            self.assertEqual(calls[0][2], {"final": False})
+            self.assertEqual(calls[1][0], (ftp, snapshot))
+            self.assertEqual(calls[1][2], {
+                "idempotency_key": "ftp-trigger", "final": True,
+                "augmentation": {
+                    "outcome": "completed",
+                    "reason": "completed",
+                    "candidate_count": 1,
+                    "duration_ms": 0,
+                    "correlation": "ftp-trigger",
+                },
+            })
+            self.assertFalse(ftp.exists())
+            self.assertFalse(snapshot.exists())
+            self.assertEqual(released, [True])
+
+    def test_throwing_final_ranker_releases_progressive_candidates(self):
+        received_at = datetime(2026, 8, 20, 12, 30, tzinfo=timezone.utc)
+        released = []
+        errors = []
+        with tempfile.TemporaryDirectory() as directory:
+            ftp = Path(directory) / "ftp.jpg"
+            snapshot = Path(directory) / "snapshot.jpg"
+            ftp.write_bytes(b"ftp")
+            snapshot.write_bytes(b"snapshot")
+            trigger = worker_module.ProgressiveTrigger(
+                received_at, release=lambda: released.append(True),
+            )
+            items = iter((
+                worker_module.BurstWork("primary", ((ftp,), received_at), trigger),
+                worker_module.BurstWork(
+                    "augmentation", ((snapshot,), received_at), trigger
+                ),
+                None,
+            ))
+
+            class WorkQueue:
+                def get(self):
+                    return next(items)
+
+            _process_bursts(
+                WorkQueue(),
+                lambda *_args, **_kwargs: ProcessingResult(
+                    False, "no_match", idempotency_key="ftp-trigger", terminal=False,
+                ),
+                lambda paths, error, captured_at: errors.append(
+                    (paths, str(error), captured_at)
+                ),
+                ranker=lambda _paths: (_ for _ in ()).throw(RuntimeError("rank failed")),
+            )
+
+            self.assertTrue(trigger.finalized)
+            self.assertEqual(errors, [((ftp, snapshot), "rank failed", received_at)])
+            self.assertFalse(ftp.exists())
+            self.assertFalse(snapshot.exists())
+            self.assertEqual(released, [True])
+
+    def test_late_augmentation_cleans_after_its_primary_work_was_coalesced(self):
+        received_at = datetime(2026, 8, 19, 18, 30, tzinfo=timezone.utc)
+        released = []
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshot.jpg"
+            snapshot.write_bytes(b"snapshot")
+            trigger = worker_module.ProgressiveTrigger(
+                received_at, release=lambda: released.append(True), failed=True,
+            )
+            items = iter((
+                worker_module.BurstWork(
+                    "augmentation", ((snapshot,), received_at), trigger
+                ),
+                None,
+            ))
+
+            class WorkQueue:
+                def get(self):
+                    return next(items)
+
+            _process_bursts(
+                WorkQueue(), lambda *_args, **_kwargs: self.fail(
+                    "coalesced trigger reached processing"
+                )
+            )
+
+            self.assertFalse(snapshot.exists())
+            self.assertEqual(released, [True])
+
+    def test_empty_augmentation_finalizes_the_original_provisional_result(self):
+        received_at = datetime(2026, 8, 19, 18, 30, tzinfo=timezone.utc)
+        calls = []
+        provisional = ProcessingResult(
+            False, "no_match", idempotency_key="ftp-trigger", terminal=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ftp = Path(directory) / "ftp.jpg"
+            ftp.write_bytes(b"ftp")
+            trigger = worker_module.ProgressiveTrigger(received_at)
+            items = iter((
+                worker_module.BurstWork("primary", ((ftp,), received_at), trigger),
+                worker_module.BurstWork("augmentation", ((), received_at), trigger),
+                None,
+            ))
+
+            class WorkQueue:
+                def get(self):
+                    return next(items)
+
+            def emit(paths, captured_at, *timing, **options):
+                calls.append(options)
+                return provisional if len(calls) == 1 else ProcessingResult(
+                    False, "no_match", event_id=1,
+                    idempotency_key="ftp-trigger", terminal=True,
+                )
+
+            _process_bursts(WorkQueue(), emit)
+
+            self.assertEqual(calls[0], {"final": False})
+            self.assertEqual(calls[1], {
+                "idempotency_key": "ftp-trigger",
+                "final": True,
+                "provisional_result": provisional,
+                "augmentation": {
+                    "outcome": "failed",
+                    "reason": "empty",
+                    "candidate_count": 0,
+                    "duration_ms": 0,
+                },
+            })
+            self.assertFalse(ftp.exists())
+
     def test_processing_receives_the_preprocessing_start_time(self):
-        queue = BoundedBurstQueue(max_pending=2)
         received_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         paths = (Path("ranked.jpg"),)
         calls = []
-        queue.put((paths, received_at, 12.5))
-        queue.put(None)
 
-        _process_bursts(queue, lambda *args: calls.append(args))
+        _process_bursts(
+            SequenceQueue((paths, received_at, 12.5), None),
+            lambda *args: calls.append(args),
+        )
 
         self.assertEqual(calls, [(paths, received_at, 12.5)])
 
@@ -706,20 +1152,101 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(configured["handler"]["max_candidate_bytes"], 1024)
         self.assertEqual(configured["handler"]["max_pending_candidates"], 5)
 
+    def test_run_worker_stops_queued_bursts_before_controller_shutdown(self):
+        configured = {}
+        consumer_ready = ThreadEvent()
+        release_consumer = ThreadEvent()
+        consumer_finished = ThreadEvent()
+        emitted = []
+        observed_during_shutdown = []
+        real_process_bursts = worker_module._process_bursts
+
+        class Collector:
+            def __init__(self, emit, **kwargs):
+                configured["enqueue"] = emit
+
+            def flush_due(self):
+                return False
+
+        class Handler:
+            def __init__(self, collector, **kwargs):
+                pass
+
+            def retry_pending(self):
+                return 0
+
+            def schedule_candidate(self, *args):
+                pass
+
+        class OneItemQueue:
+            def __init__(self, queue):
+                self._queue = queue
+                self._consumed = False
+
+            def get(self):
+                if self._consumed:
+                    return None
+                self._consumed = True
+                return self._queue.get()
+
+        def delayed_processor(queue, emit, on_error, ranker=None):
+            consumer_ready.set()
+            release_consumer.wait(timeout=1)
+            try:
+                real_process_bursts(OneItemQueue(queue), emit, on_error, ranker)
+            finally:
+                consumer_finished.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            queued = Path(directory) / "queued.jpg"
+            received_at = datetime(2026, 8, 20, 11, 30, tzinfo=timezone.utc)
+
+            def enqueue_then_stop(_):
+                self.assertTrue(consumer_ready.wait(timeout=1))
+                queued.write_bytes(b"candidate")
+                configured["enqueue"](((queued,), received_at))
+                raise KeyboardInterrupt
+
+            def blocked_shutdown():
+                release_consumer.set()
+                self.assertTrue(consumer_finished.wait(timeout=1))
+                observed_during_shutdown.extend(emitted)
+
+            with patch(
+                "gate_controller.worker.BurstCollector", Collector
+            ), patch(
+                "gate_controller.worker.CompletedImageHandler", Handler
+            ), patch(
+                "gate_controller.worker.Observer", return_value=PassiveObserver()
+            ), patch(
+                "gate_controller.worker._process_bursts", delayed_processor
+            ), patch(
+                "gate_controller.worker.current_thread_is_main", return_value=False
+            ), patch(
+                "gate_controller.worker.sleep", side_effect=enqueue_then_stop
+            ):
+                run_worker(
+                    Path(directory), lambda *args: emitted.append(args),
+                    shutdown=blocked_shutdown,
+                )
+
+            self.assertFalse(queued.exists())
+
+        self.assertEqual(observed_during_shutdown, [])
+        self.assertEqual(emitted, [])
+
     def test_run_worker_never_defers_the_initial_ftp_burst_for_snapshot_sampling(self):
         configured = {}
         lifecycle = []
 
         class Collector:
             def __init__(self, emit, **kwargs):
-                self.index = len(configured.setdefault("collectors", []))
                 configured.setdefault("collectors", []).append(kwargs)
 
             def add(self, path, received_at=None):
                 return True
 
             def flush_due(self):
-                configured.setdefault("flushes", []).append(self.index)
                 return False
 
         class Handler:
@@ -735,8 +1262,9 @@ class WorkerTests(unittest.TestCase):
         class Sampler:
             output_directory = Path("private-snapshots")
 
-            def __init__(self, config, add_candidate):
+            def __init__(self, config, complete):
                 configured["sampler_config"] = config
+                configured["sampler_complete"] = complete
 
             def request(self, received_at=None):
                 return True
@@ -777,113 +1305,20 @@ class WorkerTests(unittest.TestCase):
                 snapshot_sampling=type("Config", (), {"enabled": True})(),
             )
 
-        self.assertEqual(len(configured["collectors"]), 2)
-        self.assertEqual(configured["collectors"][0], configured["collectors"][1])
-        self.assertEqual(configured["flushes"], [0, 1])
-        self.assertIsInstance(
-            configured["handler"]["on_first_completed"].__self__, Sampler
-        )
+        self.assertEqual(len(configured["collectors"]), 1)
+        self.assertTrue(all(
+            "defer_flush" not in options for options in configured["collectors"]
+        ))
+        self.assertIsNone(getattr(
+            configured["handler"]["on_first_completed"], "__self__", None
+        ))
+        self.assertTrue(callable(configured["sampler_complete"]))
         self.assertLess(
             lifecycle.index("thread_join:ReolinkSnapshotSampler"),
             lifecycle.index("sampler_close"),
         )
-        self.assertLess(
-            lifecycle.index("thread_join:GateBurstProcessor"),
-            lifecycle.index("sampler_close"),
-        )
 
-    def test_run_worker_uses_non_evicting_admission_for_snapshot_augmentation(self):
-        configured = {"emits": [], "queue_calls": []}
-
-        class BurstQueue:
-            def __init__(self, max_pending):
-                pass
-
-            def put(self, item):
-                configured["queue_calls"].append(("evicting", item))
-                return None
-
-            def try_put(self, item):
-                configured["queue_calls"].append(("non_evicting", item))
-                return False
-
-        class Collector:
-            def __init__(self, emit, **kwargs):
-                configured["emits"].append(emit)
-
-            def add(self, path, received_at=None):
-                return True
-
-            def flush_due(self):
-                return False
-
-        class Handler:
-            def __init__(self, collector, **kwargs):
-                pass
-
-            def retry_pending(self):
-                return 0
-
-            def schedule_candidate(self, *args):
-                pass
-
-        class Sampler:
-            output_directory = Path("private-snapshots")
-
-            def __init__(self, config, add_candidate):
-                pass
-
-            def request(self, received_at=None):
-                return True
-
-            def run_forever(self, stop_event):
-                pass
-
-            def close(self):
-                pass
-
-        class WorkerThread:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def start(self):
-                pass
-
-            def join(self, timeout=None):
-                pass
-
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "gate_controller.worker.BoundedBurstQueue", BurstQueue
-        ), patch(
-            "gate_controller.worker.BurstCollector", Collector
-        ), patch(
-            "gate_controller.worker.CompletedImageHandler", Handler
-        ), patch(
-            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
-        ), patch(
-            "gate_controller.worker.Observer", return_value=PassiveObserver()
-        ), patch(
-            "gate_controller.worker.Thread", WorkerThread
-        ), patch(
-            "gate_controller.worker.current_thread_is_main", return_value=False
-        ), patch(
-            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
-        ):
-            run_worker(
-                Path(directory), lambda *_: None,
-                snapshot_sampling=type("Config", (), {"enabled": True})(),
-            )
-
-        primary = ((Path("primary-ftp.jpg"),), None)
-        augmentation = ((Path("optional-snapshot.jpg"),), None)
-        configured["emits"][0](primary)
-        configured["emits"][1](augmentation)
-
-        self.assertIn(("evicting", primary), configured["queue_calls"])
-        self.assertIn(("non_evicting", augmentation), configured["queue_calls"])
-        self.assertNotIn(("evicting", augmentation), configured["queue_calls"])
-
-    def test_disabled_sampling_cleans_and_ignores_private_files_without_a_thread(self):
+    def test_disabled_sampling_does_not_touch_private_files_or_start_a_thread(self):
         configured = {}
         lifecycle = []
 
@@ -947,91 +1382,8 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(lifecycle.count("sampler_init"), 1)
         self.assertEqual(lifecycle.count("sampler_close"), 1)
         self.assertNotIn("thread_start:ReolinkSnapshotSampler", lifecycle)
-        self.assertEqual(configured["handler"]["ignored_roots"], (output_directory,))
+        self.assertEqual(configured["handler"]["ignored_roots"], ())
         self.assertIsNone(configured["handler"]["on_first_completed"])
-
-    def test_deferred_snapshot_cleanup_waits_for_an_overlong_processor(self):
-        lifecycle = []
-
-        class Collector:
-            def __init__(self, emit, **kwargs):
-                pass
-
-            def add(self, path, received_at=None):
-                return True
-
-            def flush_due(self):
-                return False
-
-        class Handler:
-            def __init__(self, collector, **kwargs):
-                pass
-
-            def retry_pending(self):
-                return 0
-
-            def schedule_candidate(self, *args):
-                pass
-
-        class Sampler:
-            output_directory = Path("private-snapshots")
-
-            def __init__(self, config, add_candidate):
-                pass
-
-            def request(self, received_at=None):
-                return True
-
-            def run_forever(self, stop_event):
-                pass
-
-            def close(self):
-                lifecycle.append("sampler_close")
-
-        class WorkerThread:
-            def __init__(self, *args, **kwargs):
-                self.target = kwargs.get("target", args[0] if args else None)
-                self.args = kwargs.get("args", ())
-                self.name = kwargs.get("name")
-
-            def start(self):
-                lifecycle.append(f"thread_start:{self.name}")
-                if self.name == "ReolinkSnapshotCleanup":
-                    self.target(*self.args)
-
-            def join(self, timeout=None):
-                lifecycle.append(f"thread_join:{self.name}:{timeout}")
-
-            def is_alive(self):
-                return self.name == "GateBurstProcessor"
-
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "gate_controller.worker.BurstCollector", Collector
-        ), patch(
-            "gate_controller.worker.CompletedImageHandler", Handler
-        ), patch(
-            "gate_controller.worker.ReolinkSnapshotSampler", Sampler
-        ), patch(
-            "gate_controller.worker.Observer", return_value=PassiveObserver()
-        ), patch(
-            "gate_controller.worker.Thread", WorkerThread
-        ), patch(
-            "gate_controller.worker.current_thread_is_main", return_value=False
-        ), patch(
-            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
-        ), self.assertLogs("gate_controller.worker", level="WARNING") as logs:
-            run_worker(
-                Path(directory), lambda *_: None,
-                snapshot_sampling=type("Config", (), {"enabled": True})(),
-            )
-
-        self.assertIn("outcome=cleanup_deferred", "\n".join(logs.output))
-        self.assertIn("thread_start:ReolinkSnapshotCleanup", lifecycle)
-        self.assertLess(
-            lifecycle.index("thread_join:GateBurstProcessor:None"),
-            lifecycle.index("sampler_close"),
-        )
-        self.assertEqual(lifecycle.count("sampler_close"), 1)
 
     def test_queue_coalesced_callback_receives_exact_collector_boundaries(self):
         configured = {}

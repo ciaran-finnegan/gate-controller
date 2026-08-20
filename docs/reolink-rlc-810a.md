@@ -73,17 +73,18 @@ hostname verification. A hostile device on the camera LAN could then impersonate
 the camera and capture its credentials. Enable it only when the camera cannot use
 a certificate verifiable by the Pi, and keep the camera network tightly scoped.
 
-The default takes two additional 4K snapshots sequentially under one global
-2.25-second deadline. They are written temporarily beneath the upload root in
-an ignored owner-only `.reolink-snapshots` directory, validated as bounded
-JPEGs, and added together to a separate progressive OCR burst with the original
-FTP `received_at`. Generated files cannot recursively request another sample.
-They use the existing ranking, recognition, authorization, durable actuation
-claim, and cooldown path; a camera trigger or snapshot never actuates the relay
-by itself. A plate recognized from either the primary FTP image or a later
-snapshot can open the gate only after the same authorization, claim, cooldown,
-and relay-safety checks succeed. Failure or unavailable configuration leaves the
-first FTP attempt and its normal quiet window unchanged.
+The default takes two additional 4K snapshots sequentially under one end-to-end
+2.25-second wall-clock deadline. They are written temporarily beneath the upload
+root in an ignored owner-only `.reolink-snapshots` directory and validated as
+bounded JPEGs. The first FTP image enters recognition on its normal quiet window
+and establishes one durable trigger identity. An authorizing FTP result
+finalizes immediately; only an improvable denial waits for snapshots, which
+reuse that identity and its single actuation claim. Generated files cannot
+recursively request another sample, and snapshot sampling has no relay path. A
+plate from either the primary FTP image or a later snapshot can open the gate
+only after the same authorization, claim, cooldown, and relay-safety checks
+succeed. Failure, timeout, shutdown, or unavailable configuration terminally
+finalizes the original FTP result.
 
 Do not configure on-demand ffmpeg sampling from
 `rtsp://127.0.0.1:8554/camera` for this feature. Live Pi measurements took
