@@ -8,10 +8,85 @@ from gate_controller.telemetry import (
     OcrAttemptTelemetry,
     ProcessingTrace,
     StageDurations,
+    TriggerTelemetry,
 )
 
 
 class TelemetryWireTests(unittest.TestCase):
+    def test_to_wire_emits_only_the_bounded_trigger_vocabulary(self):
+        telemetry = EventTelemetry(
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            stage_durations=StageDurations(end_to_end_ms=25),
+            frames=(), ocr_attempts=(), decision_outcome="denied",
+            decision_reason="no_match", actuation_claim="not_requested",
+            actuation_attempted=False, relay_outcome="not_attempted",
+            outbox_attempt=0, delivery_state="pending",
+            trigger=TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="line_crossing_inbound", correlation="matched",
+                event_at=datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc),
+                delta_ms=126.4,
+            ),
+        )
+
+        self.assertEqual(telemetry.to_wire()["trigger"], {
+            "source": "reolink_webhook",
+            "event_type": "line_crossing",
+            "rule_id": "line_crossing_inbound",
+            "correlation": "matched",
+            "event_at": "2026-08-20T10:00:00+00:00",
+            "delta_ms": 126,
+        })
+
+    def test_trigger_wire_enforces_only_matched_reolink_or_exact_ftp_fallback(self):
+        fallback = {
+            "source": "camera_ftp",
+            "event_type": "unverified",
+            "correlation": "unverified",
+        }
+        malformed = (
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id=None, correlation="matched", delta_ms=10,
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="not valid", correlation="matched", delta_ms=10,
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="unverified",
+                rule_id="line_crossing_inbound", correlation="matched",
+                delta_ms=10,
+            ),
+            TriggerTelemetry(
+                source="camera_ftp", event_type="vehicle",
+                rule_id="vehicle_alert", correlation="matched", delta_ms=10,
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="line_crossing_inbound", correlation="matched",
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="line_crossing_inbound", correlation="matched",
+                delta_ms="invalid",
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="line_crossing_inbound", correlation="matched",
+                delta_ms=float("nan"),
+            ),
+            TriggerTelemetry(
+                source="reolink_webhook", event_type="line_crossing",
+                rule_id="line_crossing_inbound", correlation="matched",
+                delta_ms=-1,
+            ),
+        )
+
+        for trigger in malformed:
+            with self.subTest(trigger=trigger):
+                self.assertEqual(trigger.to_wire(), fallback)
+
     def test_to_wire_clamps_rounds_and_omits_unset_stage_durations(self):
         telemetry = EventTelemetry(
             trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
