@@ -19,6 +19,8 @@ from gate_controller.worker import (
     run_worker,
 )
 from gate_controller.models import ProcessingResult
+from gate_controller.processor import GateProcessor
+from gate_controller.store import LocalStore
 from gate_controller.telemetry import TriggerTelemetry
 
 
@@ -129,6 +131,53 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(failures[0][0], (Path("ftp.jpg"),))
         self.assertIsInstance(failures[0][1], RuntimeError)
         self.assertEqual(failures[0][2:], (received_at, "sanitized-trigger"))
+
+    def test_processing_exception_persists_the_consumed_matched_trigger(self):
+        received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
+        matched = TriggerTelemetry(
+            source="reolink_webhook", event_type="line_crossing",
+            rule_id="line_crossing_inbound", correlation="matched",
+            delta_ms=32,
+        )
+
+        class UnusedRecognizer:
+            def recognise(self, _path):
+                raise AssertionError("processing should fail before OCR")
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "ftp.jpg"
+            Image.new("L", (16, 8), color=128).save(frame, format="JPEG")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = GateProcessor(
+                recognizer=UnusedRecognizer(), store=store, relay=object(),
+                authorised=(),
+            )
+            event_ids = []
+
+            def fail_processing(*_args, **_kwargs):
+                raise RuntimeError("processing failed")
+
+            def persist_error(paths, _error, candidate_received_at, *, trigger=None):
+                event_ids.append(processor.record_skipped(
+                    paths, "processing_error", candidate_received_at,
+                    trigger=trigger,
+                ).event_id)
+
+            _process_bursts(
+                SequenceQueue(((frame,), received_at), None),
+                fail_processing,
+                on_error=persist_error,
+                trigger_resolver=lambda _received_at: matched,
+            )
+
+            self.assertEqual(len(event_ids), 1)
+            self.assertEqual(store.event_telemetry(event_ids[0])["trigger"], {
+                "source": "reolink_webhook",
+                "event_type": "line_crossing",
+                "rule_id": "line_crossing_inbound",
+                "correlation": "matched",
+                "delta_ms": 32,
+            })
 
     def test_trigger_resolver_exception_uses_the_exact_ftp_fallback(self):
         received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
