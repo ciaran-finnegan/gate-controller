@@ -358,6 +358,7 @@ class GateProcessor:
                        decision_started_at: float | None = None,
                        processing_started_at: datetime | None = None,
                        trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
+        trigger = _trigger_telemetry(trigger)
         paths = tuple(_candidate_path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
@@ -382,7 +383,7 @@ class GateProcessor:
                 )
             if decision_started_at is None:
                 trace.mark_burst()
-            trace.set_trigger(ftp_fallback_trigger())
+            trace.set_trigger(trigger or ftp_fallback_trigger())
         else:
             trace = _BestEffortTrace.wrap(trace)
         trace.mark_decision("denied", reason)
