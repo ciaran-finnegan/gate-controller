@@ -40,10 +40,65 @@ Surveillance > FTP**:
    JPEGs, validates them, then ranks frames by sharpness.
 
 Every first completed FTP JPEG is released to ranking and OCR after the normal
-quiet window. It is logged as `source=camera_ftp subtype=unverified`: an FTP
-upload alone does not prove whether the camera used generic AI vehicle, line
-crossing, manual/test, or another alarm subtype. Do not label it as line
-crossing without a separate authenticated event signal.
+quiet window. Without a correlated authenticated event it is logged as
+`camera_ftp/unverified`: an FTP upload alone does not prove whether the camera
+used generic AI vehicle, line crossing, manual/test, or another alarm subtype.
+Do not label it as line crossing without a separate authenticated event signal.
+
+## Authenticated Trigger Provenance
+
+The camera can send metadata about the rule that caused an upload to the
+controller's bounded webhook endpoint. This metadata is observability only: it
+never authorizes a vehicle, changes matching, invokes the relay, or actuates the
+gate. The initial FTP recognition does not wait for the webhook or for optional
+snapshot work; the controller performs a nearest-event lookup from bounded
+in-memory state and otherwise retains the `camera_ftp/unverified` fallback.
+
+Put a random 20-128 character secret in the root-readable
+`/etc/gate-controller.env` file:
+
+```sh
+GATE_REOLINK_WEBHOOK_SECRET=
+GATE_REOLINK_WEBHOOK_HOST=0.0.0.0
+GATE_REOLINK_WEBHOOK_PORT=8766
+```
+
+In the camera's Webhook settings, use this private-LAN URL:
+
+```text
+http://PI_PRIVATE_ADDRESS:8766/reolink/events
+```
+
+Use the camera's default JSON body and include the same secret at the top
+level. The controller bounds the whole request and each relevant string, then
+retains only normalized type, rule, event time, and correlation timing:
+
+```json
+{
+  "alarm": {
+    "alarmTime": "time",
+    "channel": "chn",
+    "message": "message",
+    "name": "name",
+    "type": "type"
+  },
+  "secret": "same-random-secret",
+  "type": "type"
+}
+```
+
+Top-level camera `test` and `manual` notifications are recorded as
+`manual_test`. Invalid, stale, duplicate, unauthorized, and oversized requests
+cannot reach recognition or relay code. Raw payloads, camera identifiers, and
+the secret are not logged or stored. Restrict TCP/8766 with the host firewall or
+camera VLAN so only the camera can connect, and do not port-forward it.
+No nginx or ONVIF listener is needed or installed for trigger provenance.
+
+The moved-line experiment baseline is vehicle-only line crossing, sensitivity 80,
+with the line spanning the driveway at the configured inbound capture point.
+Keep that baseline fixed while collecting matched and unverified events; change
+one camera variable at a time only after comparing missed entries and false
+positives across day, night, rain, and headlights.
 
 ## Optional HTTPS Snapshot Augmentation
 
