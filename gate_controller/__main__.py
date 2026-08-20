@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,8 @@ from .runtime import require_python_version
 MIN_QUIET_WINDOW_SECONDS = 0.1
 MAX_QUIET_WINDOW_SECONDS = 2.0
 DEFAULT_QUIET_WINDOW_SECONDS = 0.2
+MANAGED_RELEASES_ROOT = Path("/opt/gate-controller-deploy/releases")
+MANAGED_RELEASE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def main() -> None:
@@ -340,7 +343,8 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
-                       clock=None) -> dict:
+                       module_path=Path(__file__),
+                       managed_releases_root=MANAGED_RELEASES_ROOT, clock=None) -> dict:
     now = (clock or (lambda: datetime.now(timezone.utc)))()
     camera_upload_recent = _camera_is_fresh(
         latest_image.get("received_at"), now, camera_stale_seconds
@@ -361,9 +365,33 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         "relay": _relay_status(relay),
         "media": read_media_capabilities(media_capabilities_path),
     }
+    release_sha = _managed_release_sha(
+        module_path, releases_root=managed_releases_root
+    )
+    if release_sha is not None:
+        status["software"] = {"release_sha": release_sha}
     if authorised is not None:
         status["authorisation"] = authorised.status()
     return status
+
+
+def _managed_release_sha(
+    module_path: Path, *, releases_root=MANAGED_RELEASES_ROOT
+) -> str | None:
+    try:
+        resolved_module = Path(module_path).resolve(strict=True)
+        resolved_releases = Path(releases_root).resolve(strict=True)
+        relative_module = resolved_module.relative_to(resolved_releases)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if len(relative_module.parts) < 2:
+        return None
+    release_sha = relative_module.parts[0]
+    release = resolved_releases / release_sha
+    if (MANAGED_RELEASE_SHA_PATTERN.fullmatch(release_sha) is None
+            or release.is_symlink() or not release.is_dir()):
+        return None
+    return release_sha
 
 
 def _relay_status(relay) -> dict:
