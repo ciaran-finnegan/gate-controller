@@ -29,6 +29,22 @@ def read_unit(relative_path):
 
 
 class CloudflareDocumentationTests(unittest.TestCase):
+    def test_reolink_docs_cover_authenticated_trigger_provenance_without_a_proxy(self):
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(
+            encoding="utf-8"
+        )
+        environment = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("GATE_REOLINK_WEBHOOK_SECRET", environment)
+        self.assertIn("GATE_REOLINK_WEBHOOK_HOST", environment)
+        self.assertIn("GATE_REOLINK_WEBHOOK_PORT", environment)
+        self.assertIn("http://PI_PRIVATE_ADDRESS:8766/reolink/events", camera)
+        self.assertIn('"secret"', camera)
+        self.assertIn("camera_ftp/unverified", camera)
+        self.assertIn("sensitivity 80", camera)
+        self.assertIn("does not wait", camera)
+        self.assertIn("No nginx or ONVIF listener", camera)
+
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -177,6 +193,12 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         command = shlex.split(service["ExecStart"])
 
         self.assertEqual(["--quiet-window", "0.2"], command[-2:])
+
+    def test_application_service_leaves_webhook_network_overrides_to_environment_file(self):
+        environment = read_unit("file-monitor.service")["Service"].get("Environment", "")
+
+        self.assertNotIn("GATE_REOLINK_WEBHOOK_HOST", environment)
+        self.assertNotIn("GATE_REOLINK_WEBHOOK_PORT", environment)
 
     def test_root_updater_executes_only_fixed_bootstrap_helper(self):
         unit = read_unit("deployment/systemd/gate-controller-updater.service")
