@@ -19,7 +19,7 @@ from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
 from gate_controller.authorisation import AuthorisedPlateCache
 from gate_controller.images import rank_images
-from gate_controller.telemetry import FrameTelemetry, ProcessingTrace
+from gate_controller.telemetry import FrameTelemetry, ProcessingTrace, TriggerTelemetry
 
 
 class StaticRecognizer:
@@ -155,6 +155,79 @@ class FailingTelemetryTrace:
 
 
 class GateProcessorTests(unittest.TestCase):
+    def test_trigger_provenance_is_attached_without_changing_the_gate_decision(self):
+        relay_calls = []
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="line_crossing",
+            rule_id="line_crossing_inbound", correlation="matched",
+            delta_ms=25,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "event.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(
+                store, RecordingRelay(relay_calls),
+                StaticRecognizer(PlateObservation(None, 0.0)),
+            )
+
+            result = processor.process((frame,), trigger=trigger)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(
+                store.event_telemetry(result.event_id)["trigger"],
+                trigger.to_wire(),
+            )
+            self.assertEqual(relay_calls, [])
+
+    def test_post_correlation_skip_preserves_the_matched_trigger(self):
+        now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+        matched = TriggerTelemetry(
+            source="reolink_webhook", event_type="line_crossing",
+            rule_id="line_crossing_inbound", correlation="matched",
+            delta_ms=125,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "stale-after-correlation.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(
+                store, RecordingRelay([]), SequenceRecognizer([]),
+                clock=lambda: now,
+            )
+
+            result = processor.process(
+                (frame,), received_at=now - timedelta(seconds=9),
+                trigger=matched,
+            )
+
+            self.assertEqual(result.reason, "stale_burst")
+            self.assertEqual(
+                store.event_telemetry(result.event_id)["trigger"],
+                matched.to_wire(),
+            )
+
+    def test_skipped_ftp_event_persists_the_exact_fallback_trigger(self):
+        matched = TriggerTelemetry(
+            source="reolink_webhook", event_type="line_crossing",
+            rule_id="line_crossing_inbound", correlation="matched",
+            delta_ms=25,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "rejected-before-ocr.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(
+                store, RecordingRelay([]), SequenceRecognizer([]),
+            )
+
+            result = processor.record_skipped(
+                (frame,), "image_too_large", trigger=matched,
+            )
+
+            self.assertEqual(store.event_telemetry(result.event_id)["trigger"], {
+                "source": "camera_ftp",
+                "event_type": "unverified",
+                "correlation": "unverified",
+            })
+
     def _processor(self, store, relay, recognizer, outbox=None, clock=None,
                    cooldown=timedelta(seconds=20), **kwargs):
         return GateProcessor(
