@@ -17,7 +17,10 @@ from .actuation import ActuationCoordinator
 from .images import measure_frame_quality
 from .matching import decide_access, normalise_plate
 from .models import GateEvent, ProcessingResult
-from .telemetry import AugmentationTelemetry, OcrAttemptTelemetry, ProcessingTrace
+from .telemetry import (
+    AugmentationTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
+    ftp_fallback_trigger,
+)
 
 
 MAX_OCR_FRAMES = 3
@@ -88,8 +91,10 @@ class GateProcessor:
                 idempotency_key: str | None = None,
                 final: bool = True,
                 provisional_result: ProcessingResult | None = None,
-                augmentation: AugmentationTelemetry | dict | None = None) -> ProcessingResult:
+                augmentation: AugmentationTelemetry | dict | None = None,
+                trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
         augmentation = _augmentation_telemetry(augmentation)
+        trigger = _trigger_telemetry(trigger)
         if provisional_result is not None:
             provisional_key = provisional_result.idempotency_key
             if (
@@ -126,6 +131,7 @@ class GateProcessor:
             )
         trace = self._new_trace()
         trace.set_augmentation(augmentation)
+        trace.set_trigger(trigger)
         if (
             received_at is not None
             or decision_started_at is not None
@@ -350,7 +356,8 @@ class GateProcessor:
                        trace: ProcessingTrace | _BestEffortTrace | None = None,
                        idempotency_key: str | None = None, *,
                        decision_started_at: float | None = None,
-                       processing_started_at: datetime | None = None) -> ProcessingResult:
+                       processing_started_at: datetime | None = None,
+                       trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
         paths = tuple(_candidate_path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
@@ -375,6 +382,7 @@ class GateProcessor:
                 )
             if decision_started_at is None:
                 trace.mark_burst()
+            trace.set_trigger(ftp_fallback_trigger())
         else:
             trace = _BestEffortTrace.wrap(trace)
         trace.mark_decision("denied", reason)
@@ -634,6 +642,13 @@ class _BestEffortTrace:
         if callable(operation):
             self._call("set_augmentation", augmentation)
 
+    def set_trigger(self, trigger) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "set_trigger", None)
+        if callable(operation):
+            self._call("set_trigger", trigger)
+
     def seed_upstream(
         self, received_at: datetime | None, decision_started_at: float | None,
         processing_started_at: datetime | None = None,
@@ -722,6 +737,21 @@ def _augmentation_telemetry(value) -> AugmentationTelemetry | None:
         candidate_count=value.get("candidate_count", 0),
         duration_ms=value.get("duration_ms", 0),
         correlation=value.get("correlation"),
+    )
+
+
+def _trigger_telemetry(value) -> TriggerTelemetry | None:
+    if value is None or isinstance(value, TriggerTelemetry):
+        return value
+    if not isinstance(value, dict):
+        return None
+    return TriggerTelemetry(
+        source=value.get("source", "camera_ftp"),
+        event_type=value.get("event_type", "unverified"),
+        rule_id=value.get("rule_id"),
+        correlation=value.get("correlation", "unverified"),
+        event_at=value.get("event_at"),
+        delta_ms=value.get("delta_ms"),
     )
 
 
