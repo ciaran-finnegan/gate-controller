@@ -25,6 +25,7 @@ from .outbox import (
 )
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
+from .reolink_snapshots import load_reolink_snapshot_config
 from .store import LocalStore
 from .telemetry_export import export_telemetry
 from .worker import (
@@ -71,6 +72,9 @@ def main() -> None:
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
+    snapshot_sampling = load_reolink_snapshot_config(
+        os.environ, arguments.directory, max_candidate_bytes=max_candidate_bytes
+    )
     authorisation_staleness = timedelta(
         seconds=float(os.environ.get("GATE_AUTHORISATION_MAX_STALENESS_SECONDS", "300"))
     )
@@ -97,7 +101,8 @@ def main() -> None:
     )
 
     def process(paths, received_at=None, decision_started_at=None,
-                processing_started_at=None):
+                processing_started_at=None, *, idempotency_key=None, final=True,
+                provisional_result=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
@@ -105,6 +110,9 @@ def main() -> None:
             received_at=received_at,
             decision_started_at=decision_started_at,
             processing_started_at=processing_started_at,
+            idempotency_key=idempotency_key,
+            final=final,
+            provisional_result=provisional_result,
         )
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
@@ -142,6 +150,7 @@ def main() -> None:
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
+        snapshot_sampling=snapshot_sampling,
     )
 
 

@@ -64,6 +64,7 @@ class MainConfigurationTests(unittest.TestCase):
             run_worker.call_args.kwargs["on_timed_skipped"],
             run_worker.call_args.kwargs["on_skipped"],
         )
+        self.assertFalse(run_worker.call_args.kwargs["snapshot_sampling"].enabled)
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -495,6 +496,13 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertIn("GATE_MAX_BURST_CANDIDATES=8", example)
         self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_BASE_URL=", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_USERNAME=", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_PASSWORD=", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=false", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_COUNT=2", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS=2.25", example)
+        self.assertIn("GATE_REOLINK_SNAPSHOT_MAX_BYTES=4194304", example)
 
 
 if __name__ == "__main__":

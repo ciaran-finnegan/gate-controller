@@ -26,6 +26,9 @@ FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
 })
+IMPROVABLE_DENIAL_REASONS = frozenset({
+    "ambiguous_fuzzy_match", "no_match", "ocr_busy", "ocr_error",
+})
 
 
 class _OcrBusy(TimeoutError):
@@ -81,21 +84,48 @@ class GateProcessor:
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
-                processing_started_at: datetime | None = None) -> ProcessingResult:
+                processing_started_at: datetime | None = None, *,
+                idempotency_key: str | None = None,
+                final: bool = True,
+                provisional_result: ProcessingResult | None = None) -> ProcessingResult:
+        if provisional_result is not None:
+            provisional_key = provisional_result.idempotency_key
+            if (
+                not final
+                or provisional_result.terminal
+                or not provisional_key
+                or (idempotency_key is not None and idempotency_key != provisional_key)
+            ):
+                raise ValueError("invalid provisional processing result")
+            return self.record_skipped(
+                paths,
+                provisional_result.reason,
+                received_at,
+                idempotency_key=provisional_key,
+                decision_started_at=decision_started_at,
+                processing_started_at=processing_started_at,
+            )
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
         activation_deadline = deadline - self._activation_guard_seconds
-        candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
+        candidates = _unique_content_candidates(
+            tuple(_candidate_path(path) for path in paths)
+        )
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
-        idempotency_key = _event_key_from_digests(digests)
+        idempotency_key = idempotency_key or _event_key_from_digests(digests)
         if self._store.event_exists(idempotency_key):
             if self._outbox_enabled:
                 event_id = self._store.terminal_outcome(idempotency_key)
                 event_id = event_id.event_id if event_id else self._store.event_id(idempotency_key)
                 if event_id is not None:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
-            return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
+            return ProcessingResult(
+                False,
+                self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
+                self._store.event_id(idempotency_key),
+                idempotency_key=idempotency_key,
+            )
         trace = self._new_trace()
         if (
             received_at is not None
@@ -199,6 +229,15 @@ class GateProcessor:
             timed_out = True
         if decision is None:
             reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
+            if not final and reason in IMPROVABLE_DENIAL_REASONS:
+                trace.mark_decision("denied", reason)
+                return self._finish_result(
+                    trace,
+                    ProcessingResult(
+                        False, reason, idempotency_key=idempotency_key,
+                        terminal=False,
+                    ),
+                )
             return self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -210,7 +249,10 @@ class GateProcessor:
                                   decision)
             event_id = self._record(event, paths)
             return self._finish_result(
-                trace, ProcessingResult(False, "decision_timeout", event_id, decision)
+                trace, ProcessingResult(
+                    False, "decision_timeout", event_id, decision,
+                    idempotency_key=idempotency_key,
+                )
             )
         if not _is_fresh(decision_at, received_at, self._max_image_age):
             trace.mark_decision("denied", "stale_burst")
@@ -218,7 +260,10 @@ class GateProcessor:
                                   decision)
             event_id = self._record(event, paths)
             return self._finish_result(
-                trace, ProcessingResult(False, "stale_burst", event_id, decision)
+                trace, ProcessingResult(
+                    False, "stale_burst", event_id, decision,
+                    idempotency_key=idempotency_key,
+                )
             )
         event = GateEvent(
             source="ocr", reason=decision.reason, opened=False, idempotency_key=idempotency_key,
@@ -235,9 +280,20 @@ class GateProcessor:
             trace.mark_decision("allowed", decision.reason)
         outbox_payload = self._outbox_payload(paths, await_telemetry=True)
         if not decision.allowed:
+            if not final and event.reason in IMPROVABLE_DENIAL_REASONS:
+                return self._finish_result(
+                    trace,
+                    ProcessingResult(
+                        False, event.reason, decision=decision,
+                        idempotency_key=idempotency_key, terminal=False,
+                    ),
+                )
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
-                trace, ProcessingResult(False, event.reason, event_id, decision)
+                trace, ProcessingResult(
+                    False, event.reason, event_id, decision,
+                    idempotency_key=idempotency_key,
+                )
             )
         actuation_at = self._clock()
         if not _is_fresh(actuation_at, received_at, self._max_image_age):
@@ -246,7 +302,10 @@ class GateProcessor:
             )
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
-                trace, ProcessingResult(False, "stale_burst", event_id, decision)
+                trace, ProcessingResult(
+                    False, "stale_burst", event_id, decision,
+                    idempotency_key=idempotency_key,
+                )
             )
         def activation_inhibition():
             with self._ocr_slot_lock:
@@ -281,7 +340,10 @@ class GateProcessor:
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._finish_result(
             trace,
-            ProcessingResult(execution.opened, execution.reason, execution.event_id, decision),
+            ProcessingResult(
+                execution.opened, execution.reason, execution.event_id, decision,
+                idempotency_key=idempotency_key,
+            ),
         )
 
     def record_skipped(self, paths: Iterable[Path], reason: str,
@@ -290,7 +352,7 @@ class GateProcessor:
                        idempotency_key: str | None = None, *,
                        decision_started_at: float | None = None,
                        processing_started_at: datetime | None = None) -> ProcessingResult:
-        paths = tuple(Path(path) for path in paths)
+        paths = tuple(_candidate_path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
             event_id = self._store.event_id(idempotency_key)
@@ -300,6 +362,7 @@ class GateProcessor:
                 False,
                 self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
                 event_id,
+                idempotency_key=idempotency_key,
             )
         if trace is None:
             trace = self._new_trace()
@@ -322,7 +385,9 @@ class GateProcessor:
             received_at=received_at or self._clock(), decision_at=self._clock(),
         )
         event_id = self._record(event, paths)
-        result = ProcessingResult(False, reason, event_id)
+        result = ProcessingResult(
+            False, reason, event_id, idempotency_key=idempotency_key
+        )
         return self._finish_result(trace, result)
 
     def _finish_result(
@@ -370,7 +435,7 @@ class GateProcessor:
     ) -> dict | None:
         if not self._outbox_enabled:
             return None
-        paths = tuple(Path(path) for path in paths)
+        paths = tuple(_candidate_path(path) for path in paths)
         prepare_payload = getattr(self._outbox, "prepare_payload", None)
         if not callable(prepare_payload):
             payload = {"event_id": None}
@@ -594,8 +659,15 @@ def _content_digest(path: Path) -> str:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError:
-        digest.update(f"missing:{path.resolve()}".encode("utf-8"))
+        missing = str(path) if getattr(path, "_descriptor_anchored", False) else path.resolve()
+        digest.update(f"missing:{missing}".encode("utf-8"))
     return digest.hexdigest()
+
+
+def _candidate_path(path):
+    if getattr(path, "_descriptor_anchored", False):
+        return path
+    return Path(path)
 
 
 def _unique_content_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:

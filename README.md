@@ -149,6 +149,37 @@ still stop the burst immediately. `GATE_MAX_BURST_CANDIDATES` defaults to 8 and
 `GATE_MAX_CANDIDATE_IMAGE_BYTES` defaults to 8 MiB. Startup rejects values above
 the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
 bounded set, the newest candidates are retained and then ranked by image quality.
+
+Optional Reolink HTTPS Snap augmentation is best effort and never delays the
+initial FTP recognition path. Configure `GATE_REOLINK_SNAPSHOT_BASE_URL`,
+`GATE_REOLINK_SNAPSHOT_USERNAME`, and `GATE_REOLINK_SNAPSHOT_PASSWORD` together.
+The base URL must be a bare HTTPS origin whose host is a private or loopback IP
+literal; credentials, paths, queries, fragments, redirects, and public hosts are
+rejected. Set `GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true` only for a camera
+with a deliberately accepted self-signed certificate on that private address.
+
+The default captures two sequential additional snapshots under one 2.25-second
+end-to-end wall-clock deadline. `GATE_REOLINK_SNAPSHOT_COUNT` is limited to 1-4,
+`GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS` is limited to 3 seconds, and
+`GATE_REOLINK_SNAPSHOT_MAX_BYTES` cannot exceed the configured candidate-image
+limit. Generated JPEGs live in an ignored owner-only directory beside the FTP
+upload root. The first FTP image enters recognition immediately and establishes
+one durable trigger identity. An authorizing result finalizes immediately; only
+an improvable denial waits for snapshots, which reuse that identity and its
+single actuation claim. Login, snapshot, validation, timeout, and shutdown
+failures terminally record the original FTP result. Snapshot sampling itself has
+no actuation path.
+Logs record `source=camera_ftp subtype=unverified` and
+`augmentation=reolink_snapshot` without camera credentials or token values.
+
+On-demand ffmpeg capture from the local MediaMTX RTSP path is deliberately not
+used for recognition augmentation. Production Pi measurements took 4.88-5.44
+seconds for three frames because the upstream H.264 keyframe interval is about
+five seconds, which is unsuitable for the four-second decision budget. The
+sequential HTTPS Snap path measured roughly 0.78-0.96 seconds per 4K image;
+concurrent Snap requests are avoided because the camera serialized them and
+returned duplicate frames.
+
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
 camera recognition events: each contained one 3840x2160 frame, with no second
