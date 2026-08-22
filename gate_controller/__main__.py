@@ -18,6 +18,7 @@ from .authorisation import (
 from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
+from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import (
@@ -30,7 +31,6 @@ from .reolink_events import (
     ReolinkEventCorrelator, ReolinkWebhookWorker,
     load_reolink_webhook_config,
 )
-from .reolink_snapshots import load_reolink_snapshot_config
 from .store import LocalStore
 from .telemetry_export import export_telemetry
 from .worker import (
@@ -79,9 +79,8 @@ def main() -> None:
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
-    snapshot_sampling = load_reolink_snapshot_config(
-        os.environ, arguments.directory, max_candidate_bytes=max_candidate_bytes
-    )
+    hot_stream_config = load_hot_stream_config(os.environ, arguments.directory)
+    hot_stream = HotStreamBuffer(hot_stream_config) if hot_stream_config.enabled else None
     authorisation_staleness = timedelta(
         seconds=float(os.environ.get("GATE_AUTHORISATION_MAX_STALENESS_SECONDS", "300"))
     )
@@ -93,9 +92,12 @@ def main() -> None:
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
+        hot_stream=hot_stream,
     )
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(os.environ)
     background_workers = tuple(background_workers) + tuple(trigger_workers)
+    if hot_stream is not None:
+        background_workers += (hot_stream,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
         recognizer=PlateRecognizerClient(token),
@@ -110,8 +112,7 @@ def main() -> None:
     )
 
     def process(paths, received_at=None, decision_started_at=None,
-                processing_started_at=None, *, idempotency_key=None, final=True,
-                provisional_result=None, augmentation=None, trigger=None):
+                processing_started_at=None, *, trigger=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
@@ -119,10 +120,6 @@ def main() -> None:
             received_at=received_at,
             decision_started_at=decision_started_at,
             processing_started_at=processing_started_at,
-            idempotency_key=idempotency_key,
-            final=final,
-            provisional_result=provisional_result,
-            augmentation=augmentation,
             trigger=trigger,
         )
 
@@ -152,6 +149,8 @@ def main() -> None:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
     def shutdown():
+        if hot_stream is not None:
+            hot_stream.close()
         return _shutdown_controller(processor, relay)
 
     run_worker(
@@ -164,8 +163,8 @@ def main() -> None:
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
-        snapshot_sampling=snapshot_sampling,
         trigger_resolver=trigger_correlator.correlate,
+        hot_frame_provider=hot_stream,
     )
 
 
@@ -254,7 +253,8 @@ def _quiet_window(value: str) -> float:
 
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,
-                             coordinator=None, authorised=None, camera_directory=None):
+                             coordinator=None, authorised=None, camera_directory=None,
+                             hot_stream=None):
     environment = os.environ if environment is None else environment
     latest_image = latest_image if latest_image is not None else {}
     prompt_player = PromptPlayer(_configured_prompts(environment))
@@ -290,6 +290,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             store, prompt_player, latest_image, authorised, relay=relay,
             camera_directory=camera_directory,
             camera_stale_seconds=camera_stale_seconds,
+            hot_stream=hot_stream,
         )
         workers.append(HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -316,6 +317,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
+        hot_stream=hot_stream,
     )
 
 
@@ -365,6 +367,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
+                       hot_stream=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        module_path=Path(__file__),
                        managed_releases_root=MANAGED_RELEASES_ROOT, clock=None) -> dict:
@@ -387,6 +390,10 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         "camera_connected": None,
         "relay": _relay_status(relay),
         "media": read_media_capabilities(media_capabilities_path),
+        "recognition": {
+            "hot_stream": _hot_stream_status(hot_stream),
+            "local_shadow": {"mode": "disabled", "ready": False},
+        },
     }
     release_sha = _managed_release_sha(
         module_path, releases_root=managed_releases_root
@@ -396,6 +403,30 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if authorised is not None:
         status["authorisation"] = authorised.status()
     return status
+
+
+def _hot_stream_status(hot_stream) -> dict:
+    default = {
+        "enabled": False,
+        "ready": False,
+        "stream": "clear",
+        "sample_fps": 5.0,
+        "source_profile": {
+            "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+        },
+        "latest_frame_age_ms": None,
+        "buffered_frames": 0,
+        "restart_count": 0,
+    }
+    if hot_stream is None:
+        return default
+    try:
+        measured = hot_stream.status()
+    except Exception:
+        return default
+    if not isinstance(measured, dict):
+        return default
+    return {key: measured.get(key, value) for key, value in default.items()}
 
 
 def _managed_release_sha(

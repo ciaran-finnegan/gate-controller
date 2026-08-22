@@ -30,6 +30,7 @@ _AUTH_KEYS = frozenset({
 })
 _GATEWAY_STATIC_KEY_ORDER = (
     "MTX_PATHS_CAMERA_SOURCE",
+    "MTX_PATHS_CLEAR_SOURCE",
     "MTX_WEBRTCLOCALUDPADDRESS",
     "MTX_WEBRTCLOCALTCPADDRESS",
     "MTX_WEBRTCADDITIONALHOSTS",
@@ -165,6 +166,9 @@ def validate_gateway_static_environment(values: Mapping[str, str]) -> dict[str, 
     if set(selected) != _GATEWAY_STATIC_KEYS:
         raise MediaConfigError("static gateway environment has missing or forbidden keys")
     _validate_rtsp_source(selected["MTX_PATHS_CAMERA_SOURCE"])
+    _validate_rtsp_source(selected["MTX_PATHS_CLEAR_SOURCE"])
+    if selected["MTX_PATHS_CAMERA_SOURCE"] == selected["MTX_PATHS_CLEAR_SOURCE"]:
+        raise MediaConfigError("fluent and clear camera sources must be distinct")
     udp_host, _ = _parse_ice_bind(selected["MTX_WEBRTCLOCALUDPADDRESS"])
     tcp_host, _ = _parse_ice_bind(selected["MTX_WEBRTCLOCALTCPADDRESS"])
     if udp_host != tcp_host:
@@ -216,6 +220,7 @@ def migrate_gateway_environments(gateway_path, runtime_turn_path) -> None:
     """Atomically split a legacy combined gateway file, preserving current TURN data."""
     gateway_values = parse_trusted_environment(gateway_path)
     gateway_values, source_key_migrated = _migrate_legacy_source_key(gateway_values)
+    gateway_values, clear_source_migrated = _migrate_clear_source_key(gateway_values)
     keys = set(gateway_values)
     if keys == _GATEWAY_KEYS:
         validate_gateway_environment(gateway_values)
@@ -247,7 +252,7 @@ def migrate_gateway_environments(gateway_path, runtime_turn_path) -> None:
         validate_split_gateway_environment(
             static_values, parse_trusted_environment(runtime_turn_path)
         )
-    if source_key_migrated:
+    if source_key_migrated or clear_source_migrated:
         _atomic_write_environment(
             gateway_path,
             _serialize_environment(static_values, _GATEWAY_STATIC_KEY_ORDER),
@@ -263,6 +268,21 @@ def _migrate_legacy_source_key(values: Mapping[str, str]):
     if not has_legacy:
         return migrated, False
     migrated["MTX_PATHS_CAMERA_SOURCE"] = migrated.pop(_LEGACY_GATEWAY_SOURCE_KEY)
+    return migrated, True
+
+
+def _migrate_clear_source_key(values: Mapping[str, str]):
+    migrated = dict(values)
+    if "MTX_PATHS_CLEAR_SOURCE" in migrated:
+        return migrated, False
+    fluent = migrated.get("MTX_PATHS_CAMERA_SOURCE")
+    if not isinstance(fluent, str):
+        return migrated, False
+    parsed = urlsplit(fluent)
+    if not parsed.path.endswith("_sub"):
+        raise MediaConfigError("clear camera source cannot be derived safely")
+    clear_path = f"{parsed.path[:-4]}_main"
+    migrated["MTX_PATHS_CLEAR_SOURCE"] = parsed._replace(path=clear_path).geturl()
     return migrated, True
 
 

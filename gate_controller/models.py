@@ -79,5 +79,3 @@ class ProcessingResult:
     event_id: int | None = None
     decision: MatchDecision | None = None
     telemetry: EventTelemetry | None = None
-    idempotency_key: str | None = None
-    terminal: bool = True

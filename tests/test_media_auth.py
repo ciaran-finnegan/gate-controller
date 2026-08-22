@@ -134,10 +134,14 @@ class MediaAuthServerTests(unittest.TestCase):
 
         self.assertEqual(200, status)
 
-    def test_allows_only_the_two_blank_credential_loopback_rtsp_operations(self):
+    def test_allows_only_the_hot_stream_and_transcoder_loopback_rtsp_operations(self):
         now = int(time.time())
 
-        for action, path in (("read", "camera"), ("publish", "gate")):
+        for action, path in (
+            ("read", "camera"),
+            ("read", "clear"),
+            ("publish", "gate"),
+        ):
             with self.subTest(action=action, path=path):
                 body = json.dumps(local_rtsp_request(action, path)).encode("utf-8")
                 self.assertEqual(200, authorize_body(body, SECRET, now=now))
@@ -155,7 +159,11 @@ class MediaAuthServerTests(unittest.TestCase):
             ("action", "playback"),
             ("path", "other"),
         )
-        allowed = (("read", "camera"), ("publish", "gate"))
+        allowed = (
+            ("read", "camera"),
+            ("read", "clear"),
+            ("publish", "gate"),
+        )
 
         for action, path in allowed:
             for field, value in mutations:
@@ -166,7 +174,11 @@ class MediaAuthServerTests(unittest.TestCase):
                         401,
                         authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
                     )
-        for action, path in (("read", "gate"), ("publish", "camera")):
+        for action, path in (
+            ("read", "gate"),
+            ("publish", "camera"),
+            ("publish", "clear"),
+        ):
             with self.subTest(action=action, path=path):
                 payload = local_rtsp_request(action, path)
                 self.assertEqual(

@@ -406,7 +406,8 @@ GATE_MEDIA_TALKBACK_CONFIGURED=false
 ```
 
 The static gateway environment contains exactly these MediaMTX 1.19.3 overrides.
-`MTX_PATHS_CAMERA_SOURCE` must use `rtsp` or `rtsps`. Both ICE listeners must use
+`MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE` must use `rtsp` or
+`rtsps` and identify distinct Fluent and Clear paths. Both ICE listeners must use
 the same explicit, non-loopback, non-wildcard IP that is reachable on the Pi;
 hostnames are not accepted for binds. `MTX_WEBRTCADDITIONALHOSTS` must be that
 exact IP so MediaMTX can advertise the listeners while interface discovery is
@@ -415,6 +416,7 @@ both MediaMTX and the browser to use the generated relay.
 
 ```text
 MTX_PATHS_CAMERA_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_PATH
+MTX_PATHS_CLEAR_SOURCE=rtsp://REPLACE_USER:REPLACE_PASSWORD@REPLACE_CAMERA_IP:554/REPLACE_CLEAR_PATH
 MTX_WEBRTCLOCALUDPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCLOCALTCPADDRESS=REPLACE_PI_IP:8189
 MTX_WEBRTCADDITIONALHOSTS=REPLACE_PI_IP

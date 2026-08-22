@@ -1,21 +1,16 @@
 import logging
 import os
-from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 import signal
 from datetime import datetime, timezone
-from threading import Condition, Event, Lock, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep, time
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .images import rank_images, wait_until_readable
-from .reolink_snapshots import (
-    MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS, ReolinkSnapshotSampler,
-)
 from .telemetry import ftp_fallback_trigger
 
 
@@ -24,7 +19,6 @@ DEFAULT_MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 MAX_BURST_CANDIDATES = 16
 MAX_CANDIDATE_BYTES = 16 * 1024 * 1024
 MAX_STARTUP_ENTRIES = 128
-MAX_FINAL_OCR_CANDIDATES = 3
 _TRIGGER_UNSET = object()
 
 
@@ -36,140 +30,23 @@ class WorkerFailure(RuntimeError):
 
 
 class BoundedBurstQueue:
-    """Keep fresh FTP work in a lane that snapshots cannot displace."""
+    """A one-consumer queue that keeps the freshest pending camera work."""
 
-    def __init__(self, max_pending: int = 2, on_discard=None):
-        self._max_pending = max_pending
-        self._on_discard = on_discard
-        self._primary = deque()
-        self._augmentation = deque()
-        self._augmentation_reservations = 0
-        self._stopping = False
-        self._condition = Condition()
+    def __init__(self, max_pending: int = 2):
+        self._queue = Queue(maxsize=max_pending)
 
     def put(self, item):
-        if item is None:
-            self.stop()
-            return None
-        discard = False
-        with self._condition:
-            if self._stopping:
-                discard = True
-                dropped = None
-            else:
-                dropped = None
-                if len(self._primary) >= self._max_pending:
-                    dropped = self._primary.popleft()
-                self._primary.append(item)
-                self._condition.notify()
-        if discard:
-            self._discard((item,))
+        dropped = None
+        if self._queue.full():
+            try:
+                dropped = self._queue.get_nowait()
+            except Empty:
+                pass
+        self._queue.put(item)
         return dropped
 
-    def reserve_augmentation(self) -> bool:
-        with self._condition:
-            if self._stopping or self._augmentation_reservations >= self._max_pending:
-                return False
-            self._augmentation_reservations += 1
-            return True
-
-    def cancel_augmentation_reservation(self) -> None:
-        with self._condition:
-            if self._augmentation_reservations > len(self._augmentation):
-                self._augmentation_reservations -= 1
-
-    def put_augmentation(self, item):
-        discard = False
-        with self._condition:
-            if self._stopping:
-                discard = True
-            elif self._augmentation_reservations <= len(self._augmentation):
-                raise RuntimeError("augmentation queue slot was not reserved")
-            else:
-                self._augmentation.append(item)
-                self._condition.notify()
-        if discard:
-            self._discard((item,))
-        return None
-
-    def stop(self) -> None:
-        with self._condition:
-            if self._stopping:
-                return
-            self._stopping = True
-            discarded = tuple(self._primary) + tuple(self._augmentation)
-            self._primary.clear()
-            self._augmentation.clear()
-            self._augmentation_reservations = 0
-            self._condition.notify_all()
-        self._discard(discarded)
-
     def get(self):
-        with self._condition:
-            while (
-                not self._primary
-                and not self._augmentation
-                and not self._stopping
-            ):
-                self._condition.wait()
-            if self._stopping:
-                return None
-            if self._primary:
-                return self._primary.popleft()
-            if self._augmentation:
-                self._augmentation_reservations -= 1
-                return self._augmentation.popleft()
-            return None
-
-    def _discard(self, items) -> None:
-        if self._on_discard is None:
-            return
-        for item in items:
-            try:
-                self._on_discard(self, item)
-            except Exception:
-                LOGGER.exception("gate_burst_shutdown_cleanup_failed")
-
-
-@dataclass
-class ProgressiveTrigger:
-    received_at: datetime
-    release: object = lambda: None
-    primary_item: tuple | None = None
-    snapshots: tuple[Path, ...] | None = None
-    initial_result: object | None = None
-    failed: bool = False
-    finalized: bool = False
-    finalizing: bool = False
-    augmentation_submitted: bool = False
-    abandoned: bool = False
-    augmentation_started_at: float | None = None
-    augmentation_reason: str | None = None
-    terminalizer: object | None = None
-    trigger_summary: object | None = None
-    trigger_resolved: bool = False
-    _lock: Lock = field(default_factory=Lock, repr=False)
-    _released: bool = False
-
-    def release_once(self) -> None:
-        with self._lock:
-            if self._released:
-                return
-            self._released = True
-        self.release()
-
-
-@dataclass(frozen=True)
-class BurstWork:
-    kind: str
-    item: tuple
-    trigger: ProgressiveTrigger
-
-
-@dataclass(frozen=True)
-class CollectedBurst:
-    item: tuple
-    context: object
+        return self._queue.get()
 
 
 class BurstCollector:
@@ -178,7 +55,7 @@ class BurstCollector:
                  include_decision_started_at: bool = False,
                  include_processing_started_at: bool = False,
                  max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
-                 wall_clock=None, on_abandoned=None):
+                 wall_clock=None):
         if not 1 <= max_candidates <= MAX_BURST_CANDIDATES:
             raise ValueError("max_candidates exceeds the safe range")
         self._emit = emit
@@ -191,17 +68,14 @@ class BurstCollector:
         self._include_decision_started_at = include_decision_started_at
         self._include_processing_started_at = include_processing_started_at
         self._max_candidates = max_candidates
-        self._on_abandoned = on_abandoned
         self._pending: list[Path] = []
         self._received_at: datetime | None = None
         self._first_seen: float | None = None
         self._deadline: float | None = None
-        self._context = None
         self._lock = Lock()
 
     def add(self, path: Path, received_at: datetime | None = None) -> bool:
-        if not getattr(path, "_descriptor_anchored", False):
-            path = Path(path)
+        path = Path(path)
         dropped = None
         with self._lock:
             first_candidate = not self._pending
@@ -220,13 +94,6 @@ class BurstCollector:
             _remove_upload(dropped)
         return first_candidate
 
-    def bind_context(self, context) -> bool:
-        with self._lock:
-            if not self._pending or self._context is not None:
-                return False
-            self._context = context
-            return True
-
     def flush_due(self) -> bool:
         with self._lock:
             decision_started_at = self._clock()
@@ -236,18 +103,14 @@ class BurstCollector:
             pending = tuple(self._pending)
             received_at = self._received_at
             first_seen = self._first_seen
-            context = self._context
             self._pending = []
             self._received_at = None
             self._first_seen = None
             self._deadline = None
-            self._context = None
         ranked = tuple(self._ranker(pending))
         ranked_paths = set(ranked)
         _remove_uploads(path for path in pending if path not in ranked_paths)
         if not ranked:
-            if context is not None and self._on_abandoned is not None:
-                self._on_abandoned(context)
             return False
         wait_ms = (
             max(0, round((decision_started_at - first_seen) * 1_000))
@@ -267,10 +130,7 @@ class BurstCollector:
             details.append(decision_started_at)
         if self._include_processing_started_at:
             details.append(processing_started_at)
-        item = tuple(details) if len(details) > 1 else ranked
-        self._emit(
-            CollectedBurst(item, context) if context is not None else item
-        )
+        self._emit(tuple(details) if len(details) > 1 else ranked)
         return True
 
 
@@ -376,10 +236,7 @@ class CompletedImageHandler(FileSystemEventHandler):
                 with self._lock:
                     self._retry_at.pop(path, None)
                 if first_candidate:
-                    context = self._request_augmentation(received_at)
-                    bind_context = getattr(self._collector, "bind_context", None)
-                    if context is not None and callable(bind_context):
-                        bind_context(context)
+                    self._add_hot_frames(received_at)
                 completed += 1
             else:
                 with self._lock:
@@ -388,26 +245,21 @@ class CompletedImageHandler(FileSystemEventHandler):
                                                 attempts + 1, received_at)
         return completed
 
-    def _request_augmentation(self, received_at: datetime):
-        request = "disabled"
-        context = None
-        if self._on_first_completed is not None:
-            try:
-                result = self._on_first_completed(received_at)
-                request = "skipped" if result is False else "accepted"
-                if result is not None and result is not False and result is not True:
-                    context = result
-            except Exception:
-                LOGGER.warning(
-                    "gate_camera source=camera_ftp subtype=unverified "
-                    "augmentation_request=failed reason=request_error"
-                )
-                return None
-        LOGGER.info(
-            "gate_camera source=camera_ftp subtype=unverified augmentation_request=%s",
-            request,
-        )
-        return context
+    def _add_hot_frames(self, received_at: datetime) -> None:
+        if self._on_first_completed is None:
+            return
+        selected = ()
+        added = 0
+        try:
+            selected = tuple(self._on_first_completed(received_at) or ())
+            for path in selected[:3]:
+                self._collector.add(Path(path), received_at)
+                added += 1
+            _remove_uploads(Path(path) for path in selected[3:])
+            LOGGER.info("gate_hot_stream added_to_burst=%d", added)
+        except Exception:
+            _remove_uploads(Path(path) for path in selected[added:])
+            LOGGER.warning("gate_hot_stream added_to_burst=0 reason=selection_error")
 
     def _too_large(self, path: Path) -> bool:
         try:
@@ -443,9 +295,6 @@ class StartupReconciler:
             if entry is None:
                 return False
             path = Path(entry.path)
-            ignores = getattr(self._handler, "ignores", None)
-            if callable(ignores) and ignores(path):
-                continue
             if entry.is_dir(follow_symlinks=False):
                 self._entries.append(os.scandir(path))
                 continue
@@ -507,17 +356,12 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                max_image_age: float = 8.0, on_skipped=None, on_error=None,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
-               on_timed_skipped=None, snapshot_sampling=None,
-               trigger_resolver=None) -> None:
+               on_timed_skipped=None, trigger_resolver=None,
+               hot_frame_provider=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
-    bursts = BoundedBurstQueue(
-        max_pending_bursts,
-        on_discard=lambda queue, item: _discard_burst_work(item, queue),
-    )
+    bursts = BoundedBurstQueue(max_pending_bursts)
 
     def report_dropped(item, reason):
-        if isinstance(item, BurstWork):
-            item = item.item
         paths, received_at, *timing = item
         options = {}
         if trigger_resolver is not None:
@@ -536,81 +380,20 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         on_skipped(paths, reason, received_at, **options)
 
     def enqueue(item):
-        work = (
-            BurstWork("primary", item.item, item.context)
-            if isinstance(item, CollectedBurst) else item
-        )
-        dropped = bursts.put(work)
+        dropped = bursts.put(item)
         if dropped is not None:
             try:
                 report_dropped(dropped, "queue_coalesced")
             finally:
-                dropped_item = dropped.item if isinstance(dropped, BurstWork) else dropped
-                _remove_uploads(dropped_item[0])
-                if isinstance(dropped, BurstWork):
-                    _abandon_progressive_trigger(dropped.trigger, bursts)
+                _remove_uploads(dropped[0])
 
-    collector_options = {
-        "quiet_window": quiet_window,
-        "ranker": lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
-        "include_received_at": True,
-        "include_decision_started_at": True,
-        "include_processing_started_at": True,
-        "max_candidates": max_burst_candidates,
-        "on_abandoned": lambda trigger: _abandon_progressive_trigger(
-            trigger, bursts
-        ),
-    }
-    collector = BurstCollector(enqueue, **collector_options)
-    sampler = None
-    progressive_triggers = {}
-    progressive_triggers_lock = Lock()
-    sampling_enabled = bool(snapshot_sampling is not None and snapshot_sampling.enabled)
-
-    def release_trigger(key, trigger):
-        with progressive_triggers_lock:
-            if progressive_triggers.get(key) is trigger:
-                progressive_triggers.pop(key, None)
-
-    def complete_augmentation(paths, received_at):
-        paths = tuple(paths)
-        key = id(received_at)
-        with progressive_triggers_lock:
-            trigger = progressive_triggers.get(key)
-        if trigger is None:
-            _remove_uploads(paths)
-            return
-        with trigger._lock:
-            if trigger.abandoned:
-                _remove_uploads(paths)
-                return
-            trigger.snapshots = paths
-            trigger.augmentation_submitted = True
-            work = BurstWork(
-                "augmentation", (paths, trigger.received_at), trigger
-            )
-        bursts.put_augmentation(work)
-
-    if snapshot_sampling is not None:
-        sampler = ReolinkSnapshotSampler(snapshot_sampling, complete_augmentation)
-
-    def request_augmentation(received_at):
-        if sampler is None or not bursts.reserve_augmentation():
-            return False
-        key = id(received_at)
-        trigger = ProgressiveTrigger(
-            received_at, augmentation_started_at=monotonic(),
-        )
-        trigger.release = lambda: release_trigger(key, trigger)
-        with progressive_triggers_lock:
-            progressive_triggers[key] = trigger
-        if sampler.request(received_at):
-            return trigger
-        with progressive_triggers_lock:
-            progressive_triggers.pop(key, None)
-        bursts.cancel_augmentation_reservation()
-        return False
-
+    collector = BurstCollector(
+        enqueue, quiet_window=quiet_window,
+        ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
+        include_received_at=True, include_decision_started_at=True,
+        include_processing_started_at=True,
+        max_candidates=max_burst_candidates,
+    )
     handler = CompletedImageHandler(
         collector,
         on_rejected=(
@@ -618,8 +401,13 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         ) if on_skipped else None,
         max_candidate_bytes=max_candidate_bytes,
         max_pending_candidates=max_burst_candidates,
-        on_first_completed=request_augmentation if sampling_enabled else None,
-        ignored_roots=(sampler.output_directory,) if sampling_enabled else (),
+        on_first_completed=(
+            hot_frame_provider.select if hot_frame_provider is not None else None
+        ),
+        ignored_roots=(
+            (hot_frame_provider.output_directory,)
+            if hot_frame_provider is not None else ()
+        ),
     )
     observer = Observer()
     observer.schedule(handler, str(directory), recursive=True)
@@ -637,14 +425,6 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
               stop_event, failures),
         daemon=True, name="GateBurstProcessor",
     )
-    sampling_thread = (
-        Thread(
-            target=_supervise_worker,
-            args=("ReolinkSnapshotSampler", sampler.run_forever, (stop_event,),
-                  stop_event, failures),
-            daemon=True, name="ReolinkSnapshotSampler",
-        ) if sampling_enabled else None
-    )
     background_threads = [
         Thread(
             target=_supervise_worker,
@@ -661,7 +441,6 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     startup_reconciler = None
     startup_reconciliation_pending = False
     processing_started = False
-    sampling_started = False
     started_background_threads = []
     try:
         observer.start()
@@ -675,9 +454,6 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         startup_reconciliation_pending = startup_reconciler.run_batch()
         processing_thread.start()
         processing_started = True
-        if sampling_thread is not None:
-            sampling_thread.start()
-            sampling_started = True
         for thread in background_threads:
             thread.start()
             started_background_threads.append(thread)
@@ -694,7 +470,6 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         pass
     finally:
         stop_event.set()
-        bursts.put(None)
         try:
             if shutdown is not None:
                 shutdown()
@@ -705,13 +480,13 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 if observer_started:
                     observer.stop()
                     observer.join()
-                if sampling_started:
-                    sampling_thread.join(
-                        timeout=MAX_REOLINK_SNAPSHOT_TIMEOUT_SECONDS + 0.5
-                    )
-                if sampler is not None:
-                    sampler.close()
                 if processing_started:
+                    dropped = bursts.put(None)
+                    if dropped is not None:
+                        try:
+                            report_dropped(dropped, "service_stopping")
+                        finally:
+                            _remove_uploads(dropped[0])
                     processing_thread.join(timeout=5)
                 for thread in started_background_threads:
                     thread.join(timeout=1)
@@ -735,11 +510,6 @@ def _process_bursts(
         item = bursts.get()
         if item is None:
             return
-        if isinstance(item, BurstWork):
-            _process_progressive_work(
-                item, emit, on_error, bursts, ranker, trigger_resolver,
-            )
-            continue
         paths, received_at, *timing = item
         trigger_summary = _TRIGGER_UNSET
         try:
@@ -758,188 +528,12 @@ def _process_bursts(
             _remove_uploads(paths)
 
 
-def _process_progressive_work(
-    work: BurstWork, emit, on_error, bursts, ranker, trigger_resolver=None,
-) -> None:
-    trigger = work.trigger
-    paths, received_at, *timing = work.item
-    paths = tuple(paths)
-    if work.kind == "augmentation":
-        with trigger._lock:
-            already_finalized = trigger.finalized
-            trigger.snapshots = paths
-            waiting_for_primary = (
-                trigger.initial_result is None and not trigger.failed
-            )
-        if already_finalized:
-            _cleanup_progressive_trigger(trigger, paths)
-            return
-        if waiting_for_primary:
-            return
-        _finalize_progressive_trigger(trigger, emit, on_error, ranker)
-        return
-
-    with trigger._lock:
-        trigger.primary_item = (paths, received_at, *timing)
-        trigger.terminalizer = lambda: _finalize_progressive_trigger(
-            trigger, emit, on_error, ranker,
-        )
-    options = {"final": False}
-    if trigger_resolver is not None:
-        trigger_summary = _resolve_trigger(trigger_resolver, received_at)
-        with trigger._lock:
-            trigger.trigger_summary = trigger_summary
-            trigger.trigger_resolved = True
-        options["trigger"] = trigger_summary
-    try:
-        result = emit(paths, received_at, *timing, **options)
-    except Exception as error:
-        _report_processing_error(
-            on_error, paths, error, received_at,
-            trigger.trigger_summary if trigger.trigger_resolved else _TRIGGER_UNSET,
-        )
-        _remove_uploads(paths)
-        _abandon_progressive_trigger(trigger, bursts)
-        return
-    with trigger._lock:
-        trigger.initial_result = result
-        snapshots = trigger.snapshots
-        abandoned = trigger.abandoned
-    if getattr(result, "terminal", True):
-        _remove_uploads(paths)
-        _abandon_progressive_trigger(trigger, bursts)
-        return
-    if abandoned:
-        _finalize_progressive_trigger(trigger, emit, on_error, ranker)
-        return
-    if snapshots is not None:
-        _finalize_progressive_trigger(trigger, emit, on_error, ranker)
-
-
-def _finalize_progressive_trigger(trigger: ProgressiveTrigger, emit, on_error, ranker) -> None:
-    with trigger._lock:
-        if trigger.finalized or trigger.finalizing:
-            return
-        snapshots = trigger.snapshots or ()
-        primary_item = trigger.primary_item
-        failed = trigger.failed
-        result = trigger.initial_result
-        if primary_item is None or result is None:
-            if not failed:
-                return
-            trigger.finalizing = True
-            cleanup_paths = tuple(snapshots)
-            primary_item = None
-        else:
-            trigger.finalizing = True
-            cleanup_paths = tuple(primary_item[0]) + tuple(snapshots)
-        augmentation_started_at = trigger.augmentation_started_at
-        augmentation_reason = trigger.augmentation_reason
-    try:
-        if primary_item is None:
-            return
-        primary_paths, received_at, *timing = primary_item
-        if getattr(result, "terminal", True):
-            return
-        combined = tuple(primary_paths) + tuple(snapshots)
-        augmentation_failed = failed or not snapshots
-        selected = tuple(primary_paths)
-        if not augmentation_failed:
-            try:
-                selected = tuple(ranker(combined))[:MAX_FINAL_OCR_CANDIDATES]
-            except Exception as error:
-                _report_processing_error(
-                    on_error, combined, error, received_at,
-                    trigger.trigger_summary
-                    if trigger.trigger_resolved else _TRIGGER_UNSET,
-                )
-                augmentation_failed = True
-                augmentation_reason = "selection_error"
-            else:
-                augmentation_failed = not selected
-        options = {
-            "idempotency_key": result.idempotency_key,
-            "final": True,
-        }
-        if trigger.trigger_resolved:
-            options["trigger"] = trigger.trigger_summary
-        if augmentation_failed:
-            selected = tuple(primary_paths)
-            options["provisional_result"] = result
-            options["augmentation"] = {
-                "outcome": "failed",
-                "reason": augmentation_reason or (
-                    "empty" if not snapshots else "selection_empty"
-                ),
-                "candidate_count": len(snapshots),
-                "duration_ms": _augmentation_duration_ms(augmentation_started_at),
-            }
-        else:
-            options["augmentation"] = {
-                "outcome": "completed",
-                "reason": "completed",
-                "candidate_count": len(snapshots),
-                "duration_ms": _augmentation_duration_ms(augmentation_started_at),
-                "correlation": result.idempotency_key,
-            }
-        try:
-            emit(selected, received_at, *timing, **options)
-        except Exception as error:
-            _report_processing_error(
-                on_error, combined, error, received_at,
-                trigger.trigger_summary
-                if trigger.trigger_resolved else _TRIGGER_UNSET,
-            )
-    finally:
-        _cleanup_progressive_trigger(trigger, cleanup_paths)
-        with trigger._lock:
-            trigger.finalizing = False
-            trigger.finalized = True
-
-
 def _resolve_trigger(trigger_resolver, received_at):
     try:
         return trigger_resolver(received_at)
     except Exception:
         LOGGER.warning("gate_camera trigger_correlation=failed", exc_info=True)
         return ftp_fallback_trigger()
-
-
-def _abandon_progressive_trigger(
-    trigger: ProgressiveTrigger, bursts: BoundedBurstQueue, reason: str = "abandoned",
-) -> None:
-    with trigger._lock:
-        if trigger.abandoned:
-            return
-        trigger.abandoned = True
-        trigger.failed = True
-        trigger.augmentation_reason = reason
-        snapshots = trigger.snapshots or ()
-        cancel_reservation = not trigger.augmentation_submitted
-        result = trigger.initial_result
-        terminalizer = trigger.terminalizer
-        primary_item = trigger.primary_item
-    if cancel_reservation:
-        bursts.cancel_augmentation_reservation()
-    if result is not None and not getattr(result, "terminal", True) and terminalizer:
-        terminalizer()
-        return
-    primary_paths = primary_item[0] if primary_item is not None else ()
-    _cleanup_progressive_trigger(trigger, tuple(primary_paths) + tuple(snapshots))
-
-
-def _discard_burst_work(item, bursts: BoundedBurstQueue) -> None:
-    if isinstance(item, BurstWork):
-        _abandon_progressive_trigger(item.trigger, bursts, reason="shutdown")
-        _remove_uploads(item.item[0])
-        return
-    _remove_uploads(item[0])
-
-
-def _augmentation_duration_ms(started_at: float | None) -> int:
-    if started_at is None:
-        return 0
-    return max(0, round((monotonic() - started_at) * 1_000))
 
 
 def _report_processing_error(
@@ -954,20 +548,6 @@ def _report_processing_error(
             on_error(paths, error, received_at, trigger=trigger)
     except Exception:
         LOGGER.exception("gate_burst_error_handler_failed")
-
-
-def _cleanup_progressive_trigger(trigger: ProgressiveTrigger, paths) -> None:
-    try:
-        _remove_uploads(paths)
-    except Exception:
-        LOGGER.exception("gate_burst_cleanup_failed")
-    finally:
-        try:
-            trigger.release_once()
-        except Exception:
-            LOGGER.exception("gate_burst_release_failed")
-
-
 def _supervise_worker(name, target, args, stop_event, failures) -> None:
     try:
         target(*args)
@@ -1000,9 +580,6 @@ def _remove_uploads(paths) -> None:
 
 def _remove_upload(path: Path) -> None:
     try:
-        if getattr(path, "_descriptor_anchored", False):
-            path.unlink(missing_ok=True)
-        else:
-            Path(path).unlink(missing_ok=True)
+        Path(path).unlink(missing_ok=True)
     except OSError as error:
         LOGGER.warning("camera_upload_cleanup_failed path=%s error=%s", path, error)

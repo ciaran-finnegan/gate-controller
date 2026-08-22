@@ -65,6 +65,7 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn('webrtcLocalUDPAddress: ""', config)
         self.assertIn('webrtcLocalTCPAddress: ""', config)
         self.assertIn("  camera: {}", config)
+        self.assertIn("  clear: {}", config)
         self.assertIn("gate:", config)
         self.assertIn("    source: publisher", config)
         self.assertIn("    overridePublisher: false", config)
@@ -1485,6 +1486,7 @@ finally:
         )
         gateway.write_text(
             "MTX_PATHS_CAMERA_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/stream\n"
+            "MTX_PATHS_CLEAR_SOURCE=rtsp://camera-user:camera-pass@10.0.0.10:554/clear\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
@@ -1564,6 +1566,7 @@ prepare_gateway_environments
             self.assertEqual(
                 {
                     "MTX_PATHS_CAMERA_SOURCE",
+                    "MTX_PATHS_CLEAR_SOURCE",
                     "MTX_WEBRTCLOCALUDPADDRESS",
                     "MTX_WEBRTCLOCALTCPADDRESS",
                     "MTX_WEBRTCADDITIONALHOSTS",
