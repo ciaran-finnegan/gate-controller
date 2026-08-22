@@ -141,29 +141,6 @@ class OcrAttemptTelemetry:
 
 
 @dataclass(frozen=True)
-class AugmentationTelemetry:
-    outcome: str
-    reason: str
-    candidate_count: int
-    duration_ms: float
-    correlation: str | None = None
-
-    def to_wire(self) -> dict[str, object]:
-        payload = {
-            "outcome": _token(self.outcome),
-            "reason": _token(self.reason),
-            "candidate_count": _rounded_int(
-                self.candidate_count, 0, MAX_ITEMS, 0,
-            ),
-            "duration_ms": _duration(self.duration_ms) or 0,
-        }
-        correlation = _optional_string(self.correlation)
-        if correlation is not None:
-            payload["correlation"] = correlation
-        return payload
-
-
-@dataclass(frozen=True)
 class TriggerTelemetry:
     source: str
     event_type: str
@@ -285,7 +262,6 @@ class EventTelemetry:
     outbox_attempt: int
     delivery_state: str
     stage_timestamps: StageTimestamps = field(default_factory=StageTimestamps)
-    augmentation: AugmentationTelemetry | None = None
     trigger: TriggerTelemetry | None = None
 
     def __post_init__(self) -> None:
@@ -335,8 +311,6 @@ class EventTelemetry:
         timestamps = self.stage_timestamps.to_wire()
         if timestamps:
             payload["stage_timestamps"] = timestamps
-        if self.augmentation is not None:
-            payload["augmentation"] = self.augmentation.to_wire()
         if self.trigger is not None:
             payload["trigger"] = self.trigger.to_wire()
         return payload
@@ -377,7 +351,6 @@ class ProcessingTrace:
         self._actuation_claim = "not_requested"
         self._actuation_attempted = False
         self._relay_outcome = "not_attempted"
-        self._augmentation: AugmentationTelemetry | None = None
         self._trigger: TriggerTelemetry | None = None
         self._finished_telemetry: EventTelemetry | None = None
 
@@ -413,9 +386,6 @@ class ProcessingTrace:
     def mark_burst(self) -> None:
         if self._burst is None:
             self._burst = self._monotonic_clock()
-
-    def set_augmentation(self, augmentation: AugmentationTelemetry | None) -> None:
-        self._augmentation = augmentation
 
     def set_trigger(self, trigger: TriggerTelemetry | None) -> None:
         self._trigger = trigger
@@ -535,7 +505,6 @@ class ProcessingTrace:
                 relay_finished_at=self._wall_at(self._relay_finished),
                 processing_finished_at=self._wall_at(self._finished),
             ),
-            augmentation=self._augmentation,
             trigger=self._trigger,
         )
         return self._finished_telemetry

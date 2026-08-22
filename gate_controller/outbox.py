@@ -37,11 +37,11 @@ class EvidenceSpool:
     def __init__(self, root: Path):
         self.root = Path(root)
 
-    def stage(self, source_path) -> str:
+    def stage(self, source_path: Path) -> str:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
-                encoded = _normalise_jpeg(source_path)
+                encoded = _normalise_jpeg(Path(source_path))
         except Exception as error:
             raise EvidenceSpoolError(
                 f"could not prepare JPEG evidence: {source_path}"
@@ -205,20 +205,18 @@ def _is_ingest_acknowledgement(value: object) -> bool:
     )
 
 
-def _normalise_jpeg(source_path) -> bytes | None:
-    with source_path.open("rb") as source_file:
-        if source_file.read(3) != b"\xff\xd8\xff":
+def _normalise_jpeg(path: Path) -> bytes | None:
+    if not path.is_file() or not _has_jpeg_signature(path):
+        return None
+    with Image.open(path) as source:
+        if source.format != "JPEG":
             return None
-        source_file.seek(0)
-        with Image.open(source_file) as source:
-            if source.format != "JPEG":
-                return None
-            image = ImageOps.exif_transpose(source).convert("RGB")
-            image.thumbnail(
-                (MAX_OUTBOX_IMAGE_DIMENSION, MAX_OUTBOX_IMAGE_DIMENSION),
-                Image.Resampling.LANCZOS,
-            )
-            return _bounded_jpeg(image)
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail(
+            (MAX_OUTBOX_IMAGE_DIMENSION, MAX_OUTBOX_IMAGE_DIMENSION),
+            Image.Resampling.LANCZOS,
+        )
+        return _bounded_jpeg(image)
 
 
 def _bounded_jpeg(image: Image.Image) -> bytes | None:
@@ -236,6 +234,14 @@ def _bounded_jpeg(image: Image.Image) -> bytes | None:
             break
         working = working.resize((width, height), Image.Resampling.LANCZOS)
     return None
+
+
+def _has_jpeg_signature(path: Path) -> bool:
+    try:
+        with Path(path).open("rb") as source:
+            return source.read(3) == b"\xff\xd8\xff"
+    except OSError:
+        return False
 
 
 class TelemetryRetentionWorker:

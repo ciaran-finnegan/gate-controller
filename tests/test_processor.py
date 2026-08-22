@@ -979,103 +979,6 @@ class GateProcessorTests(unittest.TestCase):
                 "reason": reason,
             })
 
-    def test_empty_augmentation_terminalizes_the_provisional_recognition_trace(self):
-        received_at = datetime(2026, 8, 20, 11, 15, tzinfo=timezone.utc)
-        relay_calls = []
-        with tempfile.TemporaryDirectory() as directory:
-            frame = Path(directory) / "ftp.jpg"
-            frame.write_bytes(b"ftp-candidate")
-            store = LocalStore(Path(directory) / "gate.db")
-            processor = self._processor(
-                store,
-                RecordingRelay(relay_calls),
-                StaticRecognizer(PlateObservation("NOPE", 0.87)),
-                clock=lambda: received_at,
-            )
-            quality = FrameTelemetry(
-                sequence=0,
-                digest="0" * 64,
-                width=16,
-                height=8,
-                sharpness=0.4,
-                brightness=0.5,
-                darkness=0.1,
-                highlight_clipping=0.0,
-            )
-            with patch(
-                "gate_controller.processor.measure_frame_quality",
-                return_value=quality,
-            ):
-                provisional = processor.process(
-                    (frame,), received_at=received_at, final=False,
-                )
-                terminal = processor.process(
-                    (frame,),
-                    received_at=received_at,
-                    idempotency_key=provisional.idempotency_key,
-                    provisional_result=provisional,
-                    augmentation={
-                        "outcome": "failed",
-                        "reason": "empty",
-                        "candidate_count": 0,
-                        "duration_ms": 42,
-                    },
-                )
-            persisted = store.event_telemetry(terminal.event_id)
-
-        self.assertFalse(provisional.terminal)
-        self.assertTrue(terminal.terminal)
-        self.assertEqual(terminal.reason, provisional.reason)
-        self.assertEqual(terminal.decision, provisional.decision)
-        self.assertEqual(relay_calls, [])
-        self.assertEqual(persisted["frames"], provisional.telemetry.to_wire()["frames"])
-        self.assertEqual(
-            persisted["ocr_attempts"], provisional.telemetry.to_wire()["ocr_attempts"],
-        )
-        self.assertEqual(
-            persisted["stage_durations"],
-            provisional.telemetry.to_wire()["stage_durations"],
-        )
-        self.assertEqual(persisted["decision"], provisional.telemetry.to_wire()["decision"])
-        self.assertEqual(persisted["augmentation"], {
-            "outcome": "failed",
-            "reason": "empty",
-            "candidate_count": 0,
-            "duration_ms": 42,
-        })
-
-    def test_successful_augmentation_is_persisted_with_correlation(self):
-        received_at = datetime(2026, 8, 20, 12, 45, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as directory:
-            frame = self._jpeg(directory, "snapshot.jpg")
-            store = LocalStore(Path(directory) / "gate.db")
-            result = self._processor(
-                store,
-                RecordingRelay([]),
-                StaticRecognizer(PlateObservation(None, 0.0)),
-                clock=lambda: received_at,
-            ).process(
-                (frame,),
-                received_at=received_at,
-                augmentation={
-                    "outcome": "completed",
-                    "reason": "completed",
-                    "candidate_count": 2,
-                    "duration_ms": 37,
-                    "correlation": "ftp-trigger",
-                },
-            )
-            persisted = store.event_telemetry(result.event_id)
-
-        self.assertFalse(result.opened)
-        self.assertEqual(persisted["augmentation"], {
-            "outcome": "completed",
-            "reason": "completed",
-            "candidate_count": 2,
-            "duration_ms": 37,
-            "correlation": "ftp-trigger",
-        })
-
     def test_direct_skip_trace_factory_failure_still_records_the_event(self):
         def fail_factory(**kwargs):
             raise RuntimeError("trace creation failed")
@@ -1196,6 +1099,27 @@ class GateProcessorTests(unittest.TestCase):
 
             self.assertTrue(first.opened)
             self.assertFalse(second.opened)
+            self.assertEqual(second.reason, "duplicate_event")
+            self.assertEqual(calls, ["relay"])
+
+    def test_explicit_ftp_identity_deduplicates_different_ranked_hot_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            store = LocalStore(Path(directory) / "gate.db")
+            ftp = self._jpeg(directory, "ftp.jpg", 128)
+            first_hot = self._jpeg(directory, "first-hot.jpg", 32)
+            second_hot = self._jpeg(directory, "second-hot.jpg", 224)
+            ftp_identity = hashlib.sha256(ftp.read_bytes()).hexdigest()
+            processor = self._processor(
+                store,
+                RecordingRelay(calls),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+            )
+
+            first = processor.process((first_hot, ftp), idempotency_key=ftp_identity)
+            second = processor.process((second_hot, ftp), idempotency_key=ftp_identity)
+
+            self.assertTrue(first.opened)
             self.assertEqual(second.reason, "duplicate_event")
             self.assertEqual(calls, ["relay"])
 
@@ -2187,109 +2111,6 @@ class GateProcessorTests(unittest.TestCase):
 
             self.assertTrue(first.opened)
             self.assertTrue(second.opened)
-
-    def test_progressive_snapshot_reuses_the_ftp_trigger_single_actuation_claim(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ftp = self._jpeg(directory, "ftp.jpg", 32)
-            snapshot = self._jpeg(directory, "snapshot.jpg", 224)
-            calls = []
-            now = [datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)]
-            store = LocalStore(root / "gate.db")
-            processor = self._processor(
-                store,
-                RecordingRelay(calls),
-                StaticRecognizer(PlateObservation("12D3456", 0.95)),
-                cooldown=timedelta(seconds=0),
-                max_image_age=timedelta(minutes=5),
-                clock=lambda: now[0],
-                outbox=object(),
-            )
-
-            initial = processor.process((ftp,), final=False)
-            now[0] += timedelta(minutes=1)
-            augmented = processor.process(
-                (ftp, snapshot),
-                idempotency_key=initial.idempotency_key,
-                final=True,
-            )
-
-            self.assertTrue(initial.opened)
-            self.assertTrue(initial.terminal)
-            self.assertEqual(augmented.reason, "duplicate_event")
-            self.assertEqual(initial.event_id, store.event_id(initial.idempotency_key))
-            self.assertEqual(store.pending_outbox_count(), 1)
-            self.assertEqual(calls, ["relay"])
-
-    def test_improvable_ftp_denial_is_provisional_until_snapshots_finalize_its_key(self):
-        class PathRecognizer:
-            def recognise(self, path):
-                if Path(path).name == "snapshot.jpg":
-                    return PlateObservation("12D3456", 0.95)
-                return PlateObservation(None, 0.0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ftp = self._jpeg(directory, "ftp.jpg", 32)
-            snapshot = self._jpeg(directory, "snapshot.jpg", 224)
-            calls = []
-            store = LocalStore(root / "gate.db")
-            processor = self._processor(
-                store,
-                RecordingRelay(calls),
-                PathRecognizer(),
-                cooldown=timedelta(seconds=0),
-                max_image_age=timedelta(minutes=5),
-            )
-
-            initial = processor.process((ftp,), final=False)
-
-            self.assertEqual(initial.reason, "no_match")
-            self.assertFalse(initial.terminal)
-            self.assertIsNone(initial.event_id)
-            self.assertFalse(store.event_exists(initial.idempotency_key))
-            self.assertEqual(calls, [])
-
-            augmented = processor.process(
-                (ftp, snapshot),
-                idempotency_key=initial.idempotency_key,
-                final=True,
-            )
-
-            self.assertTrue(augmented.opened)
-            self.assertTrue(augmented.terminal)
-            self.assertEqual(store.event_id(initial.idempotency_key), augmented.event_id)
-            self.assertEqual(calls, ["relay"])
-
-    def test_empty_augmentation_terminally_persists_original_without_repeating_ocr(self):
-        class CountingRecognizer:
-            def __init__(self):
-                self.calls = 0
-
-            def recognise(self, path):
-                self.calls += 1
-                return PlateObservation(None, 0.0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            image = self._jpeg(directory, "ftp.jpg")
-            recognizer = CountingRecognizer()
-            store = LocalStore(Path(directory) / "gate.db")
-            processor = self._processor(
-                store, RecordingRelay([]), recognizer,
-            )
-            initial = processor.process((image,), final=False)
-
-            finalized = processor.process(
-                (image,), idempotency_key=initial.idempotency_key, final=True,
-                provisional_result=initial,
-            )
-
-            self.assertEqual(recognizer.calls, 1)
-            self.assertTrue(finalized.terminal)
-            self.assertEqual(finalized.reason, "no_match")
-            self.assertEqual(
-                finalized.event_id, store.event_id(initial.idempotency_key)
-            )
 
     def test_reordered_frames_with_the_same_content_are_a_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:

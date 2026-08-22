@@ -121,6 +121,7 @@ def _allows_local_rtsp(payload: dict) -> bool:
         return False
     return (payload["action"], payload["path"]) in {
         ("read", "camera"),
+        ("read", "clear"),
         ("publish", "gate"),
     }
 

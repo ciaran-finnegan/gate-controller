@@ -307,6 +307,7 @@ configure_turn_refresh_timer
             self.assertIn(b"MTX_WEBRTCICESERVERS2_0_USERNAME=new-short-lived-user\n", after)
             self.assertIn(b"MTX_WEBRTCICESERVERS2_0_PASSWORD=new-short-lived-password\n", after)
             self.assertNotIn(b"MTX_PATHS_CAMERA_SOURCE", after)
+            self.assertNotIn(b"MTX_PATHS_CLEAR_SOURCE", after)
             self.assertNotIn(b"long-term-api-token", after)
             self.assertEqual(0o600, runtime_turn.stat().st_mode & 0o777)
             self.assertEqual(
@@ -526,6 +527,7 @@ configure_turn_refresh_timer
         )
         gateway.write_text(
             "MTX_PATHS_CAMERA_SOURCE=rtsp://camera:password@10.0.0.10:554/live\n"
+            "MTX_PATHS_CLEAR_SOURCE=rtsp://camera:password@10.0.0.10:554/clear\n"
             "MTX_WEBRTCLOCALUDPADDRESS=10.0.0.5:8189\n"
             "MTX_WEBRTCADDITIONALHOSTS=10.0.0.5\n"
             "MTX_WEBRTCLOCALTCPADDRESS=10.0.0.5:8189\n"

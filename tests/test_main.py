@@ -22,6 +22,97 @@ from gate_controller.store import LocalStore
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def test_hot_stream_close_failure_cannot_skip_controller_safety_shutdown(self):
+        calls = []
+
+        class HotStream:
+            def close(self):
+                calls.append("hot_close")
+                raise OSError("child unavailable")
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                return True
+
+        with self.assertLogs("gate_controller.__main__", level="WARNING"):
+            safe = gate_main._shutdown_controller_with_hot_stream(
+                HotStream(), Processor(), Relay(),
+            )
+
+        self.assertTrue(safe)
+        self.assertEqual(calls, [
+            "hot_close", "relay_begin_shutdown", "processor_close", "relay_shutdown",
+        ])
+
+    def test_main_starts_and_selects_from_one_shared_hot_stream_buffer(self):
+        hot_buffer = object()
+        hot_config = type("Config", (), {"enabled": True})()
+        base_worker = object()
+        with patch.dict(
+            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "load_hot_stream_config", return_value=hot_config,
+        ), patch.object(
+            gate_main, "HotStreamBuffer", return_value=hot_buffer,
+        ), patch.object(
+            gate_main, "build_background_workers",
+            return_value=((base_worker,), object(), object()),
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker") as run_worker:
+            gate_main.main()
+
+        self.assertIn(hot_buffer, run_worker.call_args.kwargs["background_workers"])
+        self.assertIs(hot_buffer, run_worker.call_args.kwargs["hot_frame_provider"])
+
+    def test_status_exposes_only_nonsecret_effective_hot_stream_health(self):
+        store = self.create_store()
+
+        class HotStream:
+            def status(self):
+                return {
+                    "enabled": True,
+                    "ready": True,
+                    "stream": "clear",
+                    "sample_fps": 5.0,
+                    "source_profile": {
+                        "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+                    },
+                    "latest_frame_age_ms": 92,
+                    "buffered_frames": 8,
+                    "restart_count": 0,
+                }
+
+        status = gate_main._controller_status(
+            store, type("Prompt", (), {"available": False})(), {},
+            hot_stream=HotStream(),
+        )
+
+        self.assertTrue(status["recognition"]["hot_stream"]["ready"])
+        self.assertEqual(3840, status["recognition"]["hot_stream"]["source_profile"]["width"])
+        self.assertNotIn("source_url", str(status))
+
     def test_reolink_trigger_pipeline_has_no_relay_or_authorisation_dependency(self):
         correlator, workers = build_reolink_trigger_pipeline({
             "GATE_REOLINK_WEBHOOK_SECRET": "correct-horse-battery-staple",
@@ -111,7 +202,6 @@ class MainConfigurationTests(unittest.TestCase):
             run_worker.call_args.kwargs["on_timed_skipped"],
             run_worker.call_args.kwargs["on_skipped"],
         )
-        self.assertFalse(run_worker.call_args.kwargs["snapshot_sampling"].enabled)
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -617,13 +707,6 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertIn("GATE_MAX_BURST_CANDIDATES=8", example)
         self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_BASE_URL=", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_USERNAME=", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_PASSWORD=", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=false", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_COUNT=2", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS=2.25", example)
-        self.assertIn("GATE_REOLINK_SNAPSHOT_MAX_BYTES=4194304", example)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@
 
 Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
 VLAN. Give the camera a DHCP reservation and allow it to initiate FTP uploads
-to the Pi only. When snapshot augmentation is enabled, also allow only the Pi
-to initiate HTTPS (TCP/443) requests to the camera's reserved private address.
+to the Pi. Allow only the Pi media gateway to initiate RTSP requests to the
+camera's reserved private address.
 Do not forward RTSP, ONVIF, the Reolink web interface, FTP, HTTPS, or the Pi GPIO
 interface to the internet. Remote users use the authenticated web application,
 which sends an Access-protected request through Cloudflare Tunnel to the Pi's
@@ -15,7 +15,8 @@ Use a dedicated `ftp-user` with a home or upload directory at
 `/var/lib/gate-controller/uploads`. Limit the FTP service to the camera VLAN
 and the camera address where possible. Use FTPS when both camera firmware and
 the FTP server support it. The controller only accepts completed `.jpg` or
-`.jpeg` files. Its recognition burst does not depend on RTSP.
+`.jpeg` files. FTP remains the trigger; recent OCR candidates come from the
+continuously decoded clear RTSP stream when it is healthy.
 
 Create `ftp-user` before running the gate-controller bootstrap. Bootstrap adds
 it to the `gate-controller` group and creates the upload directory with setgid
@@ -50,8 +51,8 @@ Do not label it as line crossing without a separate authenticated event signal.
 The camera can send metadata about the rule that caused an upload to the
 controller's bounded webhook endpoint. This metadata is observability only: it
 never authorizes a vehicle, changes matching, invokes the relay, or actuates the
-gate. The initial FTP recognition does not wait for the webhook or for optional
-snapshot work; the controller performs a nearest-event lookup from bounded
+gate. The initial FTP recognition does not wait for the webhook or any new
+camera connection; the controller performs a nearest-event lookup from bounded
 in-memory state and otherwise retains the `camera_ftp/unverified` fallback.
 
 Put a random 20-128 character secret in the root-readable
@@ -100,56 +101,34 @@ Keep that baseline fixed while collecting matched and unverified events; change
 one camera variable at a time only after comparing missed entries and false
 positives across day, night, rain, and headlights.
 
-## Optional HTTPS Snapshot Augmentation
+## Continuously Hot Recognition Stream
 
-The controller can use the Reolink HTTPS Snap API to collect a later bounded
-sample without delaying the first FTP OCR attempt. Put these settings in the
-root-readable `/etc/gate-controller.env` file:
+MediaMTX continuously pulls both camera profiles: `camera` is Fluent and
+`clear` is Clear. The controller keeps one ffmpeg decoder attached to the
+loopback clear path from service startup, so an FTP event never opens a new
+stream or waits for the camera's roughly five-second keyframe interval.
+
+The decoder samples Clear at 5 fps into an eight-frame, byte-bounded in-memory
+ring. On the first completed FTP JPEG, the three newest distinct clear frames
+are materialised into an owner-only ignored directory and added to the same
+200 ms burst. FTP and clear frames are quality-ranked together before the normal
+maximum-three cloud OCR requests. There is no on-trigger HTTPS request, second
+OCR queue, or additional recognition cooldown. If the stream is unavailable,
+the original FTP/cloud path proceeds unchanged.
+
+Enable the reviewed preset in `/etc/gate-controller.env`:
 
 ```sh
-GATE_REOLINK_SNAPSHOT_BASE_URL=https://192.168.0.54
-GATE_REOLINK_SNAPSHOT_USERNAME=
-GATE_REOLINK_SNAPSHOT_PASSWORD=
-GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true
-GATE_REOLINK_SNAPSHOT_COUNT=2
-GATE_REOLINK_SNAPSHOT_TIMEOUT_SECONDS=2.25
-GATE_REOLINK_SNAPSHOT_MAX_BYTES=4194304
+GATE_HOT_STREAM_ENABLED=true
+GATE_HOT_STREAM_SAMPLE_FPS=5
+GATE_HOT_STREAM_FRAME_COUNT=8
+GATE_HOT_STREAM_SELECTION_COUNT=3
+GATE_HOT_STREAM_MAX_AGE_SECONDS=1
 ```
 
-Use the camera's current reserved private address and a dedicated least-privilege
-camera account where the firmware supports one. The origin must be HTTPS with a
-private or loopback IP literal and no credentials, path, query, or fragment.
-Self-signed TLS must be opted into explicitly. Counts above four, timeouts above
-three seconds, and response limits above the controller image ceiling are
-rejected at startup.
-
-Setting `GATE_REOLINK_SNAPSHOT_ALLOW_SELF_SIGNED=true` disables certificate and
-hostname verification. A hostile device on the camera LAN could then impersonate
-the camera and capture its credentials. Enable it only when the camera cannot use
-a certificate verifiable by the Pi, and keep the camera network tightly scoped.
-
-The default takes two additional 4K snapshots sequentially under one end-to-end
-2.25-second wall-clock deadline. They are written temporarily beneath the upload
-root in an ignored owner-only `.reolink-snapshots` directory and validated as
-bounded JPEGs. The first FTP image enters recognition on its normal quiet window
-and establishes one durable trigger identity. An authorizing FTP result
-finalizes immediately; only an improvable denial waits for snapshots, which
-reuse that identity and its single actuation claim. Generated files cannot
-recursively request another sample, and snapshot sampling has no relay path. A
-plate from either the primary FTP image or a later snapshot can open the gate
-only after the same authorization, claim, cooldown, and relay-safety checks
-succeed. Failure, timeout, shutdown, or unavailable configuration terminally
-finalizes the original FTP result.
-
-Do not configure on-demand ffmpeg sampling from
-`rtsp://127.0.0.1:8554/camera` for this feature. Live Pi measurements took
-4.88-5.44 seconds for three frames because capture waited for the roughly
-five-second upstream H.264 keyframe interval. Two sequential HTTPS snapshots
-measured 625 ms and 677 ms on the installed RLC-810A after the Clear stream was
-changed to 10 fps. Concurrent requests are avoided because the camera serializes
-them and can return duplicate frames. RTSP remains available to the separately
-isolated media gateway; it is not the recognition augmentation source until a
-fresh measured RTSP configuration is faster than HTTPS Snap.
+Camera credentials remain only in `/etc/gate-media-gateway.env`; the controller
+connects only to `rtsp://127.0.0.1:8554/clear`, and the web UI receives
+only non-secret effective profile and health fields.
 
 The exact labels vary by firmware. The installed RLC-810A has a fixed 4 mm lens,
 supports vehicle detection and FTP upload, and has no optical zoom. Firmware
@@ -165,9 +144,10 @@ Use the following measured starting point for rapid vehicle recognition:
 - **Fluent/sub:** 640x360, 10 fps, H.264, 256 Kbit/s.
 - **Frame Rate Mode:** Constant.
 
-Ten frames per second bounds detector sampling delay to about 100 ms. The
-controller does not continuously decode or OCR every 4K frame: Fluent is the
-continuous low-cost detector feed, while selected 4K JPEGs are used for OCR.
+Ten camera frames per second bounds source-frame delay to about 100 ms. The
+controller continuously decodes Clear but emits JPEG candidates at 5 fps and
+does not OCR them until an FTP trigger arrives. Fluent remains the browser and
+future low-cost detector feed.
 Keeping 6144 Kbit/s at 10 fps preserves more detail per Clear frame. Frame rate
 does not freeze a moving plate by itself; exposure time controls motion blur.
 

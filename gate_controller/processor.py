@@ -18,7 +18,7 @@ from .images import measure_frame_quality
 from .matching import decide_access, normalise_plate
 from .models import GateEvent, ProcessingResult
 from .telemetry import (
-    AugmentationTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
+    OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
     ftp_fallback_trigger,
 )
 
@@ -28,9 +28,6 @@ DEFAULT_ACTIVATION_GUARD_SECONDS = 0.1
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
-})
-IMPROVABLE_DENIAL_REASONS = frozenset({
-    "ambiguous_fuzzy_match", "no_match", "ocr_busy", "ocr_error",
 })
 
 
@@ -88,32 +85,13 @@ class GateProcessor:
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
                 processing_started_at: datetime | None = None, *,
-                idempotency_key: str | None = None,
-                final: bool = True,
-                provisional_result: ProcessingResult | None = None,
-                augmentation: AugmentationTelemetry | dict | None = None,
-                trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
-        augmentation = _augmentation_telemetry(augmentation)
+                trigger: TriggerTelemetry | dict | None = None,
+                idempotency_key: str | None = None) -> ProcessingResult:
         trigger = _trigger_telemetry(trigger)
-        if provisional_result is not None:
-            provisional_key = provisional_result.idempotency_key
-            if (
-                not final
-                or provisional_result.terminal
-                or not provisional_key
-                or (idempotency_key is not None and idempotency_key != provisional_key)
-            ):
-                raise ValueError("invalid provisional processing result")
-            return self._terminalize_provisional_result(
-                paths, provisional_result, received_at,
-                augmentation=augmentation,
-            )
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
         activation_deadline = deadline - self._activation_guard_seconds
-        candidates = _unique_content_candidates(
-            tuple(_candidate_path(path) for path in paths)
-        )
+        candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
         idempotency_key = idempotency_key or _event_key_from_digests(digests)
@@ -123,14 +101,8 @@ class GateProcessor:
                 event_id = event_id.event_id if event_id else self._store.event_id(idempotency_key)
                 if event_id is not None:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
-            return ProcessingResult(
-                False,
-                self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
-                self._store.event_id(idempotency_key),
-                idempotency_key=idempotency_key,
-            )
+            return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
         trace = self._new_trace()
-        trace.set_augmentation(augmentation)
         trace.set_trigger(trigger)
         if (
             received_at is not None
@@ -234,15 +206,6 @@ class GateProcessor:
             timed_out = True
         if decision is None:
             reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
-            if not final and reason in IMPROVABLE_DENIAL_REASONS:
-                trace.mark_decision("denied", reason)
-                return self._finish_result(
-                    trace,
-                    ProcessingResult(
-                        False, reason, idempotency_key=idempotency_key,
-                        terminal=False,
-                    ),
-                )
             return self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -254,10 +217,7 @@ class GateProcessor:
                                   decision)
             event_id = self._record(event, paths)
             return self._finish_result(
-                trace, ProcessingResult(
-                    False, "decision_timeout", event_id, decision,
-                    idempotency_key=idempotency_key,
-                )
+                trace, ProcessingResult(False, "decision_timeout", event_id, decision)
             )
         if not _is_fresh(decision_at, received_at, self._max_image_age):
             trace.mark_decision("denied", "stale_burst")
@@ -265,10 +225,7 @@ class GateProcessor:
                                   decision)
             event_id = self._record(event, paths)
             return self._finish_result(
-                trace, ProcessingResult(
-                    False, "stale_burst", event_id, decision,
-                    idempotency_key=idempotency_key,
-                )
+                trace, ProcessingResult(False, "stale_burst", event_id, decision)
             )
         event = GateEvent(
             source="ocr", reason=decision.reason, opened=False, idempotency_key=idempotency_key,
@@ -285,20 +242,9 @@ class GateProcessor:
             trace.mark_decision("allowed", decision.reason)
         outbox_payload = self._outbox_payload(paths, await_telemetry=True)
         if not decision.allowed:
-            if not final and event.reason in IMPROVABLE_DENIAL_REASONS:
-                return self._finish_result(
-                    trace,
-                    ProcessingResult(
-                        False, event.reason, decision=decision,
-                        idempotency_key=idempotency_key, terminal=False,
-                    ),
-                )
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
-                trace, ProcessingResult(
-                    False, event.reason, event_id, decision,
-                    idempotency_key=idempotency_key,
-                )
+                trace, ProcessingResult(False, event.reason, event_id, decision)
             )
         actuation_at = self._clock()
         if not _is_fresh(actuation_at, received_at, self._max_image_age):
@@ -307,10 +253,7 @@ class GateProcessor:
             )
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
             return self._finish_result(
-                trace, ProcessingResult(
-                    False, "stale_burst", event_id, decision,
-                    idempotency_key=idempotency_key,
-                )
+                trace, ProcessingResult(False, "stale_burst", event_id, decision)
             )
         def activation_inhibition():
             with self._ocr_slot_lock:
@@ -345,10 +288,7 @@ class GateProcessor:
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._finish_result(
             trace,
-            ProcessingResult(
-                execution.opened, execution.reason, execution.event_id, decision,
-                idempotency_key=idempotency_key,
-            ),
+            ProcessingResult(execution.opened, execution.reason, execution.event_id, decision),
         )
 
     def record_skipped(self, paths: Iterable[Path], reason: str,
@@ -359,7 +299,7 @@ class GateProcessor:
                        processing_started_at: datetime | None = None,
                        trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
         trigger = _trigger_telemetry(trigger)
-        paths = tuple(_candidate_path(path) for path in paths)
+        paths = tuple(Path(path) for path in paths)
         idempotency_key = idempotency_key or _event_key(paths)
         if self._store.event_exists(idempotency_key):
             event_id = self._store.event_id(idempotency_key)
@@ -369,7 +309,6 @@ class GateProcessor:
                 False,
                 self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
                 event_id,
-                idempotency_key=idempotency_key,
             )
         if trace is None:
             trace = self._new_trace()
@@ -393,45 +332,8 @@ class GateProcessor:
             received_at=received_at or self._clock(), decision_at=self._clock(),
         )
         event_id = self._record(event, paths)
-        result = ProcessingResult(
-            False, reason, event_id, idempotency_key=idempotency_key
-        )
+        result = ProcessingResult(False, reason, event_id)
         return self._finish_result(trace, result)
-
-    def _terminalize_provisional_result(
-        self, paths: Iterable[Path], provisional_result: ProcessingResult,
-        received_at: datetime | None, *, augmentation: AugmentationTelemetry | None,
-    ) -> ProcessingResult:
-        decision = provisional_result.decision
-        event = GateEvent(
-            source="ocr", reason=provisional_result.reason, opened=False,
-            idempotency_key=provisional_result.idempotency_key,
-            received_at=received_at or self._clock(), decision_at=self._clock(),
-            authorised_plate=decision.authorised_plate if decision else None,
-            observed_plate=decision.observed_plate if decision else None,
-            ocr_confidence=decision.confidence if decision else 0.0,
-        )
-        event_id = self._record(event, paths)
-        telemetry = provisional_result.telemetry
-        if telemetry is not None and augmentation is not None:
-            telemetry = replace(telemetry, augmentation=augmentation)
-        result = ProcessingResult(
-            False, provisional_result.reason, event_id, decision,
-            telemetry=telemetry,
-            idempotency_key=provisional_result.idempotency_key,
-        )
-        if telemetry is None:
-            self._release_outbox_without_telemetry(event_id)
-            return result
-        _log_completed_trace(telemetry)
-        try:
-            self._store.attach_event_telemetry(event_id, telemetry)
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "event_telemetry_attach status=persistence_failed"
-            )
-            self._release_outbox_without_telemetry(event_id)
-        return result
 
     def _finish_result(
         self, trace: _BestEffortTrace, result: ProcessingResult
@@ -478,7 +380,7 @@ class GateProcessor:
     ) -> dict | None:
         if not self._outbox_enabled:
             return None
-        paths = tuple(_candidate_path(path) for path in paths)
+        paths = tuple(Path(path) for path in paths)
         prepare_payload = getattr(self._outbox, "prepare_payload", None)
         if not callable(prepare_payload):
             payload = {"event_id": None}
@@ -636,13 +538,6 @@ class _BestEffortTrace:
     def mark_burst(self) -> None:
         self._call("mark_burst")
 
-    def set_augmentation(self, augmentation) -> None:
-        if self._trace is None:
-            return
-        operation = getattr(self._trace, "set_augmentation", None)
-        if callable(operation):
-            self._call("set_augmentation", augmentation)
-
     def set_trigger(self, trigger) -> None:
         if self._trace is None:
             return
@@ -716,29 +611,8 @@ def _content_digest(path: Path) -> str:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError:
-        missing = str(path) if getattr(path, "_descriptor_anchored", False) else path.resolve()
-        digest.update(f"missing:{missing}".encode("utf-8"))
+        digest.update(f"missing:{path.resolve()}".encode("utf-8"))
     return digest.hexdigest()
-
-
-def _candidate_path(path):
-    if getattr(path, "_descriptor_anchored", False):
-        return path
-    return Path(path)
-
-
-def _augmentation_telemetry(value) -> AugmentationTelemetry | None:
-    if value is None or isinstance(value, AugmentationTelemetry):
-        return value
-    if not isinstance(value, dict):
-        return None
-    return AugmentationTelemetry(
-        outcome=value.get("outcome", "failed"),
-        reason=value.get("reason", "unknown"),
-        candidate_count=value.get("candidate_count", 0),
-        duration_ms=value.get("duration_ms", 0),
-        correlation=value.get("correlation"),
-    )
 
 
 def _trigger_telemetry(value) -> TriggerTelemetry | None:

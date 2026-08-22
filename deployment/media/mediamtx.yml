@@ -54,6 +54,7 @@ pathDefaults:
 
 paths:
   camera: {}
+  clear: {}
   gate:
     source: publisher
     overridePublisher: false
