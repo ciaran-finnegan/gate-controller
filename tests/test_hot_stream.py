@@ -77,7 +77,7 @@ class HotFrameRingTests(unittest.TestCase):
 
 
 class HotStreamConfigurationTests(unittest.TestCase):
-    def test_is_disabled_by_default_and_uses_only_the_fixed_loopback_clear_path(self):
+    def test_is_disabled_by_default_and_uses_only_the_fixed_loopback_fluent_path(self):
         disabled = load_hot_stream_config({}, Path("/var/lib/gate-controller/uploads"))
         enabled = load_hot_stream_config(
             {"GATE_HOT_STREAM_ENABLED": "true"},
@@ -86,9 +86,9 @@ class HotStreamConfigurationTests(unittest.TestCase):
 
         self.assertFalse(disabled.enabled)
         self.assertTrue(enabled.enabled)
-        self.assertEqual("rtsp://127.0.0.1:8554/clear", enabled.source_url)
+        self.assertEqual("rtsp://127.0.0.1:8554/camera", enabled.source_url)
         self.assertEqual(5.0, enabled.sample_fps)
-        self.assertEqual(3, enabled.selection_count)
+        self.assertEqual(2, enabled.selection_count)
 
     def test_ffmpeg_command_and_child_environment_are_secret_free_and_bounded(self):
         config = load_hot_stream_config(
@@ -98,9 +98,19 @@ class HotStreamConfigurationTests(unittest.TestCase):
         buffer = HotStreamBuffer(config)
 
         self.assertEqual("/usr/bin/ffmpeg", buffer.command[0])
-        self.assertIn("rtsp://127.0.0.1:8554/clear", buffer.command)
+        self.assertIn("rtsp://127.0.0.1:8554/camera", buffer.command)
         self.assertIn("fps=5", buffer.command)
         self.assertEqual({"LANG": "C", "LC_ALL": "C"}, buffer.child_environment)
+
+    def test_rejects_more_fallback_frames_than_the_three_frame_ocr_budget(self):
+        with self.assertRaisesRegex(ValueError, "safe range"):
+            load_hot_stream_config(
+                {
+                    "GATE_HOT_STREAM_ENABLED": "true",
+                    "GATE_HOT_STREAM_SELECTION_COUNT": "3",
+                },
+                Path("/var/lib/gate-controller/uploads"),
+            )
 
     def test_capture_loop_keeps_a_local_process_reference_during_close(self):
         class Stdout:

@@ -160,6 +160,7 @@ class WorkerTests(unittest.TestCase):
                 ranker=lambda candidates: tuple(reversed(candidates)),
                 include_received_at=True,
                 include_idempotency_key=True,
+                prefer_first_candidate=True,
                 arrival_clock=lambda: received_at,
             )
             collector.add(ftp, received_at)
@@ -172,7 +173,7 @@ class WorkerTests(unittest.TestCase):
                 lambda *args, **kwargs: calls.append((args, kwargs)),
             )
 
-            self.assertEqual((hot, ftp), calls[0][0][0])
+            self.assertEqual((ftp, hot), calls[0][0][0])
             self.assertEqual(expected, calls[0][1]["idempotency_key"])
 
     def test_trigger_correlation_does_not_wait_before_initial_ftp_recognition(self):
@@ -957,6 +958,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(configured["collector"]["max_candidates"], 5)
         self.assertTrue(configured["collector"]["include_decision_started_at"])
         self.assertTrue(configured["collector"]["include_processing_started_at"])
+        self.assertTrue(configured["collector"]["prefer_first_candidate"])
         self.assertEqual(configured["handler"]["max_candidate_bytes"], 1024)
         self.assertEqual(configured["handler"]["max_pending_candidates"], 5)
 

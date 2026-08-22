@@ -82,6 +82,7 @@ class BurstCollector:
                  include_decision_started_at: bool = False,
                  include_processing_started_at: bool = False,
                  include_idempotency_key: bool = False,
+                 prefer_first_candidate: bool = False,
                  max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                  wall_clock=None):
         if not 1 <= max_candidates <= MAX_BURST_CANDIDATES:
@@ -96,6 +97,7 @@ class BurstCollector:
         self._include_decision_started_at = include_decision_started_at
         self._include_processing_started_at = include_processing_started_at
         self._include_idempotency_key = include_idempotency_key
+        self._prefer_first_candidate = prefer_first_candidate
         self._max_candidates = max_candidates
         self._pending: list[Path] = []
         self._received_at: datetime | None = None
@@ -150,6 +152,9 @@ class BurstCollector:
             self._first_seen = None
             self._deadline = None
         ranked = tuple(self._ranker(pending))
+        if self._prefer_first_candidate and pending and pending[0] in ranked:
+            primary = pending[0]
+            ranked = (primary, *(path for path in ranked if path != primary))
         ranked_paths = set(ranked)
         _remove_uploads(path for path in pending if path not in ranked_paths)
         if not ranked:
@@ -296,7 +301,7 @@ class CompletedImageHandler(FileSystemEventHandler):
         added = 0
         try:
             selected = tuple(self._on_first_completed(received_at) or ())
-            capacity = min(3, self._collector.remaining_capacity)
+            capacity = min(2, self._collector.remaining_capacity)
             for path in selected[:capacity]:
                 self._collector.add(Path(path), received_at)
                 added += 1
@@ -440,6 +445,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         include_received_at=True, include_decision_started_at=True,
         include_processing_started_at=True,
         include_idempotency_key=True,
+        prefer_first_candidate=True,
         max_candidates=max_burst_candidates,
     )
     handler = CompletedImageHandler(

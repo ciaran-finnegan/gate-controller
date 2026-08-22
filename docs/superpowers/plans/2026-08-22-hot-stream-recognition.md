@@ -1,7 +1,7 @@
 # Hot Stream Recognition Implementation Plan
 
 **Goal:** Replace the on-trigger Reolink snapshot fallback with an always-hot
-clear-stream frame ring, surface its effective profile, and add a strictly
+fluent-stream frame ring, surface its effective profile, and add a strictly
 non-actuating local-recognition shadow seam.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-hot-stream-recognition.md`
@@ -32,8 +32,9 @@ non-actuating local-recognition shadow seam.
 
 ## Task 4: Merge buffered frames into the first OCR burst
 
-- Write failing worker tests proving the three newest buffered frames enter the
-  first 200 ms burst without a second queue or processing pass.
+- Write failing worker tests proving two newest buffered frames enter the first
+  200 ms burst after the high-resolution FTP primary without a second queue or
+  processing pass.
 - Wire the provider into controller startup/shutdown and remove all progressive
   augmentation code.
 - Add health/profile fields to the controller heartbeat.
@@ -60,5 +61,5 @@ non-actuating local-recognition shadow seam.
 - Push branches, create PRs, wait for required CI, merge through the protected
   path, and wait for the Pi updater.
 - Back up root-managed media configuration, migrate it transactionally, restart
-  media/controller services, and verify the loopback clear stream, buffer age,
+  media/controller services, and verify the loopback fluent stream, buffer age,
   resource use and one non-actuating trigger.

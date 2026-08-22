@@ -418,10 +418,10 @@ def _hot_stream_status(hot_stream) -> dict:
     default = {
         "enabled": False,
         "ready": False,
-        "stream": "clear",
+        "stream": "fluent",
         "sample_fps": 5.0,
         "source_profile": {
-            "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+            "codec": "h264", "width": 640, "height": 360, "fps": 10,
         },
         "latest_frame_age_ms": None,
         "buffered_frames": 0,
