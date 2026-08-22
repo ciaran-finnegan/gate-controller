@@ -39,6 +39,8 @@ class BoundedBurstQueue:
     """A one-consumer queue that keeps the freshest pending camera work."""
 
     def __init__(self, max_pending: int = 2):
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
         self._queue = Queue(maxsize=max_pending)
         self._lock = Lock()
         self._stopping = False
@@ -524,7 +526,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                     report_dropped(dropped, "service_stopping")
                 finally:
                     _remove_uploads(dropped[0])
-            processing_thread.join(timeout=5)
+            processing_thread.join()
         try:
             if shutdown is not None:
                 shutdown()

@@ -818,6 +818,12 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(dropped, (Path("first.jpg"),))
         self.assertEqual(queue.get(), (Path("second.jpg"),))
 
+    def test_bounded_queue_rejects_non_positive_capacity(self):
+        for max_pending in (0, -1):
+            with self.subTest(max_pending=max_pending):
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    BoundedBurstQueue(max_pending=max_pending)
+
     def test_stopping_the_burst_queue_discards_pending_work_before_the_sentinel(self):
         queue = BoundedBurstQueue(max_pending=2)
         first = ((Path("first.jpg"),), datetime(2026, 8, 22, tzinfo=timezone.utc))
@@ -1216,7 +1222,7 @@ class WorkerTests(unittest.TestCase):
                 calls.append(f"thread_start:{self.name}")
 
             def join(self, timeout=None):
-                calls.append(f"thread_join:{self.name}")
+                calls.append((f"thread_join:{self.name}", timeout))
 
         with tempfile.TemporaryDirectory() as directory, patch(
             "gate_controller.worker.Observer", return_value=Observer()
@@ -1233,7 +1239,7 @@ class WorkerTests(unittest.TestCase):
             )
 
         self.assertLess(
-            calls.index("thread_join:GateBurstProcessor"),
+            calls.index(("thread_join:GateBurstProcessor", None)),
             calls.index("relay_shutdown"),
         )
         self.assertLess(calls.index("relay_shutdown"), calls.index("observer_stop"))
