@@ -148,7 +148,9 @@ Plate Recognizer request also uses a shorter bounded timeout and exact matches
 still stop the burst immediately. `GATE_MAX_BURST_CANDIDATES` defaults to 8 and
 `GATE_MAX_CANDIDATE_IMAGE_BYTES` defaults to 8 MiB. Startup rejects values above
 the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
-bounded set, the newest candidates are retained and then ranked by image quality.
+bounded set, the high-resolution FTP trigger remains the first OCR attempt. Up
+to two continuously buffered fluent-stream fallbacks follow in quality order,
+keeping all three inside the existing OCR attempt ceiling.
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
 camera recognition events: each contained one 3840x2160 frame, with no second

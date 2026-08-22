@@ -1,4 +1,4 @@
-"""Bounded continuously decoded clear-stream frames for first-pass OCR."""
+"""Bounded continuously decoded fluent-stream frames for OCR fallback."""
 
 import hashlib
 import logging
@@ -19,7 +19,7 @@ from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 FFMPEG_BINARY = "/usr/bin/ffmpeg"
-LOOPBACK_CLEAR_STREAM = "rtsp://127.0.0.1:8554/clear"
+LOOPBACK_FLUENT_STREAM = "rtsp://127.0.0.1:8554/camera"
 MAX_FRAMES = 16
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -29,10 +29,10 @@ MAX_TOTAL_BYTES = 64 * 1024 * 1024
 class HotStreamConfig:
     enabled: bool
     output_directory: Path
-    source_url: str = LOOPBACK_CLEAR_STREAM
+    source_url: str = LOOPBACK_FLUENT_STREAM
     sample_fps: float = 5.0
     frame_count: int = 8
-    selection_count: int = 3
+    selection_count: int = 2
     max_frame_bytes: int = 8 * 1024 * 1024
     max_total_bytes: int = 48 * 1024 * 1024
     max_age_seconds: float = 1.0
@@ -43,9 +43,12 @@ def load_hot_stream_config(environment, upload_root: Path) -> HotStreamConfig:
     enabled = _boolean(environment.get("GATE_HOT_STREAM_ENABLED", "false"))
     sample_fps = _number(environment.get("GATE_HOT_STREAM_SAMPLE_FPS", "5"), 1, 10)
     frame_count = _integer(environment.get("GATE_HOT_STREAM_FRAME_COUNT", "8"), 1, MAX_FRAMES)
-    selection_count = _integer(
-        environment.get("GATE_HOT_STREAM_SELECTION_COUNT", "3"), 1, 3,
+    requested_selection_count = _integer(
+        environment.get("GATE_HOT_STREAM_SELECTION_COUNT", "2"), 1, 3,
     )
+    # Release 5f2359f documented three buffered selections. Keep that persisted
+    # value upgrade-compatible while reserving the first OCR request for FTP.
+    selection_count = min(requested_selection_count, 2)
     if selection_count > frame_count:
         raise ValueError("hot stream selection count exceeds frame count")
     max_frame_bytes = _integer(
@@ -225,10 +228,10 @@ class HotStreamBuffer:
         return {
             "enabled": self.config.enabled,
             **ring,
-            "stream": "clear",
+            "stream": "fluent",
             "sample_fps": self.config.sample_fps,
             "source_profile": {
-                "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+                "codec": "h264", "width": 640, "height": 360, "fps": 10,
             },
             "restart_count": self._restart_count,
         }

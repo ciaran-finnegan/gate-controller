@@ -94,10 +94,10 @@ class MainConfigurationTests(unittest.TestCase):
                 return {
                     "enabled": True,
                     "ready": True,
-                    "stream": "clear",
+                    "stream": "fluent",
                     "sample_fps": 5.0,
                     "source_profile": {
-                        "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+                        "codec": "h264", "width": 640, "height": 360, "fps": 10,
                     },
                     "latest_frame_age_ms": 92,
                     "buffered_frames": 8,
@@ -110,7 +110,7 @@ class MainConfigurationTests(unittest.TestCase):
         )
 
         self.assertTrue(status["recognition"]["hot_stream"]["ready"])
-        self.assertEqual(3840, status["recognition"]["hot_stream"]["source_profile"]["width"])
+        self.assertEqual(640, status["recognition"]["hot_stream"]["source_profile"]["width"])
         self.assertNotIn("source_url", str(status))
 
     def test_reolink_trigger_pipeline_has_no_relay_or_authorisation_dependency(self):

@@ -105,16 +105,17 @@ positives across day, night, rain, and headlights.
 
 MediaMTX continuously pulls both camera profiles: `camera` is Fluent and
 `clear` is Clear. The controller keeps one ffmpeg decoder attached to the
-loopback clear path from service startup, so an FTP event never opens a new
+loopback fluent path from service startup, so an FTP event never opens a new
 stream or waits for the camera's roughly five-second keyframe interval.
 
-The decoder samples Clear at 5 fps into an eight-frame, byte-bounded in-memory
-ring. On the first completed FTP JPEG, the three newest distinct clear frames
+The decoder samples Fluent at 5 fps into an eight-frame, byte-bounded in-memory
+ring. On the first completed FTP JPEG, the two newest distinct fluent frames
 are materialised into an owner-only ignored directory and added to the same
-200 ms burst. FTP and clear frames are quality-ranked together before the normal
-maximum-three cloud OCR requests. There is no on-trigger HTTPS request, second
-OCR queue, or additional recognition cooldown. If the stream is unavailable,
-the original FTP/cloud path proceeds unchanged.
+200 ms burst. The high-resolution FTP image remains the first OCR attempt, then
+the fluent fallbacks use the remaining two requests in quality order. There is
+no on-trigger HTTPS request, second OCR queue, or additional recognition
+cooldown. If the stream is unavailable, the original FTP/cloud path proceeds
+unchanged.
 
 Enable the reviewed preset in `/etc/gate-controller.env`:
 
@@ -122,12 +123,12 @@ Enable the reviewed preset in `/etc/gate-controller.env`:
 GATE_HOT_STREAM_ENABLED=true
 GATE_HOT_STREAM_SAMPLE_FPS=5
 GATE_HOT_STREAM_FRAME_COUNT=8
-GATE_HOT_STREAM_SELECTION_COUNT=3
+GATE_HOT_STREAM_SELECTION_COUNT=2
 GATE_HOT_STREAM_MAX_AGE_SECONDS=1
 ```
 
 Camera credentials remain only in `/etc/gate-media-gateway.env`; the controller
-connects only to `rtsp://127.0.0.1:8554/clear`, and the web UI receives
+connects only to `rtsp://127.0.0.1:8554/camera`, and the web UI receives
 only non-secret effective profile and health fields.
 
 The exact labels vary by firmware. The installed RLC-810A has a fixed 4 mm lens,
@@ -145,9 +146,11 @@ Use the following measured starting point for rapid vehicle recognition:
 - **Frame Rate Mode:** Constant.
 
 Ten camera frames per second bounds source-frame delay to about 100 ms. The
-controller continuously decodes Clear but emits JPEG candidates at 5 fps and
-does not OCR them until an FTP trigger arrives. Fluent remains the browser and
-future low-cost detector feed.
+high-resolution FTP JPEG remains the first OCR attempt. The controller also
+continuously decodes Fluent and retains JPEG fallbacks at 5 fps, adding the two
+newest frames only when an FTP trigger arrives. Clear remains continuously
+available through MediaMTX without imposing a permanent 4K software-decode load
+on the Pi.
 Keeping 6144 Kbit/s at 10 fps preserves more detail per Clear frame. Frame rate
 does not freeze a moving plate by itself; exposure time controls motion blur.
 
