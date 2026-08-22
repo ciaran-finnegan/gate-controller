@@ -43,9 +43,12 @@ def load_hot_stream_config(environment, upload_root: Path) -> HotStreamConfig:
     enabled = _boolean(environment.get("GATE_HOT_STREAM_ENABLED", "false"))
     sample_fps = _number(environment.get("GATE_HOT_STREAM_SAMPLE_FPS", "5"), 1, 10)
     frame_count = _integer(environment.get("GATE_HOT_STREAM_FRAME_COUNT", "8"), 1, MAX_FRAMES)
-    selection_count = _integer(
-        environment.get("GATE_HOT_STREAM_SELECTION_COUNT", "2"), 1, 2,
+    requested_selection_count = _integer(
+        environment.get("GATE_HOT_STREAM_SELECTION_COUNT", "2"), 1, 3,
     )
+    # Release 5f2359f documented three buffered selections. Keep that persisted
+    # value upgrade-compatible while reserving the first OCR request for FTP.
+    selection_count = min(requested_selection_count, 2)
     if selection_count > frame_count:
         raise ValueError("hot stream selection count exceeds frame count")
     max_frame_bytes = _integer(

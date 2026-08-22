@@ -102,15 +102,16 @@ class HotStreamConfigurationTests(unittest.TestCase):
         self.assertIn("fps=5", buffer.command)
         self.assertEqual({"LANG": "C", "LC_ALL": "C"}, buffer.child_environment)
 
-    def test_rejects_more_fallback_frames_than_the_three_frame_ocr_budget(self):
-        with self.assertRaisesRegex(ValueError, "safe range"):
-            load_hot_stream_config(
-                {
-                    "GATE_HOT_STREAM_ENABLED": "true",
-                    "GATE_HOT_STREAM_SELECTION_COUNT": "3",
-                },
-                Path("/var/lib/gate-controller/uploads"),
-            )
+    def test_accepts_the_previous_three_frame_preset_but_caps_fallbacks_at_two(self):
+        config = load_hot_stream_config(
+            {
+                "GATE_HOT_STREAM_ENABLED": "true",
+                "GATE_HOT_STREAM_SELECTION_COUNT": "3",
+            },
+            Path("/var/lib/gate-controller/uploads"),
+        )
+
+        self.assertEqual(2, config.selection_count)
 
     def test_capture_loop_keeps_a_local_process_reference_during_close(self):
         class Stdout:
