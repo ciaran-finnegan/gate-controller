@@ -65,6 +65,16 @@ class HotFrameRingTests(unittest.TestCase):
             self.assertEqual(frame, paths[0].read_bytes())
             self.assertEqual(0o600, paths[0].stat().st_mode & 0o777)
 
+    def test_identical_live_samples_refresh_freshness_without_duplicate_selection(self):
+        ring = HotFrameRing(max_frames=3, max_frame_bytes=4096, max_total_bytes=12288)
+        frame = jpeg("black")
+
+        self.assertTrue(ring.add(frame, captured_at=1.0))
+        self.assertFalse(ring.add(frame, captured_at=5.0))
+
+        self.assertEqual([frame], ring.select(3, now=5.5, max_age=1.0))
+        self.assertTrue(ring.status(now=5.5, max_age=1.0)["ready"])
+
 
 class HotStreamConfigurationTests(unittest.TestCase):
     def test_is_disabled_by_default_and_uses_only_the_fixed_loopback_clear_path(self):

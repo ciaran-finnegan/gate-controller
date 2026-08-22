@@ -118,8 +118,12 @@ class HotFrameRing:
         digest = hashlib.sha256(frame).digest()
         captured_at = monotonic() if captured_at is None else captured_at
         with self._lock:
-            if any(candidate[1] == digest for candidate in self._frames):
-                return False
+            for index, candidate in enumerate(self._frames):
+                if candidate[1] == digest:
+                    _old_timestamp, _digest, existing = candidate
+                    del self._frames[index]
+                    self._frames.append((captured_at, digest, existing))
+                    return False
             self._frames.append((captured_at, digest, frame))
             self._total_bytes += len(frame)
             while (

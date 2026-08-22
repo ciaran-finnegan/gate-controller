@@ -119,6 +119,31 @@ class WorkerTests(unittest.TestCase):
 
             self.assertEqual((ftp,), emitted[0])
 
+    def test_hot_frames_never_evict_the_triggering_ftp_candidate(self):
+        received_at = datetime(2026, 8, 22, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / name for name in ("ftp.jpg", "hot-1.jpg", "hot-2.jpg", "hot-3.jpg")]
+            for path, colour in zip(paths, ("red", "green", "blue", "yellow")):
+                Image.new("RGB", (32, 16), color=colour).save(path, format="JPEG")
+            emitted = []
+            collector = BurstCollector(
+                emitted.append, quiet_window=0, ranker=lambda candidates: candidates,
+                max_candidates=3, arrival_clock=lambda: received_at,
+            )
+            handler = CompletedImageHandler(
+                collector, arrival_clock=lambda: received_at,
+                on_first_completed=lambda _received_at: tuple(paths[1:]),
+            )
+
+            handler.schedule_candidate(paths[0])
+            self.assertEqual(1, handler.retry_pending())
+            self.assertTrue(collector.flush_due())
+
+            self.assertEqual(tuple(paths[:3]), emitted[0])
+            self.assertTrue(paths[0].exists())
+            self.assertFalse(paths[3].exists())
+
     def test_trigger_correlation_does_not_wait_before_initial_ftp_recognition(self):
         received_at = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
         calls = []
@@ -762,6 +787,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(dropped, (Path("first.jpg"),))
         self.assertEqual(queue.get(), (Path("second.jpg"),))
 
+    def test_stopping_the_burst_queue_discards_pending_work_before_the_sentinel(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        first = ((Path("first.jpg"),), datetime(2026, 8, 22, tzinfo=timezone.utc))
+        second = ((Path("second.jpg"),), datetime(2026, 8, 22, tzinfo=timezone.utc))
+        queue.put(first)
+        queue.put(second)
+
+        self.assertEqual((first, second), queue.stop())
+        self.assertIsNone(queue.get())
+
     def test_burst_received_at_uses_first_filesystem_arrival_not_image_mtime(self):
         monotonic_clock = MutableClock()
         arrivals = iter([
@@ -1126,7 +1161,7 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("relay_shutdown", calls)
         self.assertEqual(calls[-1], "sigterm_restore")
 
-    def test_service_stop_latches_relay_before_worker_cleanup(self):
+    def test_service_stop_joins_burst_processor_before_controller_shutdown(self):
         calls = []
 
         class Observer:
@@ -1142,8 +1177,20 @@ class WorkerTests(unittest.TestCase):
             def join(self):
                 calls.append("observer_join")
 
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name")
+
+            def start(self):
+                calls.append(f"thread_start:{self.name}")
+
+            def join(self, timeout=None):
+                calls.append(f"thread_join:{self.name}")
+
         with tempfile.TemporaryDirectory() as directory, patch(
             "gate_controller.worker.Observer", return_value=Observer()
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
         ), patch(
             "gate_controller.worker.current_thread_is_main", return_value=False
         ), patch(
@@ -1154,6 +1201,10 @@ class WorkerTests(unittest.TestCase):
                 shutdown=lambda: calls.append("relay_shutdown"),
             )
 
+        self.assertLess(
+            calls.index("thread_join:GateBurstProcessor"),
+            calls.index("relay_shutdown"),
+        )
         self.assertLess(calls.index("relay_shutdown"), calls.index("observer_stop"))
 
     def test_retry_policy_expires_missing_candidates(self):

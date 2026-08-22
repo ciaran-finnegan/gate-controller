@@ -34,19 +34,38 @@ class BoundedBurstQueue:
 
     def __init__(self, max_pending: int = 2):
         self._queue = Queue(maxsize=max_pending)
+        self._lock = Lock()
+        self._stopping = False
 
     def put(self, item):
-        dropped = None
-        if self._queue.full():
-            try:
-                dropped = self._queue.get_nowait()
-            except Empty:
-                pass
-        self._queue.put(item)
-        return dropped
+        with self._lock:
+            if self._stopping:
+                return item
+            dropped = None
+            if self._queue.full():
+                try:
+                    dropped = self._queue.get_nowait()
+                except Empty:
+                    pass
+            self._queue.put_nowait(item)
+            return dropped
 
     def get(self):
         return self._queue.get()
+
+    def stop(self) -> tuple:
+        with self._lock:
+            if self._stopping:
+                return ()
+            self._stopping = True
+            dropped = []
+            while True:
+                try:
+                    dropped.append(self._queue.get_nowait())
+                except Empty:
+                    break
+            self._queue.put_nowait(None)
+            return tuple(dropped)
 
 
 class BurstCollector:
@@ -93,6 +112,11 @@ class BurstCollector:
         if dropped is not None:
             _remove_upload(dropped)
         return first_candidate
+
+    @property
+    def remaining_capacity(self) -> int:
+        with self._lock:
+            return max(0, self._max_candidates - len(self._pending))
 
     def flush_due(self) -> bool:
         with self._lock:
@@ -252,10 +276,11 @@ class CompletedImageHandler(FileSystemEventHandler):
         added = 0
         try:
             selected = tuple(self._on_first_completed(received_at) or ())
-            for path in selected[:3]:
+            capacity = min(3, self._collector.remaining_capacity)
+            for path in selected[:capacity]:
                 self._collector.add(Path(path), received_at)
                 added += 1
-            _remove_uploads(Path(path) for path in selected[3:])
+            _remove_uploads(Path(path) for path in selected[capacity:])
             LOGGER.info("gate_hot_stream added_to_burst=%d", added)
         except Exception:
             _remove_uploads(Path(path) for path in selected[added:])
@@ -470,6 +495,15 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         pass
     finally:
         stop_event.set()
+        if processing_started:
+            for dropped in bursts.stop():
+                if dropped is None:
+                    continue
+                try:
+                    report_dropped(dropped, "service_stopping")
+                finally:
+                    _remove_uploads(dropped[0])
+            processing_thread.join(timeout=5)
         try:
             if shutdown is not None:
                 shutdown()
@@ -480,14 +514,6 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 if observer_started:
                     observer.stop()
                     observer.join()
-                if processing_started:
-                    dropped = bursts.put(None)
-                    if dropped is not None:
-                        try:
-                            report_dropped(dropped, "service_stopping")
-                        finally:
-                            _remove_uploads(dropped[0])
-                    processing_thread.join(timeout=5)
                 for thread in started_background_threads:
                     thread.join(timeout=1)
             finally:
