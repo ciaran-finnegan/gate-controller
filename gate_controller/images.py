@@ -120,12 +120,21 @@ def rank_images(paths, *, max_bytes: int | None = None) -> list[Path]:
                     grayscale = image.convert("L")
                     edges = grayscale.filter(ImageFilter.FIND_EDGES)
                     sharpness = ImageStat.Stat(edges).var[0]
+            digest = _content_digest(path)
         except (
             OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
         ):
             continue
-        scored_paths.append((sharpness, path))
-    return [path for _, path in sorted(scored_paths, key=lambda item: (-item[0], _content_digest(item[1])))]
+        scored_paths.append((sharpness, digest, path))
+    return [
+        path for _sharpness, _digest, path
+        in sorted(scored_paths, key=lambda item: (-item[0], item[1]))
+    ]
+
+
+def content_digest(path: Path) -> str:
+    """Return the stable content identity for a readable image."""
+    return _content_digest(Path(path))
 
 
 def _content_digest(path: Path) -> str:

@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 import tempfile
 import os
@@ -143,6 +144,36 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(tuple(paths[:3]), emitted[0])
             self.assertTrue(paths[0].exists())
             self.assertFalse(paths[3].exists())
+
+    def test_ranked_hot_frames_keep_the_ftp_digest_as_processing_identity(self):
+        received_at = datetime(2026, 8, 22, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ftp = root / "ftp.jpg"
+            hot = root / "hot.jpg"
+            Image.new("RGB", (32, 16), color="red").save(ftp, format="JPEG")
+            Image.new("RGB", (32, 16), color="blue").save(hot, format="JPEG")
+            expected = hashlib.sha256(ftp.read_bytes()).hexdigest()
+            emitted = []
+            collector = BurstCollector(
+                emitted.append, quiet_window=0,
+                ranker=lambda candidates: tuple(reversed(candidates)),
+                include_received_at=True,
+                include_idempotency_key=True,
+                arrival_clock=lambda: received_at,
+            )
+            collector.add(ftp, received_at)
+            collector.add(hot, received_at)
+            self.assertTrue(collector.flush_due())
+            calls = []
+
+            _process_bursts(
+                SequenceQueue(emitted[0], None),
+                lambda *args, **kwargs: calls.append((args, kwargs)),
+            )
+
+            self.assertEqual((hot, ftp), calls[0][0][0])
+            self.assertEqual(expected, calls[0][1]["idempotency_key"])
 
     def test_trigger_correlation_does_not_wait_before_initial_ftp_recognition(self):
         received_at = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)

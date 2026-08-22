@@ -165,6 +165,22 @@ class ImageTests(unittest.TestCase):
 
             self.assertEqual(forward, reverse)
 
+    def test_rank_images_skips_a_candidate_removed_before_digest_tiebreak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            removed = Path(directory) / "removed.jpg"
+            stable = Path(directory) / "stable.jpg"
+            Image.new("L", (16, 16), color=100).save(removed)
+            Image.new("L", (16, 16), color=100).save(stable)
+            real_digest = image_tools._content_digest
+
+            def digest(path):
+                if Path(path) == removed:
+                    raise FileNotFoundError(path)
+                return real_digest(path)
+
+            with patch("gate_controller.images._content_digest", side_effect=digest):
+                self.assertEqual([stable], rank_images((removed, stable)))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -102,6 +102,44 @@ class HotStreamConfigurationTests(unittest.TestCase):
         self.assertIn("fps=5", buffer.command)
         self.assertEqual({"LANG": "C", "LC_ALL": "C"}, buffer.child_environment)
 
+    def test_capture_loop_keeps_a_local_process_reference_during_close(self):
+        class Stdout:
+            def read(self, _size):
+                return b""
+
+        class Process:
+            stdout = Stdout()
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        config = load_hot_stream_config(
+            {"GATE_HOT_STREAM_ENABLED": "true"}, Path("/tmp"),
+        )
+        buffer = HotStreamBuffer(config, popen=lambda *_args, **_kwargs: Process())
+
+        class Stop:
+            def __init__(self):
+                self.calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                if self.calls == 2:
+                    buffer.close()
+                    return False
+                return self.calls >= 3
+
+            def wait(self, _seconds=None):
+                return True
+
+        buffer.run_forever(Stop())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,37 @@ from gate_controller.store import LocalStore
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def test_hot_stream_close_failure_cannot_skip_controller_safety_shutdown(self):
+        calls = []
+
+        class HotStream:
+            def close(self):
+                calls.append("hot_close")
+                raise OSError("child unavailable")
+
+        class Processor:
+            def close(self):
+                calls.append("processor_close")
+
+        class Relay:
+            def begin_shutdown(self):
+                calls.append("relay_begin_shutdown")
+                return True
+
+            def shutdown(self):
+                calls.append("relay_shutdown")
+                return True
+
+        with self.assertLogs("gate_controller.__main__", level="WARNING"):
+            safe = gate_main._shutdown_controller_with_hot_stream(
+                HotStream(), Processor(), Relay(),
+            )
+
+        self.assertTrue(safe)
+        self.assertEqual(calls, [
+            "hot_close", "relay_begin_shutdown", "processor_close", "relay_shutdown",
+        ])
+
     def test_main_starts_and_selects_from_one_shared_hot_stream_buffer(self):
         hot_buffer = object()
         hot_config = type("Config", (), {"enabled": True})()

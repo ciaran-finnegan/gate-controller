@@ -112,7 +112,8 @@ def main() -> None:
     )
 
     def process(paths, received_at=None, decision_started_at=None,
-                processing_started_at=None, *, trigger=None):
+                processing_started_at=None, *, trigger=None,
+                idempotency_key=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         return processor.process(
@@ -121,6 +122,7 @@ def main() -> None:
             decision_started_at=decision_started_at,
             processing_started_at=processing_started_at,
             trigger=trigger,
+            idempotency_key=idempotency_key,
         )
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
@@ -149,9 +151,7 @@ def main() -> None:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
     def shutdown():
-        if hot_stream is not None:
-            hot_stream.close()
-        return _shutdown_controller(processor, relay)
+        return _shutdown_controller_with_hot_stream(hot_stream, processor, relay)
 
     run_worker(
         arguments.directory, process, quiet_window=arguments.quiet_window,
@@ -193,6 +193,15 @@ def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
         processor_completed, _ = _bounded_shutdown_call(processor.close, processor_timeout)
         relay_completed, relay_safe = _bounded_shutdown_call(relay.shutdown, relay_timeout)
     return relay_latched and processor_completed and relay_completed and relay_safe is True
+
+
+def _shutdown_controller_with_hot_stream(hot_stream, processor, relay) -> bool:
+    try:
+        if hot_stream is not None:
+            hot_stream.close()
+    except BaseException:
+        logging.getLogger(__name__).warning("hot_stream_close_failed", exc_info=True)
+    return _shutdown_controller(processor, relay)
 
 
 def _bounded_shutdown_call(operation, timeout: float) -> tuple[bool, object | None]:

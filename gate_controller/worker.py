@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import signal
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 from time import monotonic, sleep, time
@@ -10,7 +11,7 @@ from time import monotonic, sleep, time
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from .images import rank_images, wait_until_readable
+from .images import content_digest, rank_images, wait_until_readable
 from .telemetry import ftp_fallback_trigger
 
 
@@ -27,6 +28,11 @@ LOGGER = logging.getLogger(__name__)
 
 class WorkerFailure(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class BurstIdentity:
+    idempotency_key: str
 
 
 class BoundedBurstQueue:
@@ -73,6 +79,7 @@ class BurstCollector:
                  arrival_clock=None, include_received_at: bool = False,
                  include_decision_started_at: bool = False,
                  include_processing_started_at: bool = False,
+                 include_idempotency_key: bool = False,
                  max_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                  wall_clock=None):
         if not 1 <= max_candidates <= MAX_BURST_CANDIDATES:
@@ -86,9 +93,11 @@ class BurstCollector:
         self._include_received_at = include_received_at
         self._include_decision_started_at = include_decision_started_at
         self._include_processing_started_at = include_processing_started_at
+        self._include_idempotency_key = include_idempotency_key
         self._max_candidates = max_candidates
         self._pending: list[Path] = []
         self._received_at: datetime | None = None
+        self._idempotency_key: str | None = None
         self._first_seen: float | None = None
         self._deadline: float | None = None
         self._lock = Lock()
@@ -101,6 +110,11 @@ class BurstCollector:
             if first_candidate:
                 self._received_at = received_at or self._arrival_clock()
                 self._first_seen = self._clock()
+                if self._include_idempotency_key:
+                    try:
+                        self._idempotency_key = content_digest(path)
+                    except OSError:
+                        self._idempotency_key = None
             elif received_at is not None and received_at < self._received_at:
                 self._received_at = received_at
             if path in self._pending:
@@ -126,9 +140,11 @@ class BurstCollector:
             processing_started_at = self._wall_clock()
             pending = tuple(self._pending)
             received_at = self._received_at
+            idempotency_key = self._idempotency_key
             first_seen = self._first_seen
             self._pending = []
             self._received_at = None
+            self._idempotency_key = None
             self._first_seen = None
             self._deadline = None
         ranked = tuple(self._ranker(pending))
@@ -154,6 +170,8 @@ class BurstCollector:
             details.append(decision_started_at)
         if self._include_processing_started_at:
             details.append(processing_started_at)
+        if self._include_idempotency_key and idempotency_key is not None:
+            details.append(BurstIdentity(idempotency_key))
         self._emit(tuple(details) if len(details) > 1 else ranked)
         return True
 
@@ -388,6 +406,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
     def report_dropped(item, reason):
         paths, received_at, *timing = item
+        if timing and isinstance(timing[-1], BurstIdentity):
+            timing.pop()
         options = {}
         if trigger_resolver is not None:
             options["trigger"] = ftp_fallback_trigger()
@@ -417,6 +437,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
         include_received_at=True, include_decision_started_at=True,
         include_processing_started_at=True,
+        include_idempotency_key=True,
         max_candidates=max_burst_candidates,
     )
     handler = CompletedImageHandler(
@@ -540,6 +561,8 @@ def _process_bursts(
         trigger_summary = _TRIGGER_UNSET
         try:
             options = {}
+            if timing and isinstance(timing[-1], BurstIdentity):
+                options["idempotency_key"] = timing.pop().idempotency_key
             if trigger_resolver is not None:
                 trigger_summary = _resolve_trigger(
                     trigger_resolver, received_at,

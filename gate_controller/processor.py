@@ -85,7 +85,8 @@ class GateProcessor:
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
                 processing_started_at: datetime | None = None, *,
-                trigger: TriggerTelemetry | dict | None = None) -> ProcessingResult:
+                trigger: TriggerTelemetry | dict | None = None,
+                idempotency_key: str | None = None) -> ProcessingResult:
         trigger = _trigger_telemetry(trigger)
         started = self._decision_clock() if decision_started_at is None else decision_started_at
         deadline = started + self._decision_timeout
@@ -93,7 +94,7 @@ class GateProcessor:
         candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
-        idempotency_key = _event_key_from_digests(digests)
+        idempotency_key = idempotency_key or _event_key_from_digests(digests)
         if self._store.event_exists(idempotency_key):
             if self._outbox_enabled:
                 event_id = self._store.terminal_outcome(idempotency_key)

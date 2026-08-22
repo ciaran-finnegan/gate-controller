@@ -241,7 +241,7 @@ class HotStreamBuffer:
         while not stop_event.is_set():
             parser = JpegStreamParser(self.config.max_frame_bytes)
             try:
-                self._process = self._popen(
+                process = self._popen(
                     self.command,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
@@ -249,8 +249,9 @@ class HotStreamBuffer:
                     env=self.child_environment,
                     close_fds=True,
                 )
+                self._process = process
                 while not stop_event.is_set():
-                    chunk = self._process.stdout.read(64 * 1024)
+                    chunk = process.stdout.read(64 * 1024)
                     if not chunk:
                         break
                     for frame in parser.feed(chunk):

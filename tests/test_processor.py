@@ -1102,6 +1102,27 @@ class GateProcessorTests(unittest.TestCase):
             self.assertEqual(second.reason, "duplicate_event")
             self.assertEqual(calls, ["relay"])
 
+    def test_explicit_ftp_identity_deduplicates_different_ranked_hot_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+            store = LocalStore(Path(directory) / "gate.db")
+            ftp = self._jpeg(directory, "ftp.jpg", 128)
+            first_hot = self._jpeg(directory, "first-hot.jpg", 32)
+            second_hot = self._jpeg(directory, "second-hot.jpg", 224)
+            ftp_identity = hashlib.sha256(ftp.read_bytes()).hexdigest()
+            processor = self._processor(
+                store,
+                RecordingRelay(calls),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+            )
+
+            first = processor.process((first_hot, ftp), idempotency_key=ftp_identity)
+            second = processor.process((second_hot, ftp), idempotency_key=ftp_identity)
+
+            self.assertTrue(first.opened)
+            self.assertEqual(second.reason, "duplicate_event")
+            self.assertEqual(calls, ["relay"])
+
     def test_ocr_error_fails_closed_without_relay_activation(self):
         with tempfile.TemporaryDirectory() as directory:
             calls = []
