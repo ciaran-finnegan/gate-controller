@@ -17,6 +17,7 @@ from .actuation import ActuationCoordinator
 from .images import measure_frame_quality
 from .matching import decide_access, normalise_plate
 from .models import GateEvent, ProcessingResult
+from .ocr import classify_failure_cause
 from .telemetry import (
     OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
     ftp_fallback_trigger,
@@ -25,6 +26,13 @@ from .telemetry import (
 
 MAX_OCR_FRAMES = 3
 DEFAULT_ACTIVATION_GUARD_SECONDS = 0.1
+OCR_CONNECT_TIMEOUT_SECONDS = 1.0
+OCR_READ_TIMEOUT_SECONDS = 2.0
+# The first frame is the full-resolution capture and fallback frames are often
+# unavailable, so the opening attempt may spend more of the decision budget
+# waiting for a slow API. The decision deadline still bounds the whole event.
+OCR_FIRST_ATTEMPT_READ_TIMEOUT_SECONDS = 2.8
+MIN_OCR_TIMEOUT_SECONDS = 0.1
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -163,7 +171,9 @@ class GateProcessor:
                 ocr_started = True
 
             try:
-                observation = self._recognise(path, deadline, mark_ocr_start)
+                observation = self._recognise(
+                    path, deadline, mark_ocr_start, first_attempt=sequence == 0,
+                )
             except _OcrBusy:
                 trace.add_ocr_rejection(OcrAttemptTelemetry(
                     frame_sequence=sequence,
@@ -179,11 +189,15 @@ class GateProcessor:
                     ))
                 timed_out = True
                 break
-            except Exception:
+            except Exception as error:
+                # The event-level reason stays "ocr_error"; only the recorded
+                # cause distinguishes a network fault from an API fault.
+                failure_cause = _safe_failure_cause(error)
                 if ocr_started:
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_error",
+                        failure_cause=failure_cause,
                     ))
                 ocr_failure_reason = "ocr_error"
                 continue
@@ -390,15 +404,23 @@ class GateProcessor:
             payload["_awaiting_telemetry"] = True
         return payload
 
-    def _recognise(self, path: Path, deadline: float, on_start=None):
+    def _recognise(self, path: Path, deadline: float, on_start=None, *,
+                   first_attempt: bool = False):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         operation = lambda: self._recognise_call(path)
         if not self._recognizer_accepts_timeout:
             return self._run_ocr_bounded(operation, deadline, on_start)
-        connect = min(1.0, max(0.1, remaining / 3))
-        read = min(2.0, max(0.1, remaining - connect))
+        connect = min(
+            OCR_CONNECT_TIMEOUT_SECONDS,
+            max(MIN_OCR_TIMEOUT_SECONDS, remaining / 3),
+        )
+        read_cap = (
+            OCR_FIRST_ATTEMPT_READ_TIMEOUT_SECONDS if first_attempt
+            else OCR_READ_TIMEOUT_SECONDS
+        )
+        read = min(read_cap, max(MIN_OCR_TIMEOUT_SECONDS, remaining - connect))
         operation = lambda: self._recognise_call(path, timeout=(connect, read))
         return self._run_ocr_bounded(operation, deadline, on_start)
 
@@ -691,17 +713,41 @@ def _accepts_keyword(callable_object, keyword: str) -> bool:
     )
 
 
+def _safe_failure_cause(error: BaseException) -> str | None:
+    """Classify an OCR failure without ever disturbing recognition."""
+    try:
+        return classify_failure_cause(error)
+    except Exception:
+        return None
+
+
+def _recorded_failure_causes(telemetry) -> tuple:
+    try:
+        return tuple(
+            getattr(attempt, "failure_cause", None)
+            for attempt in telemetry.ocr_attempts
+        )
+    except Exception:
+        return ()
+
+
 def _log_completed_trace(telemetry) -> None:
     try:
         wire = telemetry.to_wire()
-        attempts = [
-            {
+        # failure_cause is journal-only: it is absent from the wire payload
+        # because the ingest contract rejects unknown ocr_attempts keys.
+        causes = _recorded_failure_causes(telemetry)
+        attempts = []
+        for index, attempt in enumerate(wire.get("ocr_attempts", ())):
+            entry = {
                 "frame_sequence": attempt.get("frame_sequence"),
                 "duration_ms": attempt.get("duration_ms"),
                 "status": attempt.get("status"),
             }
-            for attempt in wire.get("ocr_attempts", ())
-        ]
+            cause = causes[index] if index < len(causes) else None
+            if cause is not None:
+                entry["failure_cause"] = cause
+            attempts.append(entry)
         logging.getLogger(__name__).info(
             "gate_pipeline stage=processing_finished trace_id=%s outcome=%s reason=%s "
             "relay_outcome=%s durations=%s timestamps=%s ocr_attempts=%s",

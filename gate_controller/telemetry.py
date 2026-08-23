@@ -21,6 +21,7 @@ MAX_UPSTREAM_INTERVAL_SECONDS = MAX_DURATION_MS / 1_000
 MAX_CLOCK_SKEW_SECONDS = 0.1
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_FAILURE_CAUSE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _TRIGGER_EVENT_TYPES = frozenset({
     "line_crossing", "vehicle", "manual_test", "other", "unverified",
@@ -75,6 +76,12 @@ def _optional_string(value: object | None) -> str | None:
     return value[:MAX_STRING_LENGTH]
 
 
+def _optional_failure_cause(value: object | None) -> str | None:
+    if isinstance(value, str) and _FAILURE_CAUSE.fullmatch(value):
+        return value
+    return None
+
+
 def _trace_id(value: object) -> str:
     if isinstance(value, str):
         try:
@@ -127,8 +134,20 @@ class OcrAttemptTelemetry:
     confidence: float | None = None
     make: str | None = None
     colour: str | None = None
+    #: Bounded reason this attempt failed. Journal-only: the Cloudflare ingest
+    #: contract validates ``ocr_attempts`` against a strict key allowlist and
+    #: rejects the whole event for any unknown key, so this is deliberately
+    #: absent from :meth:`to_wire`.
+    failure_cause: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "failure_cause", _optional_failure_cause(self.failure_cause)
+        )
 
     def to_wire(self) -> dict[str, object]:
+        # Wire keys are frozen by the ingest contract. Do not add fields here
+        # without first extending the Worker's OCR_ATTEMPT_KEYS allowlist.
         return {
             "frame_sequence": _rounded_int(self.frame_sequence, 0, MAX_ITEMS - 1, 0),
             "duration_ms": _duration(self.duration_ms) or 0,
