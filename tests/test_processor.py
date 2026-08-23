@@ -9,10 +9,12 @@ from threading import Event, Lock, Thread
 from time import monotonic
 from unittest.mock import patch
 from PIL import Image
+from requests import exceptions as requests_exceptions
 
 import gate_controller.images as image_tools
 import gate_controller.processor as processor_module
 from gate_controller.models import PlateObservation, RelayResult
+from gate_controller.ocr import OcrResponseError
 from gate_controller.outbox import EvidenceSpool, OutboxWorker
 from gate_controller.processor import GateProcessor
 from gate_controller.relay import RelayController
@@ -2323,6 +2325,214 @@ class GateProcessorTests(unittest.TestCase):
 
             self.assertEqual(repaired.reason, "duplicate_event")
             self.assertEqual(store.pending_outbox_count(), 1)
+
+
+class OcrFailureCauseTests(unittest.TestCase):
+    """A denied ocr_error event records *why* the OCR call failed."""
+
+    def _processor(self, store, relay, recognizer, **kwargs):
+        return GateProcessor(
+            recognizer=recognizer,
+            store=store,
+            relay=relay,
+            authorised={"12D3456"},
+            cooldown=timedelta(seconds=20),
+            clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+            **kwargs,
+        )
+
+    def _jpeg(self, directory: str, name: str, colour: int = 128) -> Path:
+        path = Path(directory) / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _process_failure(self, directory, error):
+        processor = self._processor(
+            LocalStore(Path(directory) / "gate.db"),
+            RecordingRelay([]),
+            StaticRecognizer(error=error),
+        )
+        return processor.process((self._jpeg(directory, "frame.jpg"),))
+
+    def test_records_the_cause_while_keeping_the_ocr_error_reason(self):
+        cases = (
+            (OcrResponseError("OCR service returned HTTP 429", "http_429"), "http_429"),
+            (OcrResponseError("invalid json", "invalid_json"), "invalid_json"),
+            (OcrResponseError("no usable plate", "no_usable_plate"), "no_usable_plate"),
+            (requests_exceptions.ReadTimeout("slow"), "read_timeout"),
+            (requests_exceptions.ConnectTimeout("unreachable"), "connect_timeout"),
+            (requests_exceptions.ConnectionError("refused"), "connection_error"),
+        )
+        for error, expected in cases:
+            with self.subTest(cause=expected), tempfile.TemporaryDirectory() as directory:
+                result = self._process_failure(directory, error)
+
+                self.assertFalse(result.opened)
+                self.assertEqual(result.reason, "ocr_error")
+                attempt = tuple(result.telemetry.ocr_attempts)[0]
+                self.assertEqual(attempt.status, "ocr_error")
+                self.assertEqual(attempt.failure_cause, expected)
+
+    def test_wire_payload_still_carries_only_the_unchanged_attempt_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._process_failure(
+                directory, OcrResponseError("rate limited", "http_429")
+            )
+
+        wire = result.telemetry.to_wire()
+        self.assertEqual(wire["decision"]["reason"], "ocr_error")
+        self.assertEqual(wire["ocr_attempts"][0]["status"], "ocr_error")
+        self.assertNotIn("failure_cause", wire["ocr_attempts"][0])
+        self.assertEqual(set(wire["ocr_attempts"][0]), {
+            "frame_sequence", "duration_ms", "status", "plate",
+            "confidence", "make", "colour",
+        })
+
+    def test_journal_line_reports_the_cause_without_plates_or_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "private-owner-registration.jpg")
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay([]),
+                StaticRecognizer(
+                    error=OcrResponseError("rate limited", "http_429")
+                ),
+            )
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,))
+
+        combined = "\n".join(logs.output)
+        self.assertIn(f"trace_id={result.telemetry.trace_id}", combined)
+        self.assertIn("outcome=denied reason=ocr_error", combined)
+        self.assertIn('"failure_cause":"http_429"', combined)
+        self.assertIn('"status":"ocr_error"', combined)
+        self.assertNotIn(str(frame), combined)
+        self.assertNotIn("rate limited", combined)
+
+    def test_successful_attempts_carry_no_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self._processor(
+                LocalStore(Path(directory) / "gate.db"),
+                RecordingRelay([]),
+                StaticRecognizer(PlateObservation("12D3456", 0.95)),
+            )
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((self._jpeg(directory, "frame.jpg"),))
+
+        self.assertTrue(result.opened)
+        self.assertIsNone(tuple(result.telemetry.ocr_attempts)[0].failure_cause)
+        self.assertNotIn("failure_cause", "\n".join(logs.output))
+
+    def test_an_unclassifiable_failure_still_denies_with_ocr_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._process_failure(directory, ValueError("something odd"))
+
+        self.assertEqual(result.reason, "ocr_error")
+        self.assertEqual(
+            tuple(result.telemetry.ocr_attempts)[0].failure_cause, "unclassified"
+        )
+
+    def test_a_failing_classifier_never_breaks_recognition(self):
+        def explode(error):
+            raise RuntimeError("classifier unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(processor_module, "classify_failure_cause", explode):
+                result = self._process_failure(
+                    directory, OcrResponseError("rate limited", "http_429")
+                )
+
+        self.assertFalse(result.opened)
+        self.assertEqual(result.reason, "ocr_error")
+        self.assertIsNone(tuple(result.telemetry.ocr_attempts)[0].failure_cause)
+
+
+class OcrReadWindowTests(unittest.TestCase):
+    """The first frame may spend more of the decision budget on a slow API."""
+
+    class RecordingTimeoutRecognizer:
+        def __init__(self, results):
+            self.results = iter(results)
+            self.timeouts = []
+
+        def recognise(self, path, timeout=None):
+            self.timeouts.append(timeout)
+            result = next(self.results)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    def _processor(self, store, relay, recognizer, **kwargs):
+        return GateProcessor(
+            recognizer=recognizer,
+            store=store,
+            relay=relay,
+            authorised={"12D3456"},
+            clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+            **kwargs,
+        )
+
+    def _timeouts(self, results, decision_timeout=4.0, frames=3):
+        decision_clock = MutableClock()
+        recognizer = self.RecordingTimeoutRecognizer(results)
+        with tempfile.TemporaryDirectory() as directory:
+            self._processor(
+                LocalStore(Path(directory) / "gate.db"), RecordingRelay([]), recognizer,
+                decision_timeout=decision_timeout, decision_clock=decision_clock,
+            ).process(tuple(Path(f"frame-{index}.jpg") for index in range(frames)))
+        return recognizer.timeouts
+
+    def test_only_the_first_attempt_may_use_the_widened_read_window(self):
+        timeouts = self._timeouts([PlateObservation(None, 0.0)] * 3)
+
+        self.assertEqual(len(timeouts), 3)
+        self.assertEqual(timeouts[0], (1.0, 2.8))
+        self.assertEqual(timeouts[1], (1.0, 2.0))
+        self.assertEqual(timeouts[2], (1.0, 2.0))
+
+    def test_the_widened_window_still_fits_inside_the_decision_budget(self):
+        decision_timeout = 4.0
+        timeouts = self._timeouts(
+            [PlateObservation(None, 0.0)] * 3, decision_timeout=decision_timeout,
+        )
+
+        for connect, read in timeouts:
+            self.assertLessEqual(connect + read, decision_timeout)
+            self.assertGreaterEqual(connect, 0.1)
+            self.assertGreaterEqual(read, 0.1)
+
+    def test_a_retry_after_a_first_attempt_failure_returns_to_the_narrow_cap(self):
+        timeouts = self._timeouts([
+            OcrResponseError("slow upstream", "read_timeout"),
+            PlateObservation(None, 0.0),
+            PlateObservation(None, 0.0),
+        ])
+
+        self.assertEqual(timeouts[0], (1.0, 2.8))
+        self.assertEqual(timeouts[1], (1.0, 2.0))
+
+    def test_a_short_budget_never_exceeds_the_remaining_time(self):
+        for decision_timeout in (0.5, 1.0, 2.0, 3.0):
+            with self.subTest(decision_timeout=decision_timeout):
+                timeouts = self._timeouts(
+                    [PlateObservation(None, 0.0)] * 3,
+                    decision_timeout=decision_timeout,
+                )
+                connect, read = timeouts[0]
+                self.assertLessEqual(read, 2.8)
+                self.assertLessEqual(connect + read, max(decision_timeout, 0.2))
+
+    def test_the_widened_window_only_applies_below_the_hard_read_cap(self):
+        # With a 3s budget the first attempt cannot reach the 2.8s cap, so the
+        # widened window changes nothing for smaller budgets.
+        timeouts = self._timeouts(
+            [PlateObservation(None, 0.0)] * 3, decision_timeout=3.0,
+        )
+
+        self.assertEqual(timeouts[0], (1.0, 2.0))
+        self.assertEqual(timeouts[1], (1.0, 2.0))
 
 
 if __name__ == "__main__":

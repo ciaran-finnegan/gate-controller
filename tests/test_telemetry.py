@@ -648,5 +648,105 @@ class ProcessingTraceTests(unittest.TestCase):
         })
 
 
+class OcrFailureCauseTelemetryTests(unittest.TestCase):
+    """The cause is recorded locally and deliberately kept off the wire.
+
+    The Cloudflare ingest contract validates ``ocr_attempts`` against a strict
+    key allowlist and rejects the entire event for any unknown key, so adding
+    the cause to ``to_wire`` would drop every OCR event on the floor.
+    """
+
+    WIRE_KEYS = {
+        "frame_sequence", "duration_ms", "status", "plate",
+        "confidence", "make", "colour",
+    }
+
+    def _telemetry(self, *attempts):
+        return EventTelemetry(
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+            stage_durations=StageDurations(),
+            frames=(),
+            ocr_attempts=attempts,
+            decision_outcome="denied",
+            decision_reason="ocr_error",
+            actuation_claim="not_requested",
+            actuation_attempted=False,
+            relay_outcome="not_attempted",
+            outbox_attempt=0,
+            delivery_state="pending",
+        )
+
+    def test_records_the_cause_on_the_attempt_without_widening_the_wire(self):
+        attempt = OcrAttemptTelemetry(
+            frame_sequence=0, duration_ms=1_200, status="ocr_error",
+            failure_cause="read_timeout",
+        )
+
+        self.assertEqual(attempt.failure_cause, "read_timeout")
+        self.assertEqual(set(attempt.to_wire()), self.WIRE_KEYS)
+        self.assertNotIn("failure_cause", attempt.to_wire())
+
+    def test_wire_payload_is_identical_with_and_without_a_recorded_cause(self):
+        without = self._telemetry(
+            OcrAttemptTelemetry(frame_sequence=0, duration_ms=1_200, status="ocr_error")
+        )
+        with_cause = self._telemetry(
+            OcrAttemptTelemetry(
+                frame_sequence=0, duration_ms=1_200, status="ocr_error",
+                failure_cause="http_429",
+            )
+        )
+
+        self.assertEqual(without.to_wire(), with_cause.to_wire())
+        self.assertEqual(
+            with_cause.to_wire()["ocr_attempts"][0]["status"], "ocr_error"
+        )
+
+    def test_wire_attempt_keys_stay_inside_the_ingest_allowlist(self):
+        wire = self._telemetry(
+            OcrAttemptTelemetry(0, 0, "ocr_error", failure_cause="connection_error"),
+            OcrAttemptTelemetry(1, 0, "ocr_timeout"),
+        ).to_wire()
+
+        for attempt in wire["ocr_attempts"]:
+            self.assertEqual(set(attempt), self.WIRE_KEYS)
+            self.assertFalse(
+                {"failure_cause", "cause", "exception", "raw_response", "path"}
+                & set(attempt)
+            )
+
+    def test_discards_unbounded_or_malformed_causes(self):
+        for value in ("", "Has Spaces", "UPPER", "x" * 33, 42, object(), None):
+            with self.subTest(value=value):
+                attempt = OcrAttemptTelemetry(0, 0, "ocr_error", failure_cause=value)
+                self.assertIsNone(attempt.failure_cause)
+
+    def test_positional_construction_stays_compatible(self):
+        attempt = OcrAttemptTelemetry(0, 5, "no_plate", None, 0.0, None, None)
+
+        self.assertIsNone(attempt.failure_cause)
+        self.assertEqual(attempt.status, "no_plate")
+
+    def test_trace_preserves_the_cause_while_timing_the_attempt(self):
+        # anchor, ocr start, ocr end, finish
+        clock = iter((0.0, 0.0, 1.5, 2.0))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(clock),
+            wall_clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+            trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2",
+        )
+
+        trace.mark_ocr_start()
+        trace.add_ocr_attempt(OcrAttemptTelemetry(
+            frame_sequence=0, status="ocr_error", failure_cause="connect_timeout",
+        ))
+        telemetry = trace.finish()
+
+        recorded = tuple(telemetry.ocr_attempts)[0]
+        self.assertEqual(recorded.failure_cause, "connect_timeout")
+        self.assertGreater(recorded.duration_ms, 0)
+        self.assertNotIn("failure_cause", telemetry.to_wire()["ocr_attempts"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
