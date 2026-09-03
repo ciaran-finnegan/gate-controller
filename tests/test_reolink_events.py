@@ -93,6 +93,18 @@ class ReolinkWebhookTests(unittest.TestCase):
         self.assertEqual(trigger.to_wire()["event_type"], "line_crossing")
         self.assertEqual(trigger.to_wire()["event_at"], "2026-08-20T10:00:00+00:00")
 
+    def test_compact_offset_alarm_time_is_used_for_staleness(self):
+        # An hour-old "+0000" alarm time must be parsed, not ignored, so the
+        # stale check still applies on every supported Python version.
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+        payload = self.payload(alarmTime="2026-08-20T09:00:00.000+0000")
+
+        response = self.request(endpoint, payload)
+
+        self.assertEqual(response.status, 422)
+        self.assertEqual(correlator.pending_count, 0)
+
     def test_rejects_non_index_channel_values(self):
         for channel in (True, -1, 256, 1.5, ["0"]):
             with self.subTest(channel=channel):

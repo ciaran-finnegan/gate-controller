@@ -14,13 +14,15 @@ and the Pi validation harness apply unchanged to the fitted camera.
 | | RLC-810A (installed) | RLC-811A (replacement) |
 | --- | --- | --- |
 | Lens | fixed 4 mm | motorised 2.7-13.5 mm, 5x optical zoom |
-| Horizontal field of view | about 87 degrees | 105 degrees wide to 31 degrees at full zoom |
-| Aperture | f/1.6 | f/1.6 wide to f/3.3 at full zoom |
-| Sensor | 1/2.8 inch 8 MP | 1/2.8 inch 8 MP |
+| Horizontal field of view | 87 degrees | 105 degrees wide to 31 degrees at full zoom |
+| Aperture | f/2.0 | f/1.6 wide to f/3.3 at full zoom |
+| Sensor | 1/2.49 inch 8 MP | 1/2.8 inch 8 MP |
 | Two-way audio | no | yes |
 | Power | PoE | PoE |
 
-Per-pixel image quality is the same. The gain from the RLC-811A is entirely
+Values are from Reolink's specification sheets. The sensors are close in size
+and resolution, so per-pixel image quality is similar rather than identical.
+The gain from the RLC-811A is entirely
 framing: the zoom puts more of the 3840-pixel frame width on the plate. Two-way
 audio is a separate concern; the media stack keeps talkback
 `hardware_unverified` until a physical backchannel acceptance test on the
@@ -114,9 +116,10 @@ before slowing the shutter. Disable WDR/HDR for the plate corridor; it
 brightens the retroreflective plate into the bonnet and produces two-exposure
 ghosting on a moving vehicle.
 
-At the zoom above the aperture is about f/2-f/2.5, one to one and a half stops
-darker than the RLC-810A. Night captures rely on the light below, not on a
-slower shutter.
+At the zoom above the aperture is about f/2-f/2.5, level with or up to about
+two thirds of a stop darker than the RLC-810A's f/2.0. At full zoom it is
+f/3.3, about 1.4 stops darker. Night captures rely on the light below, not on
+a slower shutter.
 
 ## Night Light
 

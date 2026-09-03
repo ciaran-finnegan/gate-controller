@@ -524,11 +524,17 @@ def _rule_id(value: str | None) -> str | None:
     return normalized[:64] or None
 
 
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+
 def _parse_event_time(value: str | None) -> datetime | None:
+    """Parse the camera's alarm time, including the +0000 style offset
+    Reolink firmware sends, which Python 3.10 fromisoformat rejects."""
     if not value:
         return None
+    normalized = _COMPACT_OFFSET.sub(r"\1\2:\3", value.replace("Z", "+00:00"))
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
     if parsed.tzinfo is None:
