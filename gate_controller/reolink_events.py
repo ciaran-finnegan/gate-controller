@@ -447,7 +447,7 @@ def _sanitize_event(
     outer_type = _bounded_string(payload.get("type"), required=False)
     name = _bounded_string(alarm.get("name"), required=False)
     message = _bounded_string(alarm.get("message"), required=False)
-    channel = _bounded_string(alarm.get("channel"), required=False)
+    channel = _bounded_scalar(alarm.get("channel"))
     alarm_time = _bounded_string(alarm.get("alarmTime"), required=False)
     fallback_time = _bounded_string(alarm.get("time"), required=False)
     event_at = _parse_event_time(alarm_time) or _parse_event_time(fallback_time)
@@ -491,6 +491,17 @@ def _bounded_string(value: object, *, required: bool) -> str | None:
     ):
         raise InvalidReolinkWebhook("invalid bounded field")
     return value or None
+
+
+def _bounded_scalar(value: object) -> str | None:
+    """Accept the numeric channel index Reolink firmware sends as JSON."""
+    if isinstance(value, bool):
+        raise InvalidReolinkWebhook("invalid bounded field")
+    if isinstance(value, int):
+        if not 0 <= value <= 255:
+            raise InvalidReolinkWebhook("invalid bounded field")
+        return str(value)
+    return _bounded_string(value, required=False)
 
 
 def _event_type(*values: str | None) -> str:

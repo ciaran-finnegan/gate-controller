@@ -2,10 +2,11 @@
 
 The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
 two-way audio. Earlier issues that call the installed unit an RLC-811A are
-mislabelled. The RLC-811A is the additional dedicated plate camera; its
-zoom framing, exposure, and trigger placement are covered in
-[RLC-811A plate camera commissioning](reolink-rlc-811a.md). Everything below
-applies to both units unless that document says otherwise.
+mislabelled. The gate has one Ethernet port, so only one camera can be fitted.
+The RLC-811A replaces the RLC-810A at the same mount; its zoom framing,
+exposure, capture point, and cutover are covered in
+[RLC-811A gate camera swap](reolink-rlc-811a.md). Everything below applies to
+whichever camera is fitted unless that document says otherwise.
 
 ## Network Boundary
 
@@ -78,14 +79,17 @@ http://PI_PRIVATE_ADDRESS:8766/reolink/events
 ```
 
 Use the camera's default JSON body and include the same secret at the top
-level. The controller bounds the whole request and each relevant string, then
-retains only normalized type, rule, event time, and correlation timing:
+level. The camera substitutes the placeholders; `channel` arrives as a JSON
+number and `alarmTime` with a `+0000` style offset, both of which the
+controller accepts. The controller bounds the whole request and each relevant
+field, then retains only normalized type, rule, event time, and correlation
+timing:
 
 ```json
 {
   "alarm": {
     "alarmTime": "time",
-    "channel": "chn",
+    "channel": 0,
     "message": "message",
     "name": "name",
     "type": "type"
@@ -182,8 +186,7 @@ entrance after the vehicle has straightened.
 
 Because the RLC-810A lens is fixed, frame the capture point by physically aiming
 or relocating the camera and use a software crop only after capture. The
-RLC-811A frames the capture point by zoom instead; see its commissioning
-document. A useful
+RLC-811A frames the capture point by zoom instead; see its swap document. A useful
 commissioning target is a plate around 150-250 pixels wide in the 4K JPEG, with
 combined horizontal and vertical plate angle below 30 degrees and ideally
 10-20 degrees. Keep the motion light outside the frame and avoid aiming it at

@@ -1,25 +1,24 @@
-# Reolink RLC-811A Plate Camera Commissioning
+# Reolink RLC-811A Gate Camera Swap
 
 The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
-two-way audio. It stays the wide context and line-crossing trigger camera until
-a before/after comparison exists. The RLC-811A is the additional camera being
-commissioned as a dedicated plate-reading camera. This document covers only
-what differs from [RLC-810A deployment and night calibration](reolink-rlc-810a.md).
-Network boundary, FTP burst setup, authenticated trigger provenance, stream
-settings, and the Pi validation harness apply to whichever single camera the
-controller is pointed at. The controller is single-camera today; see
-[Single-Camera Controller Limits](#single-camera-controller-limits) before
-letting both cameras upload or stream at once.
+two-way audio. The gate has one Ethernet port, so only one camera can be
+fitted. The RLC-811A replaces the RLC-810A on the same pillar mount; the
+RLC-810A is removed and kept as the rollback unit. This document covers only
+what differs from
+[RLC-810A deployment and night calibration](reolink-rlc-810a.md). Network
+boundary, FTP burst setup, authenticated trigger provenance, stream settings,
+and the Pi validation harness apply unchanged to the fitted camera.
 
 ## Hardware Differences
 
-| | RLC-810A (installed) | RLC-811A (new) |
+| | RLC-810A (installed) | RLC-811A (replacement) |
 | --- | --- | --- |
 | Lens | fixed 4 mm | motorised 2.7-13.5 mm, 5x optical zoom |
 | Horizontal field of view | about 87 degrees | 105 degrees wide to 31 degrees at full zoom |
 | Aperture | f/1.6 | f/1.6 wide to f/3.3 at full zoom |
 | Sensor | 1/2.8 inch 8 MP | 1/2.8 inch 8 MP |
 | Two-way audio | no | yes |
+| Power | PoE | PoE |
 
 Per-pixel image quality is the same. The gain from the RLC-811A is entirely
 framing: the zoom puts more of the 3840-pixel frame width on the plate. Two-way
@@ -27,124 +26,151 @@ audio is a separate concern; the media stack keeps talkback
 `hardware_unverified` until a physical backchannel acceptance test on the
 RLC-811A is complete.
 
-## Framing By Zoom
+## Single-Camera Controller
 
-Approximate plate width in the 4K frame for an Irish or UK 520 mm plate:
+The controller assumes one camera and the single Ethernet port makes that the
+physical reality too. There is no per-camera burst grouping, no camera key in
+webhook correlation, and one MediaMTX `camera`/`clear` source pair
+(`MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE`). Every one of those
+points at the fitted camera. Do not attempt to run both cameras into the
+controller through a switch at the gate; that needs controller changes that
+do not exist.
 
-| Distance to plate | RLC-810A 87 degrees | RLC-811A 60 degrees | RLC-811A 31 degrees |
+## Mounting Height
+
+The RLC-810A is mounted on the gate pillar at about 1.2 m, and the RLC-811A
+goes on the same mount at the same height. That is correct. Do not mount it
+lower:
+
+- Plates sit at roughly 0.4-0.7 m. From 1.2 m the camera looks slightly down
+  at the plate, which keeps the vertical angle small at every useful distance
+  and keeps the plate clear of the bonnet line.
+- Headlights sit at roughly 0.6-0.9 m. At 1.2 m the lens is just above them.
+  Lower puts the lens in the beam at night; higher than about 2 m increases
+  the vertical angle and puts more sky and foliage in the frame.
+- Lower also means more spray, mud, and leaf litter on the cover.
+
+Approximate plate angles from a 1.2 m pillar mount, for a plate at 0.5 m
+height and a vehicle centre line about 1.75 m to the side of the pillar:
+
+| Distance along the drive | Vertical | Horizontal | Combined |
 | --- | --- | --- | --- |
-| 4 m | 263 px | 432 px | 900 px |
-| 6 m | 175 px | 288 px | 600 px |
-| 8 m | 132 px | 216 px | 450 px |
-| 10 m | 105 px | 173 px | 360 px |
-| 15 m | 70 px | 115 px | 240 px |
-| 20 m | 53 px | 86 px | 180 px |
+| 2 m | 19 degrees | 41 degrees | too oblique |
+| 3 m | 13 degrees | 30 degrees | about 32 degrees |
+| 4 m | 10 degrees | 24 degrees | about 26 degrees |
+| 5 m | 8 degrees | 19 degrees | about 21 degrees |
+| 6 m | 7 degrees | 16 degrees | about 17 degrees |
+| 8 m | 5 degrees | 12 degrees | about 13 degrees |
 
-The commissioning target is unchanged: a plate 150-250 pixels wide at the
-capture point, combined horizontal and vertical plate angle below 30 degrees
-and ideally 10-20 degrees. From the gate pillar the RLC-810A cannot meet that
-target beyond about 6 m. The RLC-811A at full zoom meets it out to about 20 m.
+The commissioning target is a combined angle below 30 degrees, ideally 10-20
+degrees, so the capture point must be at least 4 m from the pillar and is best
+at 5-8 m.
 
-Frame the corridor by zoom, not by relocating the camera:
+## Capture Point And The Stop At The Gate
 
-1. Mount at 1.2-2 m, above most headlights, forward of the fence plane.
-2. Pick one capture point on the stretch where vehicles have straightened after
-   the bend. Aim along the approach at that point, not down at the tarmac in
-   front of the pillar.
-3. Zoom in until a parked test vehicle's plate at the capture point is 150-250
-   pixels wide in a saved 4K JPEG. Do not zoom tighter than needed: at 31
-   degrees the corridor is only about 5.5 m wide at 10 m and a moving vehicle
-   crosses it in one to two seconds.
-4. Save JPEGs at the nearest and farthest expected plate positions before
-   enabling FTP uploads for this camera.
+Vehicles slow and stop at the closed gate. That does not by itself give a
+sharp plate, for two reasons:
 
-## Motion Blur And Exposure
+- A vehicle stopped at the gate is 1-3 m from the pillar. From the table above
+  that is too oblique to read. The stopped position only helps if the vehicle
+  stops at least 4-5 m out; measure where they actually stop.
+- The controller reads the plate at the moment the camera fires. The 4K FTP
+  JPEG is taken at the line crossing, the fluent fallback frames are those no
+  more than one second old when the trigger arrives, and every OCR attempt
+  runs inside the decision deadline. Nothing waits for the vehicle to come to
+  rest. The line-crossing line is therefore the only control over when the
+  plate is captured.
 
-Zoom makes motion blur worse, not better: the same vehicle movement covers more
-pixels at a longer focal length. Set **Exposure** to **Manual** where the
-firmware exposes it, start the shutter limit at 1/500 second, and test no
-slower than 1/250 second with moving vehicles. Cap gain before slowing the
-shutter.
+Use the deceleration zone instead. A vehicle 5-8 m from a closed gate is
+already slowing, typically below 10 km/h, which is under 3 m per second:
 
-At full zoom the aperture is f/3.3, about two stops darker than the RLC-810A.
-Night calibration needs the fast shutter and the darker lens together, so
-expect more gain or the spotlight to be required than on the RLC-810A. Keep
-IR, spotlight, and the existing motion light out of the plate corridor and
-follow the RLC-810A night calibration steps for headlight bloom.
+| Shutter | Plate movement during exposure | Blur on a 400 px plate |
+| --- | --- | --- |
+| 1/500 s | up to 6 mm | about 4 px |
+| 1/250 s | up to 11 mm | about 9 px |
+| 1/100 s | up to 28 mm | about 21 px |
 
-## Trigger Line And Detection Zone
+At 1/500 s a slowing vehicle at 5-8 m is effectively still. Set it up as:
 
-Because the zoomed corridor is short, the camera event and FTP snapshot must
-land while the plate is inside it:
+1. Aim the camera along the approach at a point 6 m from the pillar, not down
+   at the tarmac in front of it.
+2. Zoom until a parked test vehicle's plate at 6 m is 250-350 px wide in a
+   saved 4K JPEG. That is roughly a 45-60 degree horizontal view; at that zoom
+   the plate at 5 m is about 300-430 px and at 8 m about 190-270 px, so the
+   whole 5-8 m corridor is above the 150 px minimum.
+3. Draw the vehicle detection zone around that corridor only.
+4. Place the line-crossing line across the drive at about 6 m from the pillar,
+   vehicle-only, inbound direction, so the FTP JPEG is taken while the plate
+   is square-on and the vehicle is slowing. Keep sensitivity at the frozen 80
+   baseline until day and night captures have been inspected.
+5. Save JPEGs at 5 m and 8 m before enabling the alarm FTP schedule.
 
-- Draw the vehicle detection zone around the zoomed corridor only.
-- Place the line-crossing line at the near edge of the corridor, where the
-  plate enters the framed area, rather than across the whole driveway.
-- Keep detection vehicle-only and the FTP alarm upload on this camera's own
-  schedule. Do not point both cameras at the watched uploads tree at the same
-  time; see the limits below.
+## Exposure
 
-The RLC-810A keeps its frozen line-crossing baseline (vehicle-only, sensitivity
-80, full-width line) during the comparison window. Change one camera variable
-at a time.
+Zoom makes motion blur worse, not better: the same vehicle movement covers
+more pixels at a longer focal length. Set **Exposure** to **Manual**, shutter
+limit 1/500 s, and test no slower than 1/250 s with a moving vehicle. Cap gain
+before slowing the shutter. Disable WDR/HDR for the plate corridor; it
+brightens the retroreflective plate into the bonnet and produces two-exposure
+ghosting on a moving vehicle.
 
-## Single-Camera Controller Limits
+At the zoom above the aperture is about f/2-f/2.5, one to one and a half stops
+darker than the RLC-810A. Night captures rely on the light below, not on a
+slower shutter.
 
-The controller assumes one camera. Adding a second one does not change that
-until per-camera support is built:
+## Night Light
 
-- **Bursts.** Every completed JPEG in the watched uploads tree that arrives
-  inside one quiet window joins the same burst, whichever camera sent it.
-  Content-digest deduplication removes only byte-identical files; it does not
-  separate sources. Two cameras uploading together would produce mixed bursts.
-- **Webhook correlation.** The correlator attaches the single nearest camera
-  event to a burst without a camera key. With two cameras firing, one burst
-  can be attributed to the wrong rule and the other event left to attach to a
-  later burst.
-- **Media and hot stream.** MediaMTX exposes one `camera`/`clear` source pair
-  (`MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE`) and the hot stream
-  always reads `rtsp://127.0.0.1:8554/camera`. Whichever camera those point at
-  supplies the fluent fallback frames for every FTP trigger, so an RLC-811A
-  trigger would be augmented with RLC-810A frames unless the sources are
-  repointed.
+A motion-controlled spotlight lights the approach at night. For plates it
+must:
 
-Commission accordingly, one camera at a time owning the watched tree and the
-media paths:
+- **Be on before the vehicle reaches 8 m from the pillar.** Its motion sensor
+  must see the vehicle further out than the capture corridor, and the lamp
+  must reach full brightness before the crossing. A light that comes on as the
+  vehicle reaches the gate lights the stopped, oblique position, not the
+  capture.
+- **Light the plate from near the camera axis.** Plates are retroreflective:
+  light returns to where it came from. A lamp beside the camera lights the
+  plate brightly; a lamp behind or above the vehicle does not.
+- **Stay out of the frame and off the lens.** No part of the lamp or its beam
+  should hit the camera cover.
+- **Be the only light.** With a white spotlight covering the corridor, turn the
+  RLC-811A's own spotlight off and keep IR off. Two sources double the plate
+  return and wash out the characters. If the external lamp cannot cover the
+  corridor, use the camera's spotlight alone instead.
 
-1. **Commissioning.** Upload RLC-811A test JPEGs to a separate FTP directory
-   outside `/var/lib/gate-controller/uploads`, or review them on the camera
-   itself. Verify plate width, angle, and blur from those files. Leave the
-   RLC-810A FTP, webhook, and media configuration untouched.
-2. **Cutover.** When the RLC-811A view passes acceptance, in one change:
-   disable the RLC-810A alarm FTP upload and its webhook, enable the RLC-811A
-   FTP upload into the watched tree and its webhook, and repoint
-   `MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE` in
-   `/etc/gate-media-gateway.env` at the RLC-811A. The RLC-810A then provides
-   context video only.
-3. **Rollback.** Reverse the same three settings together.
+Keep the camera in colour mode with the lamp on. Set day/night switching so it
+does not flip during an approach; a mode change mid-corridor loses the frame.
+If plates wash out at night, reduce exposure or gain, never add a second light.
+If they are dark, move or re-aim the lamp closer to the camera axis before
+slowing the shutter.
 
-Running both cameras into recognition at once requires per-camera burst
-grouping, a camera key in webhook correlation, and a second MediaMTX path.
-None of those exist yet and they are out of scope for this document.
+## Cutover And Rollback
 
-## Identity And Provenance
+Only one camera is on the port at any time, so the swap is a short outage:
 
-- Reserve a LAN address for the RLC-811A before its first FTP or webhook
-  configuration. Do not rely on DHCP.
-- Give it a distinct camera name; the installed unit reports as `front.station`.
-- Configure its webhook with the same controller URL and secret as the RLC-810A
-  but a distinct rule name, so trigger provenance identifies which camera fired.
-  Enable it only at cutover, when the RLC-810A webhook is disabled.
-- Record both camera models and firmware versions when commissioning.
-- Camera events never actuate the relay. Recognition, authorisation, claim, and
-  relay code are unchanged by adding a camera.
+1. Before removing the RLC-810A, record its firmware, camera name
+   (`front.station`), FTP settings, webhook settings, and the reserved LAN
+   address. Save a current day and night capture as the baseline.
+2. Fit the RLC-811A on the same mount. Give it the same reserved LAN address
+   by moving the DHCP reservation to its MAC, so `/etc/gate-controller.env`
+   and `/etc/gate-media-gateway.env` do not change. Verify the address before
+   configuring anything else.
+3. Update firmware, then configure FTP into the watched uploads tree, the
+   webhook with the shared secret at the top level, and the stream settings
+   from the RLC-810A document. Use a distinct webhook rule name so traces show
+   which camera and rule fired.
+4. Set framing, line, exposure, and light per the sections above. Save 5 m and
+   8 m test captures by day and again at night with the spotlight.
+5. Watch the controller journal for `reolink_webhook status=rejected` on the
+   first real event; any rejection means the webhook body is not what the
+   controller expects.
+6. Rollback is refitting the RLC-810A and moving the reservation back.
 
 ## Acceptance
 
-- A saved production capture from the RLC-811A shows a plate 150-250 pixels wide
-  at the capture point, day and night, with no visible motion blur across
-  characters.
-- Events and traces identify which camera triggered and which camera supplied
-  each frame.
+- A saved production capture from the RLC-811A shows a plate 150-250 px wide
+  or wider at the capture point, day and night, with no visible motion blur
+  across characters.
+- The event trace shows the RLC-811A webhook rule as the trigger source.
 - A before/after recognition comparison over comparable passages is recorded
   before any policy or threshold change relies on the new view.
