@@ -165,8 +165,12 @@ Only one camera is on the port at any time, so the swap is a short outage:
 4. Set framing, line, exposure, and light per the sections above. Save 5 m and
    8 m test captures by day and again at night with the spotlight.
 5. Watch the controller journal for `reolink_webhook status=rejected` on the
-   first real event; any rejection means the webhook body is not what the
-   controller expects.
+   first real event and read the `reason` field before changing anything.
+   `payload` means the body is not what the controller expects; `unauthorized`
+   means the secret does not match; `stale` means the camera clock or the
+   delivery is more than fifteen seconds out; `content_type`, `content_length`,
+   `body_too_large`, and `json` mean the request framing is wrong. A duplicate
+   delivery is acknowledged and not logged as a rejection.
 6. Rollback is refitting the RLC-810A and moving the reservation back.
 
 ## Acceptance
