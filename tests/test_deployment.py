@@ -64,6 +64,10 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("1/500 second", plate_camera)
         self.assertIn("distinct rule name", plate_camera)
         self.assertIn("Camera events never actuate the relay", plate_camera)
+        self.assertIn("The controller assumes one camera", plate_camera)
+        self.assertIn("one camera at a time", plate_camera)
+        self.assertIn("MTX_PATHS_CAMERA_SOURCE", plate_camera)
+        self.assertNotIn("already tolerate frames from two cameras", plate_camera)
         self.assertNotIn("open_gate", plate_camera)
 
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):

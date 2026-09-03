@@ -6,7 +6,10 @@ a before/after comparison exists. The RLC-811A is the additional camera being
 commissioned as a dedicated plate-reading camera. This document covers only
 what differs from [RLC-810A deployment and night calibration](reolink-rlc-810a.md).
 Network boundary, FTP burst setup, authenticated trigger provenance, stream
-settings, and the Pi validation harness apply unchanged to both units.
+settings, and the Pi validation harness apply to whichever single camera the
+controller is pointed at. The controller is single-camera today; see
+[Single-Camera Controller Limits](#single-camera-controller-limits) before
+letting both cameras upload or stream at once.
 
 ## Hardware Differences
 
@@ -78,12 +81,51 @@ land while the plate is inside it:
 - Place the line-crossing line at the near edge of the corridor, where the
   plate enters the framed area, rather than across the whole driveway.
 - Keep detection vehicle-only and the FTP alarm upload on this camera's own
-  schedule. The controller's content-digest dedup and burst ranking already
-  tolerate frames from two cameras in one uploads tree.
+  schedule. Do not point both cameras at the watched uploads tree at the same
+  time; see the limits below.
 
 The RLC-810A keeps its frozen line-crossing baseline (vehicle-only, sensitivity
 80, full-width line) during the comparison window. Change one camera variable
 at a time.
+
+## Single-Camera Controller Limits
+
+The controller assumes one camera. Adding a second one does not change that
+until per-camera support is built:
+
+- **Bursts.** Every completed JPEG in the watched uploads tree that arrives
+  inside one quiet window joins the same burst, whichever camera sent it.
+  Content-digest deduplication removes only byte-identical files; it does not
+  separate sources. Two cameras uploading together would produce mixed bursts.
+- **Webhook correlation.** The correlator attaches the single nearest camera
+  event to a burst without a camera key. With two cameras firing, one burst
+  can be attributed to the wrong rule and the other event left to attach to a
+  later burst.
+- **Media and hot stream.** MediaMTX exposes one `camera`/`clear` source pair
+  (`MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE`) and the hot stream
+  always reads `rtsp://127.0.0.1:8554/camera`. Whichever camera those point at
+  supplies the fluent fallback frames for every FTP trigger, so an RLC-811A
+  trigger would be augmented with RLC-810A frames unless the sources are
+  repointed.
+
+Commission accordingly, one camera at a time owning the watched tree and the
+media paths:
+
+1. **Commissioning.** Upload RLC-811A test JPEGs to a separate FTP directory
+   outside `/var/lib/gate-controller/uploads`, or review them on the camera
+   itself. Verify plate width, angle, and blur from those files. Leave the
+   RLC-810A FTP, webhook, and media configuration untouched.
+2. **Cutover.** When the RLC-811A view passes acceptance, in one change:
+   disable the RLC-810A alarm FTP upload and its webhook, enable the RLC-811A
+   FTP upload into the watched tree and its webhook, and repoint
+   `MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE` in
+   `/etc/gate-media-gateway.env` at the RLC-811A. The RLC-810A then provides
+   context video only.
+3. **Rollback.** Reverse the same three settings together.
+
+Running both cameras into recognition at once requires per-camera burst
+grouping, a camera key in webhook correlation, and a second MediaMTX path.
+None of those exist yet and they are out of scope for this document.
 
 ## Identity And Provenance
 
@@ -92,6 +134,7 @@ at a time.
 - Give it a distinct camera name; the installed unit reports as `front.station`.
 - Configure its webhook with the same controller URL and secret as the RLC-810A
   but a distinct rule name, so trigger provenance identifies which camera fired.
+  Enable it only at cutover, when the RLC-810A webhook is disabled.
 - Record both camera models and firmware versions when commissioning.
 - Camera events never actuate the relay. Recognition, authorisation, claim, and
   relay code are unchanged by adding a camera.
