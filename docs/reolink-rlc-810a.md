@@ -1,5 +1,12 @@
 # Reolink RLC-810A Deployment and Night Calibration
 
+The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
+two-way audio. Earlier issues that call the installed unit an RLC-811A are
+mislabelled. The RLC-811A is the additional dedicated plate camera; its
+zoom framing, exposure, and trigger placement are covered in
+[RLC-811A plate camera commissioning](reolink-rlc-811a.md). Everything below
+applies to both units unless that document says otherwise.
+
 ## Network Boundary
 
 Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
@@ -174,7 +181,9 @@ slightly down at one repeatable capture point roughly 4-6 metres inside the
 entrance after the vehicle has straightened.
 
 Because the RLC-810A lens is fixed, frame the capture point by physically aiming
-or relocating the camera and use a software crop only after capture. A useful
+or relocating the camera and use a software crop only after capture. The
+RLC-811A frames the capture point by zoom instead; see its commissioning
+document. A useful
 commissioning target is a plate around 150-250 pixels wide in the 4K JPEG, with
 combined horizontal and vertical plate angle below 30 degrees and ideally
 10-20 degrees. Keep the motion light outside the frame and avoid aiming it at

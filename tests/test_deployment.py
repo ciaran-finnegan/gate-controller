@@ -45,6 +45,27 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("does not wait", camera)
         self.assertIn("No nginx or ONVIF listener", camera)
 
+    def test_camera_docs_distinguish_installed_810a_from_new_811a_plate_camera(self):
+        installed = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(
+            encoding="utf-8"
+        )
+        plate_camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("The installed gate camera is an RLC-810A", installed)
+        self.assertIn("reolink-rlc-811a.md", installed)
+        self.assertIn("The installed camera is an RLC-810A", readme)
+        self.assertIn("docs/reolink-rlc-811a.md", readme)
+        self.assertIn("RLC-810A (installed)", plate_camera)
+        self.assertIn("RLC-811A (new)", plate_camera)
+        self.assertIn("150-250 pixels wide", plate_camera)
+        self.assertIn("1/500 second", plate_camera)
+        self.assertIn("distinct rule name", plate_camera)
+        self.assertIn("Camera events never actuate the relay", plate_camera)
+        self.assertNotIn("open_gate", plate_camera)
+
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
