@@ -214,9 +214,11 @@ class ReolinkEventCorrelator:
 class ReolinkWebhookEndpoint:
     """Parse one bounded HTTP request into metadata-only correlation state."""
 
-    def __init__(self, secret: str, correlator: ReolinkEventCorrelator) -> None:
+    def __init__(self, secret: str, correlator: ReolinkEventCorrelator,
+                 on_accepted=None) -> None:
         self._secret = secret
         self._correlator = correlator
+        self._on_accepted = on_accepted
 
     def handle(
         self,
@@ -263,10 +265,22 @@ class ReolinkWebhookEndpoint:
             return self._reject(400, "payload")
         outcome = self._correlator.record(event, now=received_at)
         if outcome == "accepted":
+            self._notify_accepted(event)
             return WebhookResponse(202)
         if outcome == "duplicate":
             return WebhookResponse(200)
         return self._reject(422, "stale")
+
+    def _notify_accepted(self, event: SanitizedCameraEvent) -> None:
+        # The callback only schedules a bounded frame capture; it must never
+        # delay or change the webhook response, and it receives only the
+        # sanitized event.
+        if self._on_accepted is None:
+            return
+        try:
+            self._on_accepted(event)
+        except Exception:
+            LOGGER.warning("reolink_webhook on_accepted=failed", exc_info=True)
 
     @staticmethod
     def _reject(status: int, reason: str) -> WebhookResponse:
@@ -319,11 +333,14 @@ class ReolinkWebhookWorker:
         correlator: ReolinkEventCorrelator,
         *,
         server_factory=BoundedReolinkHTTPServer,
+        on_accepted=None,
     ) -> None:
         if not config.enabled or config.secret is None:
             raise ValueError("Reolink webhook worker requires enabled configuration")
         self._config = config
-        self._endpoint = ReolinkWebhookEndpoint(config.secret, correlator)
+        self._endpoint = ReolinkWebhookEndpoint(
+            config.secret, correlator, on_accepted=on_accepted,
+        )
         self._server_factory = server_factory
 
     def run_forever(self, stop_event) -> None:

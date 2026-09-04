@@ -10,7 +10,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from gate_controller.worker import (
-    BoundedBurstQueue, BurstCollector, CompletedImageHandler, StartupReconciler,
+    BoundedBurstQueue, BurstCollector, BurstIdentity, CompletedImageHandler, StartupReconciler,
     reconcile_completed_images,
     start_observer_then_reconcile,
     _process_bursts,
@@ -204,6 +204,93 @@ class WorkerTests(unittest.TestCase):
                 "sanitized-trigger",
             ),
         ])
+
+    def test_default_readability_window_stays_at_five_seconds(self):
+        handler = CompletedImageHandler(BurstCollector(lambda *_: None))
+
+        self.assertEqual(handler._retry_interval, 0.05)
+        self.assertGreaterEqual(handler._retry_interval * handler._max_attempts, 5.0)
+
+    def test_injected_trigger_burst_uses_its_own_trigger_and_never_correlates(self):
+        received_at = datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc)
+        early = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=180,
+        )
+        calls = []
+
+        def resolve_trigger(candidate_received_at):
+            calls.append(("correlate", candidate_received_at))
+            return "ftp-trigger"
+
+        def recognise(paths, candidate_received_at, *timing, trigger=None,
+                      idempotency_key=None):
+            calls.append(("recognise", paths, trigger, idempotency_key))
+            return ProcessingResult(False, "no_match", terminal=True)
+
+        _process_bursts(
+            SequenceQueue(
+                ((Path("clear.jpg"),), received_at, 1.0, received_at,
+                 BurstIdentity("digest-1", early)),
+                None,
+            ),
+            recognise,
+            trigger_resolver=resolve_trigger,
+        )
+
+        self.assertEqual(calls, [
+            ("recognise", (Path("clear.jpg"),), early, "digest-1"),
+        ])
+
+    def test_run_worker_attaches_an_injector_that_enqueues_a_trigger_burst(self):
+        received_at = datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc)
+        early = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=180,
+        )
+        processed = []
+        stop_after_first = ThreadEvent()
+
+        class Capture:
+            output_directory = None
+
+            def attach(self, inject):
+                self.inject = inject
+
+        capture = Capture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture.output_directory = root / ".trigger-capture"
+            capture.output_directory.mkdir(mode=0o700)
+            frame = capture.output_directory / "frame.jpg"
+            frame.write_bytes(b"\xff\xd8\xff\xd9")
+
+            def emit(paths, candidate_received_at, *timing, trigger=None,
+                     idempotency_key=None):
+                processed.append((paths, candidate_received_at, trigger, idempotency_key))
+                stop_after_first.set()
+                return ProcessingResult(False, "no_match", terminal=True)
+
+            class OneShotWorker:
+                def run_forever(self, stop_event):
+                    capture.inject((frame,), received_at, early)
+                    stop_after_first.wait(timeout=5)
+                    stop_event.set()
+
+            run_worker(
+                root, emit, quiet_window=0.1, poll_interval=0.01,
+                background_workers=(OneShotWorker(),),
+                trigger_resolver=lambda _received_at: self.fail("must not correlate"),
+                trigger_capture=capture,
+            )
+
+        self.assertEqual(len(processed), 1)
+        paths, candidate_received_at, trigger, idempotency_key = processed[0]
+        self.assertEqual(paths, (frame,))
+        self.assertEqual(candidate_received_at, received_at)
+        self.assertIs(trigger, early)
+        self.assertEqual(len(idempotency_key), 64)
+        self.assertFalse(frame.exists())
 
     def test_failed_recognition_reports_the_same_sanitized_trigger(self):
         received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)

@@ -154,3 +154,53 @@ class HotStreamConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrivateFrameWriteTests(unittest.TestCase):
+    def test_failed_frame_write_leaves_no_partial_file(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from pathlib import Path
+        from gate_controller.hot_stream import write_private_frame
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            real_write = os.write
+            calls = []
+
+            def flaky_write(descriptor, view):
+                calls.append(len(view))
+                if len(calls) == 1:
+                    real_write(descriptor, view[:2])
+                    return 2
+                raise OSError("disk gone")
+
+            with patch("gate_controller.hot_stream.os.write", flaky_write):
+                with self.assertRaises(OSError):
+                    write_private_frame(root, b"\xff\xd8\xff\xd9")
+
+            self.assertEqual(sorted(root.glob("*")), [])
+
+    def test_failed_descriptor_close_leaves_no_frame(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from pathlib import Path
+        from gate_controller.hot_stream import write_private_frame
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            real_close = os.close
+
+            def failing_close(descriptor):
+                real_close(descriptor)
+                raise OSError("close failed")
+
+            with patch("gate_controller.hot_stream.os.close", failing_close):
+                with self.assertRaises(OSError):
+                    write_private_frame(root, b"\xff\xd8\xff\xd9")
+
+            self.assertEqual(sorted(root.glob("*")), [])

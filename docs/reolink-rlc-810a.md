@@ -100,7 +100,62 @@ timing:
 ```
 
 Top-level camera `test` and `manual` notifications are recorded as
-`manual_test`. Invalid, stale, duplicate, unauthorized, and oversized requests
+`manual_test`.
+
+### Webhook-Triggered Capture
+
+Vehicles stop at the closed gate, and a stopped vehicle is the sharpest plate
+the camera can give. When the listener is enabled, an accepted `vehicle`,
+`line_crossing`, or `other` event may schedule a delayed capture: the
+controller waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle to come
+to rest, then grabs `GATE_TRIGGER_CAPTURE_COUNT` full-resolution frames
+`GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart from the loopback MediaMTX clear
+path (`rtsp://127.0.0.1:8554/clear`) and hands each to the normal burst
+pipeline. The journal records one of these scheduling outcomes per event:
+`scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
+`skipped_type` for `manual_test` events, which never capture;
+`skipped_interval` inside `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS` of the
+previous series; and `skipped_busy` while a series is already queued. A
+skipped event still has its FTP frame recognised as before.
+
+- The webhook still authorises nothing. Every captured frame goes through the
+  same recognition, authorisation, claim, cooldown, and relay code as an FTP
+  upload. A forged webhook can at most cost one bounded capture series and
+  its OCR requests, rate limited to one series per
+  `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS`.
+- The FTP path is unchanged. The 4K FTP JPEG is still taken at the line
+  crossing; place the line where the vehicle is already rolling to a halt.
+  Whichever frame reads an authorised plate first opens the gate and the
+  later bursts record `cooldown`. Each frame is a separate event with its own
+  content identity on purpose: a frame that fails to read must never
+  suppress the next one, so an unrecognised or denied vehicle produces one
+  event per frame rather than one per crossing.
+- Capture is serial and bounded: one ffmpeg child at a time, killed at the
+  timeout, frames validated as JPEG and written owner-only under
+  the controller state directory (`trigger-capture` beside the database,
+  or `GATE_TRIGGER_CAPTURE_DIRECTORY`), never under the FTP upload tree.
+- Set the camera's Clear stream **I-frame interval** to 1x the frame rate
+  (10 at 10 fps). An on-demand grab waits for the next keyframe, so a longer
+  interval adds up to that many seconds. Without this setting the capture
+  usually times out and only the FTP path runs.
+
+```sh
+GATE_TRIGGER_CAPTURE_ENABLED=true
+GATE_TRIGGER_CAPTURE_SOURCE=rtsp://127.0.0.1:8554/clear
+GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=2.5
+GATE_TRIGGER_CAPTURE_DELAY_SECONDS=1.5
+GATE_TRIGGER_CAPTURE_COUNT=2
+GATE_TRIGGER_CAPTURE_SPACING_SECONDS=1
+GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS=5
+```
+
+Watch the journal for `gate_trigger_capture outcome=captured` followed by the
+recognition trace. `outcome=failed reason=timeout` on every event means the
+keyframe interval is still too long or the clear path is not being served.
+Each captured frame is an extra OCR request, so with the default series of
+two expect roughly three Plate Recognizer calls per vehicle instead of one.
+Tune the delay from the captured frames: movement means wait longer, a
+vehicle already stopped in the FTP frame means the delay can be shorter. Invalid, stale, duplicate, unauthorized, and oversized requests
 cannot reach recognition or relay code. Raw payloads, camera identifiers, and
 the secret are not logged or stored. Restrict TCP/8766 with the host firewall or
 camera VLAN so only the camera can connect, and do not port-forward it.
@@ -152,7 +207,9 @@ the browser.
 
 Use the following measured starting point for rapid vehicle recognition:
 
-- **Clear/main:** 3840x2160, 10 fps, H.265, 6144 Kbit/s.
+- **Clear/main:** 3840x2160, 10 fps, H.265, 6144 Kbit/s, I-frame interval
+  1x (a keyframe every second) so webhook-triggered capture never waits
+  longer than that for a decodable frame.
 - **Fluent/sub:** 640x360, 10 fps, H.264, 256 Kbit/s.
 - **Frame Rate Mode:** Constant.
 
@@ -164,6 +221,13 @@ available through MediaMTX without imposing a permanent 4K software-decode load
 on the Pi.
 Keeping 6144 Kbit/s at 10 fps preserves more detail per Clear frame. Frame rate
 does not freeze a moving plate by itself; exposure time controls motion blur.
+
+`GATE_OCR_MAX_UPLOAD_WIDTH` optionally downscales frames wider than the value
+before they are sent to OCR; the file on disk is untouched. Leave it at `0`
+until a saved 4K capture shows the plate at least 300 pixels wide at the
+capture point. At that width `1920` keeps the plate above the 150 pixel target
+and cuts the upload to roughly a quarter of the bytes. Enabling it earlier
+shrinks distant plates below what OCR can read.
 
 The privacy mask may black out irrelevant scenery, but it must leave the whole
 vehicle approach, plate capture corridor, and position variance unobscured.
@@ -181,8 +245,9 @@ raise it only after confirming approaching vehicles are not missed.
 Keep the lens forward of the fence plane so nearby timber, rain droplets, and
 integrated IR cannot dominate exposure or reflect into the cover. A practical
 starting height is 1.5-2 metres, above most headlights, with the camera pointed
-slightly down at one repeatable capture point roughly 4-6 metres inside the
-entrance after the vehicle has straightened.
+slightly down at one repeatable capture point: where vehicles stop at the
+closed gate. A stopped vehicle removes motion blur entirely, so prefer the
+stop over any point on the approach.
 
 Because the RLC-810A lens is fixed, frame the capture point by physically aiming
 or relocating the camera and use a software crop only after capture. The

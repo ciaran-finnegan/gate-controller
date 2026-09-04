@@ -1,9 +1,12 @@
 import logging
 import re
 from collections.abc import Mapping
+from io import BytesIO
 from math import isfinite
 from pathlib import Path
 from threading import Lock
+
+from PIL import Image
 
 from .matching import normalise_plate
 from .models import PlateObservation
@@ -11,6 +14,9 @@ from .models import PlateObservation
 
 DEFAULT_ENDPOINT = "https://api.platerecognizer.com/v1/plate-reader/"
 DEFAULT_TIMEOUT = (1, 2)
+MIN_UPLOAD_WIDTH = 640
+MAX_UPLOAD_WIDTH = 3840
+UPLOAD_JPEG_QUALITY = 90
 
 # Bounded, operator-facing labels describing *why* an OCR attempt failed. They
 # separate network problems from API problems without ever carrying a response
@@ -131,7 +137,8 @@ class OcrResponseError(RuntimeError):
 
 class PlateRecognizerClient:
     def __init__(self, token: str, session=None, endpoint: str = DEFAULT_ENDPOINT,
-                 timeout: tuple[int, int] = DEFAULT_TIMEOUT):
+                 timeout: tuple[int, int] = DEFAULT_TIMEOUT,
+                 max_upload_width: int = 0):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -139,6 +146,11 @@ class PlateRecognizerClient:
         self._closed = False
         self._endpoint = endpoint
         self._timeout = timeout
+        if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
+            raise ValueError("max_upload_width must be an integer")
+        if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
+            raise ValueError("max_upload_width is outside the safe range")
+        self._max_upload_width = max_upload_width
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
         with self._session_lock:
@@ -176,12 +188,23 @@ class PlateRecognizerClient:
                 raise OcrResponseError(
                     "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                 )
-        with path.open("rb") as image:
+        upload = self._open_upload(path)
+        # Preparing a downscaled upload can outlast the decision deadline;
+        # never post a request the processor has already abandoned.
+        with self._session_lock:
+            abandoned = self._closed or generation != self._session_generation
+            closed = self._closed
+        if abandoned:
+            upload.close()
+            if closed:
+                raise _closed_client_error()
+            raise OcrResponseError("OCR request was abandoned", CAUSE_REQUEST_ABANDONED)
+        try:
             try:
                 response = session.post(
                     self._endpoint,
                     data={"regions": "ie"},
-                    files={"upload": (path.name, image, "image/jpeg")},
+                    files={"upload": (path.name, upload, "image/jpeg")},
                     headers={"Authorization": f"Token {self._token}"},
                     timeout=timeout or self._timeout,
                 )
@@ -190,6 +213,8 @@ class PlateRecognizerClient:
                 # original exception propagate unchanged.
                 _log_transport_failure(error)
                 raise
+        finally:
+            upload.close()
 
         if not 200 <= response.status_code < 300:
             raise _response_error(
@@ -234,6 +259,39 @@ class PlateRecognizerClient:
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
+
+    def _open_upload(self, path: Path):
+        """Return the bytes to upload: the file itself, or a bounded downscale.
+
+        Downscaling only applies when configured and the frame is wider than
+        the limit. The original file is never modified. Any decode problem
+        falls back to uploading the file unchanged so OCR still runs.
+        """
+        if not self._max_upload_width:
+            return path.open("rb")
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                if width <= self._max_upload_width:
+                    return path.open("rb")
+                target_height = max(1, round(height * self._max_upload_width / width))
+                # draft() lets the JPEG decoder skip detail the resize would
+                # discard, which keeps the Pi-side cost well below the upload
+                # time it saves.
+                image.draft("RGB", (self._max_upload_width, target_height))
+                resized = image.convert("RGB")
+                resized.thumbnail((self._max_upload_width, target_height), Image.LANCZOS)
+                buffer = BytesIO()
+                resized.save(buffer, format="JPEG", quality=UPLOAD_JPEG_QUALITY)
+        except (OSError, ValueError, Image.DecompressionBombError):
+            _LOGGER.warning("gate_ocr upload_downscale=failed")
+            return path.open("rb")
+        buffer.seek(0)
+        _LOGGER.info(
+            "gate_ocr upload_downscale=applied source_width=%d upload_width=%d upload_bytes=%d",
+            width, resized.width, buffer.getbuffer().nbytes,
+        )
+        return buffer
 
     def abandon_in_flight(self) -> bool:
         """Detach a timed-out request so later work receives a fresh session."""

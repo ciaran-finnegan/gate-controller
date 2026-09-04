@@ -156,21 +156,7 @@ class HotFrameRing:
         paths = []
         try:
             for frame in frames:
-                target = directory / f"frame-{secrets.token_hex(12)}.jpg"
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-                flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(target, flags, 0o600)
-                try:
-                    os.fchmod(descriptor, 0o600)
-                    view = memoryview(frame)
-                    while view:
-                        written = os.write(descriptor, view)
-                        if written <= 0:
-                            raise OSError("hot frame write failed")
-                        view = view[written:]
-                finally:
-                    os.close(descriptor)
-                paths.append(target)
+                paths.append(write_private_frame(directory, frame))
             return tuple(paths)
         except BaseException:
             for path in paths:
@@ -281,6 +267,35 @@ class HotStreamBuffer:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=1)
+
+
+def write_private_frame(directory: Path, frame: bytes) -> Path:
+    """Write one JPEG into an owner-only directory with a fresh random name."""
+    target = Path(directory) / f"frame-{secrets.token_hex(12)}.jpg"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o600)
+    written_ok = False
+    closed_ok = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(frame)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("frame write failed")
+            view = view[written:]
+        written_ok = True
+    finally:
+        try:
+            os.close(descriptor)
+            closed_ok = True
+        finally:
+            # A frame is only usable when every byte was written and the
+            # descriptor closed cleanly; otherwise leave nothing behind.
+            if not (written_ok and closed_ok):
+                target.unlink(missing_ok=True)
+    return target
 
 
 def _ensure_private_directory(path: Path) -> Path:
