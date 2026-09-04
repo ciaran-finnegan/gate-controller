@@ -447,7 +447,7 @@ def _sanitize_event(
     outer_type = _bounded_string(payload.get("type"), required=False)
     name = _bounded_string(alarm.get("name"), required=False)
     message = _bounded_string(alarm.get("message"), required=False)
-    channel = _bounded_string(alarm.get("channel"), required=False)
+    channel = _bounded_scalar(alarm.get("channel"))
     alarm_time = _bounded_string(alarm.get("alarmTime"), required=False)
     fallback_time = _bounded_string(alarm.get("time"), required=False)
     event_at = _parse_event_time(alarm_time) or _parse_event_time(fallback_time)
@@ -493,6 +493,17 @@ def _bounded_string(value: object, *, required: bool) -> str | None:
     return value or None
 
 
+def _bounded_scalar(value: object) -> str | None:
+    """Accept the numeric channel index Reolink firmware sends as JSON."""
+    if isinstance(value, bool):
+        raise InvalidReolinkWebhook("invalid bounded field")
+    if isinstance(value, int):
+        if not 0 <= value <= 255:
+            raise InvalidReolinkWebhook("invalid bounded field")
+        return str(value)
+    return _bounded_string(value, required=False)
+
+
 def _event_type(*values: str | None) -> str:
     combined = " ".join(value.lower() for value in values if value)
     normalized = _RULE_CHARACTER.sub("_", combined)
@@ -513,11 +524,17 @@ def _rule_id(value: str | None) -> str | None:
     return normalized[:64] or None
 
 
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+
 def _parse_event_time(value: str | None) -> datetime | None:
+    """Parse the camera's alarm time, including the +0000 style offset
+    Reolink firmware sends, which Python 3.10 fromisoformat rejects."""
     if not value:
         return None
+    normalized = _COMPACT_OFFSET.sub(r"\1\2:\3", value.replace("Z", "+00:00"))
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
     if parsed.tzinfo is None:

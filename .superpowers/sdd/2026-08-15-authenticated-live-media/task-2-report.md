@@ -143,5 +143,6 @@ Completed on `codex/media-gateway` from starting HEAD `2fddf9c`.
 - Video readiness must remain disabled until the configured ICE binds and TURN
   service pass an end-to-end test from a real non-loopback client, including a
   relay candidate and WHEP teardown. Physical Pi camera video/listen acceptance
-  and RLC-811A backchannel validation remain deployment work. Talkback remains
+  and backchannel validation remain deployment work. The installed RLC-810A
+  has no audio backchannel; talkback validation needs the RLC-811A. Talkback remains
   `hardware_unverified` until that hardware validation is completed.

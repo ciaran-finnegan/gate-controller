@@ -74,6 +74,46 @@ class ReolinkWebhookTests(unittest.TestCase):
         self.assertNotIn("camera-private-serial", encoded)
         self.assertNotIn("Vehicle crossed", encoded)
 
+    def test_accepts_numeric_channel_and_offset_alarm_time_from_camera_firmware(self):
+        # Real firmware sends "channel": 0 (JSON number), "+0000" offsets and
+        # extra fields such as "title"; none of these may reject the event.
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+        payload = self.payload(
+            channel=0, alarmTime="2026-08-20T10:00:00.000+0000", title="Alarm",
+        )
+
+        response = self.request(endpoint, payload)
+        trigger = correlator.correlate(
+            self.now + timedelta(milliseconds=125), now=self.now,
+        )
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(trigger.to_wire()["source"], "reolink_webhook")
+        self.assertEqual(trigger.to_wire()["event_type"], "line_crossing")
+        self.assertEqual(trigger.to_wire()["event_at"], "2026-08-20T10:00:00+00:00")
+
+    def test_compact_offset_alarm_time_is_used_for_staleness(self):
+        # An hour-old "+0000" alarm time must be parsed, not ignored, so the
+        # stale check still applies on every supported Python version.
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+        payload = self.payload(alarmTime="2026-08-20T09:00:00.000+0000")
+
+        response = self.request(endpoint, payload)
+
+        self.assertEqual(response.status, 422)
+        self.assertEqual(correlator.pending_count, 0)
+
+    def test_rejects_non_index_channel_values(self):
+        for channel in (True, -1, 256, 1.5, ["0"]):
+            with self.subTest(channel=channel):
+                correlator = ReolinkEventCorrelator()
+                endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+                response = self.request(endpoint, self.payload(channel=channel))
+                self.assertEqual(response.status, 400)
+                self.assertEqual(correlator.pending_count, 0)
+
     def test_maps_bounded_top_level_test_and_manual_types_to_manual_test(self):
         for webhook_type in ("test", "manual"):
             with self.subTest(webhook_type=webhook_type):

@@ -45,6 +45,35 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("does not wait", camera)
         self.assertIn("No nginx or ONVIF listener", camera)
 
+    def test_camera_docs_distinguish_installed_810a_from_new_811a_plate_camera(self):
+        installed = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(
+            encoding="utf-8"
+        )
+        plate_camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("The installed gate camera is an RLC-810A", installed)
+        self.assertIn("reolink-rlc-811a.md", installed)
+        self.assertIn("The installed camera is an RLC-810A", readme)
+        self.assertIn("docs/reolink-rlc-811a.md", readme)
+        self.assertIn("RLC-810A (installed)", plate_camera)
+        self.assertIn("RLC-811A (replacement)", plate_camera)
+        self.assertIn("one Ethernet port", plate_camera)
+        self.assertIn("The controller assumes one camera", plate_camera)
+        self.assertIn("MTX_PATHS_CAMERA_SOURCE", plate_camera)
+        self.assertIn("Do not mount it\nlower", plate_camera)
+        self.assertIn("at least 4 m from the pillar", plate_camera)
+        self.assertIn("Nothing waits for the vehicle to come to\n  rest", plate_camera)
+        self.assertIn("1/500 s", plate_camera)
+        self.assertIn("Be the only light", plate_camera)
+        self.assertIn("distinct webhook rule name", plate_camera)
+        self.assertIn("reolink_webhook status=rejected", plate_camera)
+        self.assertNotIn("already tolerate frames from two cameras", plate_camera)
+        self.assertNotIn("open_gate", plate_camera)
+        self.assertNotIn("--actuate", plate_camera)
+
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 

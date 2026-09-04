@@ -161,7 +161,10 @@ finite and between 100 ms and 2 seconds.
 
 ## Camera Deployment
 
-See [RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md).
+The installed camera is an RLC-810A. See
+[RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md). The
+gate has one Ethernet port, so the RLC-811A replaces it rather than joining
+it; see [RLC-811A gate camera swap](docs/reolink-rlc-811a.md).
 The Pi performance harness is documented in
 [Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
 is intentionally deferred until reliable on-site network access is available.
