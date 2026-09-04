@@ -17,7 +17,7 @@ DEFAULT_ENDPOINT = "https://api.platerecognizer.com/v1/plate-reader/"
 DEFAULT_TIMEOUT = (1, 2)
 MIN_UPLOAD_WIDTH = 640
 MAX_UPLOAD_WIDTH = 3840
-UPLOAD_JPEG_QUALITY = 90
+UPLOAD_JPEG_QUALITY = 85
 
 # Plate Recognizer's cloud API throttles each account to one request per
 # second, counted from when a request finishes arriving, and answers a faster
