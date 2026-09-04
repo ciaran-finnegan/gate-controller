@@ -105,13 +105,18 @@ Top-level camera `test` and `manual` notifications are recorded as
 ### Webhook-Triggered Capture
 
 Vehicles stop at the closed gate, and a stopped vehicle is the sharpest plate
-the camera can give. When the listener is enabled, each accepted `vehicle`,
-`line_crossing`, or `other` event starts a delayed capture: the controller
-waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle to come to rest,
-then grabs `GATE_TRIGGER_CAPTURE_COUNT` full-resolution frames
+the camera can give. When the listener is enabled, an accepted `vehicle`,
+`line_crossing`, or `other` event may schedule a delayed capture: the
+controller waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle to come
+to rest, then grabs `GATE_TRIGGER_CAPTURE_COUNT` full-resolution frames
 `GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart from the loopback MediaMTX clear
 path (`rtsp://127.0.0.1:8554/clear`) and hands each to the normal burst
-pipeline. `manual_test` events never capture.
+pipeline. The journal records one of these scheduling outcomes per event:
+`scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
+`skipped_type` for `manual_test` events, which never capture;
+`skipped_interval` inside `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS` of the
+previous series; and `skipped_busy` while a series is already queued. A
+skipped event still has its FTP frame recognised as before.
 
 - The webhook still authorises nothing. Every captured frame goes through the
   same recognition, authorisation, claim, cooldown, and relay code as an FTP

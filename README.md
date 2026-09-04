@@ -151,10 +151,12 @@ the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
 bounded set, the high-resolution FTP trigger remains the first OCR attempt. Up
 to two continuously buffered fluent-stream fallbacks follow in quality order,
 keeping all three inside the existing OCR attempt ceiling.
-When the Reolink webhook listener is enabled, each accepted camera event also
-starts a delayed capture: the controller waits for the vehicle to stop at the
-gate, then grabs a short series of frames from the loopback clear stream and
-recognises each (`GATE_TRIGGER_CAPTURE_*`). The webhook never authorises or
+When the Reolink webhook listener is enabled, an eligible accepted camera
+event may also schedule a delayed capture: the controller waits for the
+vehicle to stop at the gate, then grabs a short series of frames from the
+loopback clear stream and recognises each (`GATE_TRIGGER_CAPTURE_*`). Capture
+is skipped when disabled, for `manual_test` events, inside the rate-limit
+interval, or while a series is already queued. The webhook never authorises or
 actuates; the frame takes the same path as an upload, and the FTP path stays
 as the fallback. `GATE_OCR_MAX_UPLOAD_WIDTH` can downscale frames before the
 OCR upload once the plate is large enough in the 4K image.

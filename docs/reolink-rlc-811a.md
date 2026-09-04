@@ -79,10 +79,13 @@ position to aim and zoom at. Historical captures of moving vehicles are the
 blurry ones. The capture point is therefore the stop, not the approach.
 
 The controller now waits for the stop. The camera webhook fires as the
-vehicle crosses the line; the controller waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS`
-(1.5 s by default), then grabs a short series of clear-stream frames
-(`GATE_TRIGGER_CAPTURE_COUNT` frames, `GATE_TRIGGER_CAPTURE_SPACING_SECONDS`
-apart, 2 frames one second apart by default) and recognises each. The 4K FTP
+vehicle crosses the line; for an eligible event the controller waits
+`GATE_TRIGGER_CAPTURE_DELAY_SECONDS` (1.5 s by default), then grabs a short
+series of clear-stream frames (`GATE_TRIGGER_CAPTURE_COUNT` frames,
+`GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart, 2 frames one second apart by
+default) and recognises each. Events inside the rate-limit interval, arriving
+while a series is queued, or of type `manual_test` are skipped and rely on
+the FTP frame alone; the RLC-810A document lists the journal outcomes. The 4K FTP
 JPEG is still taken at the crossing, so put the line where the vehicle is
 already rolling to a halt and that frame is nearly still too.
 
@@ -189,9 +192,9 @@ Only one camera is on the port at any time, so the swap is a short outage:
 
 ## Acceptance
 
-- A saved production capture from the RLC-811A shows a plate 150-250 px wide
-  or wider at the capture point, day and night, with no visible motion blur
-  across characters.
+- A saved production capture from the RLC-811A shows a plate 300-600 px wide
+  at the stop, day and night, with no visible motion blur across characters.
+  150 px is the floor below which OCR is unreliable, not the target.
 - The event trace shows the RLC-811A webhook rule as the trigger source.
 - A before/after recognition comparison over comparable passages is recorded
   before any policy or threshold change relies on the new view.
