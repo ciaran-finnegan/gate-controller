@@ -305,10 +305,13 @@ class TriggerFrameCapture:
             ready, _, _ = select.select([descriptor], [], [], remaining)
             if not ready:
                 continue
-            chunk = os.read(descriptor, 64 * 1024)
+            # Never request more than the remaining capacity plus one byte,
+            # so an oversized frame is detected without ever being held.
+            capacity = self.config.max_frame_bytes - len(buffer)
+            chunk = os.read(descriptor, min(64 * 1024, capacity + 1))
             if not chunk:
                 break
-            if len(buffer) + len(chunk) > self.config.max_frame_bytes:
+            if len(chunk) > capacity:
                 return bytes(buffer), "frame_too_large"
             buffer.extend(chunk)
         try:

@@ -227,17 +227,27 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(sorted(self.config.output_directory.glob("*")), [])
 
     def test_oversized_output_is_cut_off_at_the_cap_and_the_child_killed(self):
+        from unittest.mock import patch
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
             max_frame_bytes=64,
         )
-        process = FakeProcess(output=jpeg())
+        process = FakeProcess(output=jpeg() + b"x" * 4096)
         capture = TriggerFrameCapture(config, popen=FakePopen([process]))
         capture.attach(lambda *args: self.injected.append(args))
+        requested = []
+        real_read = os.read
 
-        self.assertEqual(capture.capture_once(event()), ())
+        def counting_read(descriptor, size):
+            requested.append(size)
+            return real_read(descriptor, size)
+
+        with patch("gate_controller.trigger_capture.os.read", counting_read):
+            self.assertEqual(capture.capture_once(event()), ())
+
         self.assertEqual(self.injected, [])
         self.assertTrue(process.stdout.closed)
+        self.assertLessEqual(max(requested), 65)
 
     def test_scheduling_is_serial_rate_limited_and_skips_manual_tests(self):
         now = [100.0]
