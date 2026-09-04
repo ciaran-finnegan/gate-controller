@@ -61,3 +61,34 @@ class MatchingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeniedObservationTests(unittest.TestCase):
+    def test_no_match_reports_the_best_read_plate_for_review(self):
+        decision = decide_access(
+            [PlateObservation("99-X 9999", 0.61), PlateObservation("99-X 9998", 0.88)],
+            {"12D3456"},
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "no_match")
+        self.assertEqual(decision.observed_plate, "99X9998")
+        self.assertEqual(decision.confidence, 0.88)
+        self.assertIsNone(decision.authorised_plate)
+
+    def test_no_match_without_any_plate_reports_nothing(self):
+        decision = decide_access([PlateObservation(None, 0.0)], {"12D3456"})
+
+        self.assertEqual(decision.reason, "no_match")
+        self.assertIsNone(decision.observed_plate)
+        self.assertEqual(decision.confidence, 0.0)
+
+    def test_no_match_skips_a_read_that_normalises_to_nothing(self):
+        decision = decide_access(
+            [PlateObservation("---", 0.99), PlateObservation("99-X 9998", 0.70)],
+            {"12D3456"},
+        )
+
+        self.assertEqual(decision.reason, "no_match")
+        self.assertEqual(decision.observed_plate, "99X9998")
+        self.assertEqual(decision.confidence, 0.70)

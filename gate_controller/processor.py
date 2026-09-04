@@ -248,7 +248,11 @@ class GateProcessor:
             ocr_confidence=decision.confidence,
         )
         if not decision.allowed:
-            if ocr_failure_reason == "ocr_error":
+            # A frame that failed must not hide a plate another frame read:
+            # the denial is only an OCR error when nothing was recognised.
+            if ocr_failure_reason == "ocr_error" and not any(
+                observation.plate for observation in observations
+            ):
                 event = _denied_event(idempotency_key, received_at, decision_at, "ocr_error",
                                       decision)
             trace.mark_decision("denied", event.reason)

@@ -2537,3 +2537,62 @@ class OcrReadWindowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecognisedPlateBesideFailedFrameTests(unittest.TestCase):
+    """A frame that failed must not hide a plate another frame read."""
+
+    def _processor(self, store, relay, recognizer):
+        return GateProcessor(
+            recognizer=recognizer,
+            store=store,
+            relay=relay,
+            authorised={"12D3456"},
+            cooldown=timedelta(seconds=20),
+            clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+        )
+
+    def _jpeg(self, directory: str, name: str, colour: int) -> Path:
+        path = Path(directory) / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def test_an_unknown_plate_is_reported_as_no_match_not_ocr_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 64),
+                self._jpeg(directory, "second.jpg", 128),
+                self._jpeg(directory, "third.jpg", 192),
+            )
+            recognizer = SequenceRecognizer([
+                PlateObservation(None, 0.0),
+                OcrResponseError("OCR service returned HTTP 429", "http_429"),
+                PlateObservation("99-X 9999", 0.91),
+            ])
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(store, RecordingRelay([]), recognizer).process(frames)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(result.decision.observed_plate, "99X9999")
+            wire = result.telemetry.to_wire()
+            self.assertEqual(wire["decision"], {"outcome": "denied", "reason": "no_match"})
+            self.assertEqual(
+                [attempt["status"] for attempt in wire["ocr_attempts"]],
+                ["no_plate", "ocr_error", "recognized"],
+            )
+
+    def test_a_failed_frame_beside_only_empty_reads_stays_an_ocr_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 64),
+                self._jpeg(directory, "second.jpg", 128),
+            )
+            recognizer = SequenceRecognizer([
+                PlateObservation(None, 0.0),
+                OcrResponseError("OCR service returned HTTP 429", "http_429"),
+            ])
+            store = LocalStore(Path(directory) / "gate.db")
+            result = self._processor(store, RecordingRelay([]), recognizer).process(frames)
+
+            self.assertEqual(result.reason, "ocr_error")

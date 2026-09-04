@@ -596,3 +596,101 @@ class ReolinkWebhookConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReolinkWebhookUrlSecretTests(unittest.TestCase):
+    """Reolink firmware posts a custom body verbatim, so the shared secret
+    can travel as a URL query parameter alongside the camera's default body."""
+
+    secret = "correct-horse-battery-staple"
+    now = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+
+    def default_body(self, **alarm_overrides):
+        alarm = {
+            "alarmTime": "2026-08-20T10:00:00.000+0000",
+            "channel": 0,
+            "channelName": "Front Gate",
+            "device": "Front Gate",
+            "deviceModel": "RLC-810A",
+            "message": "Vehicle detected",
+            "name": "Vehicle rule",
+            "title": "Alarm",
+            "type": "VEHICLE",
+        }
+        alarm.update(alarm_overrides)
+        return {"alarm": alarm}
+
+    def post(self, endpoint, path, payload):
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Length": str(len(body)), "Content-Type": "application/json",
+        }
+        return endpoint.handle(
+            "POST", path, headers, BytesIO(body).read, received_at=self.now,
+        )
+
+    def test_accepts_the_camera_default_body_with_a_url_secret(self):
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+
+        response = self.post(
+            endpoint, f"/reolink/events?secret={self.secret}", self.default_body(),
+        )
+        trigger = correlator.correlate(
+            self.now + timedelta(milliseconds=125), now=self.now,
+        )
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(trigger.to_wire()["event_type"], "vehicle")
+        self.assertEqual(trigger.to_wire()["correlation"], "matched")
+
+    def test_rejects_a_wrong_missing_or_repeated_url_secret(self):
+        for path in (
+            "/reolink/events?secret=wrong-secret-of-adequate-length",
+            "/reolink/events",
+            "/reolink/events?secret=",
+            f"/reolink/events?secret={self.secret}&secret={self.secret}",
+            f"/reolink/events?token={self.secret}",
+        ):
+            with self.subTest(path=path):
+                endpoint = ReolinkWebhookEndpoint(self.secret, ReolinkEventCorrelator())
+                response = self.post(endpoint, path, self.default_body())
+                self.assertEqual(response.status, 401)
+
+    def test_a_wrong_body_secret_is_not_rescued_by_the_url(self):
+        endpoint = ReolinkWebhookEndpoint(self.secret, ReolinkEventCorrelator())
+        payload = self.default_body()
+        payload["secret"] = "wrong-secret-of-adequate-length"
+
+        response = self.post(endpoint, f"/reolink/events?secret={self.secret}", payload)
+
+        self.assertEqual(response.status, 401)
+
+    def test_the_query_never_changes_the_route(self):
+        endpoint = ReolinkWebhookEndpoint(self.secret, ReolinkEventCorrelator())
+
+        response = self.post(endpoint, f"/other?secret={self.secret}", self.default_body())
+
+        self.assertEqual(response.status, 404)
+
+    def test_a_test_notification_is_recorded_as_manual_test(self):
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+
+        response = self.post(
+            endpoint, f"/reolink/events?secret={self.secret}",
+            self.default_body(
+                type="TEST", title="Test message",
+                name="A webhook test message from Front Gate",
+                message=(
+                    "If you receive this message it means you have "
+                    "successfully set up your device: Front Gate"
+                ),
+            ),
+        )
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(
+            correlator.correlate(self.now, now=self.now).to_wire()["event_type"],
+            "manual_test",
+        )

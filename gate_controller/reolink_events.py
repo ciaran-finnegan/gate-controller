@@ -17,6 +17,7 @@ from socketserver import ThreadingMixIn
 from threading import BoundedSemaphore, Lock, Timer
 from time import monotonic
 from typing import Callable, Mapping
+from urllib.parse import parse_qs
 
 from .telemetry import TriggerTelemetry, ftp_fallback_trigger
 
@@ -229,7 +230,8 @@ class ReolinkWebhookEndpoint:
         *,
         received_at: datetime | None = None,
     ) -> WebhookResponse:
-        if path != REOLINK_WEBHOOK_PATH:
+        route, _separator, query = path.partition("?")
+        if route != REOLINK_WEBHOOK_PATH:
             return WebhookResponse(404)
         if method != "POST":
             return WebhookResponse(405)
@@ -258,7 +260,10 @@ class ReolinkWebhookEndpoint:
 
         received_at = _utc(received_at or datetime.now(timezone.utc))
         try:
-            event = _sanitize_event(payload, self._secret, received_at)
+            event = _sanitize_event(
+                payload, self._secret, received_at,
+                url_secret=_query_secret(query),
+            )
         except UnauthorizedReolinkWebhook:
             return self._reject(401, "unauthorized")
         except InvalidReolinkWebhook:
@@ -446,12 +451,37 @@ class _ReolinkRequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def _query_secret(query: str) -> str | None:
+    """Return the single bounded ``secret`` query value, if any.
+
+    Reolink firmware posts a custom webhook body verbatim, without
+    substituting the alarm time or type, so the only way to keep the
+    camera's real event fields is its default body, which carries no secret.
+    The shared secret is then supplied as a URL query parameter instead.
+    """
+    if not query or len(query) > 4 * MAX_REOLINK_WEBHOOK_SECRET_LENGTH:
+        return None
+    try:
+        values = parse_qs(query, strict_parsing=True, max_num_fields=4).get("secret")
+    except ValueError:
+        return None
+    if not values or len(values) != 1:
+        return None
+    value = values[0]
+    if not MIN_REOLINK_WEBHOOK_SECRET_LENGTH <= len(value) <= MAX_REOLINK_WEBHOOK_SECRET_LENGTH:
+        return None
+    return value
+
+
 def _sanitize_event(
-    payload: object, secret: str, received_at: datetime
+    payload: object, secret: str, received_at: datetime, *,
+    url_secret: str | None = None,
 ) -> SanitizedCameraEvent:
     if not isinstance(payload, dict):
         raise InvalidReolinkWebhook("payload must be an object")
     supplied_secret = payload.get("secret")
+    if supplied_secret is None:
+        supplied_secret = url_secret
     if not isinstance(supplied_secret, str) or not hmac.compare_digest(
         supplied_secret, secret
     ):
@@ -524,9 +554,12 @@ def _bounded_scalar(value: object) -> str | None:
 def _event_type(*values: str | None) -> str:
     combined = " ".join(value.lower() for value in values if value)
     normalized = _RULE_CHARACTER.sub("_", combined)
-    outer_type = _RULE_CHARACTER.sub("_", (values[0] or "").lower()).strip("_")
-    if outer_type in {"test", "manual", "manual_test"}:
-        return "manual_test"
+    # The camera's own Test button posts alarm "type": "TEST" with no
+    # top-level type, so both positions count.
+    for candidate in values[:2]:
+        candidate_type = _RULE_CHARACTER.sub("_", (candidate or "").lower()).strip("_")
+        if candidate_type in {"test", "manual", "manual_test"}:
+            return "manual_test"
     if "line_cross" in normalized:
         return "line_crossing"
     if "vehicle" in normalized or "car" in normalized:

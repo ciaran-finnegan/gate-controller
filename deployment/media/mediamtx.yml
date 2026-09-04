@@ -53,8 +53,14 @@ pathDefaults:
   sourceOnDemand: false
 
 paths:
-  camera: {}
-  clear: {}
+  # Pull both camera profiles over TCP. The default automatic transport
+  # falls back to UDP, and on this LAN the 4K clear stream lost RTP packets
+  # ("invalid fragmentation unit"), which corrupts the keyframes that
+  # webhook-triggered capture depends on.
+  camera:
+    rtspTransport: tcp
+  clear:
+    rtspTransport: tcp
   gate:
     source: publisher
     overridePublisher: false
