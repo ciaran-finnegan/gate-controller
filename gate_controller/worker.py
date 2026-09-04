@@ -12,7 +12,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .images import content_digest, rank_images, wait_until_readable
-from .telemetry import ftp_fallback_trigger
+from .telemetry import ftp_fallback_trigger, TriggerTelemetry
 
 
 DEFAULT_MAX_BURST_CANDIDATES = 8
@@ -33,6 +33,9 @@ class WorkerFailure(RuntimeError):
 @dataclass(frozen=True)
 class BurstIdentity:
     idempotency_key: str
+    # A burst injected by webhook-triggered capture carries its own sanitized
+    # trigger; the FTP path resolves one from the correlator instead.
+    trigger: TriggerTelemetry | None = None
 
 
 class BoundedBurstQueue:
@@ -184,7 +187,7 @@ class BurstCollector:
 
 
 class CompletedImageHandler(FileSystemEventHandler):
-    def __init__(self, collector: BurstCollector, retry_interval: float = 0.25,
+    def __init__(self, collector: BurstCollector, retry_interval: float = 0.05,
                  max_attempts: int = 20, max_age: float = 30.0, clock=monotonic,
                  on_rejected=None, arrival_clock=None,
                  max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
@@ -407,16 +410,17 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                on_timed_skipped=None, trigger_resolver=None,
-               hot_frame_provider=None) -> None:
+               hot_frame_provider=None, trigger_capture=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
     bursts = BoundedBurstQueue(max_pending_bursts)
 
     def report_dropped(item, reason):
         paths, received_at, *timing = item
-        if timing and isinstance(timing[-1], BurstIdentity):
-            timing.pop()
+        identity = timing.pop() if timing and isinstance(timing[-1], BurstIdentity) else None
         options = {}
-        if trigger_resolver is not None:
+        if identity is not None and identity.trigger is not None:
+            options["trigger"] = identity.trigger
+        elif trigger_resolver is not None:
             options["trigger"] = ftp_fallback_trigger()
         if on_timed_skipped is not None and timing:
             on_timed_skipped(paths, reason, received_at, *timing, **options)
@@ -439,6 +443,16 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             finally:
                 _remove_uploads(dropped[0])
 
+    def inject_trigger_burst(paths, received_at, trigger):
+        # A webhook-triggered clear frame enters the same bounded queue as an
+        # FTP burst, with its own content identity and sanitized trigger.
+        paths = tuple(Path(path) for path in paths)
+        identity = BurstIdentity(content_digest(paths[0]), trigger)
+        enqueue((paths, received_at, monotonic(), datetime.now(timezone.utc), identity))
+
+    if trigger_capture is not None:
+        trigger_capture.attach(inject_trigger_burst)
+
     collector = BurstCollector(
         enqueue, quiet_window=quiet_window,
         ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
@@ -459,8 +473,10 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             hot_frame_provider.select if hot_frame_provider is not None else None
         ),
         ignored_roots=(
-            (hot_frame_provider.output_directory,)
-            if hot_frame_provider is not None else ()
+            ((hot_frame_provider.output_directory,)
+             if hot_frame_provider is not None else ())
+            + ((trigger_capture.output_directory,)
+               if trigger_capture is not None else ())
         ),
     )
     observer = Observer()
@@ -569,9 +585,14 @@ def _process_bursts(
         trigger_summary = _TRIGGER_UNSET
         try:
             options = {}
+            identity = None
             if timing and isinstance(timing[-1], BurstIdentity):
-                options["idempotency_key"] = timing.pop().idempotency_key
-            if trigger_resolver is not None:
+                identity = timing.pop()
+                options["idempotency_key"] = identity.idempotency_key
+            if identity is not None and identity.trigger is not None:
+                trigger_summary = identity.trigger
+                options["trigger"] = trigger_summary
+            elif trigger_resolver is not None:
                 trigger_summary = _resolve_trigger(
                     trigger_resolver, received_at,
                 )

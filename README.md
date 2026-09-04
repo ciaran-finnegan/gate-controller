@@ -151,6 +151,13 @@ the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
 bounded set, the high-resolution FTP trigger remains the first OCR attempt. Up
 to two continuously buffered fluent-stream fallbacks follow in quality order,
 keeping all three inside the existing OCR attempt ceiling.
+When the Reolink webhook listener is enabled, each accepted camera event also
+grabs one frame from the loopback clear stream and recognises it before the
+FTP upload lands (`GATE_TRIGGER_CAPTURE_*`). The webhook never authorises or
+actuates; the frame takes the same path as an upload, and the FTP path stays
+as the fallback. `GATE_OCR_MAX_UPLOAD_WIDTH` can downscale frames before the
+OCR upload once the plate is large enough in the 4K image.
+
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
 camera recognition events: each contained one 3840x2160 frame, with no second

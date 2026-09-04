@@ -19,6 +19,8 @@ from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
+from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
+from .trigger_capture import TriggerFrameCapture, load_trigger_capture_config
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import (
@@ -94,13 +96,28 @@ def main() -> None:
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream,
     )
-    trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(os.environ)
+    trigger_capture_config = load_trigger_capture_config(
+        os.environ, arguments.directory,
+        webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
+    )
+    trigger_capture = (
+        TriggerFrameCapture(trigger_capture_config)
+        if trigger_capture_config.enabled else None
+    )
+    trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
+        os.environ,
+        on_accepted=trigger_capture.on_camera_event if trigger_capture else None,
+    )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if hot_stream is not None:
         background_workers += (hot_stream,)
+    if trigger_capture is not None:
+        background_workers += (trigger_capture,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
-        recognizer=PlateRecognizerClient(token),
+        recognizer=PlateRecognizerClient(
+            token, max_upload_width=_ocr_upload_width(os.environ),
+        ),
         store=store,
         relay=relay,
         authorised=authorised.get,
@@ -165,18 +182,35 @@ def main() -> None:
         max_candidate_bytes=max_candidate_bytes,
         trigger_resolver=trigger_correlator.correlate,
         hot_frame_provider=hot_stream,
+        trigger_capture=trigger_capture,
     )
 
 
-def build_reolink_trigger_pipeline(environment=None):
+def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None):
     environment = os.environ if environment is None else environment
     correlator = ReolinkEventCorrelator()
     config = load_reolink_webhook_config(environment)
     workers = (
-        (ReolinkWebhookWorker(config, correlator),)
+        (ReolinkWebhookWorker(config, correlator, on_accepted=on_accepted),)
         if config.enabled else ()
     )
     return correlator, workers
+
+
+def _ocr_upload_width(environment) -> int:
+    """0 disables downscaling; otherwise the widest frame uploaded to OCR."""
+    raw = environment.get("GATE_OCR_MAX_UPLOAD_WIDTH", "0")
+    try:
+        width = int(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("GATE_OCR_MAX_UPLOAD_WIDTH must be an integer") from error
+    if width == 0:
+        return 0
+    if not MIN_UPLOAD_WIDTH <= width <= MAX_UPLOAD_WIDTH:
+        raise ValueError(
+            f"GATE_OCR_MAX_UPLOAD_WIDTH must be 0 or between {MIN_UPLOAD_WIDTH} and {MAX_UPLOAD_WIDTH}"
+        )
+    return width
 
 
 def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,

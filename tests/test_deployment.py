@@ -74,6 +74,22 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertNotIn("open_gate", plate_camera)
         self.assertNotIn("--actuate", plate_camera)
 
+    def test_camera_docs_cover_webhook_triggered_capture_without_authorising(self):
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(encoding="utf-8")
+        environment = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Webhook-Triggered Capture", camera)
+        self.assertIn("The webhook still authorises nothing", camera)
+        self.assertIn("I-frame interval", camera)
+        self.assertIn("rtsp://127.0.0.1:8554/clear", camera)
+        self.assertIn("GATE_TRIGGER_CAPTURE_ENABLED", environment)
+        self.assertIn("GATE_OCR_MAX_UPLOAD_WIDTH", environment)
+        self.assertIn("never authorises or", readme)
+        plate_camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(encoding="utf-8")
+        self.assertIn("I-frame interval", plate_camera)
+        self.assertIn("Do not enable it\nbefore that check", plate_camera)
+
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 

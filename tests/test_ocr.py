@@ -1,3 +1,4 @@
+import io
 import tempfile
 import unittest
 from math import inf, nan
@@ -237,6 +238,82 @@ class OcrClientTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(OcrResponseError, "confidence"):
                     client.recognise(self.path)
+
+
+class OcrUploadDownscaleTests(unittest.TestCase):
+    def setUp(self):
+        from PIL import Image
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "frame.jpg"
+        Image.new("RGB", (3840, 2160), color="gray").save(self.path, format="JPEG")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def recording_session():
+        # The client closes the upload after posting, so capture its bytes
+        # while the request is in flight.
+        session = FakeSession(response=FakeResponse(payload={"results": []}))
+        session.uploaded = []
+        original_post = session.post
+
+        def post(*args, **kwargs):
+            session.uploaded.append(kwargs["files"]["upload"][1].read())
+            return original_post(*args, **kwargs)
+
+        session.post = post
+        return session
+
+    def test_uploads_the_file_unchanged_by_default(self):
+        session = FakeSession(response=FakeResponse(payload={"results": []}))
+        client = PlateRecognizerClient("token", session=session)
+
+        client.recognise(self.path)
+
+        (_args, kwargs), = session.calls
+        self.assertEqual(kwargs["files"]["upload"][0], "frame.jpg")
+        self.assertTrue(kwargs["files"]["upload"][1].closed)
+
+    def test_downscales_wide_frames_before_upload_and_leaves_the_file_alone(self):
+        from PIL import Image
+        session = self.recording_session()
+        client = PlateRecognizerClient("token", session=session, max_upload_width=1920)
+        original = self.path.read_bytes()
+
+        client.recognise(self.path)
+
+        (_args, kwargs), = session.calls
+        upload = kwargs["files"]["upload"][1]
+        self.assertTrue(upload.closed)
+        with Image.open(self.path) as image:
+            self.assertEqual(image.size, (3840, 2160))
+        self.assertEqual(self.path.read_bytes(), original)
+        uploaded, = session.uploaded
+        self.assertLess(len(uploaded), len(original))
+        with Image.open(io.BytesIO(uploaded)) as image:
+            self.assertEqual(image.size, (1920, 1080))
+            self.assertEqual(image.format, "JPEG")
+
+    def test_narrow_frames_and_undecodable_files_upload_unchanged(self):
+        from PIL import Image
+        narrow = Path(self.temporary.name) / "narrow.jpg"
+        Image.new("RGB", (640, 360), color="gray").save(narrow, format="JPEG")
+        broken = Path(self.temporary.name) / "broken.jpg"
+        broken.write_bytes(b"not a jpeg")
+        for path in (narrow, broken):
+            with self.subTest(path=path.name):
+                session = FakeSession(response=FakeResponse(payload={"results": []}))
+                client = PlateRecognizerClient("token", session=session, max_upload_width=1920)
+                client.recognise(path)
+                (_args, kwargs), = session.calls
+                self.assertEqual(kwargs["files"]["upload"][0], path.name)
+
+    def test_rejects_widths_outside_the_safe_range(self):
+        for width in (1, 639, 3841, True, 1.5):
+            with self.subTest(width=width):
+                with self.assertRaises(ValueError):
+                    PlateRecognizerClient("token", session=FakeSession(), max_upload_width=width)
 
 
 class OcrFailureCauseTests(unittest.TestCase):

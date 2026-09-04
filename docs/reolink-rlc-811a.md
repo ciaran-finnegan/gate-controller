@@ -101,11 +101,28 @@ At 1/500 s a slowing vehicle at 5-8 m is effectively still. Set it up as:
    the plate at 5 m is about 300-430 px and at 8 m about 190-270 px, so the
    whole 5-8 m corridor is above the 150 px minimum.
 3. Draw the vehicle detection zone around that corridor only.
-4. Place the line-crossing line across the drive at about 6 m from the pillar,
-   vehicle-only, inbound direction, so the FTP JPEG is taken while the plate
-   is square-on and the vehicle is slowing. Keep sensitivity at the frozen 80
-   baseline until day and night captures have been inspected.
+4. Place the line-crossing line across the drive at the far edge of the
+   corridor, about 8 m from the pillar, vehicle-only, inbound direction. The
+   FTP JPEG is taken at the crossing with the plate square-on and above 190 px,
+   and the webhook capture that follows 0.3 to 1.5 s later finds the vehicle
+   at 6-7 m, still inside the corridor and slowing. Keep sensitivity at the
+   frozen 80 baseline until day and night captures have been inspected.
 5. Save JPEGs at 5 m and 8 m before enabling the alarm FTP schedule.
+
+## Webhook Capture And Keyframes
+
+With the webhook fixed, the controller grabs a clear-stream frame the moment
+the camera fires and starts OCR before the FTP JPEG lands. This only pays off
+if the Clear stream's **I-frame interval** is set to 1x the frame rate, so set
+that on the RLC-811A at commissioning. Put the line-crossing line at the far
+edge of the framed corridor, about 8 m out: the webhook fires as the plate
+enters the frame, and the capture that follows 0.3 to 1.5 s later still finds
+the plate inside the corridor rather than past it. Details are in the
+RLC-810A document under Webhook-Triggered Capture.
+
+Once a saved 4K capture shows the plate at least 300 pixels wide, set
+`GATE_OCR_MAX_UPLOAD_WIDTH=1920` to shorten the OCR upload. Do not enable it
+before that check.
 
 ## Exposure
 

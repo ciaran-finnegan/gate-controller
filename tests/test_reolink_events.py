@@ -114,6 +114,36 @@ class ReolinkWebhookTests(unittest.TestCase):
                 self.assertEqual(response.status, 400)
                 self.assertEqual(correlator.pending_count, 0)
 
+    def test_accepted_events_notify_the_capture_hook_and_rejections_do_not(self):
+        correlator = ReolinkEventCorrelator()
+        notified = []
+        endpoint = ReolinkWebhookEndpoint(
+            self.secret, correlator, on_accepted=notified.append,
+        )
+
+        accepted = self.request(endpoint, self.payload())
+        duplicate = self.request(endpoint, self.payload())
+        unauthorized = self.request(endpoint, {**self.payload(), "secret": "wrong"})
+
+        self.assertEqual((accepted.status, duplicate.status, unauthorized.status), (202, 200, 401))
+        self.assertEqual(len(notified), 1)
+        self.assertIsInstance(notified[0], SanitizedCameraEvent)
+        self.assertEqual(notified[0].event_type, "line_crossing")
+        self.assertNotIn(self.secret, repr(notified[0]))
+
+    def test_capture_hook_failure_never_changes_the_webhook_response(self):
+        correlator = ReolinkEventCorrelator()
+
+        def explode(_event):
+            raise RuntimeError("capture unavailable")
+
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator, on_accepted=explode)
+
+        response = self.request(endpoint, self.payload())
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(correlator.pending_count, 1)
+
     def test_maps_bounded_top_level_test_and_manual_types_to_manual_test(self):
         for webhook_type in ("test", "manual"):
             with self.subTest(webhook_type=webhook_type):
