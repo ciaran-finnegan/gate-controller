@@ -204,3 +204,28 @@ class PrivateFrameWriteTests(unittest.TestCase):
                     write_private_frame(root, b"\xff\xd8\xff\xd9")
 
             self.assertEqual(sorted(root.glob("*")), [])
+
+
+class HotFrameRingLatestTests(unittest.TestCase):
+    def _jpeg(self, size):
+        from io import BytesIO
+        from PIL import Image
+        output = BytesIO()
+        Image.new("RGB", size, color="red").save(output, format="JPEG")
+        return output.getvalue()
+
+    def test_latest_returns_the_newest_fresh_frame_and_its_time(self):
+        from gate_controller.hot_stream import HotFrameRing
+        ring = HotFrameRing(max_frames=4, max_frame_bytes=1 << 20, max_total_bytes=4 << 20)
+        first, second = self._jpeg((8, 8)), self._jpeg((16, 8))
+        ring.add(first, captured_at=10.0)
+        ring.add(second, captured_at=11.0)
+
+        self.assertEqual(ring.latest(now=11.5, max_age=1.6), (second, 11.0))
+        self.assertIsNone(ring.latest(now=11.5, max_age=1.6, after=11.0))
+        self.assertEqual(ring.latest(now=11.5, max_age=1.6, after=10.0), (second, 11.0))
+        self.assertIsNone(ring.latest(now=13.0, max_age=1.6))
+        self.assertIsNone(
+            HotFrameRing(max_frames=1, max_frame_bytes=1 << 20, max_total_bytes=1 << 20)
+            .latest(now=0.0, max_age=1.0)
+        )

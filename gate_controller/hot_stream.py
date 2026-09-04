@@ -145,6 +145,25 @@ class HotFrameRing:
                 if 0 <= now - captured_at <= max_age
             ][:count]
 
+    def latest(
+        self, *, now: float | None = None, max_age: float, after: float | None = None,
+    ) -> tuple[bytes, float] | None:
+        """Return the newest fresh frame and its capture time, or None.
+
+        With ``after`` set, only a frame captured strictly later than that
+        moment qualifies, so a series never hands the same frame out twice.
+        """
+        now = monotonic() if now is None else now
+        with self._lock:
+            if not self._frames:
+                return None
+            captured_at, _digest, frame = self._frames[-1]
+        if after is not None and captured_at <= after:
+            return None
+        if not 0 <= now - captured_at <= max_age:
+            return None
+        return frame, captured_at
+
     def materialise(
         self, output_directory: Path, count: int, *,
         now: float | None = None, max_age: float,
