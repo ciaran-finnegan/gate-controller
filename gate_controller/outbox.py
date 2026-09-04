@@ -211,6 +211,15 @@ def _normalise_jpeg(path: Path) -> bytes | None:
     with Image.open(path) as source:
         if source.format != "JPEG":
             return None
+        # Let the JPEG decoder skip the detail the thumbnail discards: a
+        # full 4K decode costs about 230 ms on the Pi 5 and this staging
+        # runs before the relay pulse for an allowed vehicle.
+        scale = MAX_OUTBOX_IMAGE_DIMENSION / max(source.width, source.height, 1)
+        if scale < 1:
+            source.draft("RGB", (
+                max(1, round(source.width * scale)),
+                max(1, round(source.height * scale)),
+            ))
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.thumbnail(
             (MAX_OUTBOX_IMAGE_DIMENSION, MAX_OUTBOX_IMAGE_DIMENSION),
