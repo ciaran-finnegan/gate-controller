@@ -502,3 +502,163 @@ class OcrFailureCauseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeClock:
+    def __init__(self, start=100.0):
+        self.now = start
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(round(seconds, 3))
+        self.now += seconds
+
+
+class SequenceSession:
+    """Answer successive posts with the given responses or errors."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+        self.closed = False
+
+    def post(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def close(self):
+        self.closed = True
+
+
+class OcrPacingAndRetryTests(unittest.TestCase):
+    """Plate Recognizer throttles at one request per second; the client
+    paces itself from the previous response and retries once."""
+
+    payload = {"results": [{"plate": "12D3456", "score": 0.93}]}
+
+    def setUp(self):
+        self.image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        self.image.write(b"test image")
+        self.image.close()
+        self.path = Path(self.image.name)
+        self.clock = FakeClock()
+
+    def tearDown(self):
+        self.path.unlink(missing_ok=True)
+
+    def client(self, session):
+        return PlateRecognizerClient(
+            "token", session=session, clock=self.clock, sleep=self.clock.sleep,
+        )
+
+    def test_back_to_back_requests_wait_out_the_throttle_window(self):
+        session = SequenceSession([FakeResponse(payload=self.payload)] * 3)
+        client = self.client(session)
+
+        client.recognise(self.path)
+        self.clock.now += 0.3
+        client.recognise(self.path)
+        self.clock.now += 5.0
+        client.recognise(self.path)
+
+        self.assertEqual(len(session.calls), 3)
+        # Only the second call was too close to the previous response.
+        self.assertEqual(self.clock.sleeps, [0.75])
+
+    def test_a_throttled_response_is_retried_once_after_retry_after(self):
+        throttled = FakeResponse(status_code=429, payload={"detail": "throttled"})
+        throttled.headers = {"Retry-After": "1"}
+        session = SequenceSession([throttled, FakeResponse(payload=self.payload)])
+        client = self.client(session)
+
+        with self.assertLogs(ocr_module._LOGGER, level="INFO") as logs:
+            observation = client.recognise(self.path)
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(self.clock.sleeps, [1.05])
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_ocr stage=attempt_failed cause=http_429", combined)
+        self.assertIn("gate_ocr stage=retry cause=http_429", combined)
+        self.assertNotIn("throttled", combined)
+
+    def test_a_second_throttled_response_fails_with_its_cause(self):
+        throttled = FakeResponse(status_code=429, payload={})
+        session = SequenceSession([throttled, throttled])
+        client = self.client(session)
+
+        with self.assertRaises(OcrResponseError) as raised:
+            client.recognise(self.path)
+
+        self.assertEqual(raised.exception.failure_cause, "http_429")
+        self.assertEqual(len(session.calls), 2)
+
+    def test_retry_after_is_bounded(self):
+        throttled = FakeResponse(status_code=429, payload={})
+        throttled.headers = {"Retry-After": "600"}
+        session = SequenceSession([throttled, FakeResponse(payload=self.payload)])
+
+        self.client(session).recognise(self.path)
+
+        self.assertEqual(self.clock.sleeps, [2.0])
+
+    def test_a_connection_error_is_retried_once_on_a_fresh_session(self):
+        from requests import exceptions as requests_exceptions
+        stale = SequenceSession([requests_exceptions.ConnectionError("reset")])
+        fresh = SequenceSession([FakeResponse(payload=self.payload)])
+        client = self.client(stale)
+
+        with patch.object(client, "_create_session", return_value=fresh):
+            observation = client.recognise(self.path)
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertTrue(stale.closed)
+        self.assertEqual(len(stale.calls), 1)
+        self.assertEqual(len(fresh.calls), 1)
+
+    def test_timeouts_are_never_retried(self):
+        from requests import exceptions as requests_exceptions
+        session = SequenceSession([requests_exceptions.ReadTimeout("slow")])
+        client = self.client(session)
+
+        with self.assertRaises(requests_exceptions.ReadTimeout):
+            client.recognise(self.path)
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_an_idle_session_is_recycled_before_the_next_request(self):
+        first = SequenceSession([FakeResponse(payload=self.payload)])
+        second = SequenceSession([FakeResponse(payload=self.payload)])
+        client = self.client(first)
+
+        client.recognise(self.path)
+        self.clock.now += ocr_module.SESSION_IDLE_RECYCLE_SECONDS + 1
+        with patch.object(client, "_create_session", return_value=second):
+            client.recognise(self.path)
+
+        self.assertTrue(first.closed)
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(len(second.calls), 1)
+
+    def test_abandonment_during_the_throttle_wait_never_posts(self):
+        session = SequenceSession([FakeResponse(payload=self.payload)] * 2)
+        client = self.client(session)
+        client.recognise(self.path)
+
+        def abandon_while_sleeping(seconds):
+            self.clock.now += seconds
+            client.abandon_in_flight()
+
+        client._sleep = abandon_while_sleeping
+        with self.assertRaises(OcrResponseError) as raised:
+            client.recognise(self.path)
+
+        self.assertEqual(raised.exception.failure_cause, "request_abandoned")
+        self.assertEqual(len(session.calls), 1)

@@ -72,32 +72,45 @@ GATE_REOLINK_WEBHOOK_HOST=0.0.0.0
 GATE_REOLINK_WEBHOOK_PORT=8766
 ```
 
-In the camera's Webhook settings, use this private-LAN URL:
+In the camera's Webhook settings (Surveillance > Push > Webhook), keep
+**Content: Default** and use this private-LAN URL with the same secret as a
+query parameter:
 
 ```text
-http://PI_PRIVATE_ADDRESS:8766/reolink/events
+http://PI_PRIVATE_ADDRESS:8766/reolink/events?secret=same-random-secret
 ```
 
-Use the camera's default JSON body and include the same secret at the top
-level. The camera substitutes the placeholders; `channel` arrives as a JSON
-number and `alarmTime` with a `+0000` style offset, both of which the
-controller accepts. The controller bounds the whole request and each relevant
-field, then retains only normalized type, rule, event time, and correlation
-timing:
+The firmware sends a **Custom** body verbatim: it does not substitute
+placeholders such as `time` or `chn`, so a custom body can never carry the
+real alarm time or type. The default body does, and it looks like this
+(`channel` is a JSON number and `alarmTime` has a `+0000` offset, both of
+which the controller accepts). The controller bounds the whole request and
+each relevant field, then retains only normalized type, rule, event time, and
+correlation timing:
 
 ```json
 {
   "alarm": {
-    "alarmTime": "time",
+    "alarmTime": "2026-09-04T21:28:22.000+0000",
     "channel": 0,
-    "message": "message",
-    "name": "name",
-    "type": "type"
-  },
-  "secret": "same-random-secret",
-  "type": "type"
+    "channelName": "Front Gate",
+    "device": "Front Gate",
+    "deviceModel": "RLC-810A",
+    "message": "...",
+    "name": "...",
+    "title": "...",
+    "type": "VEHICLE"
+  }
 }
 ```
+
+A top-level `"secret"` in a custom body is still accepted, and a wrong body
+secret is never rescued by the URL. The camera's own **Test** button posts
+`"type": "TEST"`, which the controller records as `manual_test` and never
+captures from, so the journal line `gate_trigger_capture outcome=skipped_type`
+after a test proves the URL, secret and listener end to end. Through the
+camera API the same settings are `SetWebHook` with a base64-encoded
+`hookBody`; `TestWebHook` sends the test post.
 
 Top-level camera `test` and `manual` notifications are recorded as
 `manual_test`.
@@ -134,15 +147,23 @@ skipped event still has its FTP frame recognised as before.
   timeout, frames validated as JPEG and written owner-only under
   the controller state directory (`trigger-capture` beside the database,
   or `GATE_TRIGGER_CAPTURE_DIRECTORY`), never under the FTP upload tree.
-- Set the camera's Clear stream **I-frame interval** to 1x the frame rate
-  (10 at 10 fps). An on-demand grab waits for the next keyframe, so a longer
-  interval adds up to that many seconds. Without this setting the capture
-  usually times out and only the FTP path runs.
+- Set the camera's Clear stream **I-frame interval** (Interframe Space) to
+  1. An on-demand grab decodes only from the next keyframe, so a longer
+  interval adds up to that many seconds; with the interval at 2 the grab took
+  about 2.7 s against the default 2.5 s timeout and only the FTP path ran.
+  The grab skips ffmpeg's stream probing and every frame before the first
+  keyframe: a frame decoded against a synthetic grey reference is a valid
+  JPEG of nothing, and used to cost an OCR request. Measured on the Pi 5 at
+  4K H.265 with the interval at 1 the grab takes about 1.8 s.
+- MediaMTX pulls both camera profiles over TCP (`rtspTransport: tcp` per
+  path). The automatic transport used UDP, and on this LAN the 4K stream
+  logged lost RTP packets and "invalid fragmentation unit" errors, which
+  corrupt exactly the keyframes capture depends on.
 
 ```sh
 GATE_TRIGGER_CAPTURE_ENABLED=true
 GATE_TRIGGER_CAPTURE_SOURCE=rtsp://127.0.0.1:8554/clear
-GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=2.5
+GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=3
 GATE_TRIGGER_CAPTURE_DELAY_SECONDS=1.5
 GATE_TRIGGER_CAPTURE_COUNT=2
 GATE_TRIGGER_CAPTURE_SPACING_SECONDS=1
@@ -153,7 +174,27 @@ Watch the journal for `gate_trigger_capture outcome=captured` followed by the
 recognition trace. `outcome=failed reason=timeout` on every event means the
 keyframe interval is still too long or the clear path is not being served.
 Each captured frame is an extra OCR request, so with the default series of
-two expect roughly three Plate Recognizer calls per vehicle instead of one.
+two expect roughly four Plate Recognizer calls per vehicle instead of one.
+
+### OCR Request Pacing
+
+Plate Recognizer's cloud API allows one request per second per account and
+answers a faster follow-up with HTTP 429 (`Retry-After: 1`), counted from
+when the previous upload finished arriving. The controller paces every
+request process-wide from the previous response (1.05 s), retries a throttled
+or connection-level failure once, and recycles a keep-alive connection that
+has been idle for 20 s because the API closes those server-side and the
+next post on one fails instantly. The journal shows the retry as
+`gate_ocr stage=retry cause=http_429 wait_ms=...`. Before this pacing, the
+hot-stream burst of three frames lost its second request to a 429 on every
+vehicle from the day fluent frames joined the burst.
+
+Because each paced call costs at least a second, keep
+`GATE_DECISION_TIMEOUT_SECONDS` at 6 with two fluent-plus-FTP frames, and
+prefer `GATE_HOT_STREAM_SELECTION_COUNT=1`: the 640x360 fluent frame rarely
+reads a plate the 4K frames cannot, and the webhook capture now supplies the
+sharp frames. A matching first frame still opens the gate as soon as its
+own request returns; the deadline only bounds the fallbacks.
 Tune the delay from the captured frames: movement means wait longer, a
 vehicle already stopped in the FTP frame means the delay can be shorter. Invalid, stale, duplicate, unauthorized, and oversized requests
 cannot reach recognition or relay code. Raw payloads, camera identifiers, and
@@ -189,7 +230,7 @@ Enable the reviewed preset in `/etc/gate-controller.env`:
 GATE_HOT_STREAM_ENABLED=true
 GATE_HOT_STREAM_SAMPLE_FPS=5
 GATE_HOT_STREAM_FRAME_COUNT=8
-GATE_HOT_STREAM_SELECTION_COUNT=2
+GATE_HOT_STREAM_SELECTION_COUNT=1
 GATE_HOT_STREAM_MAX_AGE_SECONDS=1
 ```
 
@@ -223,11 +264,12 @@ Keeping 6144 Kbit/s at 10 fps preserves more detail per Clear frame. Frame rate
 does not freeze a moving plate by itself; exposure time controls motion blur.
 
 `GATE_OCR_MAX_UPLOAD_WIDTH` optionally downscales frames wider than the value
-before they are sent to OCR; the file on disk is untouched. Leave it at `0`
-until a saved 4K capture shows the plate at least 300 pixels wide at the
-capture point. At that width `1920` keeps the plate above the 150 pixel target
-and cuts the upload to roughly a quarter of the bytes. Enabling it earlier
-shrinks distant plates below what OCR can read.
+before they are sent to OCR; the file on disk is untouched. Set it to `1920`:
+the property uplink measured about 4.5 Mbit/s, so a 1.2-2.2 MB 4K JPEG spends
+2-4 s uploading while Plate Recognizer's own processing takes about 60 ms, and
+at 1920 the same frame uploads in well under a second. A plate 300 pixels wide
+at 4K stays above the 150 pixel target at 1920. Only drop back to `0` if a
+saved capture shows plates narrower than that at the capture point.
 
 The privacy mask may black out irrelevant scenery, but it must leave the whole
 vehicle approach, plate capture corridor, and position variance unobscured.

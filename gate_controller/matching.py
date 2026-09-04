@@ -75,7 +75,19 @@ def decide_access(
                 confidence=confidences[observed_plate],
             )
 
-    return MatchDecision(allowed=False, reason="no_match")
+    # Report the best-read plate on a denial so an unknown vehicle is
+    # reviewable; it never widens the match.
+    best = max(
+        normalised_observations,
+        key=lambda item: item[1].confidence,
+        default=None,
+    )
+    if best is None or not best[0]:
+        return MatchDecision(allowed=False, reason="no_match")
+    return MatchDecision(
+        allowed=False, reason="no_match",
+        observed_plate=best[0], confidence=best[1].confidence,
+    )
 
 
 def _is_one_known_confusion(observed_plate: str, authorised_plate: str) -> bool:

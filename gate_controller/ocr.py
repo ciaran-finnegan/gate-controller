@@ -5,6 +5,7 @@ from io import BytesIO
 from math import isfinite
 from pathlib import Path
 from threading import Lock
+from time import monotonic, sleep
 
 from PIL import Image
 
@@ -17,6 +18,20 @@ DEFAULT_TIMEOUT = (1, 2)
 MIN_UPLOAD_WIDTH = 640
 MAX_UPLOAD_WIDTH = 3840
 UPLOAD_JPEG_QUALITY = 90
+
+# Plate Recognizer's cloud API throttles each account to one request per
+# second, counted from when a request finishes arriving, and answers a faster
+# follow-up with HTTP 429 ("Expected available in 1 second"). A burst of three
+# frames therefore lost its second request every time. Requests are paced
+# process-wide from the previous response, and a throttled or connection-level
+# failure is retried once. The API also closes idle keep-alive connections;
+# posting on one fails instantly, so an idle session is recycled first.
+MIN_REQUEST_INTERVAL_SECONDS = 1.05
+SESSION_IDLE_RECYCLE_SECONDS = 20.0
+MAX_RETRY_AFTER_SECONDS = 2.0
+MAX_TRANSIENT_RETRIES = 1
+RETRYABLE_STATUS = 429
+RETRYABLE_TRANSPORT_CAUSES = frozenset({"connection_error", "tls_error"})
 
 # Bounded, operator-facing labels describing *why* an OCR attempt failed. They
 # separate network problems from API problems without ever carrying a response
@@ -135,10 +150,57 @@ class OcrResponseError(RuntimeError):
         self.failure_cause = bounded_failure_cause(failure_cause)
 
 
+class _RetryableFailure(Exception):
+    """One bounded retry is worth a try: the API throttled the request or
+    the connection failed before a response arrived."""
+
+    def __init__(self, error: BaseException, cause: str, interval: float) -> None:
+        super().__init__(cause)
+        self.error = error
+        self.cause = cause
+        self.interval = interval
+
+
+def _retry_after_seconds(response) -> float:
+    """Honour a bounded Retry-After, defaulting to the throttle interval."""
+    headers = getattr(response, "headers", None)
+    value = None
+    if isinstance(headers, Mapping):
+        value = headers.get("Retry-After")
+    try:
+        seconds = float(value) if value is not None else MIN_REQUEST_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        seconds = MIN_REQUEST_INTERVAL_SECONDS
+    if not isfinite(seconds):
+        seconds = MIN_REQUEST_INTERVAL_SECONDS
+    return min(max(seconds, MIN_REQUEST_INTERVAL_SECONDS), MAX_RETRY_AFTER_SECONDS)
+
+
+def _retryable_transport_cause(error: BaseException) -> str | None:
+    """Return the cause when the failure is worth one fresh-connection retry.
+    A failing classifier must never mask the original error, so it is
+    simply treated as not retryable."""
+    try:
+        cause = classify_failure_cause(error)
+    except Exception:
+        return None
+    return cause if cause in RETRYABLE_TRANSPORT_CAUSES else None
+
+
+def _log_retry(cause: str, wait_seconds: float) -> None:
+    try:
+        _LOGGER.info(
+            "gate_ocr stage=retry cause=%s wait_ms=%d",
+            bounded_failure_cause(cause), max(0, round(wait_seconds * 1000)),
+        )
+    except Exception:
+        return
+
+
 class PlateRecognizerClient:
     def __init__(self, token: str, session=None, endpoint: str = DEFAULT_ENDPOINT,
                  timeout: tuple[int, int] = DEFAULT_TIMEOUT,
-                 max_upload_width: int = 0):
+                 max_upload_width: int = 0, *, clock=monotonic, sleep=sleep):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -146,6 +208,12 @@ class PlateRecognizerClient:
         self._closed = False
         self._endpoint = endpoint
         self._timeout = timeout
+        self._clock = clock
+        self._sleep = sleep
+        # Pacing state: the earliest moment the next request may start, and
+        # when the pooled connection was last used.
+        self._not_before: float | None = None
+        self._session_used_at: float | None = None
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
@@ -153,6 +221,56 @@ class PlateRecognizerClient:
         self._max_upload_width = max_upload_width
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
+        retries = 0
+        while True:
+            try:
+                return self._recognise_once(path, timeout)
+            except _RetryableFailure as failure:
+                if retries >= MAX_TRANSIENT_RETRIES:
+                    raise failure.error
+                retries += 1
+                now = self._clock()
+                self._not_before = now + failure.interval
+                _log_retry(failure.cause, failure.interval)
+                if failure.cause in RETRYABLE_TRANSPORT_CAUSES:
+                    self._recycle_session()
+
+    def _recycle_session(self) -> None:
+        """Drop the pooled connection so the next request dials afresh."""
+        with self._session_lock:
+            session = self._session
+            self._session = None
+            self._session_used_at = None
+        self._close_session(session)
+
+    def _recycle_if_idle(self) -> None:
+        with self._session_lock:
+            used_at = self._session_used_at
+            idle = (
+                self._session is not None and used_at is not None
+                and self._clock() - used_at > SESSION_IDLE_RECYCLE_SECONDS
+            )
+        if idle:
+            self._recycle_session()
+
+    def _pace(self, generation: int) -> None:
+        """Wait out the API throttle window, then re-check abandonment."""
+        while True:
+            not_before = self._not_before
+            wait = 0.0 if not_before is None else not_before - self._clock()
+            if wait <= 0:
+                return
+            self._sleep(min(wait, MAX_RETRY_AFTER_SECONDS))
+            with self._session_lock:
+                if self._closed:
+                    raise _closed_client_error()
+                if generation != self._session_generation:
+                    raise OcrResponseError(
+                        "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
+                    )
+
+    def _recognise_once(self, path: Path, timeout: tuple[float, float] | None) -> PlateObservation:
+        self._recycle_if_idle()
         with self._session_lock:
             if self._closed:
                 raise _closed_client_error()
@@ -200,6 +318,7 @@ class PlateRecognizerClient:
                 raise _closed_client_error()
             raise OcrResponseError("OCR request was abandoned", CAUSE_REQUEST_ABANDONED)
         try:
+            self._pace(generation)
             try:
                 response = session.post(
                     self._endpoint,
@@ -210,12 +329,31 @@ class PlateRecognizerClient:
                 )
             except Exception as error:
                 # Classify and journal the transport failure, then let the
-                # original exception propagate unchanged.
+                # original exception propagate unchanged, after one retry on
+                # a fresh connection when it never produced a response.
                 _log_transport_failure(error)
+                if _retryable_transport_cause(error) is not None:
+                    cause = _retryable_transport_cause(error)
+                    raise _RetryableFailure(
+                        error, cause, MIN_REQUEST_INTERVAL_SECONDS
+                    ) from error
                 raise
         finally:
             upload.close()
 
+        responded_at = self._clock()
+        self._not_before = responded_at + MIN_REQUEST_INTERVAL_SECONDS
+        with self._session_lock:
+            if self._session is session:
+                self._session_used_at = responded_at
+        if response.status_code == RETRYABLE_STATUS:
+            error = _response_error(
+                f"OCR service returned HTTP {response.status_code}",
+                http_failure_cause(response.status_code),
+            )
+            raise _RetryableFailure(
+                error, error.failure_cause, _retry_after_seconds(response)
+            )
         if not 200 <= response.status_code < 300:
             raise _response_error(
                 f"OCR service returned HTTP {response.status_code}",

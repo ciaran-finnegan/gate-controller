@@ -64,8 +64,10 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertIn("webrtcAddress: 127.0.0.1:8889", config)
         self.assertIn('webrtcLocalUDPAddress: ""', config)
         self.assertIn('webrtcLocalTCPAddress: ""', config)
-        self.assertIn("  camera: {}", config)
-        self.assertIn("  clear: {}", config)
+        # Both camera pulls are pinned to TCP: UDP lost RTP packets on the
+        # 4K clear stream and corrupted the keyframes capture depends on.
+        self.assertIn("  camera:\n    rtspTransport: tcp", config)
+        self.assertIn("  clear:\n    rtspTransport: tcp", config)
         self.assertIn("gate:", config)
         self.assertIn("    source: publisher", config)
         self.assertIn("    overridePublisher: false", config)

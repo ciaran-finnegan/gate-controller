@@ -133,9 +133,17 @@ class TriggerFrameCapture:
         self._last_scheduled_at: float | None = None
         self._capture_count = 0
         self._failure_count = 0
+        # The SDP already carries the codec parameters, so probing is skipped
+        # (the default probe alone costs about two seconds at 4K), and the
+        # decoder ignores everything before the first keyframe: a P-frame
+        # decoded against a synthetic grey reference is a grey frame, which
+        # would be a valid JPEG and a wasted OCR request.
         self.command = (
             FFMPEG_BINARY, "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-i", config.source_url,
+            "-rtsp_transport", "tcp",
+            "-analyzeduration", "0", "-probesize", "32",
+            "-skip_frame", "nokey",
+            "-i", config.source_url,
             "-map", "0:v:0", "-an", "-frames:v", "1",
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
