@@ -182,3 +182,25 @@ class PrivateFrameWriteTests(unittest.TestCase):
                     write_private_frame(root, b"\xff\xd8\xff\xd9")
 
             self.assertEqual(sorted(root.glob("*")), [])
+
+    def test_failed_descriptor_close_leaves_no_frame(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from pathlib import Path
+        from gate_controller.hot_stream import write_private_frame
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            real_close = os.close
+
+            def failing_close(descriptor):
+                real_close(descriptor)
+                raise OSError("close failed")
+
+            with patch("gate_controller.hot_stream.os.close", failing_close):
+                with self.assertRaises(OSError):
+                    write_private_frame(root, b"\xff\xd8\xff\xd9")
+
+            self.assertEqual(sorted(root.glob("*")), [])

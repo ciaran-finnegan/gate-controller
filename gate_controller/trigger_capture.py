@@ -129,6 +129,7 @@ class TriggerFrameCapture:
         self._inject = None
         self._lock = Lock()
         self._process = None
+        self._closed = False
         self._last_scheduled_at: float | None = None
         self._capture_count = 0
         self._failure_count = 0
@@ -255,12 +256,14 @@ class TriggerFrameCapture:
         }
 
     def close(self) -> None:
-        """Kill and reap any ffmpeg child still running at shutdown."""
-        process = self._process
-        self._process = None
-        if process is None:
-            return
-        _terminate(process)
+        """Kill and reap any ffmpeg child still running at shutdown, and
+        refuse to track one that is spawned afterwards."""
+        with self._lock:
+            self._closed = True
+            process = self._process
+            self._process = None
+        if process is not None:
+            _terminate(process)
 
     def _grab(self) -> bytes | None:
         try:
@@ -275,12 +278,25 @@ class TriggerFrameCapture:
         except (OSError, ValueError):
             LOGGER.warning("gate_trigger_capture outcome=failed reason=spawn")
             return None
-        self._process = process
+        with self._lock:
+            # Publish under the lock so close() either sees this child or
+            # has already marked us closed, in which case it dies here.
+            if self._closed:
+                stopping = True
+            else:
+                stopping = False
+                self._process = process
+        if stopping:
+            _terminate(process)
+            LOGGER.warning("gate_trigger_capture outcome=failed reason=stopping")
+            return None
         try:
             output, reason = self._read_bounded(process)
         finally:
             _terminate(process)
-            self._process = None
+            with self._lock:
+                if self._process is process:
+                    self._process = None
         if reason is not None:
             LOGGER.warning("gate_trigger_capture outcome=failed reason=%s", reason)
             return None

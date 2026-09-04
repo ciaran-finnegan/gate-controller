@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from io import BytesIO
@@ -196,6 +197,24 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertTrue(process.stdout.closed)
         self.assertEqual(self.injected, [])
         self.assertEqual(capture.status()["failures"], 1)
+
+    def test_close_before_publication_kills_the_child_immediately(self):
+        process = FakeProcess(hang=True)
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            timeout_seconds=4.0,
+        )
+        capture = TriggerFrameCapture(config, popen=FakePopen([process]))
+        capture.attach(lambda *args: self.injected.append(args))
+        capture.close()
+
+        started = time.monotonic()
+        self.assertEqual(capture.capture_once(event()), ())
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(process.killed)
+        self.assertTrue(process.stdout.closed)
+        self.assertEqual(self.injected, [])
 
     def test_close_kills_and_reaps_a_child_still_running_at_shutdown(self):
         process = FakeProcess(hang=True)
