@@ -64,9 +64,6 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("The controller assumes one camera", plate_camera)
         self.assertIn("MTX_PATHS_CAMERA_SOURCE", plate_camera)
         self.assertIn("Do not mount it\nlower", plate_camera)
-        self.assertIn("at least 4 m from the pillar", plate_camera)
-        self.assertIn("Nothing waits for the vehicle to come to\n  rest", plate_camera)
-        self.assertIn("1/500 s", plate_camera)
         self.assertIn("Be the only light", plate_camera)
         self.assertIn("distinct webhook rule name", plate_camera)
         self.assertIn("reolink_webhook status=rejected", plate_camera)
@@ -88,6 +85,11 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("never authorises or", readme)
         plate_camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(encoding="utf-8")
         self.assertIn("I-frame interval", plate_camera)
+        self.assertIn("## Capture At The Stop", plate_camera)
+        self.assertIn("shutter capped at 1/250 s", plate_camera)
+        self.assertIn("Historical captures of moving vehicles are the", plate_camera)
+        self.assertIn("GATE_TRIGGER_CAPTURE_DELAY_SECONDS", camera)
+        self.assertNotIn("far edge", plate_camera)
         self.assertIn("Do not enable it\nbefore that check", plate_camera)
 
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):

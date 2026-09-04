@@ -1,9 +1,10 @@
 """Webhook-triggered clear-stream frame capture for early recognition.
 
 An accepted camera webhook arrives well before the camera's FTP JPEG. This
-module grabs one full-resolution frame from the loopback MediaMTX clear path
-and hands it to the normal burst pipeline, so OCR can start without waiting
-for the upload. The webhook never authorises or actuates anything by itself:
+module waits for the vehicle to stop at the closed gate, then grabs a short
+series of full-resolution frames from the loopback MediaMTX clear path and
+hands each to the normal burst pipeline, so a sharp plate at rest reaches OCR
+without waiting for the upload or relying on a moving-vehicle snapshot. The webhook never authorises or actuates anything by itself:
 the captured frame goes through the same recognition, authorisation, claim,
 and relay code as an FTP upload. The FTP path is unchanged and remains the
 fallback when capture fails.
@@ -34,6 +35,10 @@ MIN_CAPTURE_TIMEOUT_SECONDS = 0.5
 MAX_CAPTURE_TIMEOUT_SECONDS = 4.0
 MIN_CAPTURE_INTERVAL_SECONDS = 0.5
 MAX_CAPTURE_INTERVAL_SECONDS = 30.0
+MAX_CAPTURE_DELAY_SECONDS = 5.0
+MAX_CAPTURE_COUNT = 3
+MIN_CAPTURE_SPACING_SECONDS = 0.5
+MAX_CAPTURE_SPACING_SECONDS = 3.0
 SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
 
 
@@ -43,8 +48,13 @@ class TriggerCaptureConfig:
     output_directory: Path
     source_url: str = LOOPBACK_CLEAR_STREAM
     timeout_seconds: float = 2.5
-    min_interval_seconds: float = 2.0
+    min_interval_seconds: float = 5.0
     max_frame_bytes: int = 8 * 1024 * 1024
+    # Vehicles stop at the closed gate. Wait for that before the first grab,
+    # then take a short series so at least one frame sees the plate at rest.
+    delay_seconds: float = 1.5
+    capture_count: int = 2
+    spacing_seconds: float = 1.0
 
 
 def load_trigger_capture_config(
@@ -59,8 +69,19 @@ def load_trigger_capture_config(
         MIN_CAPTURE_TIMEOUT_SECONDS, MAX_CAPTURE_TIMEOUT_SECONDS,
     )
     min_interval = _number(
-        environment.get("GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS", "2"),
+        environment.get("GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS", "5"),
         MIN_CAPTURE_INTERVAL_SECONDS, MAX_CAPTURE_INTERVAL_SECONDS,
+    )
+    delay = _number(
+        environment.get("GATE_TRIGGER_CAPTURE_DELAY_SECONDS", "1.5"),
+        0.0, MAX_CAPTURE_DELAY_SECONDS,
+    )
+    capture_count = _integer(
+        environment.get("GATE_TRIGGER_CAPTURE_COUNT", "2"), 1, MAX_CAPTURE_COUNT,
+    )
+    spacing = _number(
+        environment.get("GATE_TRIGGER_CAPTURE_SPACING_SECONDS", "1"),
+        MIN_CAPTURE_SPACING_SECONDS, MAX_CAPTURE_SPACING_SECONDS,
     )
     max_frame_bytes = _integer(
         environment.get("GATE_TRIGGER_CAPTURE_MAX_FRAME_BYTES", str(8 * 1024 * 1024)),
@@ -73,6 +94,9 @@ def load_trigger_capture_config(
         timeout_seconds=timeout,
         min_interval_seconds=min_interval,
         max_frame_bytes=max_frame_bytes,
+        delay_seconds=delay,
+        capture_count=capture_count,
+        spacing_seconds=spacing,
     )
 
 
@@ -140,11 +164,30 @@ class TriggerFrameCapture:
                 event, scheduled_at = self._queue.get(timeout=0.25)
             except Empty:
                 continue
+            self.capture_series(event, scheduled_at, stop_event)
+
+    def capture_series(self, event, scheduled_at, stop_event) -> int:
+        """Wait for the vehicle to stop, then grab a short bounded series."""
+        injected = 0
+        if self._pause(stop_event, self.config.delay_seconds):
+            return injected
+        for index in range(self.config.capture_count):
+            if index and self._pause(stop_event, self.config.spacing_seconds):
+                break
             try:
-                self.capture_once(event, scheduled_at)
+                if self.capture_once(event, scheduled_at):
+                    injected += 1
             except Exception:
                 self._failure_count += 1
                 LOGGER.exception("gate_trigger_capture outcome=error")
+        return injected
+
+    @staticmethod
+    def _pause(stop_event, seconds: float) -> bool:
+        """Sleep unless stopping. Returns True when the service is stopping."""
+        if seconds <= 0:
+            return stop_event.is_set()
+        return stop_event.wait(seconds)
 
     def capture_once(self, event, scheduled_at: float | None = None) -> tuple[Path, ...]:
         """Grab, validate, and inject one frame. Returns the injected paths."""
@@ -191,6 +234,8 @@ class TriggerFrameCapture:
             "captures": self._capture_count,
             "failures": self._failure_count,
             "timeout_seconds": self.config.timeout_seconds,
+            "delay_seconds": self.config.delay_seconds,
+            "capture_count": self.config.capture_count,
         }
 
     def _grab(self) -> bytes | None:

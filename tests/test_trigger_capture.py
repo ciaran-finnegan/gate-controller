@@ -66,7 +66,10 @@ class TriggerCaptureConfigTests(unittest.TestCase):
         self.assertEqual(config.source_url, "rtsp://127.0.0.1:8554/clear")
         self.assertEqual(config.output_directory, Path("/uploads/.trigger-capture"))
         self.assertEqual(config.timeout_seconds, 2.5)
-        self.assertEqual(config.min_interval_seconds, 2.0)
+        self.assertEqual(config.min_interval_seconds, 5.0)
+        self.assertEqual(config.delay_seconds, 1.5)
+        self.assertEqual(config.capture_count, 2)
+        self.assertEqual(config.spacing_seconds, 1.0)
 
     def test_stays_off_without_the_webhook_or_when_disabled(self):
         self.assertFalse(load_trigger_capture_config({}, Path("/u"), webhook_enabled=False).enabled)
@@ -82,6 +85,9 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             {"GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS": "30"},
             {"GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS": "0"},
             {"GATE_TRIGGER_CAPTURE_ENABLED": "yes"},
+            {"GATE_TRIGGER_CAPTURE_DELAY_SECONDS": "6"},
+            {"GATE_TRIGGER_CAPTURE_COUNT": "4"},
+            {"GATE_TRIGGER_CAPTURE_SPACING_SECONDS": "0.1"},
         ):
             with self.subTest(environment=environment):
                 with self.assertRaises(ValueError):
@@ -193,9 +199,68 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         capture.run_forever(stop)
         self.assertFalse((self.root / ".x").exists())
 
-    def test_run_forever_drains_scheduled_events_and_unlinks_when_unattached(self):
+    def test_series_waits_for_the_stop_then_grabs_spaced_frames(self):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            delay_seconds=1.5, capture_count=3, spacing_seconds=0.75,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(3)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: 10.0)
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        pauses = []
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                pauses.append(seconds)
+                return False
+
+        injected = capture.capture_series(event(), 9.0, Stop())
+
+        self.assertEqual(injected, 3)
+        self.assertEqual(pauses, [1.5, 0.75, 0.75])
+        self.assertEqual(len(popen.calls), 3)
+        self.assertEqual(len(self.injected), 3)
+
+    def test_series_stops_promptly_when_the_service_is_stopping(self):
         popen = FakePopen([FakeProcess(output=jpeg())])
-        capture = TriggerFrameCapture(self.config, popen=popen, clock=lambda: 1.0)
+        capture = TriggerFrameCapture(self.config, popen=popen)
+        capture.attach(lambda *args: self.injected.append(args))
+        stop = Event()
+        stop.set()
+
+        self.assertEqual(capture.capture_series(event(), 0.0, stop), 0)
+        self.assertEqual(popen.calls, [])
+
+    def test_series_continues_past_one_failed_grab(self):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            delay_seconds=0, capture_count=2, spacing_seconds=0.5,
+        )
+        popen = FakePopen([FakeProcess(hang=True), FakeProcess(output=jpeg())])
+        capture = TriggerFrameCapture(config, popen=popen)
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, _seconds):
+                return False
+
+        self.assertEqual(capture.capture_series(event(), 0.0, Stop()), 1)
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(capture.status()["failures"], 1)
+
+    def test_run_forever_drains_scheduled_events_and_unlinks_when_unattached(self):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            delay_seconds=0, capture_count=1,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg())])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: 1.0)
         stop = Event()
         capture.on_camera_event(event())
         original_capture = capture.capture_once
@@ -210,7 +275,7 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         capture.run_forever(stop)
 
         self.assertEqual(len(popen.calls), 1)
-        self.assertEqual(sorted(self.config.output_directory.glob("*")), [])
+        self.assertEqual(sorted(config.output_directory.glob("*")), [])
         self.assertEqual(capture.status()["captures"], 0)
 
 

@@ -65,60 +65,56 @@ height and a vehicle centre line about 1.75 m to the side of the pillar:
 | 8 m | 5 degrees | 12 degrees | about 13 degrees |
 
 The commissioning target is a combined angle below 30 degrees, ideally 10-20
-degrees, so the capture point must be at least 4 m from the pillar and is best
-at 5-8 m.
+degrees. The capture point is where vehicles stop at the closed gate, so
+measure that distance, read the row, and confirm with a parked-vehicle test.
+If the plate does not read at the stop, fix the geometry rather than moving
+the capture point out: aim the camera across the drive at the stop position,
+or move the mount towards the drive centre line so the horizontal angle drops.
 
-## Capture Point And The Stop At The Gate
+## Capture At The Stop
 
-Vehicles slow and stop at the closed gate. That does not by itself give a
-sharp plate, for two reasons:
+Vehicles stop at the closed gate, and a stopped vehicle gives the sharpest
+plate the camera can produce: no motion blur at any shutter, and one fixed
+position to aim and zoom at. Historical captures of moving vehicles are the
+blurry ones. The capture point is therefore the stop, not the approach.
 
-- A vehicle stopped at the gate is 1-3 m from the pillar. From the table above
-  that is too oblique to read. The stopped position only helps if the vehicle
-  stops at least 4-5 m out; measure where they actually stop.
-- The controller reads the plate at the moment the camera fires. The 4K FTP
-  JPEG is taken at the line crossing, the fluent fallback frames are those no
-  more than one second old when the trigger arrives, and every OCR attempt
-  runs inside the decision deadline. Nothing waits for the vehicle to come to
-  rest. The line-crossing line is therefore the only control over when the
-  plate is captured.
+The controller now waits for the stop. The camera webhook fires as the
+vehicle crosses the line; the controller waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS`
+(1.5 s by default), then grabs a short series of clear-stream frames
+(`GATE_TRIGGER_CAPTURE_COUNT` frames, `GATE_TRIGGER_CAPTURE_SPACING_SECONDS`
+apart, 2 frames one second apart by default) and recognises each. The 4K FTP
+JPEG is still taken at the crossing, so put the line where the vehicle is
+already rolling to a halt and that frame is nearly still too.
 
-Use the deceleration zone instead. A vehicle 5-8 m from a closed gate is
-already slowing, typically below 10 km/h, which is under 3 m per second:
+Set it up as:
 
-| Shutter | Plate movement during exposure | Blur on a 400 px plate |
-| --- | --- | --- |
-| 1/500 s | up to 6 mm | about 4 px |
-| 1/250 s | up to 11 mm | about 9 px |
-| 1/100 s | up to 28 mm | about 21 px |
-
-At 1/500 s a slowing vehicle at 5-8 m is effectively still. Set it up as:
-
-1. Aim the camera along the approach at a point 6 m from the pillar, not down
-   at the tarmac in front of it.
-2. Zoom until a parked test vehicle's plate at 6 m is 250-350 px wide in a
-   saved 4K JPEG. That is roughly a 45-60 degree horizontal view; at that zoom
-   the plate at 5 m is about 300-430 px and at 8 m about 190-270 px, so the
-   whole 5-8 m corridor is above the 150 px minimum.
-3. Draw the vehicle detection zone around that corridor only.
-4. Place the line-crossing line across the drive at the far edge of the
-   corridor, about 8 m from the pillar, vehicle-only, inbound direction. The
-   FTP JPEG is taken at the crossing with the plate square-on and above 190 px,
-   and the webhook capture that follows 0.3 to 1.5 s later finds the vehicle
-   at 6-7 m, still inside the corridor and slowing. Keep sensitivity at the
-   frozen 80 baseline until day and night captures have been inspected.
-5. Save JPEGs at 5 m and 8 m before enabling the alarm FTP schedule.
+1. Measure where vehicles actually stop. Mark the plate position on the
+   drive with a parked car.
+2. Aim the camera at that mark, across the drive if necessary, not along the
+   approach and not down at the tarmac in front of the pillar.
+3. Zoom until the parked car's plate is 300-600 px wide in a saved 4K JPEG.
+   Do not zoom tighter: a vehicle that stops half a metre short or long must
+   still have its whole plate in frame.
+4. Draw the vehicle detection zone around the stop position and the last
+   two or three metres of approach only.
+5. Place the line-crossing line across the drive about 1 m before the plate
+   mark, vehicle-only, inbound direction, so it fires as the vehicle rolls to
+   a halt. Keep sensitivity at the frozen 80 baseline until day and night
+   captures have been inspected.
+6. Tune the delay from the journal: if `gate_trigger_capture outcome=captured`
+   frames still show movement, raise `GATE_TRIGGER_CAPTURE_DELAY_SECONDS`; if
+   the vehicle is already stopped in the FTP frame, lower it.
+7. Save JPEGs of a car stopped at the mark, and of one stopped half a metre
+   short and half a metre long, before enabling the alarm FTP schedule.
 
 ## Webhook Capture And Keyframes
 
-With the webhook fixed, the controller grabs a clear-stream frame the moment
-the camera fires and starts OCR before the FTP JPEG lands. This only pays off
-if the Clear stream's **I-frame interval** is set to 1x the frame rate, so set
-that on the RLC-811A at commissioning. Put the line-crossing line at the far
-edge of the framed corridor, about 8 m out: the webhook fires as the plate
-enters the frame, and the capture that follows 0.3 to 1.5 s later still finds
-the plate inside the corridor rather than past it. Details are in the
-RLC-810A document under Webhook-Triggered Capture.
+The delayed capture series above grabs frames from the clear stream on
+demand. Each grab waits for the next keyframe, so set the Clear stream's
+**I-frame interval** to 1x the frame rate on the RLC-811A at commissioning.
+With a longer interval the grab can wait several seconds and time out, and
+only the FTP frame is recognised. Details are in the RLC-810A document under
+Webhook-Triggered Capture.
 
 Once a saved 4K capture shows the plate at least 300 pixels wide, set
 `GATE_OCR_MAX_UPLOAD_WIDTH=1920` to shorten the OCR upload. Do not enable it
@@ -126,10 +122,11 @@ before that check.
 
 ## Exposure
 
-Zoom makes motion blur worse, not better: the same vehicle movement covers
-more pixels at a longer focal length. Set **Exposure** to **Manual**, shutter
-limit 1/500 s, and test no slower than 1/250 s with a moving vehicle. Cap gain
-before slowing the shutter. Disable WDR/HDR for the plate corridor; it
+The clear-stream captures see a stopped vehicle, so shutter speed matters
+less for them than for the FTP frame taken at the crossing. Zoom still makes
+any residual movement cover more pixels. Set **Exposure** to **Manual** with
+the shutter capped at 1/250 s so the crossing frame stays sharp, and cap gain
+before slowing the shutter. Disable WDR/HDR around the stop position; it
 brightens the retroreflective plate into the bonnet and produces two-exposure
 ghosting on a moving vehicle.
 
@@ -143,23 +140,22 @@ a slower shutter.
 A motion-controlled spotlight lights the approach at night. For plates it
 must:
 
-- **Be on before the vehicle reaches 8 m from the pillar.** Its motion sensor
-  must see the vehicle further out than the capture corridor, and the lamp
-  must reach full brightness before the crossing. A light that comes on as the
-  vehicle reaches the gate lights the stopped, oblique position, not the
-  capture.
+- **Be on and at full brightness before the vehicle stops.** Its motion
+  sensor must see the approach, not just the gate, so the lamp has come up
+  before the crossing frame and the delayed captures. It must light the stop
+  position evenly.
 - **Light the plate from near the camera axis.** Plates are retroreflective:
   light returns to where it came from. A lamp beside the camera lights the
   plate brightly; a lamp behind or above the vehicle does not.
 - **Stay out of the frame and off the lens.** No part of the lamp or its beam
   should hit the camera cover.
-- **Be the only light.** With a white spotlight covering the corridor, turn the
+- **Be the only light.** With a white spotlight covering the stop position, turn the
   RLC-811A's own spotlight off and keep IR off. Two sources double the plate
   return and wash out the characters. If the external lamp cannot cover the
-  corridor, use the camera's spotlight alone instead.
+  stop position, use the camera's spotlight alone instead.
 
 Keep the camera in colour mode with the lamp on. Set day/night switching so it
-does not flip during an approach; a mode change mid-corridor loses the frame.
+does not flip during an approach; a mode change as the vehicle arrives loses the frame.
 If plates wash out at night, reduce exposure or gain, never add a second light.
 If they are dark, move or re-aim the lamp closer to the camera axis before
 slowing the shutter.
@@ -179,8 +175,9 @@ Only one camera is on the port at any time, so the swap is a short outage:
    webhook with the shared secret at the top level, and the stream settings
    from the RLC-810A document. Use a distinct webhook rule name so traces show
    which camera and rule fired.
-4. Set framing, line, exposure, and light per the sections above. Save 5 m and
-   8 m test captures by day and again at night with the spotlight.
+4. Set framing, line, exposure, and light per the sections above. Save test
+   captures of a vehicle stopped at the gate by day and again at night with
+   the spotlight.
 5. Watch the controller journal for `reolink_webhook status=rejected` on the
    first real event and read the `reason` field before changing anything.
    `payload` means the body is not what the controller expects; `unauthorized`

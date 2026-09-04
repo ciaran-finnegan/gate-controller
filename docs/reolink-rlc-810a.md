@@ -104,19 +104,24 @@ Top-level camera `test` and `manual` notifications are recorded as
 
 ### Webhook-Triggered Capture
 
-The webhook arrives one to two seconds before the camera's FTP JPEG. When the
-listener is enabled, the controller uses each accepted `vehicle`,
-`line_crossing`, or `other` event to grab one full-resolution frame from the
-loopback MediaMTX clear path (`rtsp://127.0.0.1:8554/clear`) and hands it to
-the normal burst pipeline immediately. `manual_test` events never capture.
+Vehicles stop at the closed gate, and a stopped vehicle is the sharpest plate
+the camera can give. When the listener is enabled, each accepted `vehicle`,
+`line_crossing`, or `other` event starts a delayed capture: the controller
+waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle to come to rest,
+then grabs `GATE_TRIGGER_CAPTURE_COUNT` full-resolution frames
+`GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart from the loopback MediaMTX clear
+path (`rtsp://127.0.0.1:8554/clear`) and hands each to the normal burst
+pipeline. `manual_test` events never capture.
 
-- The webhook still authorises nothing. The captured frame goes through the
+- The webhook still authorises nothing. Every captured frame goes through the
   same recognition, authorisation, claim, cooldown, and relay code as an FTP
-  upload. A forged webhook can at most cost one bounded frame grab and one OCR
-  request, rate limited to one capture per two seconds.
-- The FTP path is unchanged. If the early frame reads an authorised plate the
-  gate opens and the later FTP burst records `cooldown`. If it does not, the
-  FTP burst is the full attempt as before.
+  upload. A forged webhook can at most cost one bounded capture series and
+  its OCR requests, rate limited to one series per
+  `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS`.
+- The FTP path is unchanged. The 4K FTP JPEG is still taken at the line
+  crossing; place the line where the vehicle is already rolling to a halt.
+  Whichever frame reads an authorised plate first opens the gate and the
+  later bursts record `cooldown`. If none reads, nothing else changes.
 - Capture is serial and bounded: one ffmpeg child at a time, killed at the
   timeout, frames validated as JPEG and written owner-only under
   `<uploads>/.trigger-capture`, which the FTP watcher ignores.
@@ -129,14 +134,19 @@ the normal burst pipeline immediately. `manual_test` events never capture.
 GATE_TRIGGER_CAPTURE_ENABLED=true
 GATE_TRIGGER_CAPTURE_SOURCE=rtsp://127.0.0.1:8554/clear
 GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=2.5
-GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS=2
+GATE_TRIGGER_CAPTURE_DELAY_SECONDS=1.5
+GATE_TRIGGER_CAPTURE_COUNT=2
+GATE_TRIGGER_CAPTURE_SPACING_SECONDS=1
+GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS=5
 ```
 
 Watch the journal for `gate_trigger_capture outcome=captured` followed by the
 recognition trace. `outcome=failed reason=timeout` on every event means the
 keyframe interval is still too long or the clear path is not being served.
-Each early capture is a second OCR request per vehicle, so expect roughly
-double the Plate Recognizer call volume. Invalid, stale, duplicate, unauthorized, and oversized requests
+Each captured frame is an extra OCR request, so with the default series of
+two expect roughly three Plate Recognizer calls per vehicle instead of one.
+Tune the delay from the captured frames: movement means wait longer, a
+vehicle already stopped in the FTP frame means the delay can be shorter. Invalid, stale, duplicate, unauthorized, and oversized requests
 cannot reach recognition or relay code. Raw payloads, camera identifiers, and
 the secret are not logged or stored. Restrict TCP/8766 with the host firewall or
 camera VLAN so only the camera can connect, and do not port-forward it.
@@ -226,8 +236,9 @@ raise it only after confirming approaching vehicles are not missed.
 Keep the lens forward of the fence plane so nearby timber, rain droplets, and
 integrated IR cannot dominate exposure or reflect into the cover. A practical
 starting height is 1.5-2 metres, above most headlights, with the camera pointed
-slightly down at one repeatable capture point roughly 4-6 metres inside the
-entrance after the vehicle has straightened.
+slightly down at one repeatable capture point: where vehicles stop at the
+closed gate. A stopped vehicle removes motion blur entirely, so prefer the
+stop over any point on the approach.
 
 Because the RLC-810A lens is fixed, frame the capture point by physically aiming
 or relocating the camera and use a software crop only after capture. The
