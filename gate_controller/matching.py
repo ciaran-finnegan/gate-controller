@@ -78,11 +78,11 @@ def decide_access(
     # Report the best-read plate on a denial so an unknown vehicle is
     # reviewable; it never widens the match.
     best = max(
-        normalised_observations,
+        (item for item in normalised_observations if item[0]),
         key=lambda item: item[1].confidence,
         default=None,
     )
-    if best is None or not best[0]:
+    if best is None:
         return MatchDecision(allowed=False, reason="no_match")
     return MatchDecision(
         allowed=False, reason="no_match",

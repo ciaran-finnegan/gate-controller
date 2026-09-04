@@ -64,7 +64,10 @@ camera connection; the controller performs a nearest-event lookup from bounded
 in-memory state and otherwise retains the `camera_ftp/unverified` fallback.
 
 Put a random 20-128 character secret in the root-readable
-`/etc/gate-controller.env` file:
+`/etc/gate-controller.env` file. Use letters and digits only: the secret is
+also copied into the camera's webhook URL below, where `+`, `&`, `#` and `%`
+would be split or decoded by the query parser and every post would be
+rejected with 401.
 
 ```sh
 GATE_REOLINK_WEBHOOK_SECRET=

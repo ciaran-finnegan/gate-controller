@@ -662,3 +662,21 @@ class OcrPacingAndRetryTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.failure_cause, "request_abandoned")
         self.assertEqual(len(session.calls), 1)
+
+    def test_a_retry_never_outlives_an_abandoned_event(self):
+        from requests import exceptions as requests_exceptions
+        stale = SequenceSession([requests_exceptions.ConnectionError("reset")])
+        fresh = SequenceSession([FakeResponse(payload=self.payload)])
+        client = self.client(stale)
+
+        def abandon_while_sleeping(seconds):
+            self.clock.now += seconds
+            client.abandon_in_flight()
+
+        client._sleep = abandon_while_sleeping
+        with patch.object(client, "_create_session", return_value=fresh):
+            with self.assertRaises(OcrResponseError) as raised:
+                client.recognise(self.path)
+
+        self.assertEqual(raised.exception.failure_cause, "request_abandoned")
+        self.assertEqual(fresh.calls, [])

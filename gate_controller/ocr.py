@@ -221,10 +221,16 @@ class PlateRecognizerClient:
         self._max_upload_width = max_upload_width
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
+        # The generation is captured once so a retry never outlives an
+        # event the processor has already abandoned.
+        with self._session_lock:
+            if self._closed:
+                raise _closed_client_error()
+            generation = self._session_generation
         retries = 0
         while True:
             try:
-                return self._recognise_once(path, timeout)
+                return self._recognise_once(path, timeout, generation)
             except _RetryableFailure as failure:
                 if retries >= MAX_TRANSIENT_RETRIES:
                     raise failure.error
@@ -269,12 +275,17 @@ class PlateRecognizerClient:
                         "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                     )
 
-    def _recognise_once(self, path: Path, timeout: tuple[float, float] | None) -> PlateObservation:
+    def _recognise_once(
+        self, path: Path, timeout: tuple[float, float] | None, generation: int,
+    ) -> PlateObservation:
         self._recycle_if_idle()
         with self._session_lock:
             if self._closed:
                 raise _closed_client_error()
-            generation = self._session_generation
+            if generation != self._session_generation:
+                raise OcrResponseError(
+                    "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
+                )
             session = self._session
         if session is None:
             created = self._create_session()

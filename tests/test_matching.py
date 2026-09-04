@@ -82,3 +82,13 @@ class DeniedObservationTests(unittest.TestCase):
         self.assertEqual(decision.reason, "no_match")
         self.assertIsNone(decision.observed_plate)
         self.assertEqual(decision.confidence, 0.0)
+
+    def test_no_match_skips_a_read_that_normalises_to_nothing(self):
+        decision = decide_access(
+            [PlateObservation("---", 0.99), PlateObservation("99-X 9998", 0.70)],
+            {"12D3456"},
+        )
+
+        self.assertEqual(decision.reason, "no_match")
+        self.assertEqual(decision.observed_plate, "99X9998")
+        self.assertEqual(decision.confidence, 0.70)
