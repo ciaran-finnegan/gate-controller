@@ -168,7 +168,9 @@ def main() -> None:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
     def shutdown():
-        return _shutdown_controller_with_hot_stream(hot_stream, processor, relay)
+        return _shutdown_controller_with_hot_stream(
+            hot_stream, processor, relay, trigger_capture=trigger_capture,
+        )
 
     run_worker(
         arguments.directory, process, quiet_window=arguments.quiet_window,
@@ -229,7 +231,13 @@ def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
     return relay_latched and processor_completed and relay_completed and relay_safe is True
 
 
-def _shutdown_controller_with_hot_stream(hot_stream, processor, relay) -> bool:
+def _shutdown_controller_with_hot_stream(hot_stream, processor, relay,
+                                         trigger_capture=None) -> bool:
+    try:
+        if trigger_capture is not None:
+            trigger_capture.close()
+    except BaseException:
+        logging.getLogger(__name__).warning("trigger_capture_close_failed", exc_info=True)
     try:
         if hot_stream is not None:
             hot_stream.close()

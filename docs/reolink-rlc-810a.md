@@ -121,7 +121,10 @@ pipeline. `manual_test` events never capture.
 - The FTP path is unchanged. The 4K FTP JPEG is still taken at the line
   crossing; place the line where the vehicle is already rolling to a halt.
   Whichever frame reads an authorised plate first opens the gate and the
-  later bursts record `cooldown`. If none reads, nothing else changes.
+  later bursts record `cooldown`. Each frame is a separate event with its own
+  content identity on purpose: a frame that fails to read must never
+  suppress the next one, so an unrecognised or denied vehicle produces one
+  event per frame rather than one per crossing.
 - Capture is serial and bounded: one ffmpeg child at a time, killed at the
   timeout, frames validated as JPEG and written owner-only under
   the controller state directory (`trigger-capture` beside the database,

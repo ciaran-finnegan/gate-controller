@@ -13,6 +13,8 @@ fallback when capture fails.
 from __future__ import annotations
 
 import logging
+import os
+import select
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -126,6 +128,7 @@ class TriggerFrameCapture:
         self._queue: Queue = Queue(maxsize=1)
         self._inject = None
         self._lock = Lock()
+        self._process = None
         self._last_scheduled_at: float | None = None
         self._capture_count = 0
         self._failure_count = 0
@@ -251,6 +254,14 @@ class TriggerFrameCapture:
             "capture_count": self.config.capture_count,
         }
 
+    def close(self) -> None:
+        """Kill and reap any ffmpeg child still running at shutdown."""
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        _terminate(process)
+
     def _grab(self) -> bytes | None:
         try:
             process = self._popen(
@@ -264,27 +275,66 @@ class TriggerFrameCapture:
         except (OSError, ValueError):
             LOGGER.warning("gate_trigger_capture outcome=failed reason=spawn")
             return None
+        self._process = process
         try:
-            output, _stderr = process.communicate(timeout=self.config.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.communicate(timeout=1)
-            except Exception:
-                pass
-            LOGGER.warning("gate_trigger_capture outcome=failed reason=timeout")
+            output, reason = self._read_bounded(process)
+        finally:
+            _terminate(process)
+            self._process = None
+        if reason is not None:
+            LOGGER.warning("gate_trigger_capture outcome=failed reason=%s", reason)
             return None
         if process.returncode != 0:
             LOGGER.warning("gate_trigger_capture outcome=failed reason=exit_status")
             return None
-        if (
-            not isinstance(output, bytes)
-            or not 0 < len(output) <= self.config.max_frame_bytes
-            or not _is_decodable_jpeg(output)
-        ):
+        if not output or not _is_decodable_jpeg(output):
             LOGGER.warning("gate_trigger_capture outcome=failed reason=invalid_frame")
             return None
         return output
+
+    def _read_bounded(self, process) -> tuple[bytes, str | None]:
+        """Read stdout until EOF, never holding more than max_frame_bytes and
+        never waiting past the capture timeout. Returns (bytes, failure)."""
+        deadline = self._clock() + self.config.timeout_seconds
+        buffer = bytearray()
+        descriptor = process.stdout.fileno()
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return bytes(buffer), "timeout"
+            ready, _, _ = select.select([descriptor], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            if len(buffer) + len(chunk) > self.config.max_frame_bytes:
+                return bytes(buffer), "frame_too_large"
+            buffer.extend(chunk)
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return bytes(buffer), "exit_wait"
+        return bytes(buffer), None
+
+
+def _terminate(process) -> None:
+    """Stop a capture child and reap it, tolerating one that has already gone."""
+    try:
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+    except OSError:
+        pass
+    stdout = getattr(process, "stdout", None)
+    if stdout is not None:
+        try:
+            stdout.close()
+        except OSError:
+            pass
 
 
 def _validate_loopback_rtsp(value: str) -> None:

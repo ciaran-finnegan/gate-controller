@@ -24,20 +24,39 @@ def jpeg(size=(64, 32)):
 
 
 class FakeProcess:
-    def __init__(self, output=b"", returncode=0, hang=False):
-        self._output = output
-        self.returncode = returncode
-        self._hang = hang
-        self.killed = False
+    """Stand-in child whose stdout is a real pipe, so bounded reads and
+    timeouts exercise the same select/os.read path as ffmpeg."""
 
-    def communicate(self, timeout=None):
-        if self._hang and not self.killed:
+    def __init__(self, output=b"", returncode=0, hang=False):
+        read_fd, self._write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.returncode = None
+        self._exit_code = returncode
+        self.killed = False
+        if not hang:
+            os.write(self._write_fd, output)
+            self._close_writer()
+            self.returncode = returncode
+
+    def _close_writer(self):
+        if self._write_fd is not None:
+            os.close(self._write_fd)
+            self._write_fd = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
             raise subprocess.TimeoutExpired("ffmpeg", timeout)
-        return self._output, b""
+        return self.returncode
 
     def kill(self):
         self.killed = True
         self.returncode = -9
+        self._close_writer()
+
+    terminate = kill
 
 
 class FakePopen:
@@ -165,19 +184,41 @@ class TriggerFrameCaptureTests(unittest.TestCase):
 
     def test_timeout_kills_the_child_and_injects_nothing(self):
         process = FakeProcess(hang=True)
-        capture, _popen = self.capture([process])
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            timeout_seconds=0.5,
+        )
+        capture = TriggerFrameCapture(config, popen=FakePopen([process]))
+        capture.attach(lambda *args: self.injected.append(args))
 
         self.assertEqual(capture.capture_once(event()), ())
         self.assertTrue(process.killed)
+        self.assertTrue(process.stdout.closed)
         self.assertEqual(self.injected, [])
         self.assertEqual(capture.status()["failures"], 1)
+
+    def test_close_kills_and_reaps_a_child_still_running_at_shutdown(self):
+        process = FakeProcess(hang=True)
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            timeout_seconds=4.0,
+        )
+        capture = TriggerFrameCapture(config, popen=FakePopen([process]))
+        capture._process = process
+
+        capture.close()
+
+        self.assertTrue(process.killed)
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(capture._process)
+        capture.close()
 
     def test_invalid_output_or_failed_exit_injects_nothing(self):
         for process in (
             FakeProcess(output=b"not a jpeg"),
             FakeProcess(output=jpeg(), returncode=1),
             FakeProcess(output=b""),
-            FakeProcess(output=jpeg(size=(4000, 3000)) if False else b"\xff\xd8\xff" + b"x" * 10),
+            FakeProcess(output=b"\xff\xd8\xff" + b"x" * 10),
         ):
             with self.subTest(process=process):
                 capture, _popen = self.capture([process])
@@ -185,16 +226,18 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(self.injected, [])
         self.assertEqual(sorted(self.config.output_directory.glob("*")), [])
 
-    def test_oversized_frames_are_rejected(self):
+    def test_oversized_output_is_cut_off_at_the_cap_and_the_child_killed(self):
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
             max_frame_bytes=64,
         )
-        capture = TriggerFrameCapture(config, popen=FakePopen([FakeProcess(output=jpeg())]))
+        process = FakeProcess(output=jpeg())
+        capture = TriggerFrameCapture(config, popen=FakePopen([process]))
         capture.attach(lambda *args: self.injected.append(args))
 
         self.assertEqual(capture.capture_once(event()), ())
         self.assertEqual(self.injected, [])
+        self.assertTrue(process.stdout.closed)
 
     def test_scheduling_is_serial_rate_limited_and_skips_manual_tests(self):
         now = [100.0]

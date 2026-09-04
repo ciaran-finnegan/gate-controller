@@ -275,6 +275,7 @@ def write_private_frame(directory: Path, frame: bytes) -> Path:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags, 0o600)
+    completed = False
     try:
         os.fchmod(descriptor, 0o600)
         view = memoryview(frame)
@@ -283,8 +284,13 @@ def write_private_frame(directory: Path, frame: bytes) -> Path:
             if written <= 0:
                 raise OSError("frame write failed")
             view = view[written:]
+        completed = True
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        finally:
+            if not completed:
+                target.unlink(missing_ok=True)
     return target
 
 
