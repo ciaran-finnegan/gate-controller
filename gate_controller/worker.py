@@ -187,8 +187,10 @@ class BurstCollector:
 
 
 class CompletedImageHandler(FileSystemEventHandler):
+    # 50 ms polling keeps ingress fast; 100 attempts preserves the same five
+    # second readability window a slow FTP transfer had at 250 ms x 20.
     def __init__(self, collector: BurstCollector, retry_interval: float = 0.05,
-                 max_attempts: int = 20, max_age: float = 30.0, clock=monotonic,
+                 max_attempts: int = 100, max_age: float = 30.0, clock=monotonic,
                  on_rejected=None, arrival_clock=None,
                  max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                  max_pending_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,

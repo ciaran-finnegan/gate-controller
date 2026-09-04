@@ -97,7 +97,7 @@ def main() -> None:
         hot_stream=hot_stream,
     )
     trigger_capture_config = load_trigger_capture_config(
-        os.environ, arguments.directory,
+        os.environ, Path(arguments.database).parent,
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
     trigger_capture = (

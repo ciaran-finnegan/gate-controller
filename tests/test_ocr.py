@@ -309,6 +309,24 @@ class OcrUploadDownscaleTests(unittest.TestCase):
                 (_args, kwargs), = session.calls
                 self.assertEqual(kwargs["files"]["upload"][0], path.name)
 
+    def test_abandonment_during_upload_preparation_never_posts(self):
+        session = FakeSession(response=FakeResponse(payload={"results": []}))
+        client = PlateRecognizerClient("token", session=session, max_upload_width=1920)
+        original_open = client._open_upload
+
+        def open_then_abandon(path):
+            upload = original_open(path)
+            client.abandon_in_flight()
+            return upload
+
+        client._open_upload = open_then_abandon
+
+        with self.assertRaises(OcrResponseError) as raised:
+            client.recognise(self.path)
+
+        self.assertEqual(raised.exception.failure_cause, "request_abandoned")
+        self.assertEqual(session.calls, [])
+
     def test_rejects_widths_outside_the_safe_range(self):
         for width in (1, 639, 3841, True, 1.5):
             with self.subTest(width=width):

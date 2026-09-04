@@ -205,6 +205,12 @@ class WorkerTests(unittest.TestCase):
             ),
         ])
 
+    def test_default_readability_window_stays_at_five_seconds(self):
+        handler = CompletedImageHandler(BurstCollector(lambda *_: None))
+
+        self.assertEqual(handler._retry_interval, 0.05)
+        self.assertGreaterEqual(handler._retry_interval * handler._max_attempts, 5.0)
+
     def test_injected_trigger_burst_uses_its_own_trigger_and_never_correlates(self):
         received_at = datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc)
         early = TriggerTelemetry(

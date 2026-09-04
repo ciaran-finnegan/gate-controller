@@ -64,12 +64,29 @@ class TriggerCaptureConfigTests(unittest.TestCase):
 
         self.assertTrue(config.enabled)
         self.assertEqual(config.source_url, "rtsp://127.0.0.1:8554/clear")
-        self.assertEqual(config.output_directory, Path("/uploads/.trigger-capture"))
+        self.assertEqual(config.output_directory, Path("/uploads/trigger-capture"))
         self.assertEqual(config.timeout_seconds, 2.5)
         self.assertEqual(config.min_interval_seconds, 5.0)
         self.assertEqual(config.delay_seconds, 1.5)
         self.assertEqual(config.capture_count, 2)
         self.assertEqual(config.spacing_seconds, 1.0)
+
+    def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
+        config = load_trigger_capture_config(
+            {}, Path("/var/lib/gate-controller"), webhook_enabled=True,
+        )
+        overridden = load_trigger_capture_config(
+            {"GATE_TRIGGER_CAPTURE_DIRECTORY": "/var/lib/gate-controller/captures"},
+            Path("/var/lib/gate-controller"), webhook_enabled=True,
+        )
+
+        self.assertEqual(config.output_directory, Path("/var/lib/gate-controller/trigger-capture"))
+        self.assertEqual(overridden.output_directory, Path("/var/lib/gate-controller/captures"))
+        with self.assertRaises(ValueError):
+            load_trigger_capture_config(
+                {"GATE_TRIGGER_CAPTURE_DIRECTORY": "relative/captures"},
+                Path("/var/lib/gate-controller"), webhook_enabled=True,
+            )
 
     def test_stays_off_without_the_webhook_or_when_disabled(self):
         self.assertFalse(load_trigger_capture_config({}, Path("/u"), webhook_enabled=False).enabled)

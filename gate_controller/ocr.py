@@ -189,6 +189,16 @@ class PlateRecognizerClient:
                     "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                 )
         upload = self._open_upload(path)
+        # Preparing a downscaled upload can outlast the decision deadline;
+        # never post a request the processor has already abandoned.
+        with self._session_lock:
+            abandoned = self._closed or generation != self._session_generation
+            closed = self._closed
+        if abandoned:
+            upload.close()
+            if closed:
+                raise _closed_client_error()
+            raise OcrResponseError("OCR request was abandoned", CAUSE_REQUEST_ABANDONED)
         try:
             try:
                 response = session.post(

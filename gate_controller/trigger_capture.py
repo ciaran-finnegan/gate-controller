@@ -58,10 +58,23 @@ class TriggerCaptureConfig:
 
 
 def load_trigger_capture_config(
-    environment, upload_root: Path, *, webhook_enabled: bool,
+    environment, state_root: Path, *, webhook_enabled: bool,
 ) -> TriggerCaptureConfig:
-    """Capture is on by default whenever the webhook listener is enabled."""
+    """Capture is on by default whenever the webhook listener is enabled.
+
+    Frames are written under the controller's own state directory, never
+    under the FTP upload tree: the installer re-owns that tree to the FTP
+    user and adds group permissions, which would break the owner-only check
+    on the next start.
+    """
     enabled = _boolean(environment.get("GATE_TRIGGER_CAPTURE_ENABLED", "true"))
+    configured_directory = environment.get("GATE_TRIGGER_CAPTURE_DIRECTORY")
+    output_directory = (
+        Path(configured_directory) if configured_directory
+        else Path(state_root) / "trigger-capture"
+    )
+    if not output_directory.is_absolute():
+        raise ValueError("GATE_TRIGGER_CAPTURE_DIRECTORY must be an absolute path")
     source_url = environment.get("GATE_TRIGGER_CAPTURE_SOURCE", LOOPBACK_CLEAR_STREAM)
     _validate_loopback_rtsp(source_url)
     timeout = _number(
@@ -89,7 +102,7 @@ def load_trigger_capture_config(
     )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
-        output_directory=Path(upload_root) / ".trigger-capture",
+        output_directory=output_directory,
         source_url=source_url,
         timeout_seconds=timeout,
         min_interval_seconds=min_interval,

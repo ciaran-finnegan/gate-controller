@@ -124,7 +124,8 @@ pipeline. `manual_test` events never capture.
   later bursts record `cooldown`. If none reads, nothing else changes.
 - Capture is serial and bounded: one ffmpeg child at a time, killed at the
   timeout, frames validated as JPEG and written owner-only under
-  `<uploads>/.trigger-capture`, which the FTP watcher ignores.
+  the controller state directory (`trigger-capture` beside the database,
+  or `GATE_TRIGGER_CAPTURE_DIRECTORY`), never under the FTP upload tree.
 - Set the camera's Clear stream **I-frame interval** to 1x the frame rate
   (10 at 10 fps). An on-demand grab waits for the next keyframe, so a longer
   interval adds up to that many seconds. Without this setting the capture
