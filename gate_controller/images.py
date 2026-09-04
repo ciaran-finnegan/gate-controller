@@ -118,8 +118,9 @@ def rank_images(paths, *, max_bytes: int | None = None) -> list[Path]:
                         continue
                     # Rank on the same bounded draft decode the quality
                     # telemetry uses: a full 4K decode costs about 170 ms per
-                    # frame on the Pi 5 and sits on the path to the relay,
-                    # the draft about 20 ms, and the ordering is unchanged.
+                    # frame on the Pi 5 and sits on the path to the relay, the
+                    # draft about 20 ms. The score is a coarse sharpness proxy
+                    # for ordering fallbacks, not a contract about fine detail.
                     image.draft("L", QUALITY_SIZE)
                     image.load()
                     grayscale = image.convert("L")
