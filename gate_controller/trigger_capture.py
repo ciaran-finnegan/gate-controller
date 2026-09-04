@@ -25,8 +25,8 @@ from time import monotonic
 from urllib.parse import urlsplit
 
 from .hot_stream import (
-    FFMPEG_BINARY, MAX_FRAME_BYTES, _ensure_private_directory,
-    _is_decodable_jpeg, write_private_frame,
+    FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
+    _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
 from .telemetry import TriggerTelemetry
 
@@ -42,6 +42,10 @@ MAX_CAPTURE_COUNT = 3
 MIN_CAPTURE_SPACING_SECONDS = 0.5
 MAX_CAPTURE_SPACING_SECONDS = 3.0
 SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
+# One keyframe per second at the camera's 1x interval; the ring only has to
+# outlive the next keyframe plus its decode.
+KEYFRAME_RING_FRAMES = 4
+KEYFRAME_MAX_AGE_SECONDS = 1.6
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,10 @@ class TriggerCaptureConfig:
     delay_seconds: float = 1.5
     capture_count: int = 2
     spacing_seconds: float = 1.0
+    # Keep the clear stream's keyframes decoded continuously so the first
+    # frame of a series is ready the instant the webhook arrives, instead of
+    # a fresh RTSP grab that costs about two seconds.
+    hot_keyframes: bool = True
 
 
 def load_trigger_capture_config(
@@ -102,6 +110,7 @@ def load_trigger_capture_config(
         environment.get("GATE_TRIGGER_CAPTURE_MAX_FRAME_BYTES", str(8 * 1024 * 1024)),
         1, MAX_FRAME_BYTES,
     )
+    hot_keyframes = _boolean(environment.get("GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES", "true"))
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -112,17 +121,73 @@ def load_trigger_capture_config(
         delay_seconds=delay,
         capture_count=capture_count,
         spacing_seconds=spacing,
+        hot_keyframes=hot_keyframes,
     )
+
+
+class ClearKeyframeBuffer(HotStreamBuffer):
+    """Continuously decode only the clear stream's keyframes.
+
+    At the camera's 1x keyframe interval this is one 4K decode per second
+    (about a quarter of one Pi 5 core), and it means a full-resolution frame
+    taken moments before the alarm is already in memory when the webhook
+    arrives. The on-demand grab remains the fallback when the ring is stale.
+    """
+
+    def __init__(self, capture_config: TriggerCaptureConfig, **kwargs) -> None:
+        super().__init__(
+            HotStreamConfig(
+                enabled=True,
+                output_directory=capture_config.output_directory,
+                source_url=capture_config.source_url,
+                sample_fps=1.0,
+                frame_count=KEYFRAME_RING_FRAMES,
+                selection_count=1,
+                max_frame_bytes=capture_config.max_frame_bytes,
+                max_total_bytes=capture_config.max_frame_bytes * KEYFRAME_RING_FRAMES,
+                max_age_seconds=KEYFRAME_MAX_AGE_SECONDS,
+            ),
+            **kwargs,
+        )
+        self.command = (
+            FFMPEG_BINARY, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-rtsp_transport", "tcp",
+            "-analyzeduration", "0", "-probesize", "32",
+            "-skip_frame", "nokey",
+            "-i", capture_config.source_url,
+            "-map", "0:v:0", "-an", "-vf", "fps=1",
+            "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
+        )
+
+    def latest(self, *, after: float | None = None) -> tuple[bytes, float] | None:
+        return self._ring.latest(
+            now=self._clock(), max_age=self.config.max_age_seconds, after=after,
+        )
+
+    def status(self) -> dict:
+        status = super().status()
+        status.update({
+            "stream": "clear",
+            "keyframes_only": True,
+            "source_profile": {
+                "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
+            },
+        })
+        return status
 
 
 class TriggerFrameCapture:
     """Grab one clear-stream frame per accepted camera event, bounded and serial."""
 
     def __init__(self, config: TriggerCaptureConfig, *, popen=subprocess.Popen,
-                 clock=monotonic, wall_clock=None):
+                 clock=monotonic, wall_clock=None, frame_source=None):
         self.config = config
         self.output_directory = config.output_directory
         self._popen = popen
+        # An object with latest(after=...) -> (jpeg_bytes, captured_at) or
+        # None, normally the ClearKeyframeBuffer.
+        self._frame_source = frame_source
+        self._last_captured_at: float | None = None
         self._clock = clock
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._queue: Queue = Queue(maxsize=1)
@@ -192,20 +257,33 @@ class TriggerFrameCapture:
             self.capture_series(event, scheduled_at, stop_event)
 
     def capture_series(self, event, scheduled_at, stop_event) -> int:
-        """Wait for the vehicle to stop, then grab a short bounded series."""
+        """Take a short bounded series: with hot keyframes the frame decoded
+        moments before the alarm goes first, immediately; the rest wait for
+        the vehicle to stop (the delay, then the spacing between frames)."""
         injected = 0
-        if self._pause(stop_event, self.config.delay_seconds):
-            return injected
-        for index in range(self.config.capture_count):
-            if index and self._pause(stop_event, self.config.spacing_seconds):
+        after = None
+        slots = self.config.capture_count
+        if self._frame_source is not None:
+            after, count = self._capture_slot(event, scheduled_at, after=after)
+            injected += count
+            slots -= 1
+        for index in range(slots):
+            wait = self.config.delay_seconds if index == 0 else self.config.spacing_seconds
+            if self._pause(stop_event, wait):
                 break
-            try:
-                if self.capture_once(event, scheduled_at):
-                    injected += 1
-            except Exception:
-                self._failure_count += 1
-                LOGGER.exception("gate_trigger_capture outcome=error")
+            after, count = self._capture_slot(event, scheduled_at, after=after)
+            injected += count
         return injected
+
+    def _capture_slot(self, event, scheduled_at, *, after):
+        try:
+            paths = self.capture_once(event, scheduled_at, after=after)
+        except Exception:
+            self._failure_count += 1
+            LOGGER.exception("gate_trigger_capture outcome=error")
+            return after, 0
+        captured_at = self._last_captured_at
+        return (captured_at if captured_at is not None else after), (1 if paths else 0)
 
     @staticmethod
     def _pause(stop_event, seconds: float) -> bool:
@@ -214,10 +292,12 @@ class TriggerFrameCapture:
             return stop_event.is_set()
         return stop_event.wait(seconds)
 
-    def capture_once(self, event, scheduled_at: float | None = None) -> tuple[Path, ...]:
-        """Grab, validate, and inject one frame. Returns the injected paths."""
+    def capture_once(self, event, scheduled_at: float | None = None, *,
+                     after: float | None = None) -> tuple[Path, ...]:
+        """Acquire, validate, and inject one frame. Returns the injected paths."""
         started = self._clock()
-        frame = self._grab()
+        frame, source, frame_captured_at = self._acquire(after)
+        self._last_captured_at = frame_captured_at
         if frame is None:
             self._failure_count += 1
             return ()
@@ -247,10 +327,26 @@ class TriggerFrameCapture:
             raise
         self._capture_count += 1
         LOGGER.info(
-            "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d",
+            "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
+            "source=%s frame_age_ms=%d",
             event.event_type, round((self._clock() - started) * 1000),
+            source, max(0, round((self._clock() - frame_captured_at) * 1000)),
         )
         return (path,)
+
+    def _acquire(self, after: float | None) -> tuple[bytes | None, str, float | None]:
+        """Prefer a fresh buffered keyframe; otherwise grab from the stream."""
+        if self._frame_source is not None:
+            try:
+                latest = self._frame_source.latest(after=after)
+            except Exception:
+                latest = None
+            if latest is not None:
+                frame, captured_at = latest
+                return frame, "keyframe", captured_at
+            LOGGER.info("gate_trigger_capture keyframe=unavailable fallback=grab")
+        frame = self._grab()
+        return frame, "grab", (self._clock() if frame is not None else None)
 
     def status(self) -> dict:
         return {

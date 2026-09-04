@@ -20,7 +20,9 @@ from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
-from .trigger_capture import TriggerFrameCapture, load_trigger_capture_config
+from .trigger_capture import (
+    ClearKeyframeBuffer, TriggerFrameCapture, load_trigger_capture_config,
+)
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import (
@@ -100,8 +102,13 @@ def main() -> None:
         os.environ, Path(arguments.database).resolve().parent,
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
+    clear_keyframes = (
+        ClearKeyframeBuffer(trigger_capture_config)
+        if trigger_capture_config.enabled and trigger_capture_config.hot_keyframes
+        else None
+    )
     trigger_capture = (
-        TriggerFrameCapture(trigger_capture_config)
+        TriggerFrameCapture(trigger_capture_config, frame_source=clear_keyframes)
         if trigger_capture_config.enabled else None
     )
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
@@ -111,6 +118,8 @@ def main() -> None:
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if hot_stream is not None:
         background_workers += (hot_stream,)
+    if clear_keyframes is not None:
+        background_workers += (clear_keyframes,)
     if trigger_capture is not None:
         background_workers += (trigger_capture,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
@@ -170,6 +179,7 @@ def main() -> None:
     def shutdown():
         return _shutdown_controller_with_hot_stream(
             hot_stream, processor, relay, trigger_capture=trigger_capture,
+            clear_keyframes=clear_keyframes,
         )
 
     run_worker(
@@ -232,12 +242,17 @@ def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
 
 
 def _shutdown_controller_with_hot_stream(hot_stream, processor, relay,
-                                         trigger_capture=None) -> bool:
+                                         trigger_capture=None, clear_keyframes=None) -> bool:
     try:
         if trigger_capture is not None:
             trigger_capture.close()
     except BaseException:
         logging.getLogger(__name__).warning("trigger_capture_close_failed", exc_info=True)
+    try:
+        if clear_keyframes is not None:
+            clear_keyframes.close()
+    except BaseException:
+        logging.getLogger(__name__).warning("clear_keyframes_close_failed", exc_info=True)
     try:
         if hot_stream is not None:
             hot_stream.close()

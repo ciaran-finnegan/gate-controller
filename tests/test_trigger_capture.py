@@ -370,3 +370,136 @@ class TriggerFrameCaptureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeKeyframeSource:
+    """Stand-in for the ClearKeyframeBuffer ring."""
+
+    max_age = 1.6
+
+    def __init__(self, frames=(), clock=lambda: 10.0):
+        # (captured_at, jpeg_bytes) pairs, newest last
+        self.frames = list(frames)
+        self.requests = []
+        self._clock = clock
+
+    def latest(self, *, after=None):
+        self.requests.append(after)
+        if not self.frames:
+            return None
+        captured_at, frame = self.frames[-1]
+        if after is not None and captured_at <= after:
+            return None
+        if not 0 <= self._clock() - captured_at <= self.max_age:
+            return None
+        return frame, captured_at
+
+
+class HotKeyframeCaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.injected = []
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _capture(self, source, popen=None, count=3, clock=None):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            delay_seconds=1.5, capture_count=count, spacing_seconds=1.0,
+        )
+        capture = TriggerFrameCapture(
+            config, popen=popen or FakePopen([]), clock=clock or (lambda: 10.0),
+            frame_source=source,
+        )
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        return capture
+
+    def test_the_buffered_keyframe_is_injected_before_any_wait(self):
+        source = FakeKeyframeSource([(9.4, jpeg())])
+        capture = self._capture(source, count=1)
+        pauses = []
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                pauses.append(seconds)
+                return False
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.capture_series(event(), 9.5, Stop())
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(pauses, [])
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(self.injected[0][0].read_bytes(), jpeg())
+        self.assertIn("source=keyframe frame_age_ms=600", "\n".join(logs.output))
+
+    def test_later_slots_wait_for_the_stop_and_never_reuse_a_frame(self):
+        clock = {"now": 10.0}
+        source = FakeKeyframeSource([(9.4, jpeg())], clock=lambda: clock["now"])
+        capture = self._capture(source, count=3, clock=lambda: clock["now"])
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                clock["now"] += seconds
+                # A new keyframe lands during each wait.
+                source.frames.append((clock["now"] - 0.2, jpeg((80, 40))))
+                return False
+
+        injected = capture.capture_series(event(), 9.5, Stop())
+
+        self.assertEqual(injected, 3)
+        # The first request is unconstrained; each later one asks for a frame
+        # newer than the one just injected.
+        self.assertEqual(source.requests, [None, 9.4, 11.3])
+        self.assertEqual(len(self.injected), 3)
+
+    def test_a_stale_ring_falls_back_to_a_grab(self):
+        source = FakeKeyframeSource([(5.0, jpeg())])  # far older than max age
+        popen = FakePopen([FakeProcess(output=jpeg((32, 16)))])
+        capture = self._capture(source, popen=popen, count=1)
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                return False
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.capture_series(event(), 9.5, Stop())
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(len(popen.calls), 1)
+        combined = "\n".join(logs.output)
+        self.assertIn("keyframe=unavailable fallback=grab", combined)
+        self.assertIn("source=grab", combined)
+
+    def test_keyframe_buffer_decodes_only_keyframes_without_probing(self):
+        from gate_controller.trigger_capture import ClearKeyframeBuffer
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+        )
+        buffer = ClearKeyframeBuffer(config)
+
+        command = buffer.command
+        self.assertIn("-skip_frame", command)
+        self.assertEqual(command[command.index("-skip_frame") + 1], "nokey")
+        self.assertIn("-probesize", command)
+        self.assertIn("rtsp://127.0.0.1:8554/clear", command)
+        self.assertEqual(buffer.status()["stream"], "clear")
+        self.assertTrue(buffer.status()["keyframes_only"])
+        self.assertIsNone(buffer.latest())
+
+    def test_hot_keyframes_can_be_disabled_by_environment(self):
+        self.assertTrue(load_trigger_capture_config({}, Path("/u"), webhook_enabled=True).hot_keyframes)
+        self.assertFalse(load_trigger_capture_config(
+            {"GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES": "false"}, Path("/u"), webhook_enabled=True,
+        ).hot_keyframes)

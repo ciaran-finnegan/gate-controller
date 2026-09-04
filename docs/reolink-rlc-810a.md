@@ -122,12 +122,21 @@ Top-level camera `test` and `manual` notifications are recorded as
 
 Vehicles stop at the closed gate, and a stopped vehicle is the sharpest plate
 the camera can give. When the listener is enabled, an accepted `vehicle`,
-`line_crossing`, or `other` event may schedule a delayed capture: the
-controller waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle to come
-to rest, then grabs `GATE_TRIGGER_CAPTURE_COUNT` full-resolution frames
-`GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart from the loopback MediaMTX clear
-path (`rtsp://127.0.0.1:8554/clear`) and hands each to the normal burst
-pipeline. The journal records one of these scheduling outcomes per event:
+`line_crossing`, or `other` event schedules a short series of full-resolution
+frames from the loopback MediaMTX clear path (`rtsp://127.0.0.1:8554/clear`),
+each handed to the normal burst pipeline. With
+`GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES=true` (the default) the controller keeps
+the clear stream's keyframes decoded continuously (one 4K decode per second
+at the camera's 1x interval, about a quarter of one Pi 5 core and 330 MB), so
+the first frame of the series is the keyframe taken moments before the alarm
+and is injected the instant the webhook arrives, ahead of the FTP upload. The
+controller then waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle
+to come to rest and takes the remaining frames of `GATE_TRIGGER_CAPTURE_COUNT`
+`GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart, each newer than the last. A stale
+ring falls back to an on-demand grab (`keyframe=unavailable fallback=grab`).
+The journal line for each frame carries `source=keyframe|grab` and
+`frame_age_ms`. Use `GATE_TRIGGER_CAPTURE_COUNT=3` so the series still covers
+the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
 `scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
 `skipped_type` for `manual_test` events, which never capture;
 `skipped_interval` inside `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS` of the
@@ -167,8 +176,9 @@ skipped event still has its FTP frame recognised as before.
 GATE_TRIGGER_CAPTURE_ENABLED=true
 GATE_TRIGGER_CAPTURE_SOURCE=rtsp://127.0.0.1:8554/clear
 GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=3
+GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES=true
 GATE_TRIGGER_CAPTURE_DELAY_SECONDS=1.5
-GATE_TRIGGER_CAPTURE_COUNT=2
+GATE_TRIGGER_CAPTURE_COUNT=3
 GATE_TRIGGER_CAPTURE_SPACING_SECONDS=1
 GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS=5
 ```
@@ -193,10 +203,11 @@ hot-stream burst of three frames lost its second request to a 429 on every
 vehicle from the day fluent frames joined the burst.
 
 Because each paced call costs at least a second, keep
-`GATE_DECISION_TIMEOUT_SECONDS` at 6 with two fluent-plus-FTP frames, and
-prefer `GATE_HOT_STREAM_SELECTION_COUNT=1`: the 640x360 fluent frame rarely
-reads a plate the 4K frames cannot, and the webhook capture now supplies the
-sharp frames. A matching first frame still opens the gate as soon as its
+`GATE_DECISION_TIMEOUT_SECONDS` at 6, and turn the fluent fallback off
+(`GATE_HOT_STREAM_ENABLED=false`) once webhook capture is running: across
+the recorded event telemetry the 640x360 fluent frames read a plate in 3 of
+189 attempts while each cost about 0.7 s of the throttle window, whereas 4K
+frames read one in four. The webhook keyframes supply the sharp frames now. A matching first frame still opens the gate as soon as its
 own request returns; the deadline only bounds the fallbacks.
 Tune the delay from the captured frames: movement means wait longer, a
 vehicle already stopped in the FTP frame means the delay can be shorter. Invalid, stale, duplicate, unauthorized, and oversized requests
