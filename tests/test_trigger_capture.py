@@ -88,7 +88,7 @@ class TriggerCaptureConfigTests(unittest.TestCase):
         self.assertEqual(config.timeout_seconds, 2.5)
         self.assertEqual(config.min_interval_seconds, 5.0)
         self.assertEqual(config.delay_seconds, 1.5)
-        self.assertEqual(config.capture_count, 2)
+        self.assertEqual(config.capture_count, 3)
         self.assertEqual(config.spacing_seconds, 1.0)
 
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):

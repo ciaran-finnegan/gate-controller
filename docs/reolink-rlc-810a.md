@@ -135,8 +135,8 @@ to come to rest and takes the remaining frames of `GATE_TRIGGER_CAPTURE_COUNT`
 `GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart, each newer than the last. A stale
 ring falls back to an on-demand grab (`keyframe=unavailable fallback=grab`).
 The journal line for each frame carries `source=keyframe|grab` and
-`frame_age_ms`. Use `GATE_TRIGGER_CAPTURE_COUNT=3` so the series still covers
-the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
+`frame_age_ms`. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
+covering the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
 `scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
 `skipped_type` for `manual_test` events, which never capture;
 `skipped_interval` inside `GATE_TRIGGER_CAPTURE_MIN_INTERVAL_SECONDS` of the
@@ -187,7 +187,7 @@ Watch the journal for `gate_trigger_capture outcome=captured` followed by the
 recognition trace. `outcome=failed reason=timeout` on every event means the
 keyframe interval is still too long or the clear path is not being served.
 Each captured frame is an extra OCR request, so with the default series of
-two expect roughly four Plate Recognizer calls per vehicle instead of one.
+three expect roughly four Plate Recognizer calls per vehicle instead of one.
 
 ### OCR Request Pacing
 

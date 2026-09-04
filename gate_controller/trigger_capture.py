@@ -59,7 +59,7 @@ class TriggerCaptureConfig:
     # Vehicles stop at the closed gate. Wait for that before the first grab,
     # then take a short series so at least one frame sees the plate at rest.
     delay_seconds: float = 1.5
-    capture_count: int = 2
+    capture_count: int = 3
     spacing_seconds: float = 1.0
     # Keep the clear stream's keyframes decoded continuously so the first
     # frame of a series is ready the instant the webhook arrives, instead of
@@ -100,7 +100,7 @@ def load_trigger_capture_config(
         0.0, MAX_CAPTURE_DELAY_SECONDS,
     )
     capture_count = _integer(
-        environment.get("GATE_TRIGGER_CAPTURE_COUNT", "2"), 1, MAX_CAPTURE_COUNT,
+        environment.get("GATE_TRIGGER_CAPTURE_COUNT", "3"), 1, MAX_CAPTURE_COUNT,
     )
     spacing = _number(
         environment.get("GATE_TRIGGER_CAPTURE_SPACING_SECONDS", "1"),
