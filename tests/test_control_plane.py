@@ -1,5 +1,6 @@
 import unittest
 
+from gate_controller.cloud_health import TransitionLogger
 from gate_controller.cloudflare_client import CloudflareStatusReporter
 from gate_controller.control_plane import HeartbeatWorker
 
@@ -40,3 +41,42 @@ class ControlPlaneTests(unittest.TestCase):
                 raise TimeoutError("offline")
 
         self.assertFalse(HeartbeatWorker(FailingReporter(), lambda: {"queue_depth": 2}).run_once())
+
+    def test_heartbeat_failures_are_logged_as_a_transition_and_recovery(self):
+        calls = {"fail": True}
+
+        class Reporter:
+            @staticmethod
+            def heartbeat(status):
+                if calls["fail"]:
+                    raise TimeoutError("offline")
+
+        import logging
+        clock = [0.0]
+        worker = HeartbeatWorker(
+            Reporter(), lambda: {"queue_depth": 0},
+            health=TransitionLogger(
+                logging.getLogger("gate_controller.control_plane"), "heartbeat",
+                repeat_interval=600.0, clock=lambda: clock[0],
+            ),
+        )
+
+        with self.assertLogs("gate_controller.control_plane", level="WARNING") as logs:
+            self.assertFalse(worker.run_once())
+            self.assertFalse(worker.run_once())
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("gate_cloud stage=heartbeat_failed error_type=TimeoutError", logs.output[0])
+
+        calls["fail"] = False
+        with self.assertLogs("gate_controller.control_plane", level="INFO") as logs:
+            self.assertTrue(worker.run_once())
+        self.assertIn("stage=heartbeat_recovered failures=2", logs.output[0])
+
+    def test_default_heartbeat_worker_logs_a_failure_without_help(self):
+        class FailingReporter:
+            @staticmethod
+            def heartbeat(status):
+                raise TimeoutError("offline")
+
+        with self.assertLogs("gate_controller.control_plane", level="WARNING"):
+            self.assertFalse(HeartbeatWorker(FailingReporter(), lambda: {}).run_once())

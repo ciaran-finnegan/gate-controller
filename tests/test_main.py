@@ -709,5 +709,35 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
 
 
+class AuthorisationStalenessTests(unittest.TestCase):
+    def test_default_keeps_the_last_snapshot_for_fourteen_days(self):
+        from gate_controller.__main__ import authorisation_max_staleness
+
+        self.assertEqual(authorisation_max_staleness({}), timedelta(days=14))
+        self.assertEqual(authorisation_max_staleness(
+            {"GATE_AUTHORISATION_MAX_STALENESS_SECONDS": "  "}
+        ), timedelta(days=14))
+
+    def test_explicit_bound_is_honoured_and_zero_disables_it(self):
+        from gate_controller.__main__ import authorisation_max_staleness
+
+        self.assertEqual(authorisation_max_staleness(
+            {"GATE_AUTHORISATION_MAX_STALENESS_SECONDS": "300"}
+        ), timedelta(seconds=300))
+        self.assertIsNone(authorisation_max_staleness(
+            {"GATE_AUTHORISATION_MAX_STALENESS_SECONDS": "0"}
+        ))
+        self.assertIsNone(authorisation_max_staleness(
+            {"GATE_AUTHORISATION_MAX_STALENESS_SECONDS": "-1"}
+        ))
+
+    def test_nonfinite_bound_is_rejected(self):
+        from gate_controller.__main__ import authorisation_max_staleness
+
+        for value in ("nan", "inf", "abc"):
+            with self.assertRaises(ValueError):
+                authorisation_max_staleness({"GATE_AUTHORISATION_MAX_STALENESS_SECONDS": value})
+
+
 if __name__ == "__main__":
     unittest.main()

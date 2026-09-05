@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 import tempfile
 from urllib.parse import urlencode
@@ -6,7 +7,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock
 
+from .cloud_health import TransitionLogger
 from .matching import normalise_plate
+
+LOGGER = logging.getLogger(__name__)
 
 
 MAX_PLATE_SNAPSHOT_BYTES = 256 * 1024
@@ -163,10 +167,12 @@ class CloudflarePlateFetcher:
 
 
 class AuthorisationRefreshWorker:
-    def __init__(self, cache: AuthorisedPlateCache, fetch, poll_interval: float = 30.0):
+    def __init__(self, cache: AuthorisedPlateCache, fetch, poll_interval: float = 30.0, *,
+                 health: TransitionLogger | None = None):
         self._cache = cache
         self._fetch = fetch
         self._poll_interval = poll_interval
+        self._health = health or TransitionLogger(LOGGER, "plates_refresh")
 
     def run_once(self) -> bool:
         try:
@@ -179,7 +185,9 @@ class AuthorisationRefreshWorker:
             self._cache.replace(row["plate"] for row in rows)
         except Exception as error:
             self._cache.mark_refresh_error(error)
+            self._health.failure(error)
             return False
+        self._health.success()
         return True
 
     def run_forever(self, stop_event: Event) -> None:

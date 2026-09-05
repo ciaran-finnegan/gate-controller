@@ -224,6 +224,17 @@ two Access service-token variables. Event ingest is `POST
 /api/controller/events`; it is idempotent by the controller event key and may
 include a bounded JPEG whose SHA-256 digest is in the event payload.
 
+The controller assumes the Worker can be unavailable for days. Recognition keeps
+using the last complete plate snapshot for 14 days
+(`GATE_AUTHORISATION_MAX_STALENESS_SECONDS`, `0` for no bound) before failing
+closed, so a Cloudflare, D1 quota, or uplink outage does not stop authorised
+vehicles. Queued events wait in the local outbox with per-item exponential
+backoff (5 s to 5 minutes) instead of retrying every poll, and heartbeat and
+plate-refresh failures appear in the journal as `gate_cloud stage=*_failed`
+transitions with the returned HTTP status, repeated at most every ten minutes,
+followed by `stage=*_recovered` when the path returns. Check those lines first
+when the app shows the controller as not reporting.
+
 The Worker deployment owns evidence retention. Store accepted JPEGs only in a
 private R2 bucket under the verified digest, keep bucket access limited to the
 Worker and approved operators, and configure the site's approved R2 lifecycle
