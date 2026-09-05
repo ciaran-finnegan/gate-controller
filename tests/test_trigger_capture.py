@@ -130,6 +130,19 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
+    def test_frame_gates_default_to_empty_scene_only_and_are_bounded(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.empty_scene_threshold, 0.03)
+        self.assertEqual(config.max_highlight_clipping, 0.0)
+        tuned = load_trigger_capture_config(
+            {"GATE_EMPTY_SCENE_THRESHOLD": "0", "GATE_MAX_HIGHLIGHT_CLIPPING": "0.35"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual((tuned.empty_scene_threshold, tuned.max_highlight_clipping), (0.0, 0.35))
+        for environment in ({"GATE_EMPTY_SCENE_THRESHOLD": "0.9"}, {"GATE_MAX_HIGHLIGHT_CLIPPING": "1.5"}):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
+
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
         config = load_trigger_capture_config(
             {}, Path("/var/lib/gate-controller"), webhook_enabled=True,
@@ -503,6 +516,102 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(len(popen.calls), 3)
         capture.note_result((self.root / "somewhere-else.jpg",), ProcessingResult(True, "exact_match"))
         self.assertEqual(capture.status()["presence"]["max_frames"], 0)
+
+    class _SceneSource:
+        """A frame source that also scores frames against an idle baseline."""
+
+        def __init__(self, frames, differences):
+            self.frames, self.differences = list(frames), list(differences)
+            self.activity = 0
+            self.served = 0
+
+        def latest(self, *, after=None):
+            if self.served >= len(self.frames):
+                return None
+            frame = self.frames[self.served]
+            self.served += 1
+            return frame, 100.0 + self.served
+
+        def note_activity(self):
+            self.activity += 1
+
+        def scene_difference(self, frame):
+            return self.differences[min(self.served - 1, len(self.differences) - 1)]
+
+    def test_an_empty_scene_frame_is_not_captured_and_the_event_marks_activity(self):
+        source = self._SceneSource([jpeg(), jpeg()], [0.012, 0.21])
+        capture = TriggerFrameCapture(self.config, popen=FakePopen([]), frame_source=source)
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        capture.on_camera_event(event())
+        self.assertEqual(source.activity, 1)
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.capture_once(event(), 100.0), ())
+            paths = capture.capture_once(event(), 100.0, after=101.0)
+        self.assertEqual(len(paths), 1)
+        combined = "\n".join(logs.output)
+        self.assertIn("outcome=skipped_empty_scene event_type=vehicle source=keyframe scene_difference=0.012", combined)
+        self.assertIn("outcome=captured", combined)
+        self.assertIn("scene_difference=0.210", combined)
+        self.assertRegex(combined, r"clipping=\d\.\d\d")
+        self.assertEqual(capture.status()["skipped"]["empty_scene"], 1)
+
+    def test_clipped_frames_are_skipped_only_when_a_threshold_is_set(self):
+        from io import BytesIO
+        from PIL import Image
+        output = BytesIO()
+        Image.new("RGB", (64, 32), color="white").save(output, format="JPEG")
+        blazed = output.getvalue()
+        strict = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            max_highlight_clipping=0.5, empty_scene_threshold=0,
+        )
+        capture = TriggerFrameCapture(strict, popen=FakePopen([]), frame_source=self._SceneSource([blazed], [None]))
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.capture_once(event(), 100.0), ())
+        self.assertIn("outcome=skipped_clipped", "\n".join(logs.output))
+        self.assertIn("clipping=1.00", "\n".join(logs.output))
+        self.assertEqual(list(strict.output_directory.iterdir()), [], "the skipped frame is not left on disk")
+        self.assertEqual(capture.status()["skipped"]["clipped"], 1)
+
+        lenient = TriggerFrameCapture(self.config, popen=FakePopen([]), frame_source=self._SceneSource([blazed], [None]))
+        lenient.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        self.assertEqual(len(lenient.capture_once(event(), 100.0)), 1)
+
+    def test_presence_session_ends_as_departed_and_warns_when_nothing_read_the_plate(self):
+        clock = [100.0]
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=1, presence_spacing_seconds=0.5, presence_max_frames=4,
+        )
+        # Series frame shows the car; the first presence frame shows an empty drive.
+        source = self._SceneSource([jpeg(), jpeg()], [0.3, 0.005])
+        capture = TriggerFrameCapture(config, popen=FakePopen([]), frame_source=source, clock=lambda: clock[0])
+        capture.attach(lambda paths, received_at, trigger: (
+            self.injected.append(paths), capture.note_result(paths, ProcessingResult(False, "ocr_error"))
+        ))
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(extra, 0)
+        combined = "\n".join(logs.output)
+        self.assertIn("outcome=presence_ended reason=departed", combined)
+        self.assertIn("WARNING:gate_controller.trigger_capture:gate_presence stage=unresolved reason=departed event_type=vehicle extra_frames=0", combined)
+        self.assertEqual(capture.status()["presence"]["unresolved"], 1)
+
+    def test_a_session_that_opened_the_gate_is_not_unresolved(self):
+        clock = [100.0]
+        capture, popen = self._presence_capture(
+            4, clock=clock, verdict=lambda n: ProcessingResult(n >= 4, "exact_match" if n >= 4 else "ocr_error"),
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.presence_session(event(), 100.0, self._Stop(clock))
+        self.assertNotIn("stage=unresolved", "\n".join(logs.output))
+        self.assertEqual(capture.status()["presence"]["unresolved"], 0)
 
     def test_run_forever_drains_scheduled_events_and_unlinks_when_unattached(self):
         config = TriggerCaptureConfig(

@@ -113,6 +113,62 @@ class HotStreamConfigurationTests(unittest.TestCase):
 
         self.assertEqual(2, config.selection_count)
 
+    def test_every_decoded_frame_reaches_the_frame_hook_and_hook_errors_are_contained(self):
+        from io import BytesIO
+        from threading import Event
+        from PIL import Image
+        from gate_controller.hot_stream import HotStreamBuffer, HotStreamConfig
+
+        output = BytesIO()
+        Image.new("RGB", (32, 16), color="blue").save(output, format="JPEG")
+        frame = output.getvalue()
+        stop = Event()
+        seen = []
+
+        class Watching(HotStreamBuffer):
+            def _on_frame(self, frame, now):
+                seen.append((frame, now))
+                if len(seen) == 2:
+                    stop.set()
+                raise RuntimeError("hook trouble must not stop decoding")
+
+        class Stdout:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stdout(frame + frame)
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = HotStreamConfig(
+            enabled=True, output_directory=Path(directory.name) / ".hot-stream",
+            source_url="rtsp://127.0.0.1:8554/clear", sample_fps=1.0, frame_count=4,
+            selection_count=1, max_frame_bytes=1_000_000, max_total_bytes=4_000_000,
+            max_age_seconds=1.0,
+        )
+        buffer = Watching(config, popen=lambda *a, **k: Process(), clock=lambda: 5.0)
+        buffer.run_forever(stop)
+
+        self.assertEqual([f for f, _ in seen], [frame, frame])
+        self.assertEqual(buffer._frame_hook_failures, 2)
+        self.assertIsNotNone(buffer._ring.latest(now=5.0, max_age=1.0))
+
     def test_capture_loop_keeps_a_local_process_reference_during_close(self):
         class Stdout:
             def read(self, _size):
