@@ -207,6 +207,7 @@ class HotStreamBuffer:
             max_total_bytes=config.max_total_bytes,
         )
         self._restart_count = 0
+        self._frame_hook_failures = 0
         self._process = None
         fps = f"{config.sample_fps:g}"
         self.command = (
@@ -263,7 +264,12 @@ class HotStreamBuffer:
                     if not chunk:
                         break
                     for frame in parser.feed(chunk):
-                        self._ring.add(frame, captured_at=self._clock())
+                        now = self._clock()
+                        self._ring.add(frame, captured_at=now)
+                        try:
+                            self._on_frame(frame, now)
+                        except Exception:
+                            self._frame_hook_failures += 1
             except (OSError, ValueError):
                 LOGGER.warning("gate_hot_stream outcome=restart reason=stream_error")
             finally:
@@ -271,6 +277,9 @@ class HotStreamBuffer:
             if not stop_event.is_set():
                 self._restart_count += 1
                 stop_event.wait(self.config.restart_seconds)
+
+    def _on_frame(self, frame: bytes, now: float) -> None:
+        """Hook for subclasses that watch every decoded frame. No-op here."""
 
     def close(self) -> None:
         self._stop_child()

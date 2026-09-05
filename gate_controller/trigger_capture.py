@@ -28,7 +28,9 @@ from .hot_stream import (
     FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
+from .images import measure_frame_quality
 from .plate_region import PlateRegion, parse_plate_region
+from .scene import SceneBaseline
 from .telemetry import TriggerTelemetry
 
 
@@ -55,6 +57,11 @@ MAX_PRESENCE_SPACING_SECONDS = 15.0
 MAX_PRESENCE_FRAMES = 10
 # Outcomes that mean the plate was never actually read, so another frame can
 # still change the answer. A plate that was read but not authorised is final.
+# Mean thumbnail difference from the idle scene below which a frame shows an
+# empty drive. Empty-vs-empty drift over 30 s measures around 0.01; a vehicle
+# in the plate band measures well above 0.08.
+DEFAULT_EMPTY_SCENE_THRESHOLD = 0.03
+MAX_EMPTY_SCENE_THRESHOLD = 0.5
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
@@ -101,6 +108,13 @@ class TriggerCaptureConfig:
     presence_window_seconds: float = 20.0
     presence_spacing_seconds: float = 3.0
     presence_max_frames: int = 4
+    # Skip frames that barely differ from the idle scene (no vehicle in the
+    # plate band yet, or it has left). 0 disables the check.
+    empty_scene_threshold: float = DEFAULT_EMPTY_SCENE_THRESHOLD
+    # Skip frames whose bright pixels exceed this fraction (headlight or IR
+    # blaze washing out the plate). 0 disables; the value is always journaled
+    # so a threshold can be chosen from real captures.
+    max_highlight_clipping: float = 0.0
 
 
 def load_trigger_capture_config(
@@ -165,6 +179,11 @@ def load_trigger_capture_config(
     presence_frames = _integer(
         environment.get("GATE_PRESENCE_MAX_FRAMES", "4"), 0, MAX_PRESENCE_FRAMES,
     )
+    empty_scene = _number(
+        environment.get("GATE_EMPTY_SCENE_THRESHOLD", str(DEFAULT_EMPTY_SCENE_THRESHOLD)),
+        0.0, MAX_EMPTY_SCENE_THRESHOLD,
+    )
+    max_clipping = _number(environment.get("GATE_MAX_HIGHLIGHT_CLIPPING", "0"), 0.0, 1.0)
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -182,6 +201,8 @@ def load_trigger_capture_config(
         presence_window_seconds=presence_window,
         presence_spacing_seconds=presence_spacing,
         presence_max_frames=presence_frames,
+        empty_scene_threshold=empty_scene,
+        max_highlight_clipping=max_clipping,
     )
 
 
@@ -251,6 +272,7 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "-vf", ",".join(decoder_filters(capture_config, sample=True)),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
+        self.scene = SceneBaseline(clock=self._clock)
         self._decode = {
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
@@ -264,6 +286,15 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             now=self._clock(), max_age=self.config.max_age_seconds, after=after,
         )
 
+    def _on_frame(self, frame: bytes, now: float) -> None:
+        self.scene.observe(frame, now)
+
+    def note_activity(self) -> None:
+        self.scene.note_activity(self._clock())
+
+    def scene_difference(self, frame: bytes) -> float | None:
+        return self.scene.difference(frame)
+
     def status(self) -> dict:
         status = super().status()
         status.update({
@@ -273,6 +304,7 @@ class ClearKeyframeBuffer(HotStreamBuffer):
                 "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
             },
             "decode": dict(self._decode),
+            "scene": self.scene.status(self._clock()),
         })
         return status
 
@@ -300,6 +332,10 @@ class TriggerFrameCapture:
         self._capture_count = 0
         self._failure_count = 0
         self._presence_retries = 0
+        self._skipped_empty = 0
+        self._skipped_clipped = 0
+        self._unresolved_sessions = 0
+        self._last_skip: str | None = None
         # Presence-session bookkeeping, shared with the worker's result hook.
         self._session_lock = Lock()
         self._session_paths: set[Path] = set()
@@ -337,6 +373,12 @@ class TriggerFrameCapture:
             outcome = "skipped_type"
         else:
             now = self._clock()
+            note_activity = getattr(self._frame_source, "note_activity", None)
+            if callable(note_activity):
+                try:
+                    note_activity()
+                except Exception:
+                    pass
             with self._lock:
                 last = self._last_scheduled_at
                 if last is not None and now - last < self.config.min_interval_seconds:
@@ -446,10 +488,21 @@ class TriggerFrameCapture:
                     "gate_trigger_capture outcome=presence_retry frame=%d event_type=%s",
                     extra, getattr(event, "event_type", "unknown"),
                 )
+            elif self._last_skip == "empty_scene":
+                reason = "departed"
+                break
         LOGGER.info(
             "gate_trigger_capture outcome=presence_ended reason=%s extra_frames=%d",
             reason, extra,
         )
+        if reason in ("window", "budget", "departed"):
+            # A vehicle was here and nothing read its plate: the one line an
+            # operator should be looking for when the gate did not open.
+            self._unresolved_sessions += 1
+            LOGGER.warning(
+                "gate_presence stage=unresolved reason=%s event_type=%s extra_frames=%d",
+                reason, getattr(event, "event_type", "unknown"), extra,
+            )
         return extra
 
     def capture_series(self, event, scheduled_at, stop_event) -> int:
@@ -497,14 +550,44 @@ class TriggerFrameCapture:
                      after: float | None = None) -> tuple[Path, ...]:
         """Acquire, validate, and inject one frame. Returns the injected paths."""
         started = self._clock()
+        self._last_skip = None
         frame, source, frame_captured_at = self._acquire(after)
         self._last_captured_at = frame_captured_at
         if frame is None:
             self._failure_count += 1
             return ()
+        scene_difference = self._scene_difference(frame)
+        if (
+            scene_difference is not None
+            and self.config.empty_scene_threshold > 0
+            and scene_difference < self.config.empty_scene_threshold
+        ):
+            self._skipped_empty += 1
+            self._last_skip = "empty_scene"
+            LOGGER.info(
+                "gate_trigger_capture outcome=skipped_empty_scene event_type=%s "
+                "source=%s scene_difference=%.3f",
+                event.event_type, source, scene_difference,
+            )
+            return ()
         path = write_private_frame(
             _ensure_private_directory(self.output_directory), frame,
         )
+        clipping = self._highlight_clipping(path)
+        if (
+            clipping is not None
+            and self.config.max_highlight_clipping > 0
+            and clipping > self.config.max_highlight_clipping
+        ):
+            path.unlink(missing_ok=True)
+            self._skipped_clipped += 1
+            self._last_skip = "clipped"
+            LOGGER.info(
+                "gate_trigger_capture outcome=skipped_clipped event_type=%s source=%s "
+                "clipping=%.2f",
+                event.event_type, source, clipping,
+            )
+            return ()
         captured_at = self._wall_clock()
         origin = started if scheduled_at is None else scheduled_at
         delta_ms = max(0.0, (self._clock() - origin) * 1000.0)
@@ -535,11 +618,30 @@ class TriggerFrameCapture:
         self._capture_count += 1
         LOGGER.info(
             "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
-            "source=%s frame_age_ms=%d",
+            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s",
             event.event_type, round((self._clock() - started) * 1000),
             source, max(0, round((self._clock() - frame_captured_at) * 1000)),
+            "unavailable" if scene_difference is None else f"{scene_difference:.3f}",
+            "unavailable" if clipping is None else f"{clipping:.2f}",
         )
         return (path,)
+
+    def _scene_difference(self, frame: bytes) -> float | None:
+        difference = getattr(self._frame_source, "scene_difference", None)
+        if not callable(difference):
+            return None
+        try:
+            value = difference(frame)
+        except Exception:
+            return None
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _highlight_clipping(path: Path) -> float | None:
+        try:
+            return float(measure_frame_quality(path).highlight_clipping)
+        except Exception:
+            return None
 
     def _acquire(self, after: float | None) -> tuple[bytes | None, str, float | None]:
         """Prefer a fresh buffered keyframe; otherwise grab from the stream."""
@@ -569,6 +671,13 @@ class TriggerFrameCapture:
                 "spacing_seconds": self.config.presence_spacing_seconds,
                 "max_frames": self.config.presence_max_frames,
                 "retries": self._presence_retries,
+                "unresolved": self._unresolved_sessions,
+            },
+            "skipped": {
+                "empty_scene": self._skipped_empty,
+                "clipped": self._skipped_clipped,
+                "empty_scene_threshold": self.config.empty_scene_threshold,
+                "max_highlight_clipping": self.config.max_highlight_clipping,
             },
         }
 

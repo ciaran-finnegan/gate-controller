@@ -177,6 +177,29 @@ camera event is waiting, or the service stops. The journal records
 `outcome=presence_ended reason=opened|plate_read|budget|window|new_event`.
 Set `GATE_PRESENCE_MAX_FRAMES=0` to disable the session.
 
+### Scene Awareness And Frame Gating
+
+The keyframe decoder keeps a small grayscale thumbnail of the idle drive,
+refreshed every 30 s while no camera event has happened for 60 s. Every
+candidate frame is scored against it before any OCR request: a frame whose
+mean difference is below `GATE_EMPTY_SCENE_THRESHOLD` (0.03; `0` disables)
+shows an empty plate band, either because the alarm fired before the vehicle
+entered the picture or because it has already left, and is skipped as
+`gate_trigger_capture outcome=skipped_empty_scene scene_difference=…`. Inside
+a presence session an empty frame is the departure signal and ends the
+session with `reason=departed`. Every captured frame journals its
+`scene_difference=` and `clipping=` (the fraction of near-white pixels) so
+both thresholds can be chosen from real captures; set
+`GATE_MAX_HIGHLIGHT_CLIPPING` (default `0`, off) to skip headlight- or
+IR-blazed frames as `outcome=skipped_clipped` once the night captures show
+where the line is.
+
+When a presence session ends by window, budget, or departure without the
+gate opening, the controller journals
+`gate_presence stage=unresolved reason=… event_type=…` at warning level and
+counts it in the status heartbeat under `presence.unresolved`. That is the
+one line to look for when a vehicle was at the gate and it did not open.
+
 Two related changes make transient failures survivable inside a single
 burst as well: a burst now waits for a busy OCR slot for as long as its own
 decision deadline allows instead of being discarded as `ocr_busy`, and a
