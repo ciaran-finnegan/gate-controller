@@ -10,7 +10,7 @@ StartLimitBurst=5
 Type=simple
 User=gate-controller
 Group=gate-controller
-SupplementaryGroups=gpio
+SupplementaryGroups=gpio video render
 WorkingDirectory=/var/lib/gate-controller
 EnvironmentFile=/etc/gate-controller.env
 Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/gate-controller-deploy/current

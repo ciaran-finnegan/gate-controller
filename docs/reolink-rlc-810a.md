@@ -127,7 +127,7 @@ frames from the loopback MediaMTX clear path (`rtsp://127.0.0.1:8554/clear`),
 each handed to the normal burst pipeline. With
 `GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES=true` (the default) the controller keeps
 the clear stream's keyframes decoded continuously (one 4K decode per second
-at the camera's 1x interval, about a quarter of one Pi 5 core and 330 MB), so
+at the camera's 1x interval), so
 the first frame of the series is the keyframe taken moments before the alarm
 and is injected the instant the webhook arrives, ahead of the FTP upload. The
 controller then waits `GATE_TRIGGER_CAPTURE_DELAY_SECONDS` for the vehicle
@@ -135,7 +135,18 @@ to come to rest and takes the remaining frames of `GATE_TRIGGER_CAPTURE_COUNT`
 `GATE_TRIGGER_CAPTURE_SPACING_SECONDS` apart, each newer than the last. A stale
 ring falls back to an on-demand grab (`keyframe=unavailable fallback=grab`).
 The journal line for each frame carries `source=keyframe|grab` and
-`frame_age_ms`. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
+`frame_age_ms`.
+
+Decoding and re-encoding 4K HEVC in software costs most of one Pi 5 core and
+about 330 MB, enough to push a fanless Pi 5 into thermal throttling. Set
+`GATE_TRIGGER_CAPTURE_HWACCEL=drm` to decode through the Pi 5's hardware HEVC
+block (the service needs the `video` and `render` groups, which the unit
+grants) and `GATE_TRIGGER_CAPTURE_FRAME_WIDTH=1920` to scale frames before the
+JPEG encode. Together they cut the decoder to about a fifth of a core.
+Recognition loses nothing: OCR uploads are already downscaled to
+`GATE_OCR_MAX_UPLOAD_WIDTH=1920` and evidence to 1280. Both settings apply to
+the on-demand grab as well. Measured on the RLC-810A stream over ten
+seconds: software 4K 8.2 s CPU, hardware decode plus 1920 scale 2.0 s. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
 covering the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
 `scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
 `skipped_type` for `manual_test` events, which never capture;

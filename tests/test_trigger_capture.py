@@ -90,6 +90,25 @@ class TriggerCaptureConfigTests(unittest.TestCase):
         self.assertEqual(config.delay_seconds, 1.5)
         self.assertEqual(config.capture_count, 3)
         self.assertEqual(config.spacing_seconds, 1.0)
+        self.assertEqual(config.hwaccel, "")
+        self.assertEqual(config.frame_width, 0)
+
+    def test_hardware_decode_and_frame_width_are_opt_in_and_validated(self):
+        config = load_trigger_capture_config(
+            {"GATE_TRIGGER_CAPTURE_HWACCEL": " DRM ", "GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "1920"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual(config.hwaccel, "drm")
+        self.assertEqual(config.frame_width, 1920)
+
+        for environment in (
+            {"GATE_TRIGGER_CAPTURE_HWACCEL": "vaapi"},
+            {"GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "320"},
+            {"GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "7680"},
+            {"GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "wide"},
+        ):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
 
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
         config = load_trigger_capture_config(
@@ -497,6 +516,43 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         self.assertEqual(buffer.status()["stream"], "clear")
         self.assertTrue(buffer.status()["keyframes_only"])
         self.assertIsNone(buffer.latest())
+        self.assertNotIn("-hwaccel", command)
+        self.assertEqual(command[command.index("-vf") + 1], "fps=1")
+        self.assertEqual(buffer.status()["decode"], {"hwaccel": "software", "frame_width": 3840})
+
+    def test_hardware_decode_and_scaling_apply_to_the_ring_and_the_grab(self):
+        from gate_controller.trigger_capture import ClearKeyframeBuffer, TriggerFrameCapture
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            hwaccel="drm", frame_width=1920,
+        )
+
+        ring = ClearKeyframeBuffer(config).command
+        hw = ring.index("-hwaccel")
+        self.assertEqual(ring[hw:hw + 6], (
+            "-hwaccel", "drm", "-hwaccel_device", "/dev/dri/renderD128",
+            "-hwaccel_output_format", "drm_prime",
+        ))
+        self.assertLess(hw, ring.index("-i"), "decoder selection must precede the input")
+        self.assertEqual(ring[ring.index("-vf") + 1], "hwdownload,format=nv12,fps=1,scale=1920:-2")
+        self.assertEqual(ClearKeyframeBuffer(config).status()["decode"],
+                         {"hwaccel": "drm", "frame_width": 1920})
+
+        grab = TriggerFrameCapture(config).command
+        self.assertIn("-hwaccel", grab)
+        self.assertLess(grab.index("-hwaccel"), grab.index("-i"))
+        self.assertEqual(grab[grab.index("-vf") + 1], "hwdownload,format=nv12,scale=1920:-2")
+        self.assertNotIn("fps=1", grab)
+
+        software_scaled = TriggerFrameCapture(TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture", frame_width=1920,
+        )).command
+        self.assertNotIn("-hwaccel", software_scaled)
+        self.assertEqual(software_scaled[software_scaled.index("-vf") + 1], "scale=1920:-2")
+        default_grab = TriggerFrameCapture(TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+        )).command
+        self.assertNotIn("-vf", default_grab)
 
     def test_hot_keyframes_can_be_disabled_by_environment(self):
         self.assertTrue(load_trigger_capture_config({}, Path("/u"), webhook_enabled=True).hot_keyframes)
