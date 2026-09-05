@@ -239,3 +239,28 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
             path.write_text("plate,name\ntruncated", encoding="utf-8")
             cache.reload_local()
             self.assertEqual(cache.get(), ("12E3456",))
+
+    def test_refresh_worker_logs_failure_once_and_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plates.csv"
+            path.write_text("plate,name\n12D3456,Ada\n", encoding="utf-8")
+            cache = AuthorisedPlateCache(path)
+            state = {"fail": True}
+
+            def fetch():
+                if state["fail"]:
+                    raise TimeoutError("offline")
+                return [{"plate": "12D3456"}]
+
+            worker = AuthorisationRefreshWorker(cache, fetch=fetch)
+
+            with self.assertLogs("gate_controller.authorisation", level="WARNING") as logs:
+                self.assertFalse(worker.run_once())
+                self.assertFalse(worker.run_once())
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("stage=plates_refresh_failed error_type=TimeoutError", logs.output[0])
+
+            state["fail"] = False
+            with self.assertLogs("gate_controller.authorisation", level="INFO") as logs:
+                self.assertTrue(worker.run_once())
+            self.assertIn("stage=plates_refresh_recovered failures=2", logs.output[0])

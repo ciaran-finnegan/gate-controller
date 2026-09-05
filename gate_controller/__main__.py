@@ -85,12 +85,11 @@ def main() -> None:
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
     hot_stream_config = load_hot_stream_config(os.environ, arguments.directory)
     hot_stream = HotStreamBuffer(hot_stream_config) if hot_stream_config.enabled else None
-    authorisation_staleness = timedelta(
-        seconds=float(os.environ.get("GATE_AUTHORISATION_MAX_STALENESS_SECONDS", "300"))
-    )
     authorised = AuthorisedPlateCache(
         arguments.authorised_plates,
-        max_staleness=authorisation_staleness if _cloud_configured(os.environ) else None,
+        max_staleness=(
+            authorisation_max_staleness(os.environ) if _cloud_configured(os.environ) else None
+        ),
     )
     latest_image = {"path": None, "received_at": None}
     background_workers, _, _ = build_background_workers(
@@ -557,6 +556,25 @@ def _cloudflare_configured(environment) -> bool:
     if any(configured) and not all(configured):
         raise ValueError("GATE_CLOUDFLARE_API_URL, GATE_CLOUDFLARE_ACCESS_CLIENT_ID, and GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET must be configured together")
     return all(configured)
+
+
+DEFAULT_AUTHORISATION_MAX_STALENESS_SECONDS = 14 * 24 * 60 * 60
+
+
+def authorisation_max_staleness(environment) -> timedelta | None:
+    """How old the cloud plate snapshot may grow before recognition fails closed.
+
+    Plate lists change rarely, so the default keeps the last good snapshot in
+    use for two weeks of cloud outage. A value of zero or less disables the
+    bound entirely; recognition then keeps the last snapshot indefinitely.
+    """
+    raw = str(environment.get("GATE_AUTHORISATION_MAX_STALENESS_SECONDS", "")).strip()
+    seconds = float(raw) if raw else float(DEFAULT_AUTHORISATION_MAX_STALENESS_SECONDS)
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):
+        raise ValueError("GATE_AUTHORISATION_MAX_STALENESS_SECONDS must be finite")
+    if seconds <= 0:
+        return None
+    return timedelta(seconds=seconds)
 
 
 def _cloud_configured(environment) -> bool:

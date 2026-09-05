@@ -92,10 +92,19 @@ Cloudflare is the active remote-control path. Set
 enable Cloudflare-backed plate refresh, status reporting, and event delivery.
 The API URL is the HTTPS Worker origin; the client ID and secret are the
 Cloudflare Access service token sent only from the controller. The controller ID
-defaults to `primary`. Plate snapshots are atomically applied to the local cache
-and fail closed when older than
-`GATE_AUTHORISATION_MAX_STALENESS_SECONDS`; recognition only reads that in-memory
-snapshot and never waits for a network request.
+defaults to `primary`. Plate snapshots are atomically applied to the local cache;
+recognition only reads that in-memory snapshot and never waits for a network
+request. Plate lists change rarely, so a cloud outage does not stop the gate:
+the last good snapshot stays in use for 14 days by default before recognition
+fails closed. Set `GATE_AUTHORISATION_MAX_STALENESS_SECONDS` to shorten or
+lengthen that window, or to `0` to keep the last snapshot indefinitely.
+
+When the Worker is unreachable or failing, the controller logs each cloud path
+as a transition rather than once per attempt: `gate_cloud stage=heartbeat_failed`
+and `stage=plates_refresh_failed` on the first failure and then at most every
+ten minutes, with a matching `_recovered` line carrying the failure count.
+Queued event deliveries back off per item from 5 s doubling to a 5 minute cap,
+and each `cloud_send_failed` line names the HTTP status the Worker returned.
 
 Detailed local pipeline telemetry is retained for 30 days by default. Set
 `GATE_TELEMETRY_RETENTION_DAYS` to an integer from 1 through 3650 to change the

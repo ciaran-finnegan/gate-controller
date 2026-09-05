@@ -428,7 +428,8 @@ class OutboxWorkerTests(unittest.TestCase):
             if len(sent) == 1:
                 raise RuntimeError("offline")
 
-        worker = OutboxWorker(store, send=send)
+        now = [datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)]
+        worker = OutboxWorker(store, send=send, clock=lambda: now[0], jitter=lambda: 1.0)
 
         with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
             self.assertEqual(worker.run_once(), 0)
@@ -444,6 +445,7 @@ class OutboxWorkerTests(unittest.TestCase):
             "state": "retry_pending",
         })
 
+        now[0] += timedelta(seconds=6)  # past the first 5 s backoff
         self.assertEqual(worker.run_once(), 1)
         self.assertEqual(sent[1]["telemetry"]["delivery"], {
             "outbox_attempt": 2,
@@ -895,11 +897,15 @@ class OutboxWorkerTests(unittest.TestCase):
             "https://sync.example/events", session=session,
             bearer_token="event-secret", controller_id="pi-front-gate",
         )
-        worker = OutboxWorker(store, sender, evidence_spool=spool)
+        now = [datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)]
+        worker = OutboxWorker(
+            store, sender, evidence_spool=spool, clock=lambda: now[0], jitter=lambda: 1.0,
+        )
 
         self.assertEqual(worker.run_once(), 0)
         self.assertTrue(evidence_path.is_file())
         self.assertEqual(store.pending_outbox_count(), 1)
+        now[0] += timedelta(seconds=6)  # past the first 5 s backoff
         self.assertEqual(worker.run_once(), 1)
 
         first = session.requests[0][1]
@@ -993,6 +999,121 @@ class OutboxWorkerTests(unittest.TestCase):
         self.assertEqual(sent[0]["schema_version"], 2)
         self.assertEqual(sent[0]["reason"], "exact_match")
         self.assertEqual(store.pending_outbox_count(), 0)
+
+    def test_failed_delivery_backs_off_exponentially_then_resets_on_success(self):
+        store, event_id = self._queued_store()
+        now = [datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)]
+        attempts = []
+        state = {"fail": True}
+
+        def send(payload):
+            attempts.append(now[0])
+            if state["fail"]:
+                raise OutboxSyncError("outbox endpoint returned HTTP 500")
+
+        worker = OutboxWorker(
+            store, send=send, controller_id="pi-front-gate",
+            clock=lambda: now[0], jitter=lambda: 1.0,
+        )
+        worker.enqueue(event_id)
+
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        self.assertIn("error_type=OutboxSyncError", logs.output[0])
+        self.assertIn("detail=outbox endpoint returned HTTP 500", logs.output[0])
+        self.assertIn("retry_in_s=5", logs.output[0])
+
+        now[0] += timedelta(seconds=4)
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(len(attempts), 1, "retried inside the backoff window")
+
+        now[0] += timedelta(seconds=2)
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("retry_in_s=10", logs.output[0])
+
+        for expected in (20, 40, 80, 160, 300, 300):
+            now[0] += timedelta(seconds=301)
+            with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+                worker.run_once()
+            self.assertIn(f"retry_in_s={expected}", logs.output[0])
+
+        state["fail"] = False
+        now[0] += timedelta(seconds=301)
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(store.pending_outbox_count(), 0)
+        self.assertEqual(worker._failures, {})
+        self.assertEqual(worker._retry_at, {})
+
+    def test_non_contract_send_failures_log_only_the_exception_type(self):
+        store, event_id = self._queued_store()
+        worker = OutboxWorker(
+            store,
+            send=lambda payload: (_ for _ in ()).throw(RuntimeError("token=private")),
+            controller_id="pi-front-gate", jitter=lambda: 1.0,
+        )
+        worker.enqueue(event_id)
+
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            worker.run_once()
+
+        self.assertIn("error_type=RuntimeError detail=unavailable", logs.output[0])
+        self.assertNotIn("private", logs.output[0])
+
+    def test_backoff_never_starves_a_fresh_delivery_behind_failing_items(self):
+        store, _ = self._queued_store()
+        now = [datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)]
+        for index in range(3):
+            failing = store.record_event(GateEvent(
+                source="ocr", reason="no_match", opened=False,
+                idempotency_key=f"failing-{index}",
+                received_at=now[0],
+            ))
+            store.queue_outbox(failing, {"controller_id": "pi-front-gate"})
+        sent = []
+
+        def send(payload):
+            if payload["idempotency_key"].startswith("failing-"):
+                raise OutboxSyncError("outbox endpoint returned HTTP 500")
+            sent.append(payload["idempotency_key"])
+
+        worker = OutboxWorker(store, send=send, clock=lambda: now[0], jitter=lambda: 1.0)
+        self.assertEqual(worker.run_once(), 0)
+
+        fresh = store.record_event(GateEvent(
+            source="ocr", reason="exact_match", opened=True,
+            idempotency_key="fresh-delivery", received_at=now[0],
+        ))
+        store.queue_outbox(fresh, {"controller_id": "pi-front-gate"})
+        now[0] += timedelta(seconds=1)
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(sent, ["fresh-delivery"])
+        self.assertEqual(store.pending_outbox_count(), 3)
+
+    def test_backoff_configuration_must_be_positive_and_ordered(self):
+        store, _ = self._queued_store()
+        with self.assertRaises(ValueError):
+            OutboxWorker(store, send=lambda payload: None, backoff_base=0)
+        with self.assertRaises(ValueError):
+            OutboxWorker(store, send=lambda payload: None, backoff_base=10, backoff_max=5)
+
+    def test_backoff_stays_at_the_cap_after_days_of_failures(self):
+        store, event_id = self._queued_store()
+        now = [datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)]
+        worker = OutboxWorker(
+            store, send=lambda payload: (_ for _ in ()).throw(OutboxSyncError("outbox endpoint returned HTTP 500")),
+            clock=lambda: now[0], jitter=lambda: 1.0,
+        )
+        worker.enqueue(event_id)
+        worker._failures[store.pending_outbox_items()[0][0]] = 5000
+
+        with self.assertLogs("gate_controller.outbox", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+
+        self.assertIn("retry_in_s=300", logs.output[0])
+        self.assertEqual(store.pending_outbox_count(), 1)
 
 
 if __name__ == "__main__":

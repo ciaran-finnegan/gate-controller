@@ -2,6 +2,7 @@ import base64
 import hashlib
 import logging
 import os
+import random
 import tempfile
 import warnings
 from collections.abc import Callable
@@ -20,6 +21,8 @@ Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMA
 LOCAL_IMAGE_PATH_KEY = "_local_image_path"
 MAX_OUTBOX_IMAGE_BYTES = 512 * 1024
 MAX_OUTBOX_IMAGE_DIMENSION = 1280
+OUTBOX_BACKOFF_BASE_SECONDS = 5.0
+OUTBOX_BACKOFF_MAX_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -300,7 +303,10 @@ class OutboxWorker:
                  evidence_spool: EvidenceSpool | None = None,
                  controller_id: str = "primary",
                  clock: Callable[[], datetime] | None = None,
-                 telemetry_retention_days: int = 30):
+                 telemetry_retention_days: int = 30,
+                 backoff_base: float = OUTBOX_BACKOFF_BASE_SECONDS,
+                 backoff_max: float = OUTBOX_BACKOFF_MAX_SECONDS,
+                 jitter: Callable[[], float] | None = None):
         if (
             isinstance(telemetry_retention_days, bool)
             or not isinstance(telemetry_retention_days, int)
@@ -318,6 +324,13 @@ class OutboxWorker:
         self._telemetry_retention_days = telemetry_retention_days
         self._last_retention_at: datetime | None = None
         self._last_item_id: int | None = None
+        if not (0 < backoff_base <= backoff_max):
+            raise ValueError("outbox backoff must satisfy 0 < base <= max")
+        self._backoff_base = float(backoff_base)
+        self._backoff_max = float(backoff_max)
+        self._jitter = jitter or (lambda: random.uniform(0.8, 1.2))
+        self._failures: dict[int, int] = {}
+        self._retry_at: dict[int, datetime] = {}
         try:
             self._store.bind_pending_outbox_controller(self._controller_id)
             self._evidence_spool.cleanup(self._store.pending_evidence_digests())
@@ -344,6 +357,9 @@ class OutboxWorker:
             after_id=self._last_item_id
         ):
             self._last_item_id = item_id
+            retry_at = self._retry_at.get(item_id)
+            if retry_at is not None and now < retry_at:
+                continue
             trace_id = "unavailable"
             try:
                 payload = self._store.prepare_outbox_attempt(item_id, self._clock())
@@ -368,16 +384,21 @@ class OutboxWorker:
                 else:
                     self._send(payload, self._evidence_spool.load(image_digest))
             except Exception as error:
+                delay = self._schedule_retry(item_id)
                 LOGGER.warning(
                     "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d "
-                    "error_type=%s",
+                    "error_type=%s detail=%s retry_in_s=%d",
                     trace_id, item_id, type(error).__name__,
+                    str(error) if isinstance(error, OutboxSyncError) else "unavailable",
+                    round(delay.total_seconds()),
                 )
                 try:
                     self._store.mark_outbox_retry(item_id)
                 except Exception:
                     pass
                 continue
+            self._failures.pop(item_id, None)
+            self._retry_at.pop(item_id, None)
             try:
                 acknowledged_at = self._clock()
                 self._store.complete_outbox_item(
@@ -405,6 +426,20 @@ class OutboxWorker:
                     pass
             completed += 1
         return completed
+
+    def _schedule_retry(self, item_id: int) -> timedelta:
+        """Back off exponentially per item so a dead endpoint is not hammered."""
+        failures = self._failures.get(item_id, 0) + 1
+        self._failures[item_id] = failures
+        # Cap the exponent: the delay is already at its ceiling long before
+        # 2 ** n stops fitting in a float during a multi-day outage.
+        seconds = min(self._backoff_max, self._backoff_base * (2 ** min(failures - 1, 16)))
+        jitter = self._jitter()
+        if not isinstance(jitter, (int, float)) or not 0.5 <= jitter <= 1.5:
+            jitter = 1.0
+        delay = timedelta(seconds=min(self._backoff_max, seconds * jitter))
+        self._retry_at[item_id] = self._clock() + delay
+        return delay
 
     def _run_retention(self, now: datetime) -> None:
         if (
