@@ -46,6 +46,12 @@ SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
 KEYFRAME_MAX_AGE_SECONDS = 1.6
+# Hardware decode through the Pi 5's HEVC block via the DRM render node. The
+# software path is the default so a host without the node keeps working.
+HWACCEL_CHOICES = frozenset({"", "drm"})
+DRM_RENDER_NODE = "/dev/dri/renderD128"
+MIN_FRAME_WIDTH = 640
+MAX_FRAME_WIDTH = 3840
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,12 @@ class TriggerCaptureConfig:
     # frame of a series is ready the instant the webhook arrives, instead of
     # a fresh RTSP grab that costs about two seconds.
     hot_keyframes: bool = True
+    # "drm" decodes through the Pi 5's hardware HEVC block instead of the CPU.
+    hwaccel: str = ""
+    # Scale decoded frames to this width before the JPEG encode; 0 keeps the
+    # native size. OCR uploads are downscaled to 1920 anyway, so encoding 4K
+    # frames only costs CPU, heat, and ring memory.
+    frame_width: int = 0
 
 
 def load_trigger_capture_config(
@@ -111,6 +123,13 @@ def load_trigger_capture_config(
         1, MAX_FRAME_BYTES,
     )
     hot_keyframes = _boolean(environment.get("GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES", "true"))
+    hwaccel = str(environment.get("GATE_TRIGGER_CAPTURE_HWACCEL", "")).strip().lower()
+    if hwaccel not in HWACCEL_CHOICES:
+        raise ValueError("GATE_TRIGGER_CAPTURE_HWACCEL must be empty or 'drm'")
+    frame_width_raw = str(environment.get("GATE_TRIGGER_CAPTURE_FRAME_WIDTH", "0")).strip()
+    frame_width = 0 if frame_width_raw in ("", "0") else _integer(
+        frame_width_raw, MIN_FRAME_WIDTH, MAX_FRAME_WIDTH,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -122,16 +141,45 @@ def load_trigger_capture_config(
         capture_count=capture_count,
         spacing_seconds=spacing,
         hot_keyframes=hot_keyframes,
+        hwaccel=hwaccel,
+        frame_width=frame_width,
     )
+
+
+def decoder_input_arguments(config: TriggerCaptureConfig) -> tuple[str, ...]:
+    """ffmpeg input options that select the decoder for the clear stream."""
+    if config.hwaccel == "drm":
+        return (
+            "-hwaccel", "drm", "-hwaccel_device", DRM_RENDER_NODE,
+            "-hwaccel_output_format", "drm_prime",
+        )
+    return ()
+
+
+def decoder_filters(config: TriggerCaptureConfig, *, sample: bool) -> tuple[str, ...]:
+    """The -vf chain: pull hardware frames back, optionally sample, then scale.
+
+    Sampling before scaling means dropped keyframes are never scaled.
+    """
+    filters = []
+    if config.hwaccel == "drm":
+        filters.extend(["hwdownload", "format=nv12"])
+    if sample:
+        filters.append("fps=1")
+    if config.frame_width > 0:
+        filters.append(f"scale={config.frame_width}:-2")
+    return tuple(filters)
 
 
 class ClearKeyframeBuffer(HotStreamBuffer):
     """Continuously decode only the clear stream's keyframes.
 
-    At the camera's 1x keyframe interval this is one 4K decode per second
-    (about a quarter of one Pi 5 core), and it means a full-resolution frame
-    taken moments before the alarm is already in memory when the webhook
-    arrives. The on-demand grab remains the fallback when the ring is stale.
+    At the camera's 1x keyframe interval this is one 4K decode per second, so
+    a frame taken moments before the alarm is already in memory when the
+    webhook arrives. Decoded in software and encoded at 4K that costs most of
+    one Pi 5 core; with ``hwaccel="drm"`` and ``frame_width=1920`` it is about
+    a fifth of a core. The on-demand grab remains the fallback when the ring
+    is stale.
     """
 
     def __init__(self, capture_config: TriggerCaptureConfig, **kwargs) -> None:
@@ -153,11 +201,15 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             FFMPEG_BINARY, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp",
             "-analyzeduration", "0", "-probesize", "32",
+            *decoder_input_arguments(capture_config),
             "-skip_frame", "nokey",
             "-i", capture_config.source_url,
-            "-map", "0:v:0", "-an", "-vf", "fps=1",
+            "-map", "0:v:0", "-an",
+            "-vf", ",".join(decoder_filters(capture_config, sample=True)),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
+        self._decode = {"hwaccel": capture_config.hwaccel or "software",
+                        "frame_width": capture_config.frame_width or 3840}
 
     def latest(self, *, after: float | None = None) -> tuple[bytes, float] | None:
         return self._ring.latest(
@@ -172,6 +224,7 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "source_profile": {
                 "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
             },
+            "decode": dict(self._decode),
         })
         return status
 
@@ -203,13 +256,16 @@ class TriggerFrameCapture:
         # decoder ignores everything before the first keyframe: a P-frame
         # decoded against a synthetic grey reference is a grey frame, which
         # would be a valid JPEG and a wasted OCR request.
+        grab_filters = decoder_filters(config, sample=False)
         self.command = (
             FFMPEG_BINARY, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp",
             "-analyzeduration", "0", "-probesize", "32",
+            *decoder_input_arguments(config),
             "-skip_frame", "nokey",
             "-i", config.source_url,
             "-map", "0:v:0", "-an", "-frames:v", "1",
+            *(("-vf", ",".join(grab_filters)) if grab_filters else ()),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
         self.child_environment = {"LANG": "C", "LC_ALL": "C"}
