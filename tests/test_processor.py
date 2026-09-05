@@ -248,6 +248,42 @@ class GateProcessorTests(unittest.TestCase):
                 "correlation": "unverified",
             })
 
+    def test_a_busy_ocr_slot_is_waited_for_within_the_deadline(self):
+        release = Event()
+
+        class SlowThenSharp:
+            def __init__(self):
+                self.calls = 0
+
+            def recognise(self, path, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    release.wait(5)
+                    return PlateObservation(plate=None, confidence=0.0)
+                return PlateObservation(plate="12D3456", confidence=0.99)
+
+        with tempfile.TemporaryDirectory() as directory:
+            blurred = self._jpeg(directory, "blurred.jpg")
+            sharp = self._jpeg(directory, "sharp.jpg", colour=64)
+            store = LocalStore(Path(directory) / "gate.db")
+            relay_calls = []
+            processor = self._processor(
+                store, RecordingRelay(relay_calls), SlowThenSharp(), decision_timeout=1.0,
+            )
+
+            first = processor.process((blurred,))
+            self.assertEqual(first.reason, "decision_timeout")
+
+            # The abandoned request still holds the slot; it frees up before the
+            # next burst's deadline, so that burst must wait, not be discarded.
+            from threading import Timer
+            Timer(0.3, release.set).start()
+            second = processor.process((sharp,))
+
+            self.assertTrue(second.opened, second)
+            self.assertEqual(second.reason, "exact_match")
+            processor.close()
+
     def _processor(self, store, relay, recognizer, outbox=None, clock=None,
                    cooldown=timedelta(seconds=20), **kwargs):
         return GateProcessor(

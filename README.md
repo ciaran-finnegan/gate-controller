@@ -111,6 +111,13 @@ band of the picture where plates appear; `gate_ocr plate_box=` journal lines
 record where each plate was read so the region can be tuned from data. See the
 RLC-810A document for the decoder settings that keep a fanless Pi 5 cool.
 
+A vehicle at the gate gets more than one chance: after the webhook capture
+series, the controller keeps offering fresh keyframes for OCR while nothing has
+read the plate (`GATE_PRESENCE_WINDOW_SECONDS`, `GATE_PRESENCE_SPACING_SECONDS`,
+`GATE_PRESENCE_MAX_FRAMES`), stops the moment the gate opens or a plate is read,
+waits for a busy OCR slot instead of discarding a frame, and retries a connect
+timeout once. The RLC-810A document describes the session and its journal lines.
+
 Detailed local pipeline telemetry is retained for 30 days by default. Set
 `GATE_TELEMETRY_RETENTION_DAYS` to an integer from 1 through 3650 to change the
 window. `python -m gate_controller telemetry-export` produces a bounded JSON or

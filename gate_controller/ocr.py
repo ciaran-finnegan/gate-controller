@@ -48,7 +48,10 @@ SESSION_IDLE_RECYCLE_SECONDS = 20.0
 MAX_RETRY_AFTER_SECONDS = 2.0
 MAX_TRANSIENT_RETRIES = 1
 RETRYABLE_STATUS = 429
-RETRYABLE_TRANSPORT_CAUSES = frozenset({"connection_error", "tls_error"})
+# A connect timeout never reached the API, so like a refused or dropped
+# connection it costs nothing to retry once on a fresh socket. Read timeouts
+# are not retried: the request may already have been accepted and billed.
+RETRYABLE_TRANSPORT_CAUSES = frozenset({"connection_error", "tls_error", "connect_timeout"})
 
 # Bounded, operator-facing labels describing *why* an OCR attempt failed. They
 # separate network problems from API problems without ever carrying a response

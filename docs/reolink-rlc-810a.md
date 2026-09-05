@@ -158,7 +158,31 @@ a camera or resolution change unchanged. Every plate read is journaled as
 `gate_ocr plate_box=x,y,w,h frame=full|cropped|region`, again as fractions
 of the whole frame, so the region can be chosen and later tightened from
 where plates were actually read rather than guessed. Frames written by the
-capture directory are never cropped twice. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
+capture directory are never cropped twice.
+
+### Presence Session
+
+A vehicle that triggered the camera is still sitting at the gate after the
+capture series, so a burst that failed to read the plate is not the end of
+the attempt. While nothing has read the plate, the controller keeps offering
+one fresh clear-stream keyframe at a time, `GATE_PRESENCE_SPACING_SECONDS`
+(3 s) apart, for up to `GATE_PRESENCE_WINDOW_SECONDS` (20 s) after the alarm
+and at most `GATE_PRESENCE_MAX_FRAMES` (4) extra frames. Only one presence
+frame is ever outstanding, so a retry can never push a sharp frame out of the
+bounded burst queue. The session ends as soon as the gate opens or a plate is
+read (an unauthorised plate is a final answer, not a reason to keep paying
+for OCR), and also when the window closes, the frame budget is spent, a newer
+camera event is waiting, or the service stops. The journal records
+`gate_trigger_capture outcome=presence_retry frame=N` for each extra frame and
+`outcome=presence_ended reason=opened|plate_read|budget|window|new_event`.
+Set `GATE_PRESENCE_MAX_FRAMES=0` to disable the session.
+
+Two related changes make transient failures survivable inside a single
+burst as well: a burst now waits for a busy OCR slot for as long as its own
+decision deadline allows instead of being discarded as `ocr_busy`, and a
+connect timeout to the OCR service is retried once on a fresh connection like
+a refused connection (read timeouts are still never retried, because the
+request may already have been accepted and billed). The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
 covering the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
 `scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
 `skipped_type` for `manual_test` events, which never capture;

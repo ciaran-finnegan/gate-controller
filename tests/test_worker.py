@@ -292,6 +292,54 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(idempotency_key), 64)
         self.assertFalse(frame.exists())
 
+    def test_run_worker_reports_each_result_to_the_capture(self):
+        received_at = datetime(2026, 9, 5, 19, 33, tzinfo=timezone.utc)
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=10,
+        )
+        noted = []
+        seen_by_hook = []
+        done = ThreadEvent()
+
+        class Capture:
+            output_directory = None
+
+            def attach(self, inject):
+                self.inject = inject
+
+            def note_result(self, paths, result):
+                noted.append((paths, result))
+
+        capture = Capture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture.output_directory = root / ".trigger-capture"
+            capture.output_directory.mkdir(mode=0o700)
+            frame = capture.output_directory / "frame.jpg"
+            frame.write_bytes(b"\xff\xd8\xff\xd9")
+            verdict = ProcessingResult(False, "ocr_error")
+
+            def emit(paths, candidate_received_at, *timing, trigger=None, idempotency_key=None):
+                done.set()
+                return verdict
+
+            class OneShotWorker:
+                def run_forever(self, stop_event):
+                    capture.inject((frame,), received_at, trigger)
+                    done.wait(timeout=5)
+                    stop_event.set()
+
+            run_worker(
+                root, emit, quiet_window=0.1, poll_interval=0.01,
+                background_workers=(OneShotWorker(),),
+                trigger_capture=capture,
+                on_result=lambda paths, result: seen_by_hook.append(result),
+            )
+
+        self.assertEqual(noted, [((frame,), verdict)])
+        self.assertEqual(seen_by_hook, [verdict])
+
     def test_failed_recognition_reports_the_same_sanitized_trigger(self):
         received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
         failures = []

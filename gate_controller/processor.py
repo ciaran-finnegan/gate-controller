@@ -219,7 +219,12 @@ class GateProcessor:
         if not (decision and decision.allowed) and self._decision_clock() - started >= self._decision_timeout:
             timed_out = True
         if decision is None:
-            reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
+            # A burst that spent its whole deadline waiting for a busy OCR slot
+            # never tried the frame; say so rather than blaming the clock.
+            if ocr_failure_reason == "ocr_busy":
+                reason = "ocr_busy"
+            else:
+                reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
             return self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -433,8 +438,16 @@ class GateProcessor:
             if self._closed:
                 raise _OcrBusy("OCR processor is closed")
             slot = self._ocr_slot
-            if not slot.acquire(blocking=False):
-                raise _OcrBusy("previous OCR request is still running")
+        # The slot is only ever held by an abandoned request that is still
+        # timing out on its socket. Waiting for it, bounded by this burst's
+        # own deadline, keeps a sharp frame alive instead of discarding it.
+        wait = max(0.0, deadline - self._decision_clock())
+        if not slot.acquire(timeout=wait):
+            raise _OcrBusy("previous OCR request is still running")
+        with self._ocr_slot_lock:
+            if self._closed:
+                slot.release()
+                raise _OcrBusy("OCR processor is closed")
         if on_start is not None:
             on_start()
         result = Queue(maxsize=1)

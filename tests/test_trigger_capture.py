@@ -11,6 +11,7 @@ from threading import Event
 from PIL import Image
 
 from gate_controller.reolink_events import SanitizedCameraEvent
+from gate_controller.models import MatchDecision, ProcessingResult
 from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
     TriggerFrameCapture,
@@ -109,6 +110,25 @@ class TriggerCaptureConfigTests(unittest.TestCase):
         ):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
+
+    def test_presence_session_is_on_by_default_and_bounded(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.presence_window_seconds, 20.0)
+        self.assertEqual(config.presence_spacing_seconds, 3.0)
+        self.assertEqual(config.presence_max_frames, 4)
+
+        tuned = load_trigger_capture_config(
+            {"GATE_PRESENCE_WINDOW_SECONDS": "45", "GATE_PRESENCE_SPACING_SECONDS": "2",
+             "GATE_PRESENCE_MAX_FRAMES": "0"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual((tuned.presence_window_seconds, tuned.presence_spacing_seconds,
+                          tuned.presence_max_frames), (45.0, 2.0, 0))
+        for environment in ({"GATE_PRESENCE_WINDOW_SECONDS": "500"},
+                            {"GATE_PRESENCE_SPACING_SECONDS": "0.2"},
+                            {"GATE_PRESENCE_MAX_FRAMES": "50"}):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
         config = load_trigger_capture_config(
@@ -361,6 +381,128 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(capture.capture_series(event(), 0.0, Stop()), 1)
         self.assertEqual(len(self.injected), 1)
         self.assertEqual(capture.status()["failures"], 1)
+
+    def _presence_capture(self, frames, *, verdict, clock, max_frames=4, window=20.0):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            presence_window_seconds=window, presence_spacing_seconds=0.5,
+            presence_max_frames=max_frames,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(frames)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: clock[0])
+        results = []
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            result = verdict(len(self.injected))
+            results.append(result)
+            if result is not None:
+                capture.note_result(paths, result)
+
+        capture.attach(inject)
+        return capture, popen
+
+    class _Stop:
+        def __init__(self, clock, step=0.0):
+            self.clock, self.step, self.pauses = clock, step, []
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.pauses.append(seconds)
+            self.clock[0] += self.step or seconds
+            return False
+
+    def test_presence_session_ends_the_moment_the_gate_opens(self):
+        clock = [100.0]
+        capture, popen = self._presence_capture(
+            5, clock=clock,
+            verdict=lambda n: ProcessingResult(n >= 4, "exact_match" if n >= 4 else "ocr_error"),
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(extra, 1)
+        self.assertEqual(len(popen.calls), 4, "three series frames plus one presence frame")
+        combined = "\n".join(logs.output)
+        self.assertIn("outcome=presence_retry frame=1", combined)
+        self.assertIn("outcome=presence_ended reason=opened extra_frames=1", combined)
+        self.assertEqual(capture.status()["presence"]["retries"], 1)
+
+    def test_presence_session_stops_when_a_plate_was_read_even_if_denied(self):
+        clock = [100.0]
+        read = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="99X9999", confidence=0.91,
+        ))
+        capture, popen = self._presence_capture(
+            5, clock=clock, verdict=lambda n: ProcessingResult(False, "ocr_error") if n < 4 else read,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(extra, 1)
+        self.assertIn("presence_ended reason=plate_read", "\n".join(logs.output))
+
+    def test_presence_session_spends_at_most_the_frame_budget_then_the_window(self):
+        clock = [100.0]
+        capture, popen = self._presence_capture(
+            9, clock=clock, max_frames=3, verdict=lambda n: ProcessingResult(False, "decision_timeout"),
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.presence_session(event(), 100.0, self._Stop(clock)), 3)
+        self.assertIn("presence_ended reason=budget extra_frames=3", "\n".join(logs.output))
+
+        clock[0] = 200.0
+        capture, popen = self._presence_capture(
+            8, clock=clock, window=10.0, verdict=lambda n: ProcessingResult(False, "decision_timeout"),
+        )
+        capture.capture_series(event(), 200.0, self._Stop(clock))
+        # The series pauses take the clock to 203.5; each presence pause then
+        # advances it 3 s, so a 10 s window fits two frames before 210.
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            windowed = capture.presence_session(event(), 200.0, self._Stop(clock, step=3.0))
+        self.assertEqual(windowed, 2)
+        self.assertIn("presence_ended reason=window", "\n".join(logs.output))
+
+    def test_presence_session_keeps_one_frame_outstanding_and_yields_to_a_new_event(self):
+        clock = [100.0]
+        # Verdicts never arrive: the session must not stack frames into the queue.
+        capture, popen = self._presence_capture(6, clock=clock, verdict=lambda n: None)
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        class TickingStop(self._Stop):
+            def is_set(self):
+                clock[0] += 5.0  # each poll of the pending verdict ages the clock
+                return False
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, TickingStop(clock))
+        self.assertEqual(extra, 0, "the series frames were still pending, so nothing more was sent")
+        self.assertIn("presence_ended reason=window", "\n".join(logs.output))
+
+        clock[0] = 300.0
+        capture.capture_series(event(), 300.0, self._Stop(clock))
+        for paths in self.injected[-3:]:
+            capture.note_result(paths, ProcessingResult(False, "ocr_error"))
+        capture.on_camera_event(event())
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.presence_session(event(), 300.0, self._Stop(clock)), 0)
+        self.assertIn("presence_ended reason=new_event", "\n".join(logs.output))
+
+    def test_presence_session_can_be_disabled_and_ignores_foreign_results(self):
+        clock = [100.0]
+        capture, popen = self._presence_capture(3, clock=clock, max_frames=0, verdict=lambda n: None)
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        self.assertEqual(capture.presence_session(event(), 100.0, self._Stop(clock)), 0)
+        self.assertEqual(len(popen.calls), 3)
+        capture.note_result((self.root / "somewhere-else.jpg",), ProcessingResult(True, "exact_match"))
+        self.assertEqual(capture.status()["presence"]["max_frames"], 0)
 
     def test_run_forever_drains_scheduled_events_and_unlinks_when_unattached(self):
         config = TriggerCaptureConfig(
