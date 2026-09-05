@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 import re
 from collections.abc import Mapping
 from io import BytesIO
@@ -10,6 +11,7 @@ from time import monotonic, sleep
 from PIL import Image
 
 from .matching import normalise_plate
+from .plate_region import PlateRegion
 from .models import PlateObservation
 
 
@@ -18,6 +20,21 @@ DEFAULT_TIMEOUT = (1, 2)
 MIN_UPLOAD_WIDTH = 640
 MAX_UPLOAD_WIDTH = 3840
 UPLOAD_JPEG_QUALITY = 85
+
+
+@dataclass(frozen=True)
+class _UploadGeometry:
+    """How the uploaded image maps back onto the camera frame."""
+    frame_width: int
+    frame_height: int
+    crop_left: int
+    crop_top: int
+    crop_width: int
+    crop_height: int
+    upload_width: int
+    upload_height: int
+    precropped: bool
+    cropped: bool
 
 # Plate Recognizer's cloud API throttles each account to one request per
 # second, counted from when a request finishes arriving, and answers a faster
@@ -200,7 +217,9 @@ def _log_retry(cause: str, wait_seconds: float) -> None:
 class PlateRecognizerClient:
     def __init__(self, token: str, session=None, endpoint: str = DEFAULT_ENDPOINT,
                  timeout: tuple[int, int] = DEFAULT_TIMEOUT,
-                 max_upload_width: int = 0, *, clock=monotonic, sleep=sleep):
+                 max_upload_width: int = 0, *, clock=monotonic, sleep=sleep,
+                 plate_region: PlateRegion | None = None,
+                 precropped_directory: Path | None = None):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -214,6 +233,13 @@ class PlateRecognizerClient:
         # when the pooled connection was last used.
         self._not_before: float | None = None
         self._session_used_at: float | None = None
+        if plate_region is not None and not isinstance(plate_region, PlateRegion):
+            raise ValueError("plate_region must be a PlateRegion")
+        self._plate_region = plate_region
+        self._precropped_directory = (
+            Path(precropped_directory).resolve() if precropped_directory is not None else None
+        )
+        self._upload_geometry: _UploadGeometry | None = None
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
@@ -394,6 +420,7 @@ class PlateRecognizerClient:
             )
         plate = first_result.get("plate")
         score = first_result.get("score")
+        self._log_plate_box(first_result.get("box"))
         if not isinstance(plate, str) or not normalise_plate(plate):
             raise _response_error(
                 "OCR service response has no usable plate", CAUSE_NO_USABLE_PLATE
@@ -409,38 +436,102 @@ class PlateRecognizerClient:
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
 
-    def _open_upload(self, path: Path):
-        """Return the bytes to upload: the file itself, or a bounded downscale.
+    def _is_precropped(self, path: Path) -> bool:
+        """Frames the keyframe decoder already cropped to the plate region."""
+        if self._precropped_directory is None:
+            return False
+        try:
+            return Path(path).resolve().is_relative_to(self._precropped_directory)
+        except (OSError, ValueError):
+            return False
 
-        Downscaling only applies when configured and the frame is wider than
-        the limit. The original file is never modified. Any decode problem
-        falls back to uploading the file unchanged so OCR still runs.
+    def _open_upload(self, path: Path):
+        """Return the bytes to upload: the file itself, or a cropped, bounded copy.
+
+        The plate region is cut out first at native resolution (unless the
+        decoder already produced a region-only frame), then the result is
+        downscaled only if it is still wider than the limit. The original
+        file is never modified. Any decode problem falls back to uploading
+        the file unchanged so OCR still runs.
         """
-        if not self._max_upload_width:
-            return path.open("rb")
+        precropped = self._is_precropped(path)
+        region = None if precropped else self._plate_region
+        self._upload_geometry = None
         try:
             with Image.open(path) as image:
-                width, height = image.size
-                if width <= self._max_upload_width:
+                frame_width, frame_height = image.size
+                if region is not None:
+                    left, top, right, bottom = region.pixel_box(frame_width, frame_height)
+                else:
+                    left, top, right, bottom = 0, 0, frame_width, frame_height
+                crop_width, crop_height = right - left, bottom - top
+                target_width = (
+                    self._max_upload_width
+                    if self._max_upload_width and crop_width > self._max_upload_width
+                    else crop_width
+                )
+                target_height = max(1, round(crop_height * target_width / crop_width))
+                self._upload_geometry = _UploadGeometry(
+                    frame_width, frame_height, left, top, crop_width, crop_height,
+                    target_width, target_height, precropped, region is not None,
+                )
+                if region is None and target_width == frame_width:
                     return path.open("rb")
-                target_height = max(1, round(height * self._max_upload_width / width))
                 # draft() lets the JPEG decoder skip detail the resize would
-                # discard, which keeps the Pi-side cost well below the upload
-                # time it saves.
-                image.draft("RGB", (self._max_upload_width, target_height))
-                resized = image.convert("RGB")
-                resized.thumbnail((self._max_upload_width, target_height), Image.LANCZOS)
+                # discard. It scales the whole frame by a power of two, so the
+                # crop box is rescaled to whatever size the decoder chose.
+                image.draft("RGB", (
+                    max(1, -(-frame_width * target_width // crop_width)),
+                    max(1, -(-frame_height * target_height // crop_height)),
+                ))
+                decoded = image.convert("RGB")
+                if region is not None:
+                    factor = decoded.width / frame_width
+                    decoded = decoded.crop(tuple(round(edge * factor) for edge in (left, top, right, bottom)))
+                if decoded.width > target_width:
+                    decoded.thumbnail((target_width, target_height), Image.LANCZOS)
                 buffer = BytesIO()
-                resized.save(buffer, format="JPEG", quality=UPLOAD_JPEG_QUALITY)
+                decoded.save(buffer, format="JPEG", quality=UPLOAD_JPEG_QUALITY)
         except (OSError, ValueError, Image.DecompressionBombError):
             _LOGGER.warning("gate_ocr upload_downscale=failed")
+            self._upload_geometry = None
             return path.open("rb")
         buffer.seek(0)
         _LOGGER.info(
-            "gate_ocr upload_downscale=applied source_width=%d upload_width=%d upload_bytes=%d",
-            width, resized.width, buffer.getbuffer().nbytes,
+            "gate_ocr upload_downscale=applied source_width=%d upload_width=%d upload_bytes=%d crop=%s",
+            frame_width, decoded.width, buffer.getbuffer().nbytes,
+            f"{left},{top},{right},{bottom}" if region is not None else "none",
         )
         return buffer
+
+    def _log_plate_box(self, box) -> None:
+        """Journal where the plate sat, as fractions of the whole camera frame.
+
+        Boxes accumulate in the journal so GATE_PLATE_REGION can be set, and
+        later tightened, from where plates were actually read.
+        """
+        geometry = self._upload_geometry
+        if geometry is None or not isinstance(box, Mapping):
+            return
+        try:
+            xmin, ymin, xmax, ymax = (float(box[key]) for key in ("xmin", "ymin", "xmax", "ymax"))
+        except (KeyError, TypeError, ValueError):
+            return
+        if geometry.upload_width <= 0 or geometry.upload_height <= 0 or xmax <= xmin or ymax <= ymin:
+            return
+        x = (geometry.crop_left + xmin / geometry.upload_width * geometry.crop_width) / geometry.frame_width
+        y = (geometry.crop_top + ymin / geometry.upload_height * geometry.crop_height) / geometry.frame_height
+        width = (xmax - xmin) / geometry.upload_width * geometry.crop_width / geometry.frame_width
+        height = (ymax - ymin) / geometry.upload_height * geometry.crop_height / geometry.frame_height
+        frame = "full"
+        if geometry.precropped and self._plate_region is not None:
+            x, y, width, height = self._plate_region.to_frame((x, y, width, height))
+            frame = "region"
+        elif geometry.cropped:
+            frame = "cropped"
+        _LOGGER.info(
+            "gate_ocr plate_box=%.3f,%.3f,%.3f,%.3f frame=%s", x, y, width, height, frame,
+        )
 
     def abandon_in_flight(self) -> bool:
         """Detach a timed-out request so later work receives a fresh session."""
