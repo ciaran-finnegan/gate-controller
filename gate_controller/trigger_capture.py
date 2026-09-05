@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Full, Queue
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -47,6 +47,18 @@ SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
 KEYFRAME_MAX_AGE_SECONDS = 1.6
+# Presence session: after the series, keep offering fresh frames while the
+# vehicle is still at the gate and nothing has read its plate yet.
+MAX_PRESENCE_WINDOW_SECONDS = 120.0
+MIN_PRESENCE_SPACING_SECONDS = 1.0
+MAX_PRESENCE_SPACING_SECONDS = 15.0
+MAX_PRESENCE_FRAMES = 10
+# Outcomes that mean the plate was never actually read, so another frame can
+# still change the answer. A plate that was read but not authorised is final.
+PRESENCE_RETRY_REASONS = frozenset({
+    "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
+    "processing_error", "queue_coalesced", "upload_incomplete",
+})
 # Hardware decode through the Pi 5's HEVC block via the DRM render node. The
 # software path is the default so a host without the node keeps working.
 HWACCEL_CHOICES = frozenset({"", "drm"})
@@ -81,6 +93,14 @@ class TriggerCaptureConfig:
     # Crop to the band of the frame where plates appear, as frame fractions,
     # before any scaling. A crop narrower than frame_width is never upscaled.
     plate_region: PlateRegion | None = None
+    # A vehicle that triggered the camera is still there after the series.
+    # While nothing has read its plate, keep offering one fresh keyframe at a
+    # time, spaced out, for a bounded window and a bounded number of frames.
+    # This is what turns a five-second network blip into a delayed open
+    # instead of a closed gate. 0 frames disables the session.
+    presence_window_seconds: float = 20.0
+    presence_spacing_seconds: float = 3.0
+    presence_max_frames: int = 4
 
 
 def load_trigger_capture_config(
@@ -135,6 +155,16 @@ def load_trigger_capture_config(
         frame_width_raw, MIN_FRAME_WIDTH, MAX_FRAME_WIDTH,
     )
     plate_region = parse_plate_region(environment.get("GATE_PLATE_REGION"))
+    presence_window = _number(
+        environment.get("GATE_PRESENCE_WINDOW_SECONDS", "20"), 0.0, MAX_PRESENCE_WINDOW_SECONDS,
+    )
+    presence_spacing = _number(
+        environment.get("GATE_PRESENCE_SPACING_SECONDS", "3"),
+        MIN_PRESENCE_SPACING_SECONDS, MAX_PRESENCE_SPACING_SECONDS,
+    )
+    presence_frames = _integer(
+        environment.get("GATE_PRESENCE_MAX_FRAMES", "4"), 0, MAX_PRESENCE_FRAMES,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -149,6 +179,9 @@ def load_trigger_capture_config(
         hwaccel=hwaccel,
         frame_width=frame_width,
         plate_region=plate_region,
+        presence_window_seconds=presence_window,
+        presence_spacing_seconds=presence_spacing,
+        presence_max_frames=presence_frames,
     )
 
 
@@ -266,6 +299,13 @@ class TriggerFrameCapture:
         self._last_scheduled_at: float | None = None
         self._capture_count = 0
         self._failure_count = 0
+        self._presence_retries = 0
+        # Presence-session bookkeeping, shared with the worker's result hook.
+        self._session_lock = Lock()
+        self._session_paths: set[Path] = set()
+        self._session_pending = 0
+        self._session_settled: str | None = None
+        self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
         # (the default probe alone costs about two seconds at 4K), and the
         # decoder ignores everything before the first keyframe: a P-frame
@@ -326,6 +366,91 @@ class TriggerFrameCapture:
             except Empty:
                 continue
             self.capture_series(event, scheduled_at, stop_event)
+            self.presence_session(event, scheduled_at, stop_event)
+
+    def note_result(self, paths, result) -> None:
+        """Learn how a frame this capture injected was decided.
+
+        Called by the worker for every processed burst; frames from other
+        sources are ignored. An open or a read plate settles the session;
+        anything that never read the plate leaves it open to another frame.
+        """
+        with self._session_lock:
+            matched = [Path(path) for path in paths if Path(path) in self._session_paths]
+            if not matched:
+                return
+            for path in matched:
+                self._session_paths.discard(path)
+            self._session_pending = max(0, self._session_pending - 1)
+            if self._session_settled is None:
+                if getattr(result, "opened", False):
+                    self._session_settled = "opened"
+                else:
+                    decision = getattr(result, "decision", None)
+                    if decision is not None and getattr(decision, "observed_plate", None):
+                        self._session_settled = "plate_read"
+                    elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
+                        self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
+            self._session_changed.set()
+
+    def presence_session(self, event, scheduled_at, stop_event) -> int:
+        """Keep offering fresh frames while the vehicle is present and unread.
+
+        One frame is outstanding at a time so a retry can never push a sharp
+        frame out of the bounded burst queue. The session ends when the gate
+        opens, a plate is read, the window closes, the frame budget is spent,
+        a newer camera event is waiting, or the service stops.
+        """
+        config = self.config
+        if config.presence_max_frames <= 0 or config.presence_window_seconds <= 0:
+            return 0
+        deadline = scheduled_at + config.presence_window_seconds
+        extra = 0
+        reason = "window"
+        after = self._last_captured_at
+        while True:
+            if stop_event.is_set():
+                reason = "stopping"
+                break
+            if not self._queue.empty():
+                reason = "new_event"
+                break
+            with self._session_lock:
+                settled = self._session_settled
+                pending = self._session_pending
+            if settled is not None:
+                reason = settled
+                break
+            if extra >= config.presence_max_frames:
+                reason = "budget"
+                break
+            if self._clock() >= deadline:
+                reason = "window"
+                break
+            if pending > 0:
+                # A frame is still being decided; wait for its verdict.
+                self._session_changed.clear()
+                self._session_changed.wait(0.25)
+                continue
+            if self._pause(stop_event, config.presence_spacing_seconds):
+                reason = "stopping"
+                break
+            if self._clock() >= deadline:
+                reason = "window"
+                break
+            after, count = self._capture_slot(event, scheduled_at, after=after)
+            if count:
+                extra += count
+                self._presence_retries += 1
+                LOGGER.info(
+                    "gate_trigger_capture outcome=presence_retry frame=%d event_type=%s",
+                    extra, getattr(event, "event_type", "unknown"),
+                )
+        LOGGER.info(
+            "gate_trigger_capture outcome=presence_ended reason=%s extra_frames=%d",
+            reason, extra,
+        )
+        return extra
 
     def capture_series(self, event, scheduled_at, stop_event) -> int:
         """Take a short bounded series: with hot keyframes the frame decoded
@@ -334,6 +459,11 @@ class TriggerFrameCapture:
         injected = 0
         after = None
         slots = self.config.capture_count
+        with self._session_lock:
+            self._session_paths.clear()
+            self._session_pending = 0
+            self._session_settled = None
+            self._session_changed.clear()
         if self._frame_source is not None:
             after, count = self._capture_slot(event, scheduled_at, after=after)
             injected += count
@@ -391,9 +521,15 @@ class TriggerFrameCapture:
             path.unlink(missing_ok=True)
             LOGGER.warning("gate_trigger_capture outcome=unattached")
             return ()
+        with self._session_lock:
+            self._session_paths.add(path)
+            self._session_pending += 1
         try:
             inject((path,), captured_at, trigger)
         except Exception:
+            with self._session_lock:
+                self._session_paths.discard(path)
+                self._session_pending = max(0, self._session_pending - 1)
             path.unlink(missing_ok=True)
             raise
         self._capture_count += 1
@@ -428,6 +564,12 @@ class TriggerFrameCapture:
             "timeout_seconds": self.config.timeout_seconds,
             "delay_seconds": self.config.delay_seconds,
             "capture_count": self.config.capture_count,
+            "presence": {
+                "window_seconds": self.config.presence_window_seconds,
+                "spacing_seconds": self.config.presence_spacing_seconds,
+                "max_frames": self.config.presence_max_frames,
+                "retries": self._presence_retries,
+            },
         }
 
     def close(self) -> None:

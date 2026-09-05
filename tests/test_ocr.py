@@ -730,7 +730,21 @@ class OcrPacingAndRetryTests(unittest.TestCase):
         self.assertEqual(len(stale.calls), 1)
         self.assertEqual(len(fresh.calls), 1)
 
-    def test_timeouts_are_never_retried(self):
+    def test_a_connect_timeout_is_retried_once_on_a_fresh_session(self):
+        from requests import exceptions as requests_exceptions
+        stale = SequenceSession([requests_exceptions.ConnectTimeout("no route")])
+        fresh = SequenceSession([FakeResponse(payload=self.payload)])
+        client = self.client(stale)
+
+        with patch.object(client, "_create_session", return_value=fresh):
+            observation = client.recognise(self.path)
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertTrue(stale.closed)
+        self.assertEqual(len(stale.calls), 1)
+        self.assertEqual(len(fresh.calls), 1)
+
+    def test_read_timeouts_are_never_retried(self):
         from requests import exceptions as requests_exceptions
         session = SequenceSession([requests_exceptions.ReadTimeout("slow")])
         client = self.client(session)

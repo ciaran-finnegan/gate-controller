@@ -412,9 +412,17 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                on_timed_skipped=None, trigger_resolver=None,
-               hot_frame_provider=None, trigger_capture=None) -> None:
+               hot_frame_provider=None, trigger_capture=None, on_result=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
     bursts = BoundedBurstQueue(max_pending_bursts)
+    note_result = getattr(trigger_capture, "note_result", None)
+    if callable(note_result):
+        provided = on_result
+
+        def on_result(paths, result, _note=note_result, _provided=provided):
+            _note(paths, result)
+            if _provided is not None:
+                _provided(paths, result)
 
     def report_dropped(item, reason):
         paths, received_at, *timing = item
@@ -488,9 +496,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     processing_args = (
         bursts, emit, on_error,
         lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
+        trigger_resolver, on_result,
     )
-    if trigger_resolver is not None:
-        processing_args += (trigger_resolver,)
     processing_thread = Thread(
         target=_supervise_worker,
         args=("GateBurstProcessor", _process_bursts, processing_args,
@@ -576,7 +583,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
 
 def _process_bursts(
-    bursts, emit, on_error=None, ranker=None, trigger_resolver=None,
+    bursts, emit, on_error=None, ranker=None, trigger_resolver=None, on_result=None,
 ) -> None:
     ranker = ranker or rank_images
     while True:
@@ -599,11 +606,17 @@ def _process_bursts(
                     trigger_resolver, received_at,
                 )
                 options["trigger"] = trigger_summary
-            emit(paths, received_at, *timing, **options)
+            result = emit(paths, received_at, *timing, **options)
         except Exception as error:
             _report_processing_error(
                 on_error, paths, error, received_at, trigger_summary,
             )
+        else:
+            if on_result is not None:
+                try:
+                    on_result(paths, result)
+                except Exception:
+                    LOGGER.exception("gate_burst_result_handler_failed")
         finally:
             _remove_uploads(paths)
 
