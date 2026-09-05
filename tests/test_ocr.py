@@ -499,6 +499,114 @@ class OcrFailureCauseTests(unittest.TestCase):
                 self.assertNotIn(secret, combined)
                 self.assertRegex(combined, r"cause=[a-z][a-z0-9_]{0,31}$")
 
+class OcrPlateRegionTests(unittest.TestCase):
+    """Cropping to the plate band and journaling where plates were read."""
+
+    def setUp(self):
+        from PIL import Image
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.path = self.root / "frame.jpg"
+        Image.new("RGB", (3840, 2160), color=(20, 120, 200)).save(self.path, format="JPEG")
+
+    @staticmethod
+    def recording_session(payload):
+        session = FakeSession(response=FakeResponse(payload=payload))
+        session.uploaded = []
+        original_post = session.post
+
+        def post(*args, **kwargs):
+            session.uploaded.append(kwargs["files"]["upload"][1].read())
+            return original_post(*args, **kwargs)
+
+        session.post = post
+        return session
+
+    def test_crops_the_region_at_native_detail_then_shrinks_only_if_still_wide(self):
+        from PIL import Image
+        from gate_controller.plate_region import PlateRegion
+        session = self.recording_session({"results": []})
+        client = PlateRecognizerClient(
+            "token", session=session, max_upload_width=1920,
+            plate_region=PlateRegion(0.1, 0.4, 0.8, 0.6),
+        )
+
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            client.recognise(self.path)
+
+        uploaded, = session.uploaded
+        with Image.open(io.BytesIO(uploaded)) as image:
+            self.assertEqual(image.size, (1920, 810))
+        self.assertIn("crop=384,864,3456,2160", "\n".join(logs.output))
+
+        narrow = PlateRecognizerClient(
+            "token", session=self.recording_session({"results": []}), max_upload_width=1920,
+            plate_region=PlateRegion(0.3, 0.5, 0.4, 0.5),
+        )
+        narrow.recognise(self.path)
+        with Image.open(io.BytesIO(narrow._session.uploaded[0])) as image:
+            self.assertEqual(image.size, (1536, 1080), "a crop already narrower than the limit is not upscaled")
+
+    def test_frames_from_the_capture_directory_are_not_cropped_twice(self):
+        from PIL import Image
+        from gate_controller.plate_region import PlateRegion
+        captures = self.root / "trigger-capture"
+        captures.mkdir()
+        precropped = captures / "keyframe.jpg"
+        Image.new("RGB", (3072, 1296), color="white").save(precropped, format="JPEG")
+        session = self.recording_session({"results": []})
+        client = PlateRecognizerClient(
+            "token", session=session, max_upload_width=1920,
+            plate_region=PlateRegion(0.1, 0.4, 0.8, 0.6), precropped_directory=captures,
+        )
+
+        client.recognise(precropped)
+
+        with Image.open(io.BytesIO(session.uploaded[0])) as image:
+            self.assertEqual(image.size, (1920, 810))
+
+    def test_journals_the_plate_box_as_fractions_of_the_whole_frame(self):
+        from gate_controller.plate_region import PlateRegion
+        box = {"xmin": 960, "ymin": 405, "xmax": 1152, "ymax": 486}
+        payload = {"results": [{"plate": "12D3456", "score": 0.93, "box": box}]}
+        region = PlateRegion(0.1, 0.4, 0.8, 0.6)
+
+        cropped = PlateRecognizerClient(
+            "token", session=self.recording_session(payload), max_upload_width=1920, plate_region=region,
+        )
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            cropped.recognise(self.path)
+        self.assertIn("gate_ocr plate_box=0.500,0.700,0.080,0.060 frame=cropped", "\n".join(logs.output))
+
+        captures = self.root / "trigger-capture"
+        captures.mkdir()
+        from PIL import Image
+        precropped = captures / "keyframe.jpg"
+        Image.new("RGB", (3072, 1296), color="white").save(precropped, format="JPEG")
+        from_region = PlateRecognizerClient(
+            "token", session=self.recording_session(payload), max_upload_width=1920,
+            plate_region=region, precropped_directory=captures,
+        )
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            from_region.recognise(precropped)
+        self.assertIn("gate_ocr plate_box=0.500,0.700,0.080,0.060 frame=region", "\n".join(logs.output))
+
+        full = PlateRecognizerClient("token", session=self.recording_session(payload), max_upload_width=1920)
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            full.recognise(self.path)
+        # The uncropped upload is 1920x1080, so the same pixel box is a shorter
+        # fraction of the frame than it was of the 810-high cropped upload.
+        self.assertIn("gate_ocr plate_box=0.500,0.375,0.100,0.075 frame=full", "\n".join(logs.output))
+
+    def test_a_malformed_box_is_ignored(self):
+        payload = {"results": [{"plate": "12D3456", "score": 0.93, "box": {"xmin": "a"}}]}
+        client = PlateRecognizerClient("token", session=self.recording_session(payload), max_upload_width=1920)
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            observation = client.recognise(self.path)
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertNotIn("plate_box=", "\n".join(logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()

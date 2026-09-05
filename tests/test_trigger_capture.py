@@ -518,7 +518,7 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         self.assertIsNone(buffer.latest())
         self.assertNotIn("-hwaccel", command)
         self.assertEqual(command[command.index("-vf") + 1], "fps=1")
-        self.assertEqual(buffer.status()["decode"], {"hwaccel": "software", "frame_width": 3840})
+        self.assertEqual(buffer.status()["decode"], {"hwaccel": "software", "frame_width": 3840, "plate_region": "full"})
 
     def test_hardware_decode_and_scaling_apply_to_the_ring_and_the_grab(self):
         from gate_controller.trigger_capture import ClearKeyframeBuffer, TriggerFrameCapture
@@ -534,25 +534,48 @@ class HotKeyframeCaptureTests(unittest.TestCase):
             "-hwaccel_output_format", "drm_prime",
         ))
         self.assertLess(hw, ring.index("-i"), "decoder selection must precede the input")
-        self.assertEqual(ring[ring.index("-vf") + 1], "hwdownload,format=nv12,fps=1,scale=1920:-2")
+        self.assertEqual(ring[ring.index("-vf") + 1], "hwdownload,format=nv12,fps=1,scale=w='min(iw,1920)':h=-2")
         self.assertEqual(ClearKeyframeBuffer(config).status()["decode"],
-                         {"hwaccel": "drm", "frame_width": 1920})
+                         {"hwaccel": "drm", "frame_width": 1920, "plate_region": "full"})
 
         grab = TriggerFrameCapture(config).command
         self.assertIn("-hwaccel", grab)
         self.assertLess(grab.index("-hwaccel"), grab.index("-i"))
-        self.assertEqual(grab[grab.index("-vf") + 1], "hwdownload,format=nv12,scale=1920:-2")
+        self.assertEqual(grab[grab.index("-vf") + 1], "hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2")
         self.assertNotIn("fps=1", grab)
 
         software_scaled = TriggerFrameCapture(TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture", frame_width=1920,
         )).command
         self.assertNotIn("-hwaccel", software_scaled)
-        self.assertEqual(software_scaled[software_scaled.index("-vf") + 1], "scale=1920:-2")
+        self.assertEqual(software_scaled[software_scaled.index("-vf") + 1], "scale=w='min(iw,1920)':h=-2")
         default_grab = TriggerFrameCapture(TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
         )).command
         self.assertNotIn("-vf", default_grab)
+
+    def test_plate_region_crops_at_native_resolution_before_a_shrink_only_scale(self):
+        from gate_controller.plate_region import PlateRegion
+        from gate_controller.trigger_capture import ClearKeyframeBuffer, TriggerFrameCapture
+        config = load_trigger_capture_config(
+            {"GATE_PLATE_REGION": "0.05,0.4,0.9,0.6", "GATE_TRIGGER_CAPTURE_HWACCEL": "drm",
+             "GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "1920"},
+            self.root, webhook_enabled=True,
+        )
+        self.assertEqual(config.plate_region, PlateRegion(0.05, 0.4, 0.9, 0.6))
+
+        ring = ClearKeyframeBuffer(config).command
+        self.assertEqual(ring[ring.index("-vf") + 1], (
+            "hwdownload,format=nv12,fps=1,"
+            "crop=trunc(iw*0.9000/2)*2:trunc(ih*0.6000/2)*2:trunc(iw*0.0500/2)*2:trunc(ih*0.4000/2)*2,"
+            "scale=w='min(iw,1920)':h=-2"
+        ))
+        self.assertEqual(ClearKeyframeBuffer(config).status()["decode"]["plate_region"], "0.05,0.4,0.9,0.6")
+        grab = TriggerFrameCapture(config).command
+        self.assertIn("crop=trunc(iw*0.9000/2)*2", grab[grab.index("-vf") + 1])
+
+        with self.assertRaises(ValueError):
+            load_trigger_capture_config({"GATE_PLATE_REGION": "0.5,0,0.9,1"}, self.root, webhook_enabled=True)
 
     def test_hot_keyframes_can_be_disabled_by_environment(self):
         self.assertTrue(load_trigger_capture_config({}, Path("/u"), webhook_enabled=True).hot_keyframes)

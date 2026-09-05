@@ -146,7 +146,19 @@ JPEG encode. Together they cut the decoder to about a fifth of a core.
 Recognition loses nothing: OCR uploads are already downscaled to
 `GATE_OCR_MAX_UPLOAD_WIDTH=1920` and evidence to 1280. Both settings apply to
 the on-demand grab as well. Measured on the RLC-810A stream over ten
-seconds: software 4K 8.2 s CPU, hardware decode plus 1920 scale 2.0 s. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
+seconds: software 4K 8.2 s CPU, hardware decode plus 1920 scale 2.0 s.
+
+Plates only ever appear in the band of the frame where vehicles stop. Set
+`GATE_PLATE_REGION=x,y,w,h` as fractions of the frame (for example
+`0.05,0.4,0.9,0.6` for the lower 60% of the picture) and the keyframe decoder
+crops to that band at native resolution before any scaling, the camera's FTP
+frames are cropped the same way before the OCR upload, and a crop narrower
+than `GATE_TRIGGER_CAPTURE_FRAME_WIDTH` is never upscaled. Fractions survive
+a camera or resolution change unchanged. Every plate read is journaled as
+`gate_ocr plate_box=x,y,w,h frame=full|cropped|region`, again as fractions
+of the whole frame, so the region can be chosen and later tightened from
+where plates were actually read rather than guessed. Frames written by the
+capture directory are never cropped twice. The default `GATE_TRIGGER_CAPTURE_COUNT=3` keeps the series
 covering the stop after the immediate frame. The journal records one of these scheduling outcomes per event:
 `scheduled`; `disabled` when `GATE_TRIGGER_CAPTURE_ENABLED=false`;
 `skipped_type` for `manual_test` events, which never capture;

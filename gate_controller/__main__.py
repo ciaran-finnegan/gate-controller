@@ -20,6 +20,7 @@ from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
+from .plate_region import parse_plate_region
 from .trigger_capture import (
     ClearKeyframeBuffer, TriggerFrameCapture, load_trigger_capture_config,
 )
@@ -125,6 +126,12 @@ def main() -> None:
     processor = GateProcessor(
         recognizer=PlateRecognizerClient(
             token, max_upload_width=_ocr_upload_width(os.environ),
+            plate_region=parse_plate_region(os.environ.get("GATE_PLATE_REGION")),
+            # Frames the keyframe decoder already cropped must not be cropped again.
+            precropped_directory=(
+                trigger_capture_config.output_directory
+                if trigger_capture_config.plate_region is not None else None
+            ),
         ),
         store=store,
         relay=relay,

@@ -28,6 +28,7 @@ from .hot_stream import (
     FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
+from .plate_region import PlateRegion, parse_plate_region
 from .telemetry import TriggerTelemetry
 
 
@@ -73,10 +74,13 @@ class TriggerCaptureConfig:
     hot_keyframes: bool = True
     # "drm" decodes through the Pi 5's hardware HEVC block instead of the CPU.
     hwaccel: str = ""
-    # Scale decoded frames to this width before the JPEG encode; 0 keeps the
-    # native size. OCR uploads are downscaled to 1920 anyway, so encoding 4K
-    # frames only costs CPU, heat, and ring memory.
+    # Scale decoded frames down to this width before the JPEG encode; 0 keeps
+    # the native size. OCR uploads are downscaled to 1920 anyway, so encoding
+    # 4K frames only costs CPU, heat, and ring memory.
     frame_width: int = 0
+    # Crop to the band of the frame where plates appear, as frame fractions,
+    # before any scaling. A crop narrower than frame_width is never upscaled.
+    plate_region: PlateRegion | None = None
 
 
 def load_trigger_capture_config(
@@ -130,6 +134,7 @@ def load_trigger_capture_config(
     frame_width = 0 if frame_width_raw in ("", "0") else _integer(
         frame_width_raw, MIN_FRAME_WIDTH, MAX_FRAME_WIDTH,
     )
+    plate_region = parse_plate_region(environment.get("GATE_PLATE_REGION"))
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -143,6 +148,7 @@ def load_trigger_capture_config(
         hot_keyframes=hot_keyframes,
         hwaccel=hwaccel,
         frame_width=frame_width,
+        plate_region=plate_region,
     )
 
 
@@ -157,17 +163,21 @@ def decoder_input_arguments(config: TriggerCaptureConfig) -> tuple[str, ...]:
 
 
 def decoder_filters(config: TriggerCaptureConfig, *, sample: bool) -> tuple[str, ...]:
-    """The -vf chain: pull hardware frames back, optionally sample, then scale.
+    """The -vf chain: pull hardware frames back, sample, crop, then scale down.
 
-    Sampling before scaling means dropped keyframes are never scaled.
+    Sampling first means dropped keyframes are never cropped or scaled; the
+    crop runs at native resolution so the plate keeps its detail; the scale
+    only ever shrinks (``min(iw, width)``), so a narrow crop is not blown up.
     """
     filters = []
     if config.hwaccel == "drm":
         filters.extend(["hwdownload", "format=nv12"])
     if sample:
         filters.append("fps=1")
+    if config.plate_region is not None:
+        filters.append(config.plate_region.ffmpeg_crop_filter())
     if config.frame_width > 0:
-        filters.append(f"scale={config.frame_width}:-2")
+        filters.append(f"scale=w='min(iw,{config.frame_width})':h=-2")
     return tuple(filters)
 
 
@@ -208,8 +218,13 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "-vf", ",".join(decoder_filters(capture_config, sample=True)),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
-        self._decode = {"hwaccel": capture_config.hwaccel or "software",
-                        "frame_width": capture_config.frame_width or 3840}
+        self._decode = {
+            "hwaccel": capture_config.hwaccel or "software",
+            "frame_width": capture_config.frame_width or 3840,
+            "plate_region": (
+                capture_config.plate_region.as_env() if capture_config.plate_region else "full"
+            ),
+        }
 
     def latest(self, *, after: float | None = None) -> tuple[bytes, float] | None:
         return self._ring.latest(

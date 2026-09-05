@@ -106,6 +106,11 @@ ten minutes, with a matching `_recovered` line carrying the failure count.
 Queued event deliveries back off per item from 5 s doubling to a 5 minute cap,
 and each `cloud_send_failed` line names the HTTP status the Worker returned.
 
+`GATE_PLATE_REGION=x,y,w,h` (frame fractions) restricts capture and OCR to the
+band of the picture where plates appear; `gate_ocr plate_box=` journal lines
+record where each plate was read so the region can be tuned from data. See the
+RLC-810A document for the decoder settings that keep a fanless Pi 5 cool.
+
 Detailed local pipeline telemetry is retained for 30 days by default. Set
 `GATE_TELEMETRY_RETENTION_DAYS` to an integer from 1 through 3650 to change the
 window. `python -m gate_controller telemetry-export` produces a bounded JSON or
