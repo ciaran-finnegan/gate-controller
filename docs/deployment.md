@@ -224,6 +224,17 @@ two Access service-token variables. Event ingest is `POST
 /api/controller/events`; it is idempotent by the controller event key and may
 include a bounded JPEG whose SHA-256 digest is in the event payload.
 
+Keep the Pi's resolver on the router and a public resolver, not on Tailscale.
+With `tailscale set --accept-dns=true` every fresh OCR connection depends on
+tailscaled forwarding the lookup over DNS-over-HTTPS across the same uplink,
+and its journal shows those forwards failing whenever the link degrades
+(`dns udp query: resolving using "https://cloudflare-dns.com/dns-query"`).
+On 2026-09-06 the Pi was switched to `tailscale set --accept-dns=false`;
+`/etc/resolv.conf` then carries the DHCP resolvers. The controller also opens
+its OCR connection the moment a camera event arrives (`prewarm`), so the
+first request of a vehicle reuses a warm TLS session instead of paying for a
+lookup and two handshakes at the critical moment.
+
 The controller assumes the Worker can be unavailable for days. Recognition keeps
 using the last complete plate snapshot for 14 days
 (`GATE_AUTHORISATION_MAX_STALENESS_SECONDS`, `0` for no bound) before failing
