@@ -284,6 +284,27 @@ class GateProcessorTests(unittest.TestCase):
             self.assertEqual(second.reason, "exact_match")
             processor.close()
 
+    def test_ocr_connect_budget_covers_a_slow_tls_handshake(self):
+        seen = []
+
+        class TimeoutRecorder:
+            def recognise(self, path, timeout=None):
+                seen.append(timeout)
+                return PlateObservation(plate="12D3456", confidence=0.99)
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            store = LocalStore(Path(directory) / "gate.db")
+            processor = self._processor(store, RecordingRelay([]), TimeoutRecorder(), decision_timeout=6.0)
+            processor.process((frame,))
+            processor.close()
+
+        (connect, read), = seen
+        self.assertGreaterEqual(connect, 2.0, "a fresh handshake over the uplink takes 0.5-0.8 s; leave headroom")
+        self.assertLessEqual(connect, 2.5)
+        self.assertGreater(read, 1.0)
+        self.assertLessEqual(connect + read, 6.0)
+
     def _processor(self, store, relay, recognizer, outbox=None, clock=None,
                    cooldown=timedelta(seconds=20), **kwargs):
         return GateProcessor(
@@ -2524,9 +2545,15 @@ class OcrReadWindowTests(unittest.TestCase):
         timeouts = self._timeouts([PlateObservation(None, 0.0)] * 3)
 
         self.assertEqual(len(timeouts), 3)
-        self.assertEqual(timeouts[0], (1.0, 2.8))
-        self.assertEqual(timeouts[1], (1.0, 2.0))
-        self.assertEqual(timeouts[2], (1.0, 2.0))
+        # A 4 s budget splits evenly: the widened 2.8 s first read only fits
+        # once the budget reaches 5.3 s (see the 6 s case below).
+        self.assertEqual(timeouts[0], (2.0, 2.0))
+        self.assertEqual(timeouts[1], (2.0, 2.0))
+        self.assertEqual(timeouts[2], (2.0, 2.0))
+
+        wide = self._timeouts([PlateObservation(None, 0.0)] * 2, decision_timeout=6.0)
+        self.assertEqual(wide[0], (2.5, 2.8))
+        self.assertEqual(wide[1], (2.5, 2.0))
 
     def test_the_widened_window_still_fits_inside_the_decision_budget(self):
         decision_timeout = 4.0
@@ -2546,8 +2573,15 @@ class OcrReadWindowTests(unittest.TestCase):
             PlateObservation(None, 0.0),
         ])
 
-        self.assertEqual(timeouts[0], (1.0, 2.8))
-        self.assertEqual(timeouts[1], (1.0, 2.0))
+        self.assertEqual(timeouts[0], (2.0, 2.0))
+        self.assertEqual(timeouts[1], (2.0, 2.0))
+
+        wide = self._timeouts([
+            OcrResponseError("slow upstream", "read_timeout"),
+            PlateObservation(None, 0.0),
+        ], decision_timeout=6.0)
+        self.assertEqual(wide[0], (2.5, 2.8))
+        self.assertEqual(wide[1], (2.5, 2.0))
 
     def test_a_short_budget_never_exceeds_the_remaining_time(self):
         for decision_timeout in (0.5, 1.0, 2.0, 3.0):
@@ -2567,8 +2601,8 @@ class OcrReadWindowTests(unittest.TestCase):
             [PlateObservation(None, 0.0)] * 3, decision_timeout=3.0,
         )
 
-        self.assertEqual(timeouts[0], (1.0, 2.0))
-        self.assertEqual(timeouts[1], (1.0, 2.0))
+        self.assertEqual(timeouts[0], (1.5, 1.5))
+        self.assertEqual(timeouts[1], (1.5, 1.5))
 
 
 if __name__ == "__main__":
