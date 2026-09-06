@@ -110,6 +110,7 @@ def main() -> None:
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
         plate_region=parse_plate_region(os.environ.get("GATE_PLATE_REGION")),
+        corpus=_training_corpus(os.environ),
         # Frames the keyframe decoder already cropped must not be cropped again.
         precropped_directory=(
             trigger_capture_config.output_directory
@@ -199,6 +200,24 @@ def main() -> None:
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
     )
+
+
+def _training_corpus(environment):
+    """A bounded on-device corpus of OCR frames and answers, or None when unset."""
+    directory = (environment.get("GATE_TRAINING_CORPUS_DIR") or "").strip()
+    if not directory:
+        return None
+    path = Path(directory)
+    if not path.is_absolute():
+        raise ValueError("GATE_TRAINING_CORPUS_DIR must be an absolute path")
+    raw = str(environment.get("GATE_TRAINING_CORPUS_MAX_BYTES", "")).strip()
+    from .corpus import DEFAULT_MAX_BYTES, TrainingCorpus
+    try:
+        max_bytes = int(raw) if raw else DEFAULT_MAX_BYTES
+    except ValueError as error:
+        raise ValueError("GATE_TRAINING_CORPUS_MAX_BYTES must be an integer") from error
+    return TrainingCorpus(path, max_bytes=max_bytes)
+
 
 
 def _clear_stream_source(config):

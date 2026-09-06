@@ -264,7 +264,8 @@ class PlateRecognizerClient:
                  timeout: tuple[int, int] = DEFAULT_TIMEOUT,
                  max_upload_width: int = 0, *, clock=monotonic, sleep=sleep,
                  plate_region: PlateRegion | None = None,
-                 precropped_directory: Path | None = None):
+                 precropped_directory: Path | None = None,
+                 corpus=None):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -285,6 +286,8 @@ class PlateRecognizerClient:
             Path(precropped_directory).resolve() if precropped_directory is not None else None
         )
         self._upload_geometry: _UploadGeometry | None = None
+        # Optional TrainingCorpus: keeps every uploaded frame and answer.
+        self._corpus = corpus
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
@@ -452,6 +455,7 @@ class PlateRecognizerClient:
                     "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                 )
         upload = self._open_upload(path)
+        corpus_image = self._corpus_image(upload) if self._corpus is not None else None
         # Preparing a downscaled upload can outlast the decision deadline;
         # never post a request the processor has already abandoned.
         with self._session_lock:
@@ -519,6 +523,7 @@ class PlateRecognizerClient:
             raise _response_error(
                 "OCR service response has invalid results", CAUSE_INVALID_RESULTS
             )
+        self._record_corpus(corpus_image, payload, path)
         if not results:
             return PlateObservation(plate=None, confidence=0.0)
         first_result = results[0]
@@ -543,6 +548,28 @@ class PlateRecognizerClient:
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
+
+    @staticmethod
+    def _corpus_image(upload) -> bytes | None:
+        """The exact bytes about to be uploaded, without consuming them."""
+        try:
+            data = upload.read()
+            upload.seek(0)
+            return data
+        except Exception:
+            return None
+
+    def _record_corpus(self, image: bytes | None, payload, path: Path) -> None:
+        if self._corpus is None or not image:
+            return
+        try:
+            self._corpus.record(
+                image, payload=payload, source="plate_recognizer",
+                geometry=self._upload_geometry,
+                extra={"precropped": self._is_precropped(path)},
+            )
+        except Exception:
+            pass
 
     def _is_precropped(self, path: Path) -> bool:
         """Frames the keyframe decoder already cropped to the plate region."""
