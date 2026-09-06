@@ -152,7 +152,15 @@ def _content_digest(path: Path) -> str:
 
 
 def _is_valid_image(path: Path) -> bool:
-    if not _has_jpeg_signature(path):
+    """A complete, decodable JPEG: signature at the head, end-of-image at the tail.
+
+    Pillow's verify() reads the structure lazily, so a JPEG still being
+    written by the camera's FTP client passes it. The RLC-810A's uploads take
+    about half a second and end exactly with the FFD9 marker; a file without
+    it is still in flight, and treating it as complete let the burst
+    processor consume, then delete, an upload while the camera was writing.
+    """
+    if not _has_jpeg_signature(path) or not _has_jpeg_end_marker(path):
         return False
     try:
         with warnings.catch_warnings():
@@ -165,6 +173,19 @@ def _is_valid_image(path: Path) -> bool:
     except (
         OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
     ):
+        return False
+
+
+def _has_jpeg_end_marker(path: Path) -> bool:
+    try:
+        with Path(path).open("rb") as source:
+            source.seek(0, 2)
+            size = source.tell()
+            if size < 4:
+                return False
+            source.seek(size - 2)
+            return source.read(2) == b"\xff\xd9"
+    except OSError:
         return False
 
 
