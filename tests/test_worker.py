@@ -5,7 +5,9 @@ import os
 import signal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from io import BytesIO
 from threading import Event as ThreadEvent, Thread
+from time import monotonic
 from unittest.mock import patch
 from PIL import Image
 
@@ -19,8 +21,10 @@ from gate_controller.worker import (
 )
 from gate_controller.models import ProcessingResult
 from gate_controller.processor import GateProcessor
+from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.store import LocalStore
 from gate_controller.telemetry import TriggerTelemetry
+from gate_controller.trigger_capture import TriggerCaptureConfig, TriggerFrameCapture
 
 
 class MutableClock:
@@ -433,6 +437,35 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(queue.get(), triggered)
         self.assertEqual(queue.get(), newer)
 
+    def test_a_burst_the_consumer_takes_mid_coalesce_costs_nobody_a_frame(self):
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=10,
+        )
+        queue = BoundedBurstQueue(max_pending=2)
+        triggered = ((Path("clear.jpg"),), None, BurstIdentity("digest-1", trigger))
+        upload = ((Path("upload-1.jpg"),), None, BurstIdentity("digest-2"))
+        newer = ((Path("upload-2.jpg"),), None, BurstIdentity("digest-3"))
+        queue.put(triggered)
+        queue.put(upload)
+
+        inner = queue._queue
+        was_full = inner.full
+
+        def full_then_consume():
+            # The processor is sitting in get() outside the queue's own lock
+            # and takes the oldest burst between this check and the drain.
+            if not was_full():
+                return False
+            inner.get_nowait()
+            return True
+
+        inner.full = full_then_consume
+
+        self.assertIsNone(queue.put(newer), "there was room, so nothing is coalesced")
+        self.assertEqual(queue.get(), upload)
+        self.assertEqual(queue.get(), newer)
+
     def test_a_queue_of_triggered_frames_still_coalesces_the_oldest(self):
         trigger = TriggerTelemetry(
             source="reolink_webhook", event_type="vehicle",
@@ -449,6 +482,91 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(queue.put(third), first)
         self.assertEqual(queue.get(), second)
         self.assertEqual(queue.get(), third)
+
+    def test_an_ftp_upload_colliding_with_session_frames_does_not_end_the_session(self):
+        """The journal scenario, end to end through the real bounded queue.
+
+        A real TriggerFrameCapture injects its series while the processor is
+        busy; the camera's own FTP upload then lands in the same queue and
+        coalesces one session frame away. The session must still retry.
+        """
+        camera_event = SanitizedCameraEvent(
+            event_id="event-1", event_type="vehicle", rule_id="front_gate",
+            received_at=datetime(2026, 9, 6, 22, 16, tzinfo=timezone.utc),
+            event_at=datetime(2026, 9, 6, 22, 15, 59, tzinfo=timezone.utc),
+        )
+        picture = BytesIO()
+        Image.new("RGB", (64, 32), color="blue").save(picture, format="JPEG")
+        frame_bytes = picture.getvalue()
+
+        class FrameSource:
+            def __init__(self):
+                self.served = 0
+
+            def latest(self, *, after=None):
+                self.served += 1
+                return frame_bytes, float(self.served)
+
+        dropped = []
+        coalesced = ThreadEvent()
+        processing = ThreadEvent()
+        release = ThreadEvent()
+
+        class RecordingCapture(TriggerFrameCapture):
+            def note_dropped(self, paths, reason):
+                accepted = super().note_dropped(paths, reason)
+                if accepted:
+                    dropped.append((tuple(paths), reason))
+                    coalesced.set()
+                return accepted
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = TriggerCaptureConfig(
+                enabled=True, output_directory=root / ".trigger-capture",
+                capture_count=3, delay_seconds=0, spacing_seconds=0,
+                presence_spacing_seconds=0, presence_max_frames=1,
+                presence_window_seconds=60.0, empty_scene_threshold=0,
+            )
+            capture = RecordingCapture(config, frame_source=FrameSource())
+            injected = []
+            session = {}
+
+            def emit(paths, *_args, **_kwargs):
+                if not processing.is_set():
+                    processing.set()
+                    release.wait(timeout=10)
+                return ProcessingResult(False, "ocr_error")
+
+            class Driver:
+                def run_forever(self, stop_event):
+                    scheduled_at = monotonic()
+                    # The first frame occupies the processor, so the next two
+                    # fill the bounded queue (max_pending_bursts=2).
+                    injected.append(capture.capture_once(camera_event, scheduled_at))
+                    processing.wait(timeout=10)
+                    injected.append(capture.capture_once(camera_event, scheduled_at))
+                    injected.append(capture.capture_once(camera_event, scheduled_at))
+                    # Now the camera's FTP upload arrives on the same queue.
+                    (root / "upload.jpg").write_bytes(frame_bytes)
+                    coalesced.wait(timeout=10)
+                    release.set()
+                    session["extra"] = capture.presence_session(
+                        camera_event, scheduled_at, stop_event,
+                    )
+                    stop_event.set()
+
+            run_worker(
+                root, emit, quiet_window=0.1, poll_interval=0.01,
+                background_workers=(Driver(),),
+                max_pending_bursts=2,
+                trigger_capture=capture,
+            )
+
+        self.assertEqual(dropped, [(injected[1], "queue_coalesced")],
+                         "the oldest queued session frame is the one coalesced")
+        self.assertEqual(session.get("extra"), 1, "the session still offered another frame")
+        self.assertEqual(capture.status()["presence"]["retries"], 1)
 
     def test_failed_recognition_reports_the_same_sanitized_trigger(self):
         received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)

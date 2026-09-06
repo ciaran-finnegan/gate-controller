@@ -223,9 +223,13 @@ queue, or lost to a processing error — is reported back to the session as
 `gate_presence stage=frame_dropped reason=…` so the next frame goes out
 immediately instead of the session waiting for a verdict that is never
 coming. Should a verdict go missing some other way, the loop writes it off
-after `GATE_DECISION_TIMEOUT_SECONDS` plus a five second margin, journals
-`gate_presence stage=verdict_overdue pending=N` once per session at warning
-level, and carries on; both are counted in the status heartbeat under
+once the frame has been outstanding for longer than any busy pipeline could
+explain — three times `GATE_DECISION_TIMEOUT_SECONDS` (every burst the bounded
+queue can hold ahead of it, plus the one being decided) plus an allowance for
+the relay pulse, measured from the injection — journals `gate_presence
+stage=verdict_overdue pending=N` once per session at warning level, and
+carries on. The frame's paths are kept, so a verdict that does arrive late
+still settles the session. Both are counted in the status heartbeat under
 `presence.dropped_frames` and `presence.lost_verdicts`.
 
 ### Scene Awareness And Frame Gating

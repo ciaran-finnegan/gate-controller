@@ -592,8 +592,8 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
             extra = capture.presence_session(event(), 100.0, TickingStop(clock))
 
-        # The default 4 s decision timeout plus the margin is 9 s; the loop
-        # gives up on that verdict and keeps the session going.
+        # Three decision timeouts plus the relay pulse allowance is 17 s from
+        # the injection; the loop gives up on that verdict and carries on.
         self.assertEqual(extra, 2)
         combined = "\n".join(logs.output)
         self.assertIn(
@@ -602,6 +602,40 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         )
         self.assertEqual(combined.count("stage=verdict_overdue"), 1, "warned once per session")
         self.assertGreaterEqual(capture.status()["presence"]["lost_verdicts"], 1)
+
+    def test_a_verdict_that_arrives_after_the_write_off_still_settles_the_session(self):
+        clock = [100.0]
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=1, delay_seconds=0, presence_spacing_seconds=0.5,
+            presence_max_frames=4, presence_window_seconds=120.0,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(3)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: clock[0])
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            if len(self.injected) == 2:
+                # The verdict for the written-off series frame lands at last,
+                # and it opened the gate: that must still end the session.
+                capture.note_result(self.injected[0], ProcessingResult(True, "exact_match"))
+
+        capture.attach(inject)
+
+        class TickingStop(self._Stop):
+            def is_set(self):
+                clock[0] += 5.0
+                return False
+
+        capture.capture_series(event(), 100.0, TickingStop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, TickingStop(clock))
+
+        self.assertEqual(extra, 1)
+        combined = "\n".join(logs.output)
+        self.assertIn("stage=verdict_overdue", combined)
+        self.assertIn("outcome=presence_ended reason=opened", combined)
+        self.assertNotIn("stage=unresolved", combined)
 
     def test_presence_session_can_be_disabled_and_ignores_foreign_results(self):
         clock = [100.0]

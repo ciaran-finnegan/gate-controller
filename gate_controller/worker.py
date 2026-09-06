@@ -70,7 +70,11 @@ class BoundedBurstQueue:
                 held.append(self._queue.get_nowait())
             except Empty:
                 break
-        if not held:
+        if len(held) < self._queue.maxsize:
+            # The consumer took a burst between the full() check and this
+            # drain, so there is room after all: nothing has to be given up.
+            for candidate in held:
+                self._queue.put_nowait(candidate)
             return None
         index = next(
             (position for position, candidate in enumerate(held)
@@ -659,7 +663,10 @@ def _process_bursts(
             # No result exists, so the frame is lost as far as its capture is
             # concerned; say so instead of leaving it pending.
             if on_dropped is not None:
-                on_dropped(paths, "processing_error")
+                try:
+                    on_dropped(paths, "processing_error")
+                except Exception:
+                    LOGGER.exception("gate_burst_drop_handler_failed")
         else:
             if on_result is not None:
                 try:

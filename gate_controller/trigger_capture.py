@@ -70,12 +70,19 @@ MAX_EMPTY_SCENE_THRESHOLD = 0.5
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
+    # A frame lost to shutdown never read the plate either; the loop leaves
+    # on its own stop_event rather than treating this as a final answer.
+    "service_stopping",
 })
 # Belt and braces behind note_dropped(): if a verdict never arrives at all the
-# session must not sit out the whole window with a vehicle at the gate. A
-# verdict cannot legitimately outlast the processor's own decision timeout, so
-# that plus this margin is when the frame is written off as lost.
-VERDICT_OVERDUE_MARGIN_SECONDS = 5.0
+# session must not sit out the whole window with a vehicle at the gate. The
+# guard has to be generous enough that it never fires on a merely busy
+# pipeline: a frame can wait behind every other burst the bounded queue holds
+# (max_pending_bursts, 2 by default) plus the one being decided, each of which
+# may take the whole decision timeout, and an open then holds the relay for
+# its pulse. Anything past that means the verdict is not coming.
+VERDICT_QUEUE_DEPTH = 3
+RELAY_PULSE_ALLOWANCE_SECONDS = 5.0
 MIN_DECISION_TIMEOUT_SECONDS = 0.5
 MAX_DECISION_TIMEOUT_SECONDS = 30.0
 # Hardware decode through the Pi 5's HEVC block via the DRM render node. The
@@ -404,6 +411,7 @@ class TriggerFrameCapture:
         self._session_lock = Lock()
         self._session_paths: set[Path] = set()
         self._session_pending = 0
+        self._session_pending_since: float | None = None
         self._session_settled: str | None = None
         self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
@@ -489,6 +497,8 @@ class TriggerFrameCapture:
             for path in matched:
                 self._session_paths.discard(path)
             self._session_pending = max(0, self._session_pending - 1)
+            if self._session_pending == 0:
+                self._session_pending_since = None
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
@@ -510,7 +520,8 @@ class TriggerFrameCapture:
         """
         if not self.note_result(paths, LostFrame(reason)):
             return False
-        self._dropped_frames += 1
+        with self._session_lock:
+            self._dropped_frames += 1
         LOGGER.info("gate_presence stage=frame_dropped reason=%s", reason)
         return True
 
@@ -530,7 +541,6 @@ class TriggerFrameCapture:
         extra = 0
         reason = "window"
         after = self._last_captured_at
-        overdue_at = None
         warned_overdue = False
         while True:
             if stop_event.is_set():
@@ -542,6 +552,7 @@ class TriggerFrameCapture:
             with self._session_lock:
                 settled = self._session_settled
                 pending = self._session_pending
+                pending_since = self._session_pending_since
             if settled is not None:
                 reason = settled
                 break
@@ -553,19 +564,16 @@ class TriggerFrameCapture:
                 break
             if pending > 0:
                 # A frame is still being decided; wait for its verdict, but
-                # never past the point where the decision must have finished.
-                now = self._clock()
-                if overdue_at is None:
-                    overdue_at = now + self._verdict_deadline_seconds()
-                elif now >= overdue_at:
+                # not past the point where it cannot still be coming. The
+                # clock runs from the injection, not from this loop noticing.
+                waited = 0.0 if pending_since is None else self._clock() - pending_since
+                if waited >= self._verdict_deadline_seconds():
                     self._abandon_verdict(pending, warned=warned_overdue)
                     warned_overdue = True
-                    overdue_at = None
                     continue
                 self._session_changed.clear()
                 self._session_changed.wait(0.25)
                 continue
-            overdue_at = None
             if self._pause(stop_event, config.presence_spacing_seconds):
                 reason = "stopping"
                 break
@@ -599,9 +607,15 @@ class TriggerFrameCapture:
         return extra
 
     def _verdict_deadline_seconds(self) -> float:
-        """How long an outstanding frame may stay undecided before it is lost."""
+        """How long an outstanding frame may stay undecided before it is lost.
+
+        Deliberately generous: every burst ahead of this one in the bounded
+        queue may spend the whole decision timeout, and an open holds the
+        relay for its pulse on top of that.
+        """
         return max(
-            self.config.decision_timeout_seconds + VERDICT_OVERDUE_MARGIN_SECONDS,
+            self.config.decision_timeout_seconds * VERDICT_QUEUE_DEPTH
+            + RELAY_PULSE_ALLOWANCE_SECONDS,
             self.config.presence_spacing_seconds * 2,
         )
 
@@ -610,12 +624,16 @@ class TriggerFrameCapture:
 
         note_dropped() should have accounted for every lost frame already, so
         this line means a frame vanished somewhere that does not report back.
+        Only the pending count is reset: the paths stay, so a verdict that
+        does arrive late still settles the session (an open must never be
+        thrown away). The cost is that a late verdict also decrements a newer
+        frame's count, which at worst offers one more frame early.
         Warned once per session; the write-off itself happens every time.
         """
         with self._session_lock:
-            self._session_paths.clear()
             self._session_pending = 0
-        self._lost_verdicts += 1
+            self._session_pending_since = None
+            self._lost_verdicts += 1
         if not warned:
             LOGGER.warning(
                 "gate_presence stage=verdict_overdue pending=%d waited_seconds=%.1f",
@@ -632,6 +650,7 @@ class TriggerFrameCapture:
         with self._session_lock:
             self._session_paths.clear()
             self._session_pending = 0
+            self._session_pending_since = None
             self._session_settled = None
             self._session_changed.clear()
         self._start_live_session()
@@ -725,12 +744,18 @@ class TriggerFrameCapture:
         with self._session_lock:
             self._session_paths.add(path)
             self._session_pending += 1
+            # The overdue guard is timed from here, not from the presence loop
+            # first noticing, so a frame injected during the series counts its
+            # whole wait.
+            self._session_pending_since = self._clock()
         try:
             inject((path,), captured_at, trigger)
         except Exception:
             with self._session_lock:
                 self._session_paths.discard(path)
                 self._session_pending = max(0, self._session_pending - 1)
+                if self._session_pending == 0:
+                    self._session_pending_since = None
             path.unlink(missing_ok=True)
             raise
         self._capture_count += 1
