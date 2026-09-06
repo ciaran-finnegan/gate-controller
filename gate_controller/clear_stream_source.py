@@ -144,7 +144,8 @@ class ClearStreamSource:
             live = ring.latest(now=self._clock(), max_age=2.0 / self.session_fps + 0.5, after=after)
             if live is not None:
                 return live
-            return None
+            # The live decoder takes about a second to deliver its first
+            # frame; until then the buffered keyframe is the instant answer.
         keyframe = self.decode_latest_keyframe()
         if keyframe is None:
             return None
@@ -170,7 +171,8 @@ class ClearStreamSource:
         now = self._clock()
         candidates = ring.since(after, now=now, max_age=window_seconds + 1.0 / self.session_fps)
         if not candidates:
-            return None
+            keyframe = self.latest(after=after)
+            return None if keyframe is None else (keyframe[0], keyframe[1], None)
         if len(candidates) == 1:
             frame, captured_at = candidates[0]
             return frame, captured_at, None

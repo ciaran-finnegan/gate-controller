@@ -206,3 +206,31 @@ class ClearStreamSourceTests(unittest.TestCase):
         source, popen = self.source(lambda command: FakeProcess())
         source.close()
         self.assertFalse(source.start_session(), "a closed source starts no session")
+
+    def test_a_fresh_session_with_no_live_frame_yet_still_decodes_the_buffered_keyframe(self):
+        decoded = jpeg()
+        never = Event()
+
+        class SilentStdout:
+            def read(self, _size):
+                never.wait(0.05)
+                return b"" if never.is_set() else b""
+
+        def factory(command):
+            if "-t" in command:
+                process = FakeProcess()
+                process.stdout = SilentStdout()
+                return process
+            return FakeProcess(output=decoded)
+
+        source, popen = self.source(factory)
+        source.ring.feed(STREAM)
+        self.assertTrue(source.start_session())
+
+        picked = source.stillest(after=None)
+        self.assertIsNotNone(picked, "the first slot must not fail while the decoder warms up")
+        frame, captured_at, stillness = picked
+        self.assertEqual((frame, captured_at, stillness), (decoded, 100.0, None))
+        self.assertEqual(source.latest(after=None), (decoded, 100.0))
+        never.set()
+        source.stop_session("test")
