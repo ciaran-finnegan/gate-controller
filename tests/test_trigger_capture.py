@@ -865,10 +865,23 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         from gate_controller.trigger_capture import ClearKeyframeBuffer, TriggerFrameCapture
         config = load_trigger_capture_config(
             {"GATE_PLATE_REGION": "0.05,0.4,0.9,0.6", "GATE_TRIGGER_CAPTURE_HWACCEL": "drm",
-             "GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "1920"},
+             "GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "1920", "GATE_TRIGGER_CAPTURE_CROP": "true"},
             self.root, webhook_enabled=True,
         )
         self.assertEqual(config.plate_region, PlateRegion(0.05, 0.4, 0.9, 0.6))
+        self.assertTrue(config.crop_capture)
+
+        # By default the region is for OCR only: captured frames stay whole so
+        # evidence keeps the camera's timestamp overlay and full context.
+        whole = load_trigger_capture_config(
+            {"GATE_PLATE_REGION": "0.05,0.4,0.9,0.6", "GATE_TRIGGER_CAPTURE_HWACCEL": "drm",
+             "GATE_TRIGGER_CAPTURE_FRAME_WIDTH": "1920"},
+            self.root, webhook_enabled=True,
+        )
+        self.assertFalse(whole.crop_capture)
+        whole_ring = ClearKeyframeBuffer(whole).command
+        self.assertNotIn("crop=", whole_ring[whole_ring.index("-vf") + 1])
+        self.assertEqual(ClearKeyframeBuffer(whole).status()["decode"]["plate_region"], "full")
 
         ring = ClearKeyframeBuffer(config).command
         self.assertEqual(ring[ring.index("-vf") + 1], (

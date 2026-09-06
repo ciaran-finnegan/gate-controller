@@ -114,7 +114,8 @@ def main() -> None:
         # Frames the keyframe decoder already cropped must not be cropped again.
         precropped_directory=(
             trigger_capture_config.output_directory
-            if trigger_capture_config.plate_region is not None else None
+            if trigger_capture_config.plate_region is not None
+            and trigger_capture_config.crop_capture else None
         ),
     )
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
