@@ -270,6 +270,26 @@ class HotFrameRingLatestTests(unittest.TestCase):
         Image.new("RGB", size, color="red").save(output, format="JPEG")
         return output.getvalue()
 
+    def test_since_lists_fresh_frames_newer_than_a_moment_oldest_first(self):
+        from io import BytesIO
+        from PIL import Image
+        from gate_controller.hot_stream import HotFrameRing
+
+        def frame(color):
+            output = BytesIO()
+            Image.new("RGB", (8, 4), color=color).save(output, format="JPEG")
+            return output.getvalue()
+
+        ring = HotFrameRing(max_frames=8, max_frame_bytes=100_000, max_total_bytes=800_000)
+        first, second, third = frame("red"), frame("green"), frame("blue")
+        ring.add(first, captured_at=10.0)
+        ring.add(second, captured_at=11.0)
+        ring.add(third, captured_at=12.0)
+
+        self.assertEqual([t for _, t in ring.since(10.0, now=12.5, max_age=5.0)], [11.0, 12.0])
+        self.assertEqual([f for f, _ in ring.since(None, now=12.5, max_age=1.0)], [third])
+        self.assertEqual(ring.since(12.0, now=12.5, max_age=5.0), [])
+
     def test_latest_returns_the_newest_fresh_frame_and_its_time(self):
         from gate_controller.hot_stream import HotFrameRing
         ring = HotFrameRing(max_frames=4, max_frame_bytes=1 << 20, max_total_bytes=4 << 20)
