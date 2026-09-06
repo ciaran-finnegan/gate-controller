@@ -429,6 +429,16 @@ positions before enabling relay output.
 Night work is a balance: enough exposure for a legible plate, but little enough
 motion blur and headlight bloom that characters remain distinct.
 
+The installed camera was measured and reconfigured against these principles on
+2026-09-06; see
+[Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
+for the settings actually deployed, the API calls, the before/after clipping
+measurements, and the rollback. Two results there change how step 2 below should
+be read on this unit: the `shutter` and `gain` limits are ignored unless
+`exposure` is `Manual`, so lowering the auto caps does nothing; and the site has
+no night illumination at all once the camera's own IR is off, so the white light
+in step 2 is a prerequisite rather than one option among several.
+
 1. Calibrate after dark with representative vehicles, headlight states, wet
    road conditions, and a clean camera cover.
 2. Start with auto day/night mode and compare IR-only, spotlight, and the

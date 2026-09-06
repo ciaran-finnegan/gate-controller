@@ -1,0 +1,47 @@
+[
+ {
+  "cmd": "GetWhiteLed",
+  "code": 0,
+  "initial": {
+   "WhiteLed": {
+    "wlAiDetectType": {
+     "dog_cat": 0,
+     "people": 0,
+     "vehicle": 0
+    }
+   }
+  },
+  "range": {
+   "AiDetectType": {
+    "dog_cat": "boolean",
+    "people": "boolean",
+    "vehicle": "boolean"
+   },
+   "WhiteLed": {
+    "bright": {
+     "max": 100,
+     "min": 0
+    }
+   }
+  },
+  "value": {
+   "WhiteLed": {
+    "LightingSchedule": {
+     "EndHour": 6,
+     "EndMin": 0,
+     "StartHour": 18,
+     "StartMin": 0
+    },
+    "bright": 85,
+    "channel": 0,
+    "mode": 1,
+    "state": 0,
+    "wlAiDetectType": {
+     "dog_cat": 1,
+     "people": 1,
+     "vehicle": 1
+    }
+   }
+  }
+ }
+]
