@@ -111,9 +111,18 @@ def main() -> None:
         TriggerFrameCapture(trigger_capture_config, frame_source=clear_keyframes)
         if trigger_capture_config.enabled else None
     )
+    recognizer = PlateRecognizerClient(
+        token, max_upload_width=_ocr_upload_width(os.environ),
+        plate_region=parse_plate_region(os.environ.get("GATE_PLATE_REGION")),
+        # Frames the keyframe decoder already cropped must not be cropped again.
+        precropped_directory=(
+            trigger_capture_config.output_directory
+            if trigger_capture_config.plate_region is not None else None
+        ),
+    )
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
         os.environ,
-        on_accepted=trigger_capture.on_camera_event if trigger_capture else None,
+        on_accepted=_camera_event_handler(trigger_capture, recognizer),
     )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if hot_stream is not None:
@@ -124,15 +133,7 @@ def main() -> None:
         background_workers += (trigger_capture,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
-        recognizer=PlateRecognizerClient(
-            token, max_upload_width=_ocr_upload_width(os.environ),
-            plate_region=parse_plate_region(os.environ.get("GATE_PLATE_REGION")),
-            # Frames the keyframe decoder already cropped must not be cropped again.
-            precropped_directory=(
-                trigger_capture_config.output_directory
-                if trigger_capture_config.plate_region is not None else None
-            ),
-        ),
+        recognizer=recognizer,
         store=store,
         relay=relay,
         authorised=authorised.get,
@@ -202,6 +203,30 @@ def main() -> None:
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
     )
+
+
+def _camera_event_handler(trigger_capture, recognizer):
+    """Warm the OCR connection the instant the camera fires, then capture.
+
+    The prewarm is fire-and-forget and must never delay or break capture.
+    """
+    prewarm = getattr(recognizer, "prewarm", None)
+    capture = trigger_capture.on_camera_event if trigger_capture is not None else None
+    if capture is None and not callable(prewarm):
+        return None
+
+    def handle(event):
+        if callable(prewarm):
+            try:
+                prewarm()
+            except Exception:
+                pass
+        if capture is not None:
+            return capture(event)
+        return None
+
+    return handle
+
 
 
 def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None):

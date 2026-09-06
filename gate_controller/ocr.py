@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from io import BytesIO
 from math import isfinite
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from time import monotonic, sleep
 
 from PIL import Image
@@ -133,12 +133,54 @@ def _requests_exceptions():
     return exceptions
 
 
-def _log_failure(cause: str) -> None:
-    """Journal the bounded cause only; never a body, path, or credential."""
+GENERIC_ERROR_CLASSES = frozenset({"OSError", "Exception", "BaseException", "RuntimeError", "Error"})
+
+
+def _innermost_error_class(error: BaseException | None) -> str:
+    """The most specific class name in the exception chain: safe to journal.
+
+    ``requests.ConnectionError`` hides whether a name lookup failed, a socket
+    was refused, or a peer reset the connection; the wrapped urllib3 error
+    (``NameResolutionError``, ``NewConnectionError``, ``ProtocolError``) or
+    the OS error beneath it (``ConnectionResetError``) says which. urllib3
+    keeps the wrapped error in ``reason``; the walk follows that as well as
+    normal chaining, and steps back from a bare ``OSError`` to the class that
+    described it. Class names carry no host, path, or credential.
+    """
+    if error is None:
+        return "unavailable"
+    chain = [error]
+    current = error
+    for _ in range(8):
+        inner = current.__cause__ or current.__context__
+        if inner is None:
+            reason = getattr(current, "reason", None)
+            if isinstance(reason, BaseException):
+                inner = reason
+        if inner is None:
+            candidates = [arg for arg in getattr(current, "args", ()) if isinstance(arg, BaseException)]
+            inner = candidates[0] if candidates else None
+        if inner is None or inner in chain:
+            break
+        chain.append(inner)
+        current = inner
+    for candidate in reversed(chain):
+        if type(candidate).__name__ not in GENERIC_ERROR_CLASSES:
+            return type(candidate).__name__
+    return type(chain[-1]).__name__
+
+
+def _log_failure(cause: str, error: BaseException | None = None) -> None:
+    """Journal the bounded cause and the innermost error class only; never a
+    body, path, or credential."""
     try:
-        _LOGGER.warning(
-            "gate_ocr stage=attempt_failed cause=%s", bounded_failure_cause(cause)
-        )
+        if error is None:
+            _LOGGER.warning("gate_ocr stage=attempt_failed cause=%s", bounded_failure_cause(cause))
+        else:
+            _LOGGER.warning(
+                "gate_ocr stage=attempt_failed cause=%s detail=%s",
+                bounded_failure_cause(cause), _innermost_error_class(error),
+            )
     except Exception:
         return
 
@@ -146,7 +188,7 @@ def _log_failure(cause: str) -> None:
 def _log_transport_failure(error: BaseException) -> None:
     """Journal a transport failure without ever masking the original error."""
     try:
-        _log_failure(classify_failure_cause(error))
+        _log_failure(classify_failure_cause(error), error)
     except Exception:
         return
 
@@ -269,6 +311,69 @@ class PlateRecognizerClient:
                 _log_retry(failure.cause, failure.interval)
                 if failure.cause in RETRYABLE_TRANSPORT_CAUSES:
                     self._recycle_session()
+
+    def prewarm(self) -> bool:
+        """Open the TLS connection now, in the background, so the first OCR
+        request of a vehicle reuses it.
+
+        Called when the camera event arrives, ~0.5 s before the first frame
+        is ready. Over a slow uplink the name lookup plus TCP and TLS
+        handshakes cost 0.4 to 0.8 s, and a name lookup at that moment is
+        exactly what a flapping link breaks. The probe carries no token, so
+        it is never billed; a failure is ignored and the real request dials
+        as before.
+        """
+        with self._session_lock:
+            if self._closed:
+                return False
+            generation = self._session_generation
+        self._recycle_if_idle()
+
+        def warm():
+            session = self._session_for_prewarm(generation)
+            if session is None:
+                return
+            get = getattr(session, "get", None)
+            if not callable(get):
+                return
+            try:
+                response = get(
+                    self._endpoint, headers={"User-Agent": "gate-controller/1"}, timeout=(2, 2),
+                )
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                return
+
+        Thread(target=warm, name="gate-ocr-prewarm", daemon=True).start()
+        return True
+
+    def _session_for_prewarm(self, generation: int):
+        """The pooled session, created if absent, unless the client moved on."""
+        with self._session_lock:
+            if self._closed or generation != self._session_generation:
+                return None
+            session = self._session
+        if session is not None:
+            return session
+        try:
+            created = self._create_session()
+        except Exception:
+            return None
+        with self._session_lock:
+            if self._closed or generation != self._session_generation:
+                discard = True
+            elif self._session is None:
+                self._session = created
+                discard = False
+            else:
+                discard = True
+                session = self._session
+        if discard:
+            self._close_session(created)
+            return session
+        return created
 
     def _recycle_session(self) -> None:
         """Drop the pooled connection so the next request dials afresh."""

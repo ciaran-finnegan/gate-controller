@@ -607,6 +607,29 @@ class OcrPlateRegionTests(unittest.TestCase):
         self.assertEqual(observation.plate, "12D3456")
         self.assertNotIn("plate_box=", "\n".join(logs.output))
 
+class OcrFailureDetailTests(unittest.TestCase):
+    def test_transport_failures_journal_the_innermost_error_class_and_nothing_else(self):
+        import requests
+        from urllib3.exceptions import MaxRetryError, NameResolutionError, NewConnectionError
+        from gate_controller.ocr import _innermost_error_class, _log_transport_failure
+
+        inner = NameResolutionError("api.example", None, OSError("Temporary failure in name resolution"))
+        wrapped = requests.ConnectionError(MaxRetryError(None, "/v1/plate-reader/?token=secret", reason=inner))
+        self.assertEqual(_innermost_error_class(wrapped), "NameResolutionError")
+        reset = requests.ConnectionError(MaxRetryError(None, "/x", reason=ConnectionResetError(104, "reset")))
+        self.assertEqual(_innermost_error_class(reset), "ConnectionResetError")
+
+        refused = requests.ConnectionError(MaxRetryError(None, "/x", reason=NewConnectionError(None, "refused")))
+        self.assertEqual(_innermost_error_class(refused), "NewConnectionError")
+        self.assertEqual(_innermost_error_class(requests.ConnectionError("bare")), "ConnectionError")
+        self.assertEqual(_innermost_error_class(None), "unavailable")
+
+        with self.assertLogs("gate_controller.ocr", level="WARNING") as logs:
+            _log_transport_failure(wrapped)
+        self.assertIn("gate_ocr stage=attempt_failed cause=connection_error detail=NameResolutionError", logs.output[0])
+        self.assertNotIn("secret", logs.output[0])
+        self.assertNotIn("api.example", logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -802,3 +825,40 @@ class OcrPacingAndRetryTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.failure_cause, "request_abandoned")
         self.assertEqual(fresh.calls, [])
+
+    def test_prewarm_opens_a_pooled_connection_without_spending_a_lookup(self):
+        from threading import Event
+        from gate_controller.ocr import PlateRecognizerClient
+        done = Event()
+
+        class WarmSession:
+            def __init__(self):
+                self.gets = []
+                self.posts = []
+                self.closed = False
+
+            def get(self, url, **kwargs):
+                self.gets.append((url, kwargs))
+                done.set()
+                return FakeResponse(status_code=403, payload={})
+
+            def post(self, *args, **kwargs):
+                self.posts.append(kwargs)
+                return FakeResponse(payload={"results": []})
+
+            def close(self):
+                self.closed = True
+
+        session = WarmSession()
+        client = PlateRecognizerClient("token", session=session)
+
+        self.assertTrue(client.prewarm())
+        self.assertTrue(done.wait(2))
+        url, kwargs = session.gets[0]
+        self.assertTrue(url.startswith("https://api.platerecognizer.com/"))
+        self.assertNotIn("Authorization", kwargs.get("headers", {}))
+        self.assertEqual(kwargs.get("timeout"), (2, 2))
+        self.assertEqual(session.posts, [], "prewarm never spends an OCR request")
+
+        client.close()
+        self.assertFalse(client.prewarm(), "a closed client does not prewarm")
