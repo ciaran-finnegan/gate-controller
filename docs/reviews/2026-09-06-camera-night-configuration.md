@@ -208,9 +208,12 @@ frame amplifies noise into the OCR crop.
 
 Changed under a later explicit instruction, which supersedes the original
 "do not touch AI detection settings" constraint for this one field. At
-sensitivity 100 the vehicle alarm fired twice tonight on an empty scene (20:27
-and 21:00, IR blob only), and each false alarm costs up to 6 OCR requests
-against a 1 req/s cloud budget.
+sensitivity 100 the vehicle AI raised a false alarm on the empty scene at 20:27
+(`gate_trigger_capture outcome=captured event_type=vehicle clipping=0.07` — the
+IR blob), and each false alarm costs up to 6 OCR requests against a 1 req/s
+cloud budget. Section 9 separates this from the motion-driven uploads that
+accounted for the rest of tonight's traffic; only the 20:27 event was the
+vehicle AI.
 
 | | before | after |
 | --- | --- | --- |
@@ -342,10 +345,11 @@ out. The presence retry window is separately being cut on the Pi from 45 s to
 decision timeout) by the main session — not by this work, and no controller
 configuration was touched here.
 
-Lowering vehicle sensitivity from 100 to 80 also feeds this: at 100 the empty
-scene fired twice tonight, and every false alarm spends up to 6 OCR requests
-against a 1 req/s budget, which can leave the real arrival queued behind
-requests for an empty driveway.
+Trigger hygiene feeds this directly. Every false alarm spends up to 6 OCR
+requests against a 1 req/s budget, which can leave a real arrival queued behind
+requests for an empty driveway. Lowering vehicle sensitivity from 100 to 80
+removes one class of those; taking generic motion off the FTP table (section 9)
+removes by far the larger class.
 
 ## 8. What still needs a physical fix
 
@@ -380,7 +384,145 @@ cannot create light, and that is now the binding constraint.
    worth more than any ISP setting — but note the 811A is about 1.4 stops
    darker at the long end, so it makes item 1 more necessary, not less.
 
-## 9. What the next real night entry should show
+## 9. Follow-up: generic motion was driving every OCR request
+
+Added at 22:50 after the user reported Plate Recognizer quota being consumed.
+Between 22:32 and 22:41, while the settings above were being changed, the app
+logged a run of black-frame "Access Denied" events. Each one cost a cloud OCR
+request. This section is the diagnosis and the fix.
+
+### What was actually firing
+
+The camera's upload and notification triggers live in three independent
+schedule tables, each a 168-character week grid (one character per hour) per
+alarm type. Read with `GetFtpV20`, `GetPushV20` and `GetRecV20`. A warning for
+anyone repeating this: `action: 1` returns `initial`, `range` **and** `value`,
+and the `initial` block is the factory default, not the live setting. The live
+state is in `value` — reading `initial` by mistake gives a completely different
+and wrong answer.
+
+Live state before this change, showing only the types that were enabled (all of
+them enabled for the full 168 hours):
+
+| table | enabled alarm types before |
+| --- | --- |
+| **FTP** | `MD`, `AI_PEOPLE`, `AI_DOG_CAT`, `AI_VEHICLE`, `AI_CROSSLINE_1`, `AI_CROSSLINE_2` |
+| **Push** | `AI_VEHICLE`, `AI_CROSSLINE_1`, `AI_CROSSLINE_2` |
+| **Record** | `MD`, `AI_PEOPLE`, `AI_DOG_CAT`, `AI_VEHICLE`, `AI_CROSSLINE_1`, `AI_CROSSLINE_2` |
+
+`MD` is generic motion detection, and on the FTP table it was enabled around the
+clock. That is the whole explanation. The controller sends **every** camera FTP
+still to cloud OCR, and the empty-scene gate only covers session captures, not
+FTP stills. So every motion event — a gust in the hedge, rain, a headlight
+sweep on the road, or an abrupt exposure change made over the API — became a 4K
+JPEG on the Pi and a paid Plate Recognizer request. `AI_PEOPLE` and
+`AI_DOG_CAT` were uploading too, which nothing in this pipeline uses.
+
+Push was already correct, and had been all along: AI vehicle and the two
+crossline rules only, no motion. That asymmetry is why the journal for
+22:32-22:41 shows a long run of `filesystem_ingress` lines and **not one**
+`gate_trigger_capture`. The webhook path never fired. Only the FTP-on-motion
+path did.
+
+### Was it my changes, or is the camera firing on the black scene?
+
+It was the changes. Every `SetIsp` and `SetIrLights` call rewrites the whole
+frame's brightness instantly, which is about as unambiguous a motion event as
+can be manufactured. The FTP timestamps line up one-for-one with the sweep:
+22:32:35/37/39 with the IR illuminator going off, 22:35:43 with the white LED
+probe being restored, 22:36:40-47 and 22:37:52-57 and 22:38:34 through the
+first candidate sweep, 22:40:53-58 through the second. Nothing fired between
+22:41 and the follow-up work.
+
+The camera is **not** raising vehicle or crossline alarms on the black scene:
+zero `gate_trigger_capture` lines in that entire window, and Push carries only
+AI types. Earlier tonight is a different story and worth separating out:
+
+- **20:27** — a genuine AI vehicle false alarm on an empty scene,
+  `gate_trigger_capture outcome=captured event_type=vehicle clipping=0.07`.
+  This is the event that justified dropping vehicle sensitivity 100 → 80 in
+  section 4. Its cause was the IR blob, which is now switched off.
+- **21:00 and 22:32-22:41** — `filesystem_ingress` only, no capture line.
+  Motion-driven FTP, not AI.
+
+### What changed
+
+Only the FTP schedule table. Every other field in the `Ftp` block — including
+the FTP server address, user name and password — was read back and written
+unchanged; the script asserted that afterwards and confirmed the credentials
+are still populated.
+
+| FTP alarm type | before | after |
+| --- | --- | --- |
+| `MD` | 168/168 | **0/168** |
+| `AI_PEOPLE` | 168/168 | **0/168** |
+| `AI_DOG_CAT` | 168/168 | **0/168** |
+| `AI_VEHICLE` | 168/168 | 168/168 (kept) |
+| `AI_CROSSLINE_1` | 168/168 | 168/168 (kept) |
+| `AI_CROSSLINE_2` | 168/168 | 168/168 (kept) |
+| all other types | 0/168 | 0/168 |
+
+`AI_CROSSLINE_0` stays disabled: Push has it at 0 while `_1` and `_2` are at
+168, which identifies `_1` and `_2` as the two rules actually in use.
+
+**Push was not changed** — it was already exactly the wanted set. **Record was
+not changed.** Recording is governed by its own table and writes to the SD card;
+it does not produce FTP uploads, so leaving `MD` enabled there costs no OCR
+requests and preserves the user's recorded footage of motion events.
+
+Vehicle sensitivity stays at **80**. It is not being lowered further, and the
+reason matters: with the IR illuminator off and `MD` no longer uploading,
+`AI_VEHICLE` and the two crossline rules are now the *only* things that can
+trigger the pipeline at all. The single AI false alarm tonight (20:27) was
+caused by the IR blob, which no longer exists. Cutting sensitivity further
+would trade a problem that is already solved against the one failure mode there
+is no recovery from.
+
+### Effect
+
+Before, on this scene, six alarm types could raise an FTP still at any hour, and
+three of them (`MD`, `AI_PEOPLE`, `AI_DOG_CAT`) fire on things the gate does not
+care about. After, only a vehicle or a crossline event uploads. The 22:32-22:41
+burst that prompted this section would not have produced a single OCR request
+under the new table.
+
+Verified on the empty scene afterwards, watching
+`journalctl -u file-monitor.service`:
+
+| window | FTP stills (`filesystem_ingress`) | OCR requests (`gate_ocr`) |
+| --- | --- | --- |
+| 22:32-22:41, before the change, during the ISP sweep | 13 | 13 |
+| 22:50-23:19, after the change, scene untouched | **0** | **0** |
+
+including a dedicated 2.5-minute continuous watch from 23:07:37 to 23:10:07
+that recorded zero events of any kind.
+
+There is a real cost, and it compounds the section 5 trade-off rather than
+sitting beside it. `MD` was a crude but genuinely functional night trigger: a
+headlit car sweeping the driveway is trivially detectable as motion, whether or
+not the AI classifies it as a vehicle. Removing it, on the same night the IR
+illuminator was switched off, means the night pipeline now rests entirely on
+AI vehicle and crossline detection against a scene lit only by the arriving
+car. If the next night entry does not trigger, restore `MD` on the FTP table as
+the first diagnostic step — it is the cheaper half of the rollback and it will
+distinguish "the AI cannot see the car" from "nothing is reaching the Pi".
+
+### Rollback
+
+Full `Get` output captured before the change is on the Pi as
+`/root/camera-{ftp,push,rec}-before-2026-09-06b.json` (root-readable only,
+contains the FTP credentials), with credential-redacted copies committed beside
+this document as `camera-*-before-2026-09-06b.redacted.json`. The redacted
+copies are enough to rebuild the schedule tables; the credentials in the live
+block are never overwritten by a schedule-only edit.
+
+To restore motion-driven FTP uploads, read the current `Ftp` block, set the
+`MD` row of `schedule.table` back to 168 ones, and send the whole block back
+with `SetFtpV20`. Do not hand-write the `Ftp` block from scratch — round-trip
+the live one, or the FTP password will be blanked and uploads will stop
+entirely.
+
+## 10. What the next real night entry should show
 
 Nothing here has been tested against a car. The next night arrival is the
 experiment, and these are the things to read off it.
@@ -399,5 +541,15 @@ experiment, and these are the things to read off it.
   retroreflective plate against a dark background is what an ANPR frame looks
   like.
 - **Time from stop to relay**, against the 5 s target and the 5.1 s baseline.
-- **False alarms overnight** at sensitivity 80: tonight's empty-scene 20:27 and
-  21:00 firings should not recur.
+- **A `gate_trigger_capture` line should now accompany the FTP still.** Before
+  section 9, FTP fired on motion and the webhook fired on AI, so the two paths
+  ran independently. Now both are driven by the same AI events, so a real
+  arrival should produce a `filesystem_ingress` *and* a
+  `gate_trigger_capture outcome=captured event_type=vehicle`. An
+  `filesystem_ingress` on its own would mean the FTP table change did not take.
+- **Overnight OCR volume should fall to near zero on an empty scene.** Any
+  `filesystem_ingress` with no vehicle present now means a genuine AI false
+  positive rather than a motion event, which is a different and more
+  interesting problem.
+- **False alarms overnight** at sensitivity 80: tonight's 20:27 vehicle-AI
+  firing should not recur, its cause (the IR blob) being switched off.
