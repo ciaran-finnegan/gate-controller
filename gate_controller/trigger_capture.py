@@ -102,9 +102,12 @@ class TriggerCaptureConfig:
     # the native size. OCR uploads are downscaled to 1920 anyway, so encoding
     # 4K frames only costs CPU, heat, and ring memory.
     frame_width: int = 0
-    # Crop to the band of the frame where plates appear, as frame fractions,
-    # before any scaling. A crop narrower than frame_width is never upscaled.
+    # The band of the frame where plates appear, as frame fractions. The OCR
+    # upload is always cropped to it; captured frames are only cropped when
+    # crop_capture is set, because a cropped capture loses the camera's
+    # timestamp overlay and the operator's context in every evidence image.
     plate_region: PlateRegion | None = None
+    crop_capture: bool = False
     # A vehicle that triggered the camera is still there after the series.
     # While nothing has read its plate, keep offering one fresh keyframe at a
     # time, spaced out, for a bounded window and a bounded number of frames.
@@ -180,6 +183,7 @@ def load_trigger_capture_config(
         frame_width_raw, MIN_FRAME_WIDTH, MAX_FRAME_WIDTH,
     )
     plate_region = parse_plate_region(environment.get("GATE_PLATE_REGION"))
+    crop_capture = _boolean(environment.get("GATE_TRIGGER_CAPTURE_CROP", "false"))
     presence_window = _number(
         environment.get("GATE_PRESENCE_WINDOW_SECONDS", "20"), 0.0, MAX_PRESENCE_WINDOW_SECONDS,
     )
@@ -216,6 +220,7 @@ def load_trigger_capture_config(
         hwaccel=hwaccel,
         frame_width=frame_width,
         plate_region=plate_region,
+        crop_capture=crop_capture,
         presence_window_seconds=presence_window,
         presence_spacing_seconds=presence_spacing,
         presence_max_frames=presence_frames,
@@ -251,7 +256,7 @@ def decoder_filters(config: TriggerCaptureConfig, *, sample: bool) -> tuple[str,
         filters.append("fps=1")
     if config.hwaccel == "drm":
         filters.extend(["hwdownload", "format=nv12"])
-    if config.plate_region is not None:
+    if config.plate_region is not None and config.crop_capture:
         filters.append(config.plate_region.ffmpeg_crop_filter())
     if config.frame_width > 0:
         filters.append(f"scale=w='min(iw,{config.frame_width})':h=-2")
@@ -300,7 +305,8 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
             "plate_region": (
-                capture_config.plate_region.as_env() if capture_config.plate_region else "full"
+                capture_config.plate_region.as_env()
+                if capture_config.plate_region and capture_config.crop_capture else "full"
             ),
         }
 
