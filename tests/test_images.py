@@ -181,6 +181,34 @@ class ImageTests(unittest.TestCase):
             with patch("gate_controller.images._content_digest", side_effect=digest):
                 self.assertEqual([stable], rank_images((removed, stable)))
 
+class UploadCompletenessTests(unittest.TestCase):
+    """A JPEG still being written must never count as readable."""
+
+    def test_a_jpeg_without_its_end_marker_is_not_readable_until_the_tail_lands(self):
+        import io
+        import tempfile
+        from PIL import Image
+        from gate_controller.images import wait_until_readable
+
+        output = io.BytesIO()
+        Image.new("RGB", (64, 32), color="blue").save(output, format="JPEG")
+        complete = output.getvalue()
+        self.assertTrue(complete.endswith(b"\xff\xd9"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Front Gate_00_20260906131244.jpg"
+            # The camera's FTP client writes sequentially; most of the file is
+            # there long before the final two bytes.
+            path.write_bytes(complete[:-2])
+            self.assertFalse(wait_until_readable(path, timeout=0, poll_interval=0))
+            path.write_bytes(complete[:-1])
+            self.assertFalse(wait_until_readable(path, timeout=0, poll_interval=0))
+            path.write_bytes(complete)
+            self.assertTrue(wait_until_readable(path, timeout=0, poll_interval=0))
+            path.write_bytes(b"\xff\xd8\xff\xd9")
+            self.assertFalse(wait_until_readable(path, timeout=0, poll_interval=0), "a marker alone is not an image")
+
+
 
 if __name__ == "__main__":
     unittest.main()
