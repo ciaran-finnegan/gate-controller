@@ -208,14 +208,29 @@ the attempt. While nothing has read the plate, the controller keeps offering
 one fresh clear-stream keyframe at a time, `GATE_PRESENCE_SPACING_SECONDS`
 (3 s) apart, for up to `GATE_PRESENCE_WINDOW_SECONDS` (20 s) after the alarm
 and at most `GATE_PRESENCE_MAX_FRAMES` (4) extra frames. Only one presence
-frame is ever outstanding, so a retry can never push a sharp frame out of the
-bounded burst queue. The session ends as soon as the gate opens or a plate is
+frame is ever outstanding, and the bounded burst queue coalesces an FTP
+upload away before a webhook-triggered frame, so a retry does not push a
+sharp frame out. The session ends as soon as the gate opens or a plate is
 read (an unauthorised plate is a final answer, not a reason to keep paying
 for OCR), and also when the window closes, the frame budget is spent, a newer
 camera event is waiting, or the service stops. The journal records
 `gate_trigger_capture outcome=presence_retry frame=N` for each extra frame and
 `outcome=presence_ended reason=opened|plate_read|budget|window|new_event`.
 Set `GATE_PRESENCE_MAX_FRAMES=0` to disable the session.
+
+A frame that leaves the pipeline without a decision — coalesced out of a full
+queue, or lost to a processing error — is reported back to the session as
+`gate_presence stage=frame_dropped reason=…` so the next frame goes out
+immediately instead of the session waiting for a verdict that is never
+coming. Should a verdict go missing some other way, the loop writes it off
+once the frame has been outstanding for longer than any busy pipeline could
+explain — three times `GATE_DECISION_TIMEOUT_SECONDS` (every burst the bounded
+queue can hold ahead of it, plus the one being decided) plus an allowance for
+the relay pulse, measured from the injection — journals `gate_presence
+stage=verdict_overdue pending=N` once per session at warning level, and
+carries on. The frame's paths are kept, so a verdict that does arrive late
+still settles the session. Both are counted in the status heartbeat under
+`presence.dropped_frames` and `presence.lost_verdicts`.
 
 ### Scene Awareness And Frame Gating
 

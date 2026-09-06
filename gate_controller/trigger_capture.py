@@ -70,7 +70,21 @@ MAX_EMPTY_SCENE_THRESHOLD = 0.5
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
+    # A frame lost to shutdown never read the plate either; the loop leaves
+    # on its own stop_event rather than treating this as a final answer.
+    "service_stopping",
 })
+# Belt and braces behind note_dropped(): if a verdict never arrives at all the
+# session must not sit out the whole window with a vehicle at the gate. The
+# guard has to be generous enough that it never fires on a merely busy
+# pipeline: a frame can wait behind every other burst the bounded queue holds
+# (max_pending_bursts, 2 by default) plus the one being decided, each of which
+# may take the whole decision timeout, and an open then holds the relay for
+# its pulse. Anything past that means the verdict is not coming.
+VERDICT_QUEUE_DEPTH = 3
+RELAY_PULSE_ALLOWANCE_SECONDS = 5.0
+MIN_DECISION_TIMEOUT_SECONDS = 0.5
+MAX_DECISION_TIMEOUT_SECONDS = 30.0
 # Hardware decode through the Pi 5's HEVC block via the DRM render node. The
 # software path is the default so a host without the node keeps working.
 HWACCEL_CHOICES = frozenset({"", "drm"})
@@ -116,6 +130,9 @@ class TriggerCaptureConfig:
     presence_window_seconds: float = 20.0
     presence_spacing_seconds: float = 3.0
     presence_max_frames: int = 4
+    # The processor's decision timeout, mirrored here only to bound how long
+    # the presence loop waits for a verdict that may never come.
+    decision_timeout_seconds: float = 4.0
     # Hold the clear stream compressed and decode only for events (the
     # default), or keep the older continuously decoded keyframe ring.
     clear_stream_mode: str = "compressed"
@@ -194,6 +211,12 @@ def load_trigger_capture_config(
     presence_frames = _integer(
         environment.get("GATE_PRESENCE_MAX_FRAMES", "4"), 0, MAX_PRESENCE_FRAMES,
     )
+    # Clamped rather than validated: the processor owns this setting, and a
+    # value it accepts must never stop capture from starting.
+    decision_timeout = _clamped(
+        environment.get("GATE_DECISION_TIMEOUT_SECONDS", "4"),
+        MIN_DECISION_TIMEOUT_SECONDS, MAX_DECISION_TIMEOUT_SECONDS, 4.0,
+    )
     empty_scene = _number(
         environment.get("GATE_EMPTY_SCENE_THRESHOLD", str(DEFAULT_EMPTY_SCENE_THRESHOLD)),
         0.0, MAX_EMPTY_SCENE_THRESHOLD,
@@ -224,6 +247,7 @@ def load_trigger_capture_config(
         presence_window_seconds=presence_window,
         presence_spacing_seconds=presence_spacing,
         presence_max_frames=presence_frames,
+        decision_timeout_seconds=decision_timeout,
         empty_scene_threshold=empty_scene,
         max_highlight_clipping=max_clipping,
         clear_stream_mode=clear_stream_mode,
@@ -261,6 +285,20 @@ def decoder_filters(config: TriggerCaptureConfig, *, sample: bool) -> tuple[str,
     if config.frame_width > 0:
         filters.append(f"scale=w='min(iw,{config.frame_width})':h=-2")
     return tuple(filters)
+
+
+@dataclass(frozen=True)
+class LostFrame:
+    """The verdict of a frame that vanished before anything could decide it.
+
+    A burst can be coalesced out of the bounded queue or lost to a processing
+    error, in which case no ``ProcessingResult`` is ever produced. This stands
+    in for one so the presence session's pending count still comes back down.
+    """
+
+    reason: str
+    opened: bool = False
+    decision: None = None
 
 
 class ClearKeyframeBuffer(HotStreamBuffer):
@@ -361,6 +399,8 @@ class TriggerFrameCapture:
         self._capture_count = 0
         self._failure_count = 0
         self._presence_retries = 0
+        self._dropped_frames = 0
+        self._lost_verdicts = 0
         self._skipped_empty = 0
         self._skipped_clipped = 0
         self._unresolved_sessions = 0
@@ -369,8 +409,12 @@ class TriggerFrameCapture:
         self._last_stillness: float | None = None
         # Presence-session bookkeeping, shared with the worker's result hook.
         self._session_lock = Lock()
+        # Every frame injected this session, kept so a late verdict can still
+        # settle it, and the subset still counted as outstanding.
         self._session_paths: set[Path] = set()
+        self._session_pending_paths: set[Path] = set()
         self._session_pending = 0
+        self._session_pending_since: float | None = None
         self._session_settled: str | None = None
         self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
@@ -441,20 +485,28 @@ class TriggerFrameCapture:
             self.capture_series(event, scheduled_at, stop_event)
             self.presence_session(event, scheduled_at, stop_event)
 
-    def note_result(self, paths, result) -> None:
+    def note_result(self, paths, result) -> bool:
         """Learn how a frame this capture injected was decided.
 
         Called by the worker for every processed burst; frames from other
         sources are ignored. An open or a read plate settles the session;
         anything that never read the plate leaves it open to another frame.
+        Returns True when the paths belonged to this session.
         """
         with self._session_lock:
             matched = [Path(path) for path in paths if Path(path) in self._session_paths]
             if not matched:
-                return
+                return False
+            outstanding = [path for path in matched if path in self._session_pending_paths]
             for path in matched:
                 self._session_paths.discard(path)
-            self._session_pending = max(0, self._session_pending - 1)
+                self._session_pending_paths.discard(path)
+            if outstanding:
+                # A verdict for a frame already written off still settles the
+                # session, but must not count against the frame now pending.
+                self._session_pending = max(0, self._session_pending - 1)
+                if self._session_pending == 0:
+                    self._session_pending_since = None
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
@@ -465,6 +517,21 @@ class TriggerFrameCapture:
                     elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
                         self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
             self._session_changed.set()
+            return True
+
+    def note_dropped(self, paths, reason: str) -> bool:
+        """Account for an injected frame that never reached a decision.
+
+        Without this the frame stays pending for the rest of the window and
+        the presence loop waits for a verdict that is never coming, with the
+        vehicle still at the gate.
+        """
+        if not self.note_result(paths, LostFrame(reason)):
+            return False
+        with self._session_lock:
+            self._dropped_frames += 1
+        LOGGER.info("gate_presence stage=frame_dropped reason=%s", reason)
+        return True
 
     def presence_session(self, event, scheduled_at, stop_event) -> int:
         """Keep offering fresh frames while the vehicle is present and unread.
@@ -482,6 +549,7 @@ class TriggerFrameCapture:
         extra = 0
         reason = "window"
         after = self._last_captured_at
+        warned_overdue = False
         while True:
             if stop_event.is_set():
                 reason = "stopping"
@@ -492,6 +560,7 @@ class TriggerFrameCapture:
             with self._session_lock:
                 settled = self._session_settled
                 pending = self._session_pending
+                pending_since = self._session_pending_since
             if settled is not None:
                 reason = settled
                 break
@@ -502,7 +571,14 @@ class TriggerFrameCapture:
                 reason = "window"
                 break
             if pending > 0:
-                # A frame is still being decided; wait for its verdict.
+                # A frame is still being decided; wait for its verdict, but
+                # not past the point where it cannot still be coming. The
+                # clock runs from the injection, not from this loop noticing.
+                waited = 0.0 if pending_since is None else self._clock() - pending_since
+                if waited >= self._verdict_deadline_seconds():
+                    self._abandon_verdict(pending, warned=warned_overdue)
+                    warned_overdue = True
+                    continue
                 self._session_changed.clear()
                 self._session_changed.wait(0.25)
                 continue
@@ -538,6 +614,40 @@ class TriggerFrameCapture:
             )
         return extra
 
+    def _verdict_deadline_seconds(self) -> float:
+        """How long an outstanding frame may stay undecided before it is lost.
+
+        Deliberately generous: every burst ahead of this one in the bounded
+        queue may spend the whole decision timeout, and an open holds the
+        relay for its pulse on top of that.
+        """
+        return max(
+            self.config.decision_timeout_seconds * VERDICT_QUEUE_DEPTH
+            + RELAY_PULSE_ALLOWANCE_SECONDS,
+            self.config.presence_spacing_seconds * 2,
+        )
+
+    def _abandon_verdict(self, pending: int, *, warned: bool) -> None:
+        """Write off verdicts that never arrived so the session can continue.
+
+        note_dropped() should have accounted for every lost frame already, so
+        this line means a frame vanished somewhere that does not report back.
+        Only the outstanding set is reset: the paths stay, so a verdict that
+        does arrive late still settles the session (an open must never be
+        thrown away) without counting against whatever is pending by then.
+        Warned once per session; the write-off itself happens every time.
+        """
+        with self._session_lock:
+            self._lost_verdicts += self._session_pending
+            self._session_pending_paths.clear()
+            self._session_pending = 0
+            self._session_pending_since = None
+        if not warned:
+            LOGGER.warning(
+                "gate_presence stage=verdict_overdue pending=%d waited_seconds=%.1f",
+                pending, self._verdict_deadline_seconds(),
+            )
+
     def capture_series(self, event, scheduled_at, stop_event) -> int:
         """Take a short bounded series: with hot keyframes the frame decoded
         moments before the alarm goes first, immediately; the rest wait for
@@ -547,7 +657,9 @@ class TriggerFrameCapture:
         slots = self.config.capture_count
         with self._session_lock:
             self._session_paths.clear()
+            self._session_pending_paths.clear()
             self._session_pending = 0
+            self._session_pending_since = None
             self._session_settled = None
             self._session_changed.clear()
         self._start_live_session()
@@ -640,13 +752,21 @@ class TriggerFrameCapture:
             return ()
         with self._session_lock:
             self._session_paths.add(path)
+            self._session_pending_paths.add(path)
             self._session_pending += 1
+            if self._session_pending_since is None:
+                # The overdue guard is timed from the oldest frame still
+                # outstanding, not from the presence loop first noticing it.
+                self._session_pending_since = self._clock()
         try:
             inject((path,), captured_at, trigger)
         except Exception:
             with self._session_lock:
                 self._session_paths.discard(path)
+                self._session_pending_paths.discard(path)
                 self._session_pending = max(0, self._session_pending - 1)
+                if self._session_pending == 0:
+                    self._session_pending_since = None
             path.unlink(missing_ok=True)
             raise
         self._capture_count += 1
@@ -739,6 +859,8 @@ class TriggerFrameCapture:
                 "max_frames": self.config.presence_max_frames,
                 "retries": self._presence_retries,
                 "unresolved": self._unresolved_sessions,
+                "dropped_frames": self._dropped_frames,
+                "lost_verdicts": self._lost_verdicts,
             },
             "skipped": {
                 "empty_scene": self._skipped_empty,
@@ -873,6 +995,17 @@ def _integer(value, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not minimum <= parsed <= maximum:
         raise ValueError("trigger capture integer configuration is outside the safe range")
     return parsed
+
+
+def _clamped(value, minimum: float, maximum: float, default: float) -> float:
+    """Read a number owned by another component: never raise, always bound."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed:  # NaN
+        return default
+    return min(max(parsed, minimum), maximum)
 
 
 def _number(value, minimum: float, maximum: float) -> float:
