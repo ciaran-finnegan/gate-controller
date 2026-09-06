@@ -409,7 +409,10 @@ class TriggerFrameCapture:
         self._last_stillness: float | None = None
         # Presence-session bookkeeping, shared with the worker's result hook.
         self._session_lock = Lock()
+        # Every frame injected this session, kept so a late verdict can still
+        # settle it, and the subset still counted as outstanding.
         self._session_paths: set[Path] = set()
+        self._session_pending_paths: set[Path] = set()
         self._session_pending = 0
         self._session_pending_since: float | None = None
         self._session_settled: str | None = None
@@ -494,11 +497,16 @@ class TriggerFrameCapture:
             matched = [Path(path) for path in paths if Path(path) in self._session_paths]
             if not matched:
                 return False
+            outstanding = [path for path in matched if path in self._session_pending_paths]
             for path in matched:
                 self._session_paths.discard(path)
-            self._session_pending = max(0, self._session_pending - 1)
-            if self._session_pending == 0:
-                self._session_pending_since = None
+                self._session_pending_paths.discard(path)
+            if outstanding:
+                # A verdict for a frame already written off still settles the
+                # session, but must not count against the frame now pending.
+                self._session_pending = max(0, self._session_pending - 1)
+                if self._session_pending == 0:
+                    self._session_pending_since = None
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
@@ -624,16 +632,16 @@ class TriggerFrameCapture:
 
         note_dropped() should have accounted for every lost frame already, so
         this line means a frame vanished somewhere that does not report back.
-        Only the pending count is reset: the paths stay, so a verdict that
+        Only the outstanding set is reset: the paths stay, so a verdict that
         does arrive late still settles the session (an open must never be
-        thrown away). The cost is that a late verdict also decrements a newer
-        frame's count, which at worst offers one more frame early.
+        thrown away) without counting against whatever is pending by then.
         Warned once per session; the write-off itself happens every time.
         """
         with self._session_lock:
+            self._lost_verdicts += self._session_pending
+            self._session_pending_paths.clear()
             self._session_pending = 0
             self._session_pending_since = None
-            self._lost_verdicts += 1
         if not warned:
             LOGGER.warning(
                 "gate_presence stage=verdict_overdue pending=%d waited_seconds=%.1f",
@@ -649,6 +657,7 @@ class TriggerFrameCapture:
         slots = self.config.capture_count
         with self._session_lock:
             self._session_paths.clear()
+            self._session_pending_paths.clear()
             self._session_pending = 0
             self._session_pending_since = None
             self._session_settled = None
@@ -743,16 +752,18 @@ class TriggerFrameCapture:
             return ()
         with self._session_lock:
             self._session_paths.add(path)
+            self._session_pending_paths.add(path)
             self._session_pending += 1
-            # The overdue guard is timed from here, not from the presence loop
-            # first noticing, so a frame injected during the series counts its
-            # whole wait.
-            self._session_pending_since = self._clock()
+            if self._session_pending_since is None:
+                # The overdue guard is timed from the oldest frame still
+                # outstanding, not from the presence loop first noticing it.
+                self._session_pending_since = self._clock()
         try:
             inject((path,), captured_at, trigger)
         except Exception:
             with self._session_lock:
                 self._session_paths.discard(path)
+                self._session_pending_paths.discard(path)
                 self._session_pending = max(0, self._session_pending - 1)
                 if self._session_pending == 0:
                     self._session_pending_since = None

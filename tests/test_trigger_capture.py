@@ -637,6 +637,47 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertIn("outcome=presence_ended reason=opened", combined)
         self.assertNotIn("stage=unresolved", combined)
 
+    def test_a_late_retryable_verdict_does_not_release_the_frame_now_pending(self):
+        clock = [100.0]
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=1, delay_seconds=0, presence_spacing_seconds=0.5,
+            presence_max_frames=3, presence_window_seconds=600.0,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(4)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: clock[0])
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            if len(self.injected) == 2:
+                # The written-off first frame is decided at last, with a
+                # reason that leaves the session open. It settles nothing and
+                # must not be counted against the frame just injected.
+                capture.note_result(self.injected[0], ProcessingResult(False, "ocr_error"))
+
+        capture.attach(inject)
+
+        class Stop:
+            def __init__(self):
+                self.polls = 0
+
+            def is_set(self):
+                self.polls += 1
+                if self.polls <= 5:
+                    clock[0] += 5.0  # enough for the guard to fire once
+                return self.polls > 8
+
+            def wait(self, seconds):
+                clock[0] += seconds
+                return False
+
+        capture.capture_series(event(), 100.0, Stop())
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, Stop())
+
+        self.assertEqual(extra, 1, "the second frame is still awaiting its own verdict")
+        self.assertIn("outcome=presence_ended reason=stopping", "\n".join(logs.output))
+
     def test_presence_session_can_be_disabled_and_ignores_foreign_results(self):
         clock = [100.0]
         capture, popen = self._presence_capture(3, clock=clock, max_frames=0, verdict=lambda n: None)
