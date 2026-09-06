@@ -1,4 +1,5 @@
 import io
+import io
 import tempfile
 import unittest
 from math import inf, nan
@@ -862,3 +863,43 @@ class OcrPacingAndRetryTests(unittest.TestCase):
 
         client.close()
         self.assertFalse(client.prewarm(), "a closed client does not prewarm")
+
+    def test_every_uploaded_frame_and_answer_reaches_the_corpus_and_a_broken_corpus_is_harmless(self):
+        from gate_controller.ocr import PlateRecognizerClient
+        recorded = []
+
+        class Corpus:
+            def record(self, image, **kwargs):
+                recorded.append((image, kwargs))
+
+        from PIL import Image
+        Image.new("RGB", (3840, 2160), color="blue").save(self.path, format="JPEG")
+        payload = {"results": [{"plate": "12D3456", "score": 0.93, "box": {"xmin": 1, "ymin": 1, "xmax": 5, "ymax": 3}}]}
+        client = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(payload=payload)),
+            max_upload_width=1920, corpus=Corpus(),
+        )
+        observation = client.recognise(self.path)
+        self.assertEqual(observation.plate, "12D3456")
+        image, kwargs = recorded[0]
+        with Image.open(io.BytesIO(image)) as uploaded:
+            self.assertEqual(uploaded.size, (1920, 1080), "the exact downscaled upload is what is kept")
+        self.assertEqual(kwargs["payload"], payload)
+        self.assertEqual(kwargs["source"], "plate_recognizer")
+        self.assertEqual(kwargs["geometry"].upload_width, 1920)
+        self.assertEqual(kwargs["extra"], {"precropped": False})
+
+        empty = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(payload={"results": []})), corpus=Corpus(),
+        )
+        self.assertIsNone(empty.recognise(self.path).plate)
+        self.assertEqual(len(recorded), 2, "no-plate answers are training data too")
+
+        class Broken:
+            def record(self, *args, **kwargs):
+                raise RuntimeError("disk full")
+
+        resilient = PlateRecognizerClient(
+            "token", session=FakeSession(response=FakeResponse(payload=payload)), corpus=Broken(),
+        )
+        self.assertEqual(resilient.recognise(self.path).plate, "12D3456")

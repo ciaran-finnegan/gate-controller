@@ -160,6 +160,21 @@ of the whole frame, so the region can be chosen and later tightened from
 where plates were actually read rather than guessed. Frames written by the
 capture directory are never cropped twice.
 
+### Training Corpus
+
+Set `GATE_TRAINING_CORPUS_DIR` (an absolute path under the controller's
+state directory, for example `/var/lib/gate-controller/training-corpus`) and
+the controller keeps every frame it uploads to Plate Recognizer, exactly as
+uploaded (cropped and downscaled), beside a JSON sidecar carrying the
+answer: plate, score, detection score, box, candidates, region and vehicle
+fields, plus the crop geometry so boxes map back to the camera frame. Empty
+answers are kept too. The directory is owner-only and bounded by
+`GATE_TRAINING_CORPUS_MAX_BYTES` (1 GiB by default); the oldest pairs go
+first. Writing never delays or fails recognition. This is the raw material
+for the local recogniser (issue #43): Plate Recognizer's answer is a
+pseudo-label to be confirmed against the gate decision and manual review,
+not truth.
+
 ### Compressed Clear Stream
 
 By default (`GATE_CLEAR_STREAM_MODE=compressed`) the controller no longer

@@ -117,6 +117,9 @@ read the plate (`GATE_PRESENCE_WINDOW_SECONDS`, `GATE_PRESENCE_SPACING_SECONDS`,
 `GATE_PRESENCE_MAX_FRAMES`), stops the moment the gate opens or a plate is read,
 waits for a busy OCR slot instead of discarding a frame, and retries a connect
 timeout once. The RLC-810A document describes the session and its journal lines.
+`GATE_TRAINING_CORPUS_DIR` keeps every uploaded frame and OCR answer on the Pi
+(bounded by `GATE_TRAINING_CORPUS_MAX_BYTES`) as training data for a local
+recogniser.
 The clear stream is held compressed while idle and decoded only for events
 (`GATE_CLEAR_STREAM_MODE`, `GATE_SESSION_FPS`, `GATE_SESSION_SECONDS`); each
 capture takes the stillest frame of the last second of the live session.
