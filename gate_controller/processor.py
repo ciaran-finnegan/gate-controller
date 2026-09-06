@@ -26,7 +26,12 @@ from .telemetry import (
 
 MAX_OCR_FRAMES = 3
 DEFAULT_ACTIVATION_GUARD_SECONDS = 0.1
-OCR_CONNECT_TIMEOUT_SECONDS = 1.0
+# The connect budget also bounds the TLS handshake (urllib3 keeps the connect
+# timeout on the socket until the request is sent). Over the gate's uplink a
+# fresh handshake to the OCR service completes 0.5-0.8 s after the dial
+# starts; 1.0 s failed under jitter as connection_error/TimeoutError on
+# 2026-09-06, and a third of a short remaining deadline failed every time.
+OCR_CONNECT_TIMEOUT_SECONDS = 2.5
 OCR_READ_TIMEOUT_SECONDS = 2.0
 # The first frame is the full-resolution capture and fallback frames are often
 # unavailable, so the opening attempt may spend more of the decision budget
@@ -421,9 +426,12 @@ class GateProcessor:
         operation = lambda: self._recognise_call(path)
         if not self._recognizer_accepts_timeout:
             return self._run_ocr_bounded(operation, deadline, on_start)
+        # Give the dial and handshake half of what is left, bounded above:
+        # a request that cannot even connect in that time will not finish
+        # reading in the rest either.
         connect = min(
             OCR_CONNECT_TIMEOUT_SECONDS,
-            max(MIN_OCR_TIMEOUT_SECONDS, remaining / 3),
+            max(MIN_OCR_TIMEOUT_SECONDS, remaining / 2),
         )
         read_cap = (
             OCR_FIRST_ATTEMPT_READ_TIMEOUT_SECONDS if first_attempt
