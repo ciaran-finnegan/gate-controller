@@ -130,6 +130,22 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
+    def test_the_verdict_guard_follows_the_processor_decision_timeout(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.decision_timeout_seconds, 4.0)
+        tuned = load_trigger_capture_config(
+            {"GATE_DECISION_TIMEOUT_SECONDS": "6"}, Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual(tuned.decision_timeout_seconds, 6.0)
+        # The processor owns this setting: anything it tolerates is clamped
+        # here rather than stopping capture from starting at all.
+        for value, expected in (("900", 30.0), ("0", 0.5), ("soon", 4.0)):
+            with self.subTest(value=value):
+                clamped = load_trigger_capture_config(
+                    {"GATE_DECISION_TIMEOUT_SECONDS": value}, Path("/u"), webhook_enabled=True,
+                )
+                self.assertEqual(clamped.decision_timeout_seconds, expected)
+
     def test_frame_gates_default_to_empty_scene_only_and_are_bounded(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
         self.assertEqual(config.empty_scene_threshold, 0.03)
@@ -519,6 +535,73 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
             self.assertEqual(capture.presence_session(event(), 300.0, self._Stop(clock)), 0)
         self.assertIn("presence_ended reason=new_event", "\n".join(logs.output))
+
+    def test_a_session_frame_coalesced_out_of_the_queue_does_not_stall_the_window(self):
+        # The frame was pushed out of the bounded burst queue by an FTP upload
+        # landing at the same moment, so no verdict was ever produced for it.
+        # Before note_dropped() the session waited out the whole window on a
+        # pending count that could never come down, with the car at the gate.
+        clock = [100.0]
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=1, delay_seconds=0, presence_spacing_seconds=0.5,
+            presence_max_frames=2,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(3)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: clock[0])
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            if len(self.injected) == 2:
+                capture.note_dropped(paths, "queue_coalesced")
+            else:
+                capture.note_result(paths, ProcessingResult(False, "ocr_error"))
+
+        capture.attach(inject)
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(extra, 2, "the dropped frame must not end the session")
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_presence stage=frame_dropped reason=queue_coalesced", combined)
+        self.assertIn("outcome=presence_retry frame=2", combined)
+        self.assertIn("outcome=presence_ended reason=budget", combined)
+        self.assertNotIn("stage=verdict_overdue", combined, "no waiting on the lost frame")
+        self.assertEqual(capture.status()["presence"]["dropped_frames"], 1)
+
+    def test_a_verdict_that_never_arrives_is_written_off_once_and_warned_about(self):
+        clock = [100.0]
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=1, delay_seconds=0, presence_spacing_seconds=0.5,
+            presence_max_frames=2, presence_window_seconds=60.0,
+        )
+        popen = FakePopen([FakeProcess(output=jpeg()) for _ in range(3)])
+        capture = TriggerFrameCapture(config, popen=popen, clock=lambda: clock[0])
+        # No frame is ever decided and nothing reports the loss either.
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+
+        class TickingStop(self._Stop):
+            def is_set(self):
+                clock[0] += 5.0  # each poll of the pending verdict ages the clock
+                return False
+
+        capture.capture_series(event(), 100.0, TickingStop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, TickingStop(clock))
+
+        # The default 4 s decision timeout plus the margin is 9 s; the loop
+        # gives up on that verdict and keeps the session going.
+        self.assertEqual(extra, 2)
+        combined = "\n".join(logs.output)
+        self.assertIn(
+            "WARNING:gate_controller.trigger_capture:"
+            "gate_presence stage=verdict_overdue pending=1", combined,
+        )
+        self.assertEqual(combined.count("stage=verdict_overdue"), 1, "warned once per session")
+        self.assertGreaterEqual(capture.status()["presence"]["lost_verdicts"], 1)
 
     def test_presence_session_can_be_disabled_and_ignores_foreign_results(self):
         clock = [100.0]

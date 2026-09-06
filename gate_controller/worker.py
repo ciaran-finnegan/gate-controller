@@ -39,7 +39,13 @@ class BurstIdentity:
 
 
 class BoundedBurstQueue:
-    """A one-consumer queue that keeps the freshest pending camera work."""
+    """A one-consumer queue that keeps the freshest pending camera work.
+
+    A full queue coalesces the oldest burst away, except that a
+    webhook-triggered frame is given up only when there is nothing else to
+    give up: a presence session holds one frame outstanding at a time, and an
+    FTP upload landing in the same second must not push it out.
+    """
 
     def __init__(self, max_pending: int = 2):
         if max_pending <= 0:
@@ -52,14 +58,29 @@ class BoundedBurstQueue:
         with self._lock:
             if self._stopping:
                 return item
-            dropped = None
-            if self._queue.full():
-                try:
-                    dropped = self._queue.get_nowait()
-                except Empty:
-                    pass
+            dropped = self._coalesce() if self._queue.full() else None
             self._queue.put_nowait(item)
             return dropped
+
+    def _coalesce(self):
+        """Remove the oldest untriggered burst, or the oldest burst of all."""
+        held = []
+        while True:
+            try:
+                held.append(self._queue.get_nowait())
+            except Empty:
+                break
+        if not held:
+            return None
+        index = next(
+            (position for position, candidate in enumerate(held)
+             if not _is_triggered(candidate)),
+            0,
+        )
+        dropped = held.pop(index)
+        for candidate in held:
+            self._queue.put_nowait(candidate)
+        return dropped
 
     def get(self):
         return self._queue.get()
@@ -77,6 +98,12 @@ class BoundedBurstQueue:
                     break
             self._queue.put_nowait(None)
             return tuple(dropped)
+
+
+def _is_triggered(item) -> bool:
+    """True for a burst injected by webhook capture: it carries its trigger."""
+    identity = item[-1] if item else None
+    return isinstance(identity, BurstIdentity) and identity.trigger is not None
 
 
 class BurstCollector:
@@ -424,6 +451,21 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             if _provided is not None:
                 _provided(paths, result)
 
+    note_dropped = getattr(trigger_capture, "note_dropped", None)
+
+    def report_lost(paths, reason):
+        """Tell the capture a frame of its own never reached a decision.
+
+        Every path that leaves the pipeline without a result comes through
+        here, so a presence session's pending count can never stick.
+        """
+        if not callable(note_dropped):
+            return
+        try:
+            note_dropped(paths, reason)
+        except Exception:
+            LOGGER.exception("gate_burst_drop_handler_failed")
+
     def report_dropped(item, reason):
         paths, received_at, *timing = item
         identity = timing.pop() if timing and isinstance(timing[-1], BurstIdentity) else None
@@ -451,6 +493,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             try:
                 report_dropped(dropped, "queue_coalesced")
             finally:
+                report_lost(dropped[0], "queue_coalesced")
                 _remove_uploads(dropped[0])
 
     def inject_trigger_burst(paths, received_at, trigger):
@@ -496,7 +539,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     processing_args = (
         bursts, emit, on_error,
         lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
-        trigger_resolver, on_result,
+        trigger_resolver, on_result, report_lost,
     )
     processing_thread = Thread(
         target=_supervise_worker,
@@ -556,6 +599,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                 try:
                     report_dropped(dropped, "service_stopping")
                 finally:
+                    report_lost(dropped[0], "service_stopping")
                     _remove_uploads(dropped[0])
             processing_thread.join()
         try:
@@ -584,6 +628,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
 def _process_bursts(
     bursts, emit, on_error=None, ranker=None, trigger_resolver=None, on_result=None,
+    on_dropped=None,
 ) -> None:
     ranker = ranker or rank_images
     while True:
@@ -611,6 +656,10 @@ def _process_bursts(
             _report_processing_error(
                 on_error, paths, error, received_at, trigger_summary,
             )
+            # No result exists, so the frame is lost as far as its capture is
+            # concerned; say so instead of leaving it pending.
+            if on_dropped is not None:
+                on_dropped(paths, "processing_error")
         else:
             if on_result is not None:
                 try:

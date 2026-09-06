@@ -340,6 +340,116 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(noted, [((frame,), verdict)])
         self.assertEqual(seen_by_hook, [verdict])
 
+    def test_a_coalesced_trigger_frame_is_reported_back_to_its_capture(self):
+        received_at = datetime(2026, 9, 6, 22, 16, tzinfo=timezone.utc)
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=10,
+        )
+        dropped = []
+        processing = ThreadEvent()
+        release = ThreadEvent()
+
+        class Capture:
+            output_directory = None
+
+            def attach(self, inject):
+                self.inject = inject
+
+            def note_result(self, paths, result):
+                pass
+
+            def note_dropped(self, paths, reason):
+                dropped.append((tuple(paths), reason))
+
+        capture = Capture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture.output_directory = root / ".trigger-capture"
+            capture.output_directory.mkdir(mode=0o700)
+            frames = []
+            for index in range(3):
+                frame = capture.output_directory / f"frame-{index}.jpg"
+                frame.write_bytes(b"\xff\xd8\xff" + bytes([index]) + b"\xd9")
+                frames.append(frame)
+
+            def emit(paths, *args, **kwargs):
+                processing.set()
+                release.wait(timeout=5)
+                return ProcessingResult(False, "ocr_error")
+
+            class OneShotWorker:
+                def run_forever(self, stop_event):
+                    capture.inject((frames[0],), received_at, trigger)
+                    # Once the first frame is being decided the queue is empty
+                    # again, so the third injection coalesces the second away.
+                    processing.wait(timeout=5)
+                    capture.inject((frames[1],), received_at, trigger)
+                    capture.inject((frames[2],), received_at, trigger)
+                    release.set()
+                    stop_event.set()
+
+            run_worker(
+                root, emit, quiet_window=0.1, poll_interval=0.01,
+                background_workers=(OneShotWorker(),),
+                max_pending_bursts=1,
+                trigger_capture=capture,
+            )
+
+            self.assertIn(((frames[1],), "queue_coalesced"), dropped)
+            self.assertFalse(frames[1].exists())
+
+    def test_a_failed_burst_is_reported_as_dropped_so_its_session_continues(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        received_at = datetime(2026, 9, 6, 22, 16, tzinfo=timezone.utc)
+        paths = (Path("frame.jpg"),)
+        dropped = []
+        queue.put((paths, received_at))
+        queue.put(None)
+
+        _process_bursts(
+            queue,
+            lambda *_: (_ for _ in ()).throw(RuntimeError("processor failed")),
+            lambda *_args: None,
+            on_dropped=lambda lost, reason: dropped.append((lost, reason)),
+        )
+
+        self.assertEqual(dropped, [(paths, "processing_error")])
+
+    def test_a_full_queue_coalesces_an_ftp_burst_before_a_triggered_frame(self):
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=10,
+        )
+        queue = BoundedBurstQueue(max_pending=2)
+        triggered = ((Path("clear.jpg"),), None, BurstIdentity("digest-1", trigger))
+        upload = ((Path("upload-1.jpg"),), None, BurstIdentity("digest-2"))
+        newer = ((Path("upload-2.jpg"),), None, BurstIdentity("digest-3"))
+
+        queue.put(triggered)
+        queue.put(upload)
+
+        self.assertEqual(queue.put(newer), upload)
+        self.assertEqual(queue.get(), triggered)
+        self.assertEqual(queue.get(), newer)
+
+    def test_a_queue_of_triggered_frames_still_coalesces_the_oldest(self):
+        trigger = TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched", delta_ms=10,
+        )
+        queue = BoundedBurstQueue(max_pending=2)
+        first = ((Path("clear-1.jpg"),), None, BurstIdentity("digest-1", trigger))
+        second = ((Path("clear-2.jpg"),), None, BurstIdentity("digest-2", trigger))
+        third = ((Path("clear-3.jpg"),), None, BurstIdentity("digest-3", trigger))
+
+        queue.put(first)
+        queue.put(second)
+
+        self.assertEqual(queue.put(third), first)
+        self.assertEqual(queue.get(), second)
+        self.assertEqual(queue.get(), third)
+
     def test_failed_recognition_reports_the_same_sanitized_trigger(self):
         received_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
         failures = []
