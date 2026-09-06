@@ -160,6 +160,29 @@ of the whole frame, so the region can be chosen and later tightened from
 where plates were actually read rather than guessed. Frames written by the
 capture directory are never cropped twice.
 
+### Compressed Clear Stream
+
+By default (`GATE_CLEAR_STREAM_MODE=compressed`) the controller no longer
+decodes the clear stream while idle. ffmpeg copies the stream's packets,
+undecoded, into a memory ring of the last few seconds (about 5% of a core and
+a few megabytes), and a small parser groups them by keyframe. When a camera
+event arrives, the newest buffered keyframe is decoded on demand (about half
+a second including ffmpeg start-up, still well ahead of a fresh RTSP grab,
+which waits for the next keyframe) and a live session decoder starts at
+`GATE_SESSION_FPS` (5) for up to `GATE_SESSION_SECONDS` (45). Measured with
+hardware decode, crop and scale: a 5 fps session costs about 60% of one core
+while it runs; 10 fps about 116%, so 5 is the default.
+
+While a session runs, each capture slot takes the *stillest* frame of the
+last second, the one that differs least from its predecessor, rather than
+whatever frame a fixed offset lands on. A stopped car produces a run of
+near-identical frames; a moving one does not. The journal records it as
+`source=session stillness=…` (mean thumbnail difference to the previous
+frame, 0..1). The session stops when the presence session ends. The scene
+baseline is refreshed from one on-demand keyframe decode every 30 s while
+idle. `GATE_CLEAR_STREAM_MODE=decoded` restores the continuously decoding
+keyframe ring.
+
 ### Presence Session
 
 A vehicle that triggered the camera is still sitting at the gate after the

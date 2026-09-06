@@ -143,6 +143,18 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
+    def test_clear_stream_defaults_to_compressed_and_validates_session_settings(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual((config.clear_stream_mode, config.session_fps, config.session_seconds), ("compressed", 5.0, 45.0))
+        decoded = load_trigger_capture_config(
+            {"GATE_CLEAR_STREAM_MODE": "decoded", "GATE_SESSION_FPS": "2", "GATE_SESSION_SECONDS": "30"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual((decoded.clear_stream_mode, decoded.session_fps, decoded.session_seconds), ("decoded", 2.0, 30.0))
+        for environment in ({"GATE_CLEAR_STREAM_MODE": "raw"}, {"GATE_SESSION_FPS": "30"}, {"GATE_SESSION_SECONDS": "1"}):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
+
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
         config = load_trigger_capture_config(
             {}, Path("/var/lib/gate-controller"), webhook_enabled=True,
@@ -613,6 +625,49 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertNotIn("stage=unresolved", "\n".join(logs.output))
         self.assertEqual(capture.status()["presence"]["unresolved"], 0)
 
+    def test_a_live_session_is_started_for_the_series_and_its_stillest_frame_is_captured(self):
+        clock = [100.0]
+
+        class LiveSource:
+            def __init__(self):
+                self.started = 0
+                self.stopped = []
+                self.served = 0
+
+            def start_session(self):
+                self.started += 1
+                return True
+
+            def stop_session(self, reason):
+                self.stopped.append(reason)
+
+            def stillest(self, *, after=None, window_seconds=1.0):
+                self.served += 1
+                return jpeg(), 100.0 + self.served, 0.004
+
+            def latest(self, *, after=None):
+                raise AssertionError("stillest must be preferred while a session is live")
+
+        source = LiveSource()
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            capture_count=2, delay_seconds=0, spacing_seconds=0.5, presence_max_frames=0,
+        )
+        capture = TriggerFrameCapture(config, popen=FakePopen([]), frame_source=source, clock=lambda: clock[0])
+        capture.attach(lambda paths, received_at, trigger: (
+            self.injected.append(paths), capture.note_result(paths, ProcessingResult(False, "ocr_error"))
+        ))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.capture_series(event(), 100.0, self._Stop(clock)), 2)
+            capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(source.started, 1)
+        self.assertEqual(len(source.stopped), 1, "the live session stops when the presence session ends")
+        combined = "\n".join(logs.output)
+        self.assertIn("source=session", combined)
+        self.assertIn("stillness=0.004", combined)
+
     def test_run_forever_drains_scheduled_events_and_unlinks_when_unattached(self):
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
@@ -785,7 +840,7 @@ class HotKeyframeCaptureTests(unittest.TestCase):
             "-hwaccel_output_format", "drm_prime",
         ))
         self.assertLess(hw, ring.index("-i"), "decoder selection must precede the input")
-        self.assertEqual(ring[ring.index("-vf") + 1], "hwdownload,format=nv12,fps=1,scale=w='min(iw,1920)':h=-2")
+        self.assertEqual(ring[ring.index("-vf") + 1], "fps=1,hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2")
         self.assertEqual(ClearKeyframeBuffer(config).status()["decode"],
                          {"hwaccel": "drm", "frame_width": 1920, "plate_region": "full"})
 
@@ -817,7 +872,7 @@ class HotKeyframeCaptureTests(unittest.TestCase):
 
         ring = ClearKeyframeBuffer(config).command
         self.assertEqual(ring[ring.index("-vf") + 1], (
-            "hwdownload,format=nv12,fps=1,"
+            "fps=1,hwdownload,format=nv12,"
             "crop=trunc(iw*0.9000/2)*2:trunc(ih*0.6000/2)*2:trunc(iw*0.0500/2)*2:trunc(ih*0.4000/2)*2,"
             "scale=w='min(iw,1920)':h=-2"
         ))

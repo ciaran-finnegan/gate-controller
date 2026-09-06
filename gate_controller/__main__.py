@@ -102,11 +102,7 @@ def main() -> None:
         os.environ, Path(arguments.database).resolve().parent,
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
-    clear_keyframes = (
-        ClearKeyframeBuffer(trigger_capture_config)
-        if trigger_capture_config.enabled and trigger_capture_config.hot_keyframes
-        else None
-    )
+    clear_keyframes = _clear_stream_source(trigger_capture_config)
     trigger_capture = (
         TriggerFrameCapture(trigger_capture_config, frame_source=clear_keyframes)
         if trigger_capture_config.enabled else None
@@ -203,6 +199,29 @@ def main() -> None:
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
     )
+
+
+def _clear_stream_source(config):
+    """The clear-stream frame source for webhook capture, or None when off.
+
+    "compressed" (default) records packets and decodes only for events;
+    "decoded" keeps the older continuously decoding keyframe ring.
+    """
+    if not (config.enabled and config.hot_keyframes):
+        return None
+    if config.clear_stream_mode == "decoded":
+        return ClearKeyframeBuffer(config)
+    from .clear_stream_source import ClearStreamSource
+    from .trigger_capture import decoder_filters, decoder_input_arguments
+    return ClearStreamSource(
+        config.source_url,
+        decoder_arguments=decoder_input_arguments(config),
+        filters=decoder_filters(config, sample=False),
+        max_frame_bytes=config.max_frame_bytes,
+        session_fps=config.session_fps,
+        session_seconds=config.session_seconds,
+    )
+
 
 
 def _camera_event_handler(trigger_capture, recognizer):

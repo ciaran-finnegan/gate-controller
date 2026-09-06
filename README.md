@@ -117,6 +117,9 @@ read the plate (`GATE_PRESENCE_WINDOW_SECONDS`, `GATE_PRESENCE_SPACING_SECONDS`,
 `GATE_PRESENCE_MAX_FRAMES`), stops the moment the gate opens or a plate is read,
 waits for a busy OCR slot instead of discarding a frame, and retries a connect
 timeout once. The RLC-810A document describes the session and its journal lines.
+The clear stream is held compressed while idle and decoded only for events
+(`GATE_CLEAR_STREAM_MODE`, `GATE_SESSION_FPS`, `GATE_SESSION_SECONDS`); each
+capture takes the stillest frame of the last second of the live session.
 Frames that show an empty drive are never sent to OCR (`GATE_EMPTY_SCENE_THRESHOLD`),
 blazed frames can be skipped once a limit is chosen (`GATE_MAX_HIGHLIGHT_CLIPPING`),
 and a vehicle that was present without the gate opening is journaled as

@@ -49,6 +49,11 @@ SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
 KEYFRAME_MAX_AGE_SECONDS = 1.6
+# How the clear stream is held while idle: "compressed" keeps packets and
+# decodes on demand; "decoded" is the older continuously decoding ring.
+CLEAR_STREAM_MODES = frozenset({"compressed", "decoded"})
+MIN_SESSION_FPS, MAX_SESSION_FPS = 1.0, 10.0
+MIN_SESSION_SECONDS, MAX_SESSION_SECONDS = 5.0, 300.0
 # Presence session: after the series, keep offering fresh frames while the
 # vehicle is still at the gate and nothing has read its plate yet.
 MAX_PRESENCE_WINDOW_SECONDS = 120.0
@@ -108,6 +113,12 @@ class TriggerCaptureConfig:
     presence_window_seconds: float = 20.0
     presence_spacing_seconds: float = 3.0
     presence_max_frames: int = 4
+    # Hold the clear stream compressed and decode only for events (the
+    # default), or keep the older continuously decoded keyframe ring.
+    clear_stream_mode: str = "compressed"
+    # Live decode rate and length of the per-event session in compressed mode.
+    session_fps: float = 5.0
+    session_seconds: float = 45.0
     # Skip frames that barely differ from the idle scene (no vehicle in the
     # plate band yet, or it has left). 0 disables the check.
     empty_scene_threshold: float = DEFAULT_EMPTY_SCENE_THRESHOLD
@@ -184,6 +195,13 @@ def load_trigger_capture_config(
         0.0, MAX_EMPTY_SCENE_THRESHOLD,
     )
     max_clipping = _number(environment.get("GATE_MAX_HIGHLIGHT_CLIPPING", "0"), 0.0, 1.0)
+    clear_stream_mode = str(environment.get("GATE_CLEAR_STREAM_MODE", "compressed")).strip().lower()
+    if clear_stream_mode not in CLEAR_STREAM_MODES:
+        raise ValueError("GATE_CLEAR_STREAM_MODE must be 'compressed' or 'decoded'")
+    session_fps = _number(environment.get("GATE_SESSION_FPS", "5"), MIN_SESSION_FPS, MAX_SESSION_FPS)
+    session_seconds = _number(
+        environment.get("GATE_SESSION_SECONDS", "45"), MIN_SESSION_SECONDS, MAX_SESSION_SECONDS,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -203,6 +221,9 @@ def load_trigger_capture_config(
         presence_max_frames=presence_frames,
         empty_scene_threshold=empty_scene,
         max_highlight_clipping=max_clipping,
+        clear_stream_mode=clear_stream_mode,
+        session_fps=session_fps,
+        session_seconds=session_seconds,
     )
 
 
@@ -224,10 +245,12 @@ def decoder_filters(config: TriggerCaptureConfig, *, sample: bool) -> tuple[str,
     only ever shrinks (``min(iw, width)``), so a narrow crop is not blown up.
     """
     filters = []
+    if sample:
+        # Before the hardware download: a dropped keyframe must not cost the
+        # 4K copy out of the decoder.
+        filters.append("fps=1")
     if config.hwaccel == "drm":
         filters.extend(["hwdownload", "format=nv12"])
-    if sample:
-        filters.append("fps=1")
     if config.plate_region is not None:
         filters.append(config.plate_region.ffmpeg_crop_filter())
     if config.frame_width > 0:
@@ -336,6 +359,8 @@ class TriggerFrameCapture:
         self._skipped_clipped = 0
         self._unresolved_sessions = 0
         self._last_skip: str | None = None
+        self._live_session = False
+        self._last_stillness: float | None = None
         # Presence-session bookkeeping, shared with the worker's result hook.
         self._session_lock = Lock()
         self._session_paths: set[Path] = set()
@@ -445,6 +470,7 @@ class TriggerFrameCapture:
         """
         config = self.config
         if config.presence_max_frames <= 0 or config.presence_window_seconds <= 0:
+            self._stop_live_session("presence_disabled")
             return 0
         deadline = scheduled_at + config.presence_window_seconds
         extra = 0
@@ -495,6 +521,7 @@ class TriggerFrameCapture:
             "gate_trigger_capture outcome=presence_ended reason=%s extra_frames=%d",
             reason, extra,
         )
+        self._stop_live_session(reason)
         if reason in ("window", "budget", "departed"):
             # A vehicle was here and nothing read its plate: the one line an
             # operator should be looking for when the gate did not open.
@@ -517,6 +544,7 @@ class TriggerFrameCapture:
             self._session_pending = 0
             self._session_settled = None
             self._session_changed.clear()
+        self._start_live_session()
         if self._frame_source is not None:
             after, count = self._capture_slot(event, scheduled_at, after=after)
             injected += count
@@ -618,11 +646,12 @@ class TriggerFrameCapture:
         self._capture_count += 1
         LOGGER.info(
             "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
-            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s",
+            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s stillness=%s",
             event.event_type, round((self._clock() - started) * 1000),
             source, max(0, round((self._clock() - frame_captured_at) * 1000)),
             "unavailable" if scene_difference is None else f"{scene_difference:.3f}",
             "unavailable" if clipping is None else f"{clipping:.2f}",
+            "unavailable" if self._last_stillness is None else f"{self._last_stillness:.3f}",
         )
         return (path,)
 
@@ -644,18 +673,50 @@ class TriggerFrameCapture:
             return None
 
     def _acquire(self, after: float | None) -> tuple[bytes | None, str, float | None]:
-        """Prefer a fresh buffered keyframe; otherwise grab from the stream."""
+        """Prefer the stillest live frame, then a buffered keyframe, then a grab."""
         if self._frame_source is not None:
+            stillest = getattr(self._frame_source, "stillest", None)
+            if callable(stillest) and self._live_session:
+                try:
+                    picked = stillest(after=after)
+                except Exception:
+                    picked = None
+                if picked is not None:
+                    frame, captured_at, stillness = picked
+                    self._last_stillness = stillness
+                    return frame, "session", captured_at
             try:
                 latest = self._frame_source.latest(after=after)
             except Exception:
                 latest = None
             if latest is not None:
                 frame, captured_at = latest
+                self._last_stillness = None
                 return frame, "keyframe", captured_at
             LOGGER.info("gate_trigger_capture keyframe=unavailable fallback=grab")
+        self._last_stillness = None
         frame = self._grab()
         return frame, "grab", (self._clock() if frame is not None else None)
+
+    def _start_live_session(self) -> None:
+        start = getattr(self._frame_source, "start_session", None)
+        if not callable(start):
+            return
+        try:
+            self._live_session = bool(start())
+        except Exception:
+            self._live_session = False
+
+    def _stop_live_session(self, reason: str) -> None:
+        if not self._live_session:
+            return
+        self._live_session = False
+        stop = getattr(self._frame_source, "stop_session", None)
+        if callable(stop):
+            try:
+                stop(reason)
+            except Exception:
+                pass
 
     def status(self) -> dict:
         return {

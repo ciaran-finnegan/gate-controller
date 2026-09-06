@@ -164,6 +164,16 @@ class HotFrameRing:
             return None
         return frame, captured_at
 
+    def since(self, after: float | None, *, now: float | None = None,
+              max_age: float) -> list[tuple[bytes, float]]:
+        """Fresh frames captured strictly after ``after``, oldest first."""
+        now = monotonic() if now is None else now
+        with self._lock:
+            return [
+                (frame, captured_at) for captured_at, _digest, frame in self._frames
+                if (after is None or captured_at > after) and 0 <= now - captured_at <= max_age
+            ]
+
     def materialise(
         self, output_directory: Path, count: int, *,
         now: float | None = None, max_age: float,
