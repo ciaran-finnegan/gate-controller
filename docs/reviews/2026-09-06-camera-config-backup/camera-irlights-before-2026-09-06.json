@@ -1,0 +1,24 @@
+[
+ {
+  "cmd": "GetIrLights",
+  "code": 0,
+  "initial": {
+   "IrLights": {
+    "state": "Auto"
+   }
+  },
+  "range": {
+   "IrLights": {
+    "state": [
+     "Auto",
+     "Off"
+    ]
+   }
+  },
+  "value": {
+   "IrLights": {
+    "state": "Auto"
+   }
+  }
+ }
+]
