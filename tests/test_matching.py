@@ -2,9 +2,9 @@ import unittest
 from datetime import datetime, timezone
 
 from gate_controller.match_policy import (
-    LEVEL_RELAXED, LEVEL_STANDARD, LEVEL_STRICT, MINUTES_PER_DAY,
+    LEVEL_STANDARD, LEVEL_STRICT, MINUTES_PER_DAY,
     RECOMMENDED_POLICY,
-    Band, MatchPolicy,
+    Band, MatchPolicy, safe_policy,
 )
 from gate_controller.matching import decide_access, normalise_plate
 from gate_controller.models import PlateObservation
@@ -189,49 +189,54 @@ class LevelledMatchingTests(unittest.TestCase):
         self.assertIsNone(decision.near_miss_distance)
 
 
-class RelaxedLevelTests(unittest.TestCase):
-    RELAXED = MatchPolicy(bands=(Band(0, MINUTES_PER_DAY, LEVEL_RELAXED),))
+class WithdrawnRelaxedLevelTests(unittest.TestCase):
+    """`relaxed` was withdrawn before release; nothing may reach it.
 
-    def _decide(self, plate, authorised, confidence=0.96):
+    Measured against this matching code with `131-D-2696` as the only
+    authorised plate, the two-edit rule returned *allowed* for 101 other
+    syntactically valid Irish registrations one edit away and 3,360 two edits
+    away — 3,461 in all, including `131-D-2695`, `132-D-2696`, `141-D-2696`
+    and `131-C-2696`. An Irish registration puts the year and county in its
+    first three or four characters, so a neighbouring plate is one edit away
+    by construction. The two-frame rule guards against OCR noise, not against
+    a correctly read stranger.
+    """
+
+    NEIGHBOURS = ("131D2695", "132D2696", "141D2696", "131C2696", "13D2696")
+
+    def _decide(self, plate, authorised, policy, confidence=0.96):
         return decide_access(
             [PlateObservation(plate, confidence),
              PlateObservation(plate, confidence)],
-            authorised, self.RELAXED,
+            authorised, policy,
         )
 
-    def test_allows_two_substitutions_outside_the_confusion_groups(self):
-        decision = self._decide("131D2698", {"131D2696"})
+    def test_a_band_naming_relaxed_matches_like_strict(self):
+        policy = safe_policy({
+            "bands": [{"start": "00:00", "end": "24:00", "level": "relaxed"}],
+        })
 
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.reason, "two_frame_edit_distance")
-        self.assertEqual(decision.match_rule, "edit_distance")
-        self.assertEqual(decision.edit_distance, 1)
+        for plate in self.NEIGHBOURS:
+            with self.subTest(plate=plate):
+                decision = self._decide(plate, {"131D2696"}, policy)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.policy_level, LEVEL_STRICT)
 
-    def test_allows_a_dropped_character(self):
-        decision = self._decide("13D2696", {"131D2696"})
+    def test_a_band_constructed_around_the_validator_still_matches_like_strict(self):
+        policy = MatchPolicy(bands=(Band(0, MINUTES_PER_DAY, "relaxed"),))
 
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.edit_distance, 1)
+        for plate in self.NEIGHBOURS:
+            with self.subTest(plate=plate):
+                self.assertFalse(self._decide(plate, {"131D2696"}, policy).allowed)
 
-    def test_rejects_three_differences(self):
-        decision = self._decide("131D9999", {"131D2696"})
+    def test_the_exact_plate_still_opens_under_a_relaxed_band(self):
+        policy = safe_policy({
+            "bands": [{"start": "00:00", "end": "24:00", "level": "relaxed"}],
+        })
 
-        self.assertFalse(decision.allowed)
-
-    def test_rejects_an_ambiguous_relaxed_match(self):
-        decision = self._decide("131D2697", {"131D2696", "131D2698"})
-
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "ambiguous_fuzzy_match")
-
-    def test_rejects_a_short_read_that_a_two_edit_budget_would_swallow(self):
-        decision = self._decide("12D", {"12D34"})
-
-        self.assertFalse(decision.allowed)
-
-    def test_still_requires_two_agreeing_frames(self):
         decision = decide_access(
-            [PlateObservation("131D2698", 0.99)], {"131D2696"}, self.RELAXED
+            [PlateObservation("131-D-2696", 0.96)], {"131D2696"}, policy
         )
 
-        self.assertFalse(decision.allowed)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "exact_match")

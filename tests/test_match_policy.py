@@ -8,14 +8,15 @@ from PIL import Image
 
 from gate_controller.match_policy import (
     DEFAULT_POLICY,
-    LEVEL_RELAXED,
     LEVEL_STANDARD,
     LEVEL_STRICT,
     RECOMMENDED_POLICY,
     STRICT_POLICY,
+    LEVELS,
     Band,
     MatchPolicy,
     MatchPolicyError,
+    level_rule,
     parse_policy,
     safe_policy,
 )
@@ -57,10 +58,28 @@ class ScheduleParsingTests(unittest.TestCase):
 
     def test_accepts_a_single_band_covering_the_whole_day(self):
         policy = parse_policy(
-            {"bands": [{"start": "00:00", "end": "24:00", "level": "relaxed"}]}
+            {"bands": [{"start": "00:00", "end": "24:00", "level": "standard"}]}
         )
 
-        self.assertEqual(policy.bands[0].level, LEVEL_RELAXED)
+        self.assertEqual(policy.bands[0].level, LEVEL_STANDARD)
+
+    def test_the_withdrawn_relaxed_level_is_not_selectable(self):
+        """`relaxed` reaches the gate as `strict`, exactly like a typo would.
+
+        Measured against this matching code, `relaxed` admitted thousands of
+        real Irish registrations for a single authorised plate, so it must not
+        be reachable from a settings document by any spelling.
+        """
+        self.assertNotIn("relaxed", LEVELS)
+
+        policy = parse_policy({"bands": [
+            {"start": "00:00", "end": "12:00", "level": "relaxed"},
+            {"start": "12:00", "end": "24:00", "level": "standard"},
+        ]})
+
+        self.assertEqual(policy.bands[0].level, LEVEL_STRICT)
+        self.assertEqual(policy.bands[1].level, LEVEL_STANDARD)
+        self.assertEqual(level_rule("relaxed").name, LEVEL_STRICT)
 
     def test_rejects_a_schedule_with_a_gap(self):
         with self.assertRaises(MatchPolicyError) as raised:
@@ -152,10 +171,21 @@ class ScheduleResolutionTests(unittest.TestCase):
         self.assertEqual(resolved.level, LEVEL_STRICT)
         self.assertEqual(resolved.band, "unresolved")
 
-    def test_a_naive_moment_is_read_as_local_time(self):
-        resolved = RECOMMENDED_POLICY.resolve(datetime(2026, 7, 1, 23, 0))
+    def test_a_naive_moment_is_read_as_utc_not_as_local_time(self):
+        """21:30 naive is 22:30 in Dublin in July, so it is in the night band.
 
-        self.assertEqual(resolved.level, LEVEL_STRICT)
+        Reading a naive datetime as local wall time would put the same instant
+        at 21:30 local and hand a 22:30 decision to the daytime band for the
+        whole of Irish Summer Time.
+        """
+        naive = RECOMMENDED_POLICY.resolve(datetime(2026, 7, 1, 21, 30))
+        aware = RECOMMENDED_POLICY.resolve(
+            datetime(2026, 7, 1, 21, 30, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(naive.local_time, "22:30")
+        self.assertEqual(naive.level, LEVEL_STRICT)
+        self.assertEqual(naive, aware)
 
 
 class BandTests(unittest.TestCase):
@@ -227,6 +257,62 @@ class MatchPolicyCacheTests(unittest.TestCase):
 
         self.assertEqual(json.loads(self.path.read_text())["plate_matching"],
                          RECOMMENDED_DOCUMENT)
+
+    def test_a_rejection_survives_a_restart(self):
+        """A restart must not hand back the fuzziness the rejection removed."""
+        cache = MatchPolicyCache(self.path)
+        cache.replace({"plate_matching": RECOMMENDED_DOCUMENT})
+        cache.replace({"plate_matching": {"bands": []}})
+
+        restarted = MatchPolicyCache(self.path)
+
+        self.assertEqual(restarted.get(), STRICT_POLICY)
+        self.assertTrue(restarted.status()["configured"])
+        self.assertIsNotNone(restarted.status()["last_error"])
+
+    def test_an_unreadable_rejection_marker_still_keeps_the_gate_closed(self):
+        cache = MatchPolicyCache(self.path)
+        cache.replace({"plate_matching": RECOMMENDED_DOCUMENT})
+        cache.replace({"plate_matching": {"bands": []}})
+        self.path.with_name(self.path.name + ".rejected").write_text(
+            "{ not json", encoding="utf-8"
+        )
+
+        self.assertEqual(MatchPolicyCache(self.path).get(), STRICT_POLICY)
+
+    def test_a_readable_document_clears_the_rejection(self):
+        cache = MatchPolicyCache(self.path)
+        cache.replace({"plate_matching": {"bands": []}})
+
+        cache.replace({"plate_matching": RECOMMENDED_DOCUMENT})
+
+        self.assertFalse(self.path.with_name(self.path.name + ".rejected").exists())
+        self.assertEqual(MatchPolicyCache(self.path).get(), RECOMMENDED_POLICY)
+        self.assertIsNone(MatchPolicyCache(self.path).status()["last_error"])
+
+    def test_the_status_uses_the_key_names_the_worker_reads(self):
+        """`bands`, `configured` and `last_error` are a cross-repo contract."""
+        cache = MatchPolicyCache(self.path)
+        cache.replace({"plate_matching": RECOMMENDED_DOCUMENT})
+
+        status = cache.status()
+
+        self.assertEqual(sorted(status), [
+            "bands", "configured", "last_error", "refreshed_at", "timezone",
+        ])
+        self.assertEqual(status["bands"], [
+            {"start": "08:00", "end": "22:00", "level": "standard"},
+            {"start": "22:00", "end": "08:00", "level": "strict"},
+        ])
+        self.assertTrue(status["configured"])
+        self.assertIsNone(status["last_error"])
+
+    def test_a_rejection_reason_reaches_the_status_bounded(self):
+        cache = MatchPolicyCache(self.path)
+
+        cache.mark_refresh_error(RuntimeError("x" * 500))
+
+        self.assertEqual(len(cache.status()["last_error"]), 200)
 
     def test_an_unusable_cache_file_is_ignored(self):
         self.path.write_text("{ not json", encoding="utf-8")

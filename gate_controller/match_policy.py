@@ -10,9 +10,12 @@ picks a risk posture rather than an edit distance:
     Today's shipped behaviour: equal length, exactly one known OCR-confusion
     substitution (``0/O``, ``1/I/L``, ``2/Z``, ``5/S``, ``8/B``), two
     high-confidence frames, and a unique authorised candidate.
-``relaxed``
-    Up to two edits (substitution, insertion, or deletion) against a longer
-    read, still with two high-confidence frames and a unique candidate.
+
+Those two are the only levels this release ships. A third, ``relaxed`` — two
+edits of any kind against a read of at least six characters — was withdrawn
+before release: see :data:`WITHDRAWN_LEVELS` and ``docs/plate-matching.md`` for
+the measurement that killed it. A band naming it is treated as naming a level
+this controller has never heard of, and becomes ``strict``.
 
 A :class:`MatchPolicy` maps local-time bands onto those levels, so a site can
 run ``standard`` by day and ``strict`` overnight. Bands are expressed in the
@@ -44,7 +47,12 @@ MAX_BANDS = 12
 
 LEVEL_STRICT = "strict"
 LEVEL_STANDARD = "standard"
-LEVEL_RELAXED = "relaxed"
+
+#: Levels that once existed and are no longer selectable. They are named here
+#: only so a schedule that mentions one is logged as withdrawn rather than as a
+#: typo; :func:`level_rule` and :func:`_parse_band` treat them as unknown, which
+#: means ``strict``.
+WITHDRAWN_LEVELS = frozenset({"relaxed"})
 
 MATCH_RULE_EXACT = "exact"
 MATCH_RULE_OCR_CONFUSION = "ocr_confusion"
@@ -64,7 +72,10 @@ class LevelRule:
     #: fuzzy matching entirely.
     max_edit_distance: int
     #: Whether a difference must be one of the known OCR confusion pairs at
-    #: equal length (``True``) or may be any edit (``False``).
+    #: equal length (``True``) or may be any edit (``False``). Every level this
+    #: release ships sets this ``True``; the free-edit path in
+    #: :mod:`gate_controller.matching` is kept for a future level and is
+    #: unreachable from settings.
     confusion_only: bool
     #: High-confidence frames that must agree before a non-exact match opens.
     min_frames: int
@@ -96,25 +107,24 @@ LEVELS: dict[str, LevelRule] = {
         # schedule existed.
         min_observed_length=0,
     ),
-    LEVEL_RELAXED: LevelRule(
-        name=LEVEL_RELAXED,
-        max_edit_distance=2,
-        confusion_only=False,
-        min_frames=2,
-        min_observed_length=6,
-    ),
 }
 
 #: Ordered strictest-first, so an unusable schedule can fall back to the
 #: safest level without a lookup table of its own.
-LEVEL_ORDER = (LEVEL_STRICT, LEVEL_STANDARD, LEVEL_RELAXED)
+LEVEL_ORDER = (LEVEL_STRICT, LEVEL_STANDARD)
 
 
 def level_rule(level: object) -> LevelRule:
     """Return the rule for ``level``, failing closed to strict when unknown."""
     if isinstance(level, str) and level in LEVELS:
         return LEVELS[level]
-    LOGGER.warning("unknown plate matching level %r; failing closed to strict", level)
+    if level in WITHDRAWN_LEVELS:
+        LOGGER.warning(
+            "plate matching level %r was withdrawn before release; using strict",
+            level,
+        )
+    else:
+        LOGGER.warning("unknown plate matching level %r; failing closed to strict", level)
     return LEVELS[LEVEL_STRICT]
 
 
@@ -184,7 +194,11 @@ class MatchPolicy:
     timezone_name: str = DEFAULT_TIMEZONE
 
     def resolve(self, moment: datetime | None = None) -> ResolvedPolicy:
-        """Return the level in force at ``moment`` (UTC-aware or naive-local)."""
+        """Return the level in force at ``moment``.
+
+        ``moment`` should be timezone-aware. A naive datetime is interpreted as
+        UTC — see :meth:`_local_time`.
+        """
         local = self._local_time(moment)
         if local is None:
             # Without a trustworthy local clock the schedule cannot be
@@ -233,6 +247,14 @@ class MatchPolicy:
         }
 
     def _local_time(self, moment: datetime | None) -> datetime | None:
+        """Convert ``moment`` to site-local time.
+
+        A naive datetime is read as **UTC**, never as local wall time. Reading
+        it as local would be a silent hour of drift under Irish Summer Time,
+        which is precisely the hour a 22:30 decision would be misfiled into
+        the daytime band. Production passes an aware clock; this is the rule
+        for anything that does not.
+        """
         if moment is None:
             moment = datetime.now(timezone.utc)
         if not isinstance(moment, datetime):
@@ -244,7 +266,8 @@ class MatchPolicy:
             return None
         try:
             if moment.tzinfo is None:
-                return moment.replace(tzinfo=zone)
+                LOGGER.debug("naive moment passed to the schedule; reading it as UTC")
+                moment = moment.replace(tzinfo=timezone.utc)
             return moment.astimezone(zone)
         except (OverflowError, ValueError):
             return None
@@ -337,8 +360,9 @@ def _parse_band(entry: object) -> Band:
         raise MatchPolicyError("each schedule band must name a level")
     if level not in LEVELS:
         LOGGER.warning(
-            "schedule band %s-%s names unknown level %r; failing closed to strict",
-            _format_minute(start), _format_minute(end), level,
+            "schedule band %s-%s names %s level %r; failing closed to strict",
+            _format_minute(start), _format_minute(end),
+            "withdrawn" if level in WITHDRAWN_LEVELS else "unknown", level,
         )
         level = LEVEL_STRICT
     if start == end:

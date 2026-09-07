@@ -150,7 +150,8 @@ def _decide_fuzzy(
 
 def _fuzzy_reason(rule: LevelRule) -> str:
     # The shipped reason string is part of the event taxonomy the cloud reads,
-    # so the standard level keeps saying exactly what it always said.
+    # so the standard level keeps saying exactly what it always said. No level
+    # this release ships reaches the second branch.
     if rule.confusion_only:
         return "two_frame_ocr_confusion"
     return "two_frame_edit_distance"
@@ -168,7 +169,12 @@ def _policy_fields(resolved: ResolvedPolicy) -> dict[str, str]:
 def _match_distance(
     observed_plate: str, authorised_plate: str, rule: LevelRule
 ) -> int | None:
-    """Return the edit distance if this pair may match under ``rule``."""
+    """Return the edit distance if this pair may match under ``rule``.
+
+    Every level this release ships is ``confusion_only``, so the free-edit
+    branch below is unreachable from settings. It is kept because a future
+    level may want it, not because anything selects it today.
+    """
     if not observed_plate or not authorised_plate:
         return None
     if rule.confusion_only:

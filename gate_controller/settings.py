@@ -25,6 +25,12 @@ Like the authorised-plate snapshot, a good document is cached on disk so a
 restart without the cloud keeps the schedule the owner configured. Unlike that
 snapshot, a *missing* document is not an error: it means no schedule has been
 configured and the controller keeps its shipped behaviour.
+
+A *rejected* document leaves a marker file beside the cache. Without it, a
+restart would quietly restore the last good schedule while the cloud is still
+serving the document that was refused, undoing the fail-closed state the
+rejection created. The marker survives the restart, the policy stays
+exact-only, and the first readable document clears both.
 """
 
 from __future__ import annotations
@@ -51,6 +57,18 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_SETTINGS_BYTES = 16 * 1024
 SETTINGS_VERSION = 1
+#: The heartbeat carries the rejection reason so the owner can see *why* the
+#: gate fell closed. It is bounded because the heartbeat payload is.
+MAX_ERROR_LENGTH = 200
+
+
+def _bounded_error(error: str | None) -> str | None:
+    if error is None:
+        return None
+    collapsed = " ".join(str(error).split())
+    if not collapsed:
+        return None
+    return collapsed[:MAX_ERROR_LENGTH]
 
 
 class SettingsError(RuntimeError):
@@ -62,6 +80,10 @@ class MatchPolicyCache:
 
     def __init__(self, path: Path | None = None, *, clock=None):
         self._path = Path(path) if path is not None else None
+        self._rejection_path = (
+            self._path.with_name(self._path.name + ".rejected")
+            if self._path is not None else None
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
         self._policy = DEFAULT_POLICY
@@ -78,11 +100,16 @@ class MatchPolicyCache:
         """Adopt a settings envelope, persisting it for the next restart.
 
         A document the controller cannot read is not silently ignored: the
-        policy fails closed to exact matches until a readable one arrives.
+        policy fails closed to exact matches until a readable one arrives, and
+        a marker on disk carries that state across a restart. The cached good
+        document is deliberately left where it is — it is the thing to go back
+        to once the cloud serves something readable again, and the marker, not
+        its absence, is what keeps the gate closed in the meantime.
         """
         try:
             policy = policy_from_settings(document)
         except MatchPolicyError as error:
+            self._persist_rejection(str(error))
             with self._lock:
                 self._policy = STRICT_POLICY
                 self._configured = True
@@ -93,6 +120,7 @@ class MatchPolicyCache:
             )
             return
         self._persist(document)
+        self._clear_rejection()
         with self._lock:
             self._policy = policy
             self._configured = True
@@ -104,18 +132,42 @@ class MatchPolicyCache:
             self._last_error = str(error)
 
     def status(self) -> dict:
+        """The heartbeat's view of the schedule actually in force.
+
+        The key names here are a contract with the Gate Mate Worker, which
+        narrows the heartbeat against an allowlist and silently drops anything
+        it does not recognise. ``bands``, ``configured`` and ``last_error`` are
+        each read by the Settings page; renaming one here without renaming it
+        in ``worker/routes/controller.ts`` makes the app show a healthy badge
+        for a controller that has fallen closed.
+        """
         with self._lock:
             return {
                 "configured": self._configured,
-                "level_bands": [band.to_wire() for band in self._policy.bands],
+                "bands": [band.to_wire() for band in self._policy.bands],
                 "timezone": self._policy.timezone_name,
                 "refreshed_at": (
                     self._refreshed_at.isoformat() if self._refreshed_at else None
                 ),
-                "last_error": self._last_error,
+                "last_error": _bounded_error(self._last_error),
             }
 
     def _load_cached(self) -> None:
+        rejection = self._read_rejection()
+        if rejection is not None:
+            # The cloud was serving a document this controller refused when it
+            # last ran. Restoring the cached schedule here would hand the gate
+            # back the fuzziness the rejection took away, so stay closed until
+            # a readable document arrives.
+            LOGGER.warning(
+                "controller settings were rejected before this restart (%s); "
+                "matching stays exact-only until a valid schedule arrives",
+                rejection,
+            )
+            self._policy = STRICT_POLICY
+            self._configured = True
+            self._last_error = rejection
+            return
         if self._path is None or not self._path.exists():
             return
         try:
@@ -139,24 +191,72 @@ class MatchPolicyCache:
         if len(encoded.encode("utf-8")) > MAX_SETTINGS_BYTES:
             LOGGER.warning("controller settings too large to cache locally")
             return
+        _write_atomically(self._path, encoded, "cache controller settings")
+
+    def _persist_rejection(self, error: str) -> None:
+        """Record that the cloud is serving a document this controller refused."""
+        if self._rejection_path is None:
+            return
+        _write_atomically(
+            self._rejection_path,
+            json.dumps({
+                "rejected_at": self._clock().isoformat(),
+                "error": _bounded_error(error),
+            }, sort_keys=True, separators=(",", ":")),
+            "record the controller settings rejection",
+        )
+
+    def _clear_rejection(self) -> None:
+        if self._rejection_path is None:
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary = tempfile.mkstemp(
-                dir=self._path.parent, prefix=f".{self._path.name}.", text=True
-            )
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as target:
-                    target.write(encoded)
-                    target.flush()
-                    os.fsync(target.fileno())
-                os.replace(temporary, self._path)
-            finally:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
+            self._rejection_path.unlink()
+        except FileNotFoundError:
+            pass
         except OSError as error:
-            LOGGER.warning("could not cache controller settings: %s", error)
+            LOGGER.warning("could not clear the settings rejection marker: %s", error)
+
+    def _read_rejection(self) -> str | None:
+        """Return the recorded rejection reason, or ``None`` if there is none.
+
+        A marker that cannot be read is still a marker: the gate stays closed
+        and the reason simply becomes generic. The alternative — treating an
+        unreadable marker as no marker — would restore the cached schedule,
+        which is the failure this whole mechanism exists to prevent.
+        """
+        if self._rejection_path is None or not self._rejection_path.exists():
+            return None
+        try:
+            if self._rejection_path.stat().st_size > MAX_SETTINGS_BYTES:
+                raise ValueError("rejection marker exceeds the size limit")
+            marker = json.loads(self._rejection_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            LOGGER.warning("settings rejection marker is unreadable: %s", error)
+            return "controller settings were rejected"
+        reason = marker.get("error") if isinstance(marker, dict) else None
+        return _bounded_error(reason) or "controller settings were rejected"
+
+
+def _write_atomically(path: Path, contents: str, purpose: str) -> None:
+    """Replace ``path`` with ``contents``, or log and leave it as it was."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", text=True
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+                target.write(contents)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    except OSError as error:
+        LOGGER.warning("could not %s: %s", purpose, error)
 
 
 def policy_from_settings(document: object) -> MatchPolicy:
