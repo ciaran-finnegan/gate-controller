@@ -26,6 +26,11 @@ IRAP_TYPES = frozenset(range(16, 22))  # BLA_W_LP .. CRA_NUT (and reserved IRAP 
 DEFAULT_MAX_BYTES = 12 * 1024 * 1024
 DEFAULT_MAX_GOPS = 8
 MAX_NAL_BYTES = 4 * 1024 * 1024
+# The start gate below only ever inspects the bytes ahead of the first
+# keyframe, so this bounds that prefix rather than a whole picture. A
+# parameter set runs to a few hundred bytes; a unit claiming to be a longer
+# one is not one, and the gate stops holding on to it.
+MAX_START_PREFIX_BYTES = 1024 * 1024
 
 
 def nal_type(nal: bytes) -> int | None:
@@ -88,6 +93,107 @@ class AnnexBSplitter:
             if unit:
                 units.append(unit)
         return units
+
+
+class IrapStartGate:
+    """Hold an Annex-B stream shut until its first IRAP, then get out of the way.
+
+    A decoder handed the middle of a GOP has no reference pictures for the
+    inter frames that precede the next keyframe, and RTSP hands it the codec
+    parameters out of band in the SDP, so it has everything it needs to
+    *attempt* them. libavcodec substitutes a generated reference for the ones
+    it never saw; in software that substitute is filled with mid-grey, but on
+    the hardware decode path it is never filled at all, so every skipped
+    block copies the decoder's zeroed buffer. The result is a flat green
+    picture - RGB(0,135,0) is what an all-zero YUV frame renders as - with
+    only the blocks that happened to be coded in that picture carrying real
+    content. It is a valid JPEG, it differs wildly from the scene baseline,
+    and it costs a paid plate lookup.
+
+    Feeding the decoder a pipe instead of RTSP already fixes that on its own:
+    ``ffmpeg -c:v copy`` drops leading non-keyframe packets unless asked for
+    ``-copyinkf``, and the parser bundles the parameter sets into the IDR
+    packet, so the copy's first bytes are ``VPS,SPS,PPS,IDR_W_RADL``. This
+    gate is the assertion that this held, not the mechanism it relies on:
+    everything before the first IRAP start code is dropped, the parameter
+    sets seen along the way are emitted with it, and ``started`` is journaled
+    so a session that never reached a keyframe says so.
+
+    It scans only that prefix. Once the IRAP start code is found the rest of
+    the buffer goes out as it stands - a part-arrived picture included - and
+    every later chunk is returned untouched, so nothing here reframes the
+    stream. Reframing was measurably worse than useless: a splitter can only
+    release a NAL once the *next* start code arrives, and this camera codes
+    two slices per picture, so access unit N would not close until N+1 landed
+    about 100 ms later, on top of the 64 KB blocking read in front of it.
+    ``captured_at`` is stamped when a frame is emitted, so that delay does
+    not show up as latency anywhere - it silently subtracts 150-250 ms from
+    every ``frame_age_ms`` the journal reports.
+    """
+
+    def __init__(self, max_prefix_bytes: int = MAX_START_PREFIX_BYTES):
+        self._held = bytearray()
+        self._parameter_sets: dict[int, bytes] = {}
+        self._max_prefix_bytes = max_prefix_bytes
+        self._started = False
+
+    @property
+    def started(self) -> bool:
+        """Whether a keyframe has been seen and the stream is flowing."""
+        return self._started
+
+    def feed(self, chunk: bytes) -> bytes:
+        """The part of ``chunk`` the decoder may safely see, possibly empty."""
+        if self._started:
+            return chunk  # the hot path: one flag, and the caller's own bytes
+        held = self._held
+        held += chunk
+        position = 0
+        keep = 0
+        while True:
+            start = held.find(START_CODE, position)
+            if start < 0:
+                # Nothing but a partial start code can still be pending.
+                keep = max(position, len(held) - 2)
+                break
+            if start + 6 > len(held):
+                # The two-byte NAL header and the slice header byte after it
+                # are what the decision needs; wait for them.
+                keep = start
+                break
+            kind = (held[start + 3] >> 1) & 0x3F
+            if kind in (NAL_VPS, NAL_SPS, NAL_PPS):
+                end = held.find(START_CODE, start + 3)
+                if end < 0:
+                    keep = start
+                    break
+                self._parameter_sets[kind] = bytes(held[start:end])
+                position = end
+                continue
+            # first_slice_segment_in_pic_flag is the first bit after the NAL
+            # header: a later slice of a picture whose start went past before
+            # the reader connected is no starting point either. Nor is a
+            # keyframe whose VPS/SPS/PPS were missed - it is no more decodable
+            # on its own than the inter frames before it.
+            if (
+                kind in IRAP_TYPES
+                and held[start + 5] & 0x80
+                and len(self._parameter_sets) == 3
+            ):
+                self._started = True
+                self._held = bytearray()
+                return b"".join(
+                    self._parameter_sets[parameter]
+                    for parameter in (NAL_VPS, NAL_SPS, NAL_PPS)
+                ) + bytes(held[start:])
+            position = start + 3
+        if keep:
+            del held[:keep]
+        if len(held) > self._max_prefix_bytes:
+            # A parameter set longer than the prefix bound is not one. Drop
+            # it rather than hold the whole pre-keyframe stream in memory.
+            del held[:-2]
+        return b""
 
 
 class HevcPacketRing:
@@ -211,21 +317,43 @@ class HevcPacketRing:
             }
 
 
-def record_command(source_url: str, ffmpeg: str = "ffmpeg") -> tuple[str, ...]:
-    """ffmpeg command that copies the clear stream's packets to stdout, undecoded."""
+def record_command(source_url: str, ffmpeg: str = "ffmpeg",
+                   duration: float | None = None) -> tuple[str, ...]:
+    """ffmpeg command that copies the clear stream's packets to stdout, undecoded.
+
+    ``duration`` bounds the copy in stream seconds, so a session that feeds a
+    decoder from this stream closes its own RTSP connection when it is done.
+    """
     return (
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-rtsp_transport", "tcp", "-analyzeduration", "0", "-probesize", "32",
-        "-i", source_url, "-map", "0:v:0", "-an", "-c:v", "copy", "-f", "hevc", "pipe:1",
+        "-i", source_url, "-map", "0:v:0", "-an",
+        *(("-t", f"{duration:g}") if duration else ()),
+        "-c:v", "copy", "-f", "hevc", "pipe:1",
     )
 
 
 def decode_command(*, ffmpeg: str = "ffmpeg", decoder_arguments: tuple[str, ...] = (),
-                   filters: tuple[str, ...] = (), frames: int | None = None) -> tuple[str, ...]:
-    """ffmpeg command that decodes an Annex-B HEVC byte stream from stdin to MJPEG on stdout."""
+                   filters: tuple[str, ...] = (), frames: int | None = None,
+                   input_framerate: float | None = None) -> tuple[str, ...]:
+    """ffmpeg command that decodes an Annex-B HEVC byte stream from stdin to MJPEG on stdout.
+
+    An Annex-B byte stream carries no timestamps, so the raw demuxer invents
+    them at its own default of 25 fps. Anything that samples with an ``fps=``
+    filter must pass ``input_framerate``, or the ratio between the filter and
+    the real stream rate is wrong: at the clear stream's 10 fps, ``fps=5`` off
+    a 25 fps assumption samples every fifth picture, that is 2 fps, not 5.
+
+    Probing is skipped as it is on every other clear-stream command: the
+    default probe costs about two seconds at 4K, buying nothing the pipe does
+    not already state. ``-fpsprobesize 0`` goes with them - the frame rate is
+    ``-r``'s to state, not the probe's to guess.
+    """
     return (
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-analyzeduration", "0", "-probesize", "32", "-fpsprobesize", "0",
         *decoder_arguments,
+        *(("-r", f"{input_framerate:g}") if input_framerate else ()),
         "-f", "hevc", "-i", "pipe:0", "-map", "0:v:0", "-an",
         *(("-frames:v", str(frames)) if frames else ()),
         *(("-vf", ",".join(filters)) if filters else ()),

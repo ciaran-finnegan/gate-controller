@@ -28,7 +28,7 @@ from .hot_stream import (
     FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
-from .images import measure_frame_quality
+from .images import measure_flat_fraction, measure_frame_quality
 from .plate_region import PlateRegion, parse_plate_region
 from .scene import SceneBaseline
 from .telemetry import TriggerTelemetry
@@ -54,6 +54,12 @@ KEYFRAME_MAX_AGE_SECONDS = 1.6
 CLEAR_STREAM_MODES = frozenset({"compressed", "decoded"})
 MIN_SESSION_FPS, MAX_SESSION_FPS = 1.0, 10.0
 MIN_SESSION_SECONDS, MAX_SESSION_SECONDS = 5.0, 300.0
+# The camera's own main-stream frame rate. The session decoder reads a raw
+# HEVC pipe, which carries no timestamps at all, so it has to be told this,
+# and nothing verifies the answer: the sampling filter keeps a fixed
+# fraction of the pictures, so a real rate that is not the stated one moves
+# the live session's rate in proportion, silently.
+MIN_SOURCE_FPS, MAX_SOURCE_FPS = 1.0, 60.0
 # Presence session: after the series, keep offering fresh frames while the
 # vehicle is still at the gate and nothing has read its plate yet.
 MAX_PRESENCE_WINDOW_SECONDS = 120.0
@@ -67,6 +73,25 @@ MAX_PRESENCE_FRAMES = 10
 # in the plate band measures well above 0.08.
 DEFAULT_EMPTY_SCENE_THRESHOLD = 0.03
 MAX_EMPTY_SCENE_THRESHOLD = 0.5
+# Fraction of the plate band that may be one single flat colour before the
+# frame is treated as a broken decode rather than a picture. The two
+# distributions this sits between were measured over 4,469 real frames and
+# the broken frames from the incident folders:
+#
+#   real     367 frames from the camera as it is configured now reach 0.632
+#            at the top, and 20 of them - infrared night, empty drive, IR
+#            bloom and mist - land between 0.5 and 0.6.
+#   broken   0.913, 0.969, 0.994 and 1.000.
+#
+# 0.6 is inside the real distribution, not above it: it would have thrown
+# away those 20 night frames, which are exactly the frames night recognition
+# cannot spare. 0.8 clears the real maximum by 0.17 and stays 0.11 below the
+# least flat broken frame. The measure is deliberately unhurried about real
+# texture - it averages a 480x270 draft down to 64x36 before comparing, and
+# that resample smooths genuine detail toward flatness - so the headroom
+# above the real frames is what has to be generous, not the margin below the
+# broken ones.
+DEFAULT_MAX_FLAT_FRACTION = 0.8
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
@@ -139,6 +164,9 @@ class TriggerCaptureConfig:
     # Live decode rate and length of the per-event session in compressed mode.
     session_fps: float = 5.0
     session_seconds: float = 45.0
+    # What the camera's main stream actually runs at, so the session decoder
+    # can time an Annex-B pipe that carries no timestamps of its own.
+    source_fps: float = 10.0
     # Skip frames that barely differ from the idle scene (no vehicle in the
     # plate band yet, or it has left). 0 disables the check.
     empty_scene_threshold: float = DEFAULT_EMPTY_SCENE_THRESHOLD
@@ -146,6 +174,9 @@ class TriggerCaptureConfig:
     # blaze washing out the plate). 0 disables; the value is always journaled
     # so a threshold can be chosen from real captures.
     max_highlight_clipping: float = 0.0
+    # Skip frames whose plate band is mostly one flat colour: a picture the
+    # decoder could not finish, not a scene. 0 disables.
+    max_flat_fraction: float = DEFAULT_MAX_FLAT_FRACTION
 
 
 def load_trigger_capture_config(
@@ -222,12 +253,21 @@ def load_trigger_capture_config(
         0.0, MAX_EMPTY_SCENE_THRESHOLD,
     )
     max_clipping = _number(environment.get("GATE_MAX_HIGHLIGHT_CLIPPING", "0"), 0.0, 1.0)
+    max_flat_fraction = _number(
+        environment.get(
+            "GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION", str(DEFAULT_MAX_FLAT_FRACTION),
+        ),
+        0.0, 1.0,
+    )
     clear_stream_mode = str(environment.get("GATE_CLEAR_STREAM_MODE", "compressed")).strip().lower()
     if clear_stream_mode not in CLEAR_STREAM_MODES:
         raise ValueError("GATE_CLEAR_STREAM_MODE must be 'compressed' or 'decoded'")
     session_fps = _number(environment.get("GATE_SESSION_FPS", "5"), MIN_SESSION_FPS, MAX_SESSION_FPS)
     session_seconds = _number(
         environment.get("GATE_SESSION_SECONDS", "45"), MIN_SESSION_SECONDS, MAX_SESSION_SECONDS,
+    )
+    source_fps = _number(
+        environment.get("GATE_CLEAR_STREAM_SOURCE_FPS", "10"), MIN_SOURCE_FPS, MAX_SOURCE_FPS,
     )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
@@ -250,9 +290,11 @@ def load_trigger_capture_config(
         decision_timeout_seconds=decision_timeout,
         empty_scene_threshold=empty_scene,
         max_highlight_clipping=max_clipping,
+        max_flat_fraction=max_flat_fraction,
         clear_stream_mode=clear_stream_mode,
         session_fps=session_fps,
         session_seconds=session_seconds,
+        source_fps=source_fps,
     )
 
 
@@ -403,6 +445,7 @@ class TriggerFrameCapture:
         self._lost_verdicts = 0
         self._skipped_empty = 0
         self._skipped_clipped = 0
+        self._skipped_corrupt = 0
         self._unresolved_sessions = 0
         self._last_skip: str | None = None
         self._live_session = False
@@ -702,6 +745,23 @@ class TriggerFrameCapture:
         if frame is None:
             self._failure_count += 1
             return ()
+        flat_fraction = self._flat_fraction(frame)
+        if (
+            flat_fraction is not None
+            and self.config.max_flat_fraction > 0
+            and flat_fraction > self.config.max_flat_fraction
+        ):
+            # Checked before the scene comparison: a frame the decoder never
+            # finished is not an observation of the drive, and its flat
+            # colour reads as a large scene difference, not a small one.
+            self._skipped_corrupt += 1
+            self._last_skip = "corrupt"
+            LOGGER.info(
+                "gate_trigger_capture outcome=skipped_corrupt event_type=%s source=%s "
+                "flat_fraction=%.3f",
+                event.event_type, source, flat_fraction,
+            )
+            return ()
         scene_difference = self._scene_difference(frame)
         if (
             scene_difference is not None
@@ -772,11 +832,13 @@ class TriggerFrameCapture:
         self._capture_count += 1
         LOGGER.info(
             "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
-            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s stillness=%s",
+            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s flat_fraction=%s "
+            "stillness=%s",
             event.event_type, round((self._clock() - started) * 1000),
             source, max(0, round((self._clock() - frame_captured_at) * 1000)),
             "unavailable" if scene_difference is None else f"{scene_difference:.3f}",
             "unavailable" if clipping is None else f"{clipping:.2f}",
+            "unavailable" if flat_fraction is None else f"{flat_fraction:.3f}",
             "unavailable" if self._last_stillness is None else f"{self._last_stillness:.3f}",
         )
         return (path,)
@@ -790,6 +852,17 @@ class TriggerFrameCapture:
         except Exception:
             return None
         return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    def _flat_fraction(self, frame: bytes) -> float | None:
+        """How much of the plate band is one flat colour, or None if unmeasurable.
+
+        The band is cropped here unless the capture is already cropped to it.
+        """
+        region = None if self.config.crop_capture else self.config.plate_region
+        try:
+            return measure_flat_fraction(frame, region)
+        except Exception:
+            return None
 
     @staticmethod
     def _highlight_clipping(path: Path) -> float | None:
@@ -865,8 +938,10 @@ class TriggerFrameCapture:
             "skipped": {
                 "empty_scene": self._skipped_empty,
                 "clipped": self._skipped_clipped,
+                "corrupt": self._skipped_corrupt,
                 "empty_scene_threshold": self.config.empty_scene_threshold,
                 "max_highlight_clipping": self.config.max_highlight_clipping,
+                "max_flat_fraction": self.config.max_flat_fraction,
             },
         }
 
