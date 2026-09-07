@@ -10,6 +10,7 @@ from time import monotonic, sleep
 
 from PIL import Image
 
+from .backpressure import NULL_GATE
 from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME
 from .matching import normalise_plate
 from .plate_region import PlateRegion
@@ -254,6 +255,31 @@ def _retryable_transport_cause(error: BaseException) -> str | None:
     return cause if cause in RETRYABLE_TRANSPORT_CAUSES else None
 
 
+def _corpus_plate(payload) -> str | None:
+    """The plate the cloud read, straight off the response, or None."""
+    if not isinstance(payload, Mapping):
+        return None
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    plate = first.get("plate") if isinstance(first, Mapping) else None
+    return plate if isinstance(plate, str) and plate.strip() else None
+
+
+def _corpus_local_plate(local) -> str | None:
+    """The on-device read's plate, for frames the cloud never saw."""
+    sidecar = getattr(local, "to_sidecar", None)
+    if not callable(sidecar):
+        return None
+    try:
+        fields = sidecar()
+    except Exception:
+        return None
+    plate = fields.get("plate") if isinstance(fields, dict) else None
+    return plate if isinstance(plate, str) and plate.strip() else None
+
+
 def _log_retry(cause: str, wait_seconds: float) -> None:
     try:
         _LOGGER.info(
@@ -271,7 +297,7 @@ class PlateRecognizerClient:
                  plate_region: PlateRegion | None = None,
                  precropped_directory: Path | None = None,
                  corpus=None, local_recognizer=None, authorised=None,
-                 match_policy=None):
+                 match_policy=None, activity=NULL_GATE):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -309,6 +335,9 @@ class PlateRecognizerClient:
         # frame; without it both sides fall back to the shipped `standard`
         # behaviour, which is what the controller does today.
         self._match_policy = match_policy
+        # The backpressure gate. Reading a frame is the busiest the uplink
+        # ever is for the gate itself, and the corpus must never be sharing it.
+        self._activity = activity or NULL_GATE
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
@@ -324,8 +353,14 @@ class PlateRecognizerClient:
         the call starts. It bounds what the local guard may spend and re-sizes
         the socket timeouts around whatever it did spend; without it the
         request behaves exactly as it always has.
+
+        The whole read is held open on the activity gate, so a corpus upload
+        defers before it starts and abandons if it is already running. The
+        gate is a counter and a timestamp behind one lock; it adds nothing
+        measurable to the frame.
         """
-        return self._recognise(path, timeout, trace_id, budget)
+        with self._activity.activity("ocr"):
+            return self._recognise(path, timeout, trace_id, budget)
 
     def _recognise(self, path: Path, timeout, trace_id, budget=None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
@@ -761,6 +796,10 @@ class PlateRecognizerClient:
             "precropped": self._is_precropped(path),
             "cloud": cloud,
             "local_ocr": self._local.config.mode if self._local is not None else "off",
+            # What the reader saw, not what the gate decided: the processor
+            # has not run yet. A training set needs to know which it is, so
+            # the name says `authorised`, and the cloud index says the same.
+            "authorised": self._frame_authorised(payload, local),
         }
         try:
             self._corpus.record(
@@ -771,6 +810,29 @@ class PlateRecognizerClient:
             )
         except Exception:
             pass
+
+    def _frame_authorised(self, payload, local) -> bool | None:
+        """Whether this frame's own plate is on the authorised list.
+
+        An exact membership test against the cached set, nothing more: the
+        fuzzy policy belongs to the decision, and this is a label. Returns
+        None when there is no plate to test or no list to test against, and
+        never raises -- a corpus field is not worth a frame.
+        """
+        if self._authorised is None:
+            return None
+        try:
+            plate = _corpus_plate(payload) or _corpus_local_plate(local)
+            if plate is None:
+                return None
+            authorised = self._authorised()
+            if not authorised:
+                return None
+            return normalise_plate(plate) in {
+                normalise_plate(candidate) for candidate in authorised
+            }
+        except Exception:
+            return None
 
     def _is_precropped(self, path: Path) -> bool:
         """Frames the keyframe decoder already cropped to the plate region."""

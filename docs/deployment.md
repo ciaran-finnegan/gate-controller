@@ -268,6 +268,7 @@ the same rule applies when the phase-2 rollup does.
 | `network` | the last completed probe cycle: `mode`, `skipped_reason`, `age_seconds`, `hops.lan` / `hops.router` (`state`, `loss`, `samples`, `min_ms` / `p50_ms` / `p95_ms` / `max_ms` / `mean_ms` / `jitter_ms`), `hops.internet` (`state`, `dns_ms`, `connect_ms`, `tls_ms`, `total_ms`, `age_seconds`), `interface` (`name`, `link_mbps`, receive/transmit bytes, packets, dropped and error **rates**, `receive_dropped_pct`) |
 | `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s` |
 | `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
+| `corpus` | `local` (bytes, records, pruned, discarded), `upload` (`pending`, `oldest_pending_age_s`, `last_success_at`, `consecutive_failures`, `last_blocked_by`) and `backpressure` (`quiet_window_seconds`, `quiet_for_seconds`, `busy`) |
 
 Everything here degrades to an absent field rather than to a healthy-looking
 default. An unreadable `/proc` file omits its metric; a failed probe omits its
@@ -485,6 +486,73 @@ retention before accepting production traffic. Confirm that event metadata and
 the R2 object share the digest before considering ingest healthy. The Pi keeps
 its local evidence until it receives a 2xx response and never performs R2
 credentials, deletion, or lifecycle management directly.
+
+## Training Corpus Off The Card
+
+Every frame the controller sends to OCR is kept under
+`GATE_TRAINING_CORPUS_DIR` as a JPEG plus a JSON sidecar carrying the plate,
+score, box, candidates, crop geometry and the on-device read. That is the
+training set for the local recogniser, and until this change it existed in
+exactly one place: a single SD card in a warm cabinet, with the oldest
+examples deleted permanently once the directory reached its cap. Cards in warm
+Pis fail. The loss is silent and it is not recoverable.
+
+The corpus now goes to R2 with its index in D1, and the local directory
+becomes a **buffer**: an artefact the cloud has confirmed is deleted from the
+card, so what remains is only what has not shipped yet.
+`GATE_TRAINING_CORPUS_MAX_BYTES` stays as the backstop for a long outage.
+
+### Backpressure
+
+Bandwidth is not the constraint. About 5.6 MB and 48 frames a day is roughly
+ten seconds of the 4.5 Mbit/s uplink; what matters is never spending those
+seconds while a vehicle is at the gate. The priority is explicit: **gate
+decisions, then event delivery, then the corpus.** In order:
+
+1. **Nothing while the gate is working.** A camera event, a presence session or
+   an OCR request in flight blocks a start outright. Each marks
+   `ActivityGate` around the work it is doing.
+2. **A quiet period first** (`GATE_CORPUS_QUIET_SECONDS`, default 60 s). The
+   gaps inside a presence session — the spacing between frames, the wait for a
+   verdict — are much shorter, so a session is never mistaken for quiet.
+3. **Real events first.** A non-empty outbox blocks the corpus entirely. An
+   owner waiting on an evidence image outranks a training frame, and delivery
+   lag is already p90 84 s with p99 pinned at the 600 s ceiling. A queue depth
+   that cannot be read counts as work pending.
+4. **Abandon, do not finish.** The request body is produced in 8 KB chunks and
+   checks the activity epoch between them, so a transfer already running is
+   torn down the instant an event begins rather than completing. The epoch,
+   not a busy flag, is what makes this reliable: an event that starts and ends
+   between two chunks still aborts the transfer.
+5. **A modest fraction of the link** — `GATE_CORPUS_UPLOAD_BYTES_PER_SECOND`,
+   default 64 KB/s, about an eighth of the uplink.
+6. **Defer rather than compete.** Any block ends the pass and waits for the
+   next poll (`GATE_CORPUS_POLL_SECONDS`, default 300 s). Failures back off
+   per pass from 60 s to 1 hour with jitter.
+
+Nothing here can affect a gate decision. It runs on its own background worker,
+holds no lock the pipeline takes, catches every failure, and a failure always
+leaves the local copy exactly where it was.
+
+### Watching It
+
+`gate_corpus stage=uploaded|deferred|aborted|upload_failed|unshippable` is the
+one journal prefix, and the heartbeat's `corpus` block carries the same state.
+The thing to watch for is `pending` climbing while `last_success_at` stands
+still: that is the buffer filling because uploads are failing, which is the
+corpus going back to being one copy on one card.
+
+`stage=unshippable` means an artefact cannot be sent as it stands — an empty
+payload, an unreadable sidecar. It is kept, not deleted, and counted where the
+heartbeat can see it; deleting it would be the very loss this exists to
+prevent.
+
+### Audio
+
+The pipeline moves **artefacts**, not frames. A sidecar names its `kind` and
+`media_type`, and discovery, upload, indexing and discard all read those
+rather than assuming a JPEG. When audio capture lands it needs to write a clip
+and a sidecar under the same stem convention and nothing here changes.
 
 ## Controller Cutover And Decommission
 

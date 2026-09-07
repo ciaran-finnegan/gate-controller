@@ -24,6 +24,7 @@ from threading import Event, Lock
 from time import monotonic
 from urllib.parse import urlsplit
 
+from .backpressure import NULL_GATE
 from .hot_stream import (
     FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
@@ -422,8 +423,12 @@ class TriggerFrameCapture:
     """Grab one clear-stream frame per accepted camera event, bounded and serial."""
 
     def __init__(self, config: TriggerCaptureConfig, *, popen=subprocess.Popen,
-                 clock=monotonic, wall_clock=None, frame_source=None):
+                 clock=monotonic, wall_clock=None, frame_source=None,
+                 activity=NULL_GATE):
         self.config = config
+        # A camera event owns the uplink from the first frame to the end of
+        # the presence session. The corpus asks this gate before it sends.
+        self._activity = activity or NULL_GATE
         self.output_directory = config.output_directory
         self._popen = popen
         # An object with latest(after=...) -> (jpeg_bytes, captured_at) or
@@ -525,8 +530,11 @@ class TriggerFrameCapture:
                 event, scheduled_at = self._queue.get(timeout=0.25)
             except Empty:
                 continue
-            self.capture_series(event, scheduled_at, stop_event)
-            self.presence_session(event, scheduled_at, stop_event)
+            # One span over both halves: a vehicle is at the gate for the
+            # whole of it, including the quiet gaps between frames.
+            with self._activity.activity("camera_event"):
+                self.capture_series(event, scheduled_at, stop_event)
+                self.presence_session(event, scheduled_at, stop_event)
 
     def note_result(self, paths, result) -> bool:
         """Learn how a frame this capture injected was decided.

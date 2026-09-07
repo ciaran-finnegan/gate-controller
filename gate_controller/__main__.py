@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from .audio import PromptPlayer
 from .actuation import ActuationCoordinator
+from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_seconds
 from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
 )
@@ -32,6 +33,9 @@ from .ocr import PlateRecognizerClient
 from .outbox import (
     CloudflareOutboxSender, HttpOutboxSender, OutboxWorker,
     TelemetryRetentionWorker,
+)
+from .corpus_upload import (
+    CloudflareCorpusSender, CorpusUploadWorker, load_corpus_upload_config,
 )
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
@@ -105,6 +109,15 @@ def main() -> None:
         ),
     )
     latest_image = {"path": None, "received_at": None}
+    # The priority ladder for one 4.5 Mbit/s uplink: gate decisions, then
+    # event delivery, then the corpus. Built here because the pipeline marks
+    # it and the corpus uploader reads it, and both are wired below.
+    activity = ActivityGate(
+        quiet_seconds=_corpus_quiet_seconds(os.environ),
+        # Read through a lambda, not bound here: a store that cannot answer
+        # must make the corpus stand down, not stop the controller starting.
+        pending_events=lambda: store.pending_outbox_count(),
+    )
     match_policy = MatchPolicyCache(
         Path(arguments.database).resolve().parent / "match-policy.json"
     )
@@ -123,20 +136,26 @@ def main() -> None:
     )
     clear_keyframes = _clear_stream_source(trigger_capture_config)
     trigger_capture = (
-        TriggerFrameCapture(trigger_capture_config, frame_source=clear_keyframes)
+        TriggerFrameCapture(
+            trigger_capture_config, frame_source=clear_keyframes,
+            activity=activity,
+        )
         if trigger_capture_config.enabled else None
     )
+    corpus = _training_corpus(os.environ)
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture,
+        corpus=corpus, activity=activity,
     )
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
         plate_region=plate_region,
-        corpus=_training_corpus(os.environ),
+        corpus=corpus,
+        activity=activity,
         local_recognizer=local_recognizer,
         authorised=authorised.get,
         # The very same provider the GateProcessor below is given. The local
@@ -184,14 +203,18 @@ def main() -> None:
                 idempotency_key=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
-        return processor.process(
-            paths,
-            received_at=received_at,
-            decision_started_at=decision_started_at,
-            processing_started_at=processing_started_at,
-            trigger=trigger,
-            idempotency_key=idempotency_key,
-        )
+        # Held for the whole burst: recognition, the decision and the relay
+        # pulse. A frame from the FTP path never reaches trigger_capture's
+        # span, so this is where that path claims the link.
+        with activity.activity("burst"):
+                return processor.process(
+                paths,
+                received_at=received_at,
+                decision_started_at=decision_started_at,
+                processing_started_at=processing_started_at,
+                trigger=trigger,
+                idempotency_key=idempotency_key,
+            )
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
                        processing_started_at=None, *, trigger=None):
@@ -243,6 +266,34 @@ def main() -> None:
         trigger_resolver=trigger_correlator.correlate,
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
+    )
+
+
+def _corpus_quiet_seconds(environment) -> float:
+    """How long the link must be idle before the corpus may use it."""
+    try:
+        return bounded_quiet_seconds(
+            environment.get("GATE_CORPUS_QUIET_SECONDS", DEFAULT_QUIET_SECONDS)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"GATE_CORPUS_QUIET_SECONDS is invalid: {error}") from error
+
+
+def _corpus_upload_worker(environment, corpus, client, controller_id, activity):
+    """The background worker that moves the corpus into R2, or None.
+
+    Built only when there is a corpus to ship and a cloud to ship it to. It
+    is deliberately the last worker in the list: nothing else waits on it,
+    and its failures are its own.
+    """
+    if corpus is None or client is None:
+        return None
+    config = load_corpus_upload_config(environment)
+    if not config.enabled:
+        return None
+    return CorpusUploadWorker(
+        corpus, CloudflareCorpusSender(client, controller_id), activity,
+        config=config, controller_id=controller_id,
     )
 
 
@@ -470,8 +521,13 @@ def _quiet_window(value: str) -> float:
 def build_background_workers(store, relay, *, environment=None, latest_image=None,
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
-                             local_recognizer=None, trigger_capture=None):
+                             local_recognizer=None, trigger_capture=None,
+                             corpus=None, activity=None):
     environment = os.environ if environment is None else environment
+    activity = activity if activity is not None else ActivityGate(
+        quiet_seconds=_corpus_quiet_seconds(environment),
+        pending_events=lambda: store.pending_outbox_count(),
+    )
     latest_image = latest_image if latest_image is not None else {}
     prompt_player = PromptPlayer(_configured_prompts(environment))
     camera_stale_seconds = float(environment.get("GATE_CAMERA_STALE_SECONDS", "60"))
@@ -514,6 +570,9 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                     environment.get("GATE_SETTINGS_REFRESH_SECONDS", "60")
                 ),
             ))
+        corpus_upload = _corpus_upload_worker(
+            environment, corpus, cloudflare_client, controller_id, activity,
+        )
         # heartbeat_worker is late-bound on purpose: the status it reports
         # includes the round trip of the POST the worker itself makes.
         heartbeat_worker = None
@@ -525,6 +584,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             local_recognizer=local_recognizer,
             trigger_capture=trigger_capture,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
+            corpus=corpus, corpus_upload=corpus_upload, activity=activity,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -532,6 +592,8 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         workers.append(heartbeat_worker)
         if net_probe is not None:
             workers.append(net_probe)
+        if corpus_upload is not None:
+            workers.append(corpus_upload)
         return tuple(workers), prompt_player, status
     outbox_url = (environment.get("GATE_OUTBOX_URL") or "").strip()
     if outbox_url:
@@ -558,6 +620,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         camera_stale_seconds=camera_stale_seconds,
         hot_stream=hot_stream, local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, net_probe=net_probe,
+        corpus=corpus, activity=activity,
     )
 
 
@@ -610,6 +673,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        hot_stream=None, match_policy=None, local_recognizer=None,
                        trigger_capture=None, net_probe=None,
                        heartbeat=None, plates=None,
+                       corpus=None, corpus_upload=None, activity=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        module_path=Path(__file__),
                        managed_releases_root=MANAGED_RELEASES_ROOT,
@@ -654,6 +718,9 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if network is not None:
         status["network"] = network
     status["cloud"] = _cloud_status(store, heartbeat, plates, now)
+    corpus_status = _corpus_status(corpus, corpus_upload, activity)
+    if corpus_status is not None:
+        status["corpus"] = corpus_status
     release_sha = _managed_release_sha(
         module_path, releases_root=managed_releases_root
     )
@@ -664,6 +731,34 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if match_policy is not None:
         status["match_policy"] = match_policy.status()
     return status
+
+
+def _corpus_status(corpus, corpus_upload, activity) -> dict | None:
+    """How far behind the corpus is, and what is holding it up.
+
+    `pending` climbing with `last_success_at` standing still is the shape of a
+    buffer that is filling because uploads are failing -- the one thing that
+    turns a bounded local cache back into a single point of loss.
+    """
+    if corpus is None:
+        return None
+    measured: dict = {"local": _bounded_status(corpus)}
+    if corpus_upload is not None:
+        measured["upload"] = _bounded_status(corpus_upload)
+    if activity is not None:
+        measured["backpressure"] = _bounded_status(activity)
+    return measured
+
+
+def _bounded_status(source) -> dict:
+    read_status = getattr(source, "status", None)
+    if not callable(read_status):
+        return {}
+    try:
+        measured = read_status()
+    except Exception:
+        return {}
+    return measured if isinstance(measured, dict) else {}
 
 
 def _local_recognizer_status(local_recognizer) -> dict:

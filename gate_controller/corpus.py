@@ -1,12 +1,24 @@
 """Keep what the OCR saw and said, for training a local recogniser later.
 
 Every frame sent to Plate Recognizer and the answer that came back are
-written under one private directory as a JPEG plus a JSON sidecar. The
-answer is a pseudo-label, not truth: the sidecar keeps the raw candidates,
-scores and box so a review step can confirm or correct it. The directory is
-bounded by size; the oldest pairs are removed first. Writing never raises
-into the recognition path.
+written under one private directory as a payload file plus a JSON sidecar
+sharing its stem. The answer is a pseudo-label, not truth: the sidecar keeps
+the raw candidates, scores and box so a review step can confirm or correct
+it. Writing never raises into the recognition path.
+
+The pair is an *artefact*, not specifically a frame. The sidecar names its
+``kind`` and ``media_type``, so the audio capture that is coming next -- the
+gate opening and closing -- is another artefact in this same directory and
+travels the same pipeline, rather than needing a second one.
+
+This directory is a **buffer, not the archive**. ``gate_controller.corpus_upload``
+ships each artefact to R2 and calls :meth:`TrainingCorpus.discard` once the
+cloud has confirmed it, so what remains on the SD card is only what has not
+shipped yet. The size bound stays as a backstop for a long outage: past the
+cap the oldest pairs are removed first, and that is a permanent loss, which is
+exactly why the upload exists.
 """
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -23,6 +35,33 @@ DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
 MIN_MAX_BYTES = 16 * 1024 * 1024
 MAX_SIDECAR_BYTES = 64 * 1024
 KEEP_RESULT_KEYS = ("plate", "score", "dscore", "box", "candidates", "region", "vehicle")
+#: Bumped when the sidecar gained its ``artefact`` block. Version 1 sidecars
+#: are still on the card and still readable: they are frames, and the reader
+#: below says so rather than making the uploader guess.
+SIDECAR_SCHEMA_VERSION = 2
+FRAME_KIND = "frame"
+FRAME_MEDIA_TYPE = "image/jpeg"
+FRAME_SUFFIX = ".jpg"
+SIDECAR_SUFFIX = ".json"
+
+
+@dataclass(frozen=True)
+class CorpusArtefact:
+    """One payload file and its sidecar, sharing a stem.
+
+    A frame today. An audio clip needs nothing here to change: the sidecar
+    names the kind and the media type, and the payload is whatever the file
+    holds.
+    """
+
+    stem: str
+    payload_path: Path
+    sidecar_path: Path
+
+    @property
+    def captured_at(self) -> str:
+        """The UTC timestamp the stem was named for, or an empty string."""
+        return self.stem.split("-", 1)[0]
 
 
 class TrainingCorpus:
@@ -36,6 +75,7 @@ class TrainingCorpus:
         self._records = 0
         self._failures = 0
         self._pruned = 0
+        self._discarded = 0
         self._total_bytes: int | None = None
 
     def record(self, image: bytes, *, payload, source: str, geometry=None,
@@ -59,9 +99,17 @@ class TrainingCorpus:
         digest = hashlib.sha256(image).hexdigest()
         stem = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{digest[:12]}"
         sidecar = {
-            "schema_version": 1,
+            "schema_version": SIDECAR_SCHEMA_VERSION,
             "captured_at": now.isoformat(),
             "source": source,
+            "artefact": {
+                "kind": FRAME_KIND,
+                "media_type": FRAME_MEDIA_TYPE,
+                "sha256": digest,
+                "bytes": len(image),
+            },
+            # Kept beside `artefact` for the sidecars already written and for
+            # anything still reading the old name. New readers want `artefact`.
             "image": {"sha256": digest, "bytes": len(image)},
             "geometry": _geometry_fields(geometry),
             "ocr": _ocr_fields(payload),
@@ -80,9 +128,9 @@ class TrainingCorpus:
                 }
             encoded = json.dumps(sidecar, sort_keys=True).encode("utf-8")
         with self._lock:
-            image_path = _write_private(directory, stem + ".jpg", bytes(image))
+            image_path = _write_private(directory, stem + FRAME_SUFFIX, bytes(image))
             try:
-                _write_private(directory, stem + ".json", encoded)
+                _write_private(directory, stem + SIDECAR_SUFFIX, encoded)
             except Exception:
                 image_path.unlink(missing_ok=True)
                 raise
@@ -90,6 +138,78 @@ class TrainingCorpus:
             self._account(len(image) + len(encoded))
             self._prune_locked(directory)
         return image_path
+
+    def pending(self, limit: int | None = None) -> list["CorpusArtefact"]:
+        """The artefacts still on the card, oldest first.
+
+        The stem starts with a UTC timestamp, so sorting the names sorts by
+        capture time. A pair missing either half is not offered: half an
+        artefact is not something to upload, and the size backstop will
+        eventually reclaim it.
+        """
+        try:
+            entries = list(self.directory.iterdir())
+        except OSError:
+            return []
+        payloads: dict[str, Path] = {}
+        sidecars: set[str] = set()
+        for entry in entries:
+            name = entry.name
+            if name.startswith(".") or not entry.is_file():
+                continue
+            if name.endswith(SIDECAR_SUFFIX):
+                sidecars.add(name[: -len(SIDECAR_SUFFIX)])
+            else:
+                payloads.setdefault(entry.stem, entry)
+        artefacts = [
+            CorpusArtefact(
+                stem=stem,
+                payload_path=payloads[stem],
+                sidecar_path=self.directory / (stem + SIDECAR_SUFFIX),
+            )
+            for stem in sorted(sidecars & payloads.keys())
+        ]
+        return artefacts if limit is None else artefacts[:max(0, limit)]
+
+    def discard(self, stem: str) -> bool:
+        """Drop one artefact that is safely in the cloud.
+
+        Called only after the cloud has confirmed the artefact is stored, so
+        this is the step that turns the card from an archive into a buffer.
+        Accounting happens under the same lock ``record`` uses: a stale byte
+        total would make the backstop prune live pairs it does not need to.
+        """
+        freed = 0
+        removed = False
+        with self._lock:
+            for suffix in (SIDECAR_SUFFIX, *self._payload_suffixes(stem)):
+                path = self.directory / (stem + suffix)
+                try:
+                    size = path.stat().st_size
+                    path.unlink()
+                except OSError:
+                    continue
+                freed += size
+                removed = True
+            if removed:
+                self._discarded += 1
+                if self._total_bytes is not None:
+                    self._total_bytes = max(0, self._total_bytes - freed)
+        return removed
+
+    def _payload_suffixes(self, stem: str) -> tuple[str, ...]:
+        """Every non-sidecar suffix written under ``stem``.
+
+        Read from the directory rather than assumed, so an audio artefact is
+        discarded by the same call that discards a frame.
+        """
+        try:
+            return tuple(
+                path.suffix for path in self.directory.glob(stem + ".*")
+                if path.is_file() and path.suffix != SIDECAR_SUFFIX
+            )
+        except OSError:
+            return (FRAME_SUFFIX,)
 
     def status(self) -> dict:
         return {
@@ -99,6 +219,7 @@ class TrainingCorpus:
             "records": self._records,
             "failures": self._failures,
             "pruned": self._pruned,
+            "discarded": self._discarded,
         }
 
     # -- internals --------------------------------------------------------
