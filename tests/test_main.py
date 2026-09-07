@@ -2,6 +2,7 @@ import argparse
 import builtins
 import unittest
 import os
+import pathlib
 import tempfile
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -151,6 +152,22 @@ def no_live_state_access():
                 f"{module}.{attribute}",
                 guarded(f"{module}.{attribute}", getattr(namespace, attribute)),
             ))
+        # Python 3.10 and earlier bind the os functions onto a module-level
+        # pathlib accessor at import time (``_NormalAccessor.stat = os.stat``),
+        # so ``Path.exists()`` never looks at ``os.stat`` again and patching it
+        # above is a silent no-op. CI runs 3.10, which is exactly where the
+        # release-blocking call lives, so patch the accessor too where it
+        # exists. 3.11+ call ``os.stat`` directly and have no accessor.
+        accessor = getattr(pathlib, "_normal_accessor", None)
+        if accessor is not None:
+            for _, attribute in _GUARDED_FILESYSTEM_CALLS:
+                if not hasattr(accessor, attribute):
+                    continue
+                stack.enter_context(patch.object(
+                    accessor,
+                    attribute,
+                    guarded(f"os.{attribute}", getattr(accessor, attribute)),
+                ))
         yield touched
     if touched:
         raise AssertionError(
