@@ -12,10 +12,15 @@ whichever camera is fitted unless that document says otherwise.
 
 There is a PIR-triggered white floodlight at the gate, separate from the
 camera's own IR illuminator and from any spotlight the camera itself may have
-(the RLC-810A has none — see the night configuration review below). Whether
-the floodlight reliably covers the stop position in front of the camera, and
-its trigger delay relative to an arriving vehicle, are unverified as of this
-writing. See
+(the RLC-810A has none — see the night configuration review below). Its hold
+timer is short: it stays lit for only a few seconds after triggering, not for
+the whole time a vehicle is stopped at the gate. Extending that hold time
+(most PIR floodlights offer roughly 10 s to several minutes) to 1-2 minutes
+and aiming the fixture at the stop position is the simplest physical fix, and
+is a prerequisite for using the floodlight to force colour night mode (see the
+Floodlight subsection below). Whether the floodlight reliably covers the stop
+position in front of the camera, and its trigger delay relative to an
+arriving vehicle, are unverified as of this writing. See
 [Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
 for the current state of that investigation, including the "Floodlight"
 subsection, and for the exposure settings deployed around it.

@@ -312,6 +312,30 @@ IR stays off regardless of `IrLights.state`. The plate then reads under
 ordinary colour exposure, as it would in daytime, rather than depending on
 the headlight-lit manual exposure this document deploys as a fallback.
 
+The owner also reports the floodlight's hold timer is short: it stays lit for
+only a few seconds after triggering, not the whole time a vehicle is stopped
+at the gate. That changes what "reliably covers the stop position" needs to
+mean, and has three implications:
+
+- **The simplest physical fix is the hold timer, not the beam.** Most PIR
+  floodlights expose an adjustable hold time from about 10 s to several
+  minutes. Setting it to 1-2 minutes and aiming the fixture at the stop
+  position would keep the plate lit for the whole decision window, rather
+  than for a few seconds around the trigger.
+- **Forcing `Isp.dayNight` to `Color` is gated on that fix.** With only a few
+  seconds of light, the camera's own `Auto` day/night switching will not
+  react and settle before the light goes out again, so the colour-mode option
+  above only becomes sensible once the hold time is extended — it is not a
+  substitute for extending it.
+- **A short window would show up as a first-frame/later-frame split.** The
+  controller's hot keyframe is injected within about half a second of the
+  alarm (`GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES`, `docs/reolink-rlc-810a.md`),
+  which could still fall inside a few-second floodlight window, while the
+  later presence-retry frames (`GATE_PRESENCE_WINDOW_SECONDS`) fall outside
+  it. If the next night entry shows the first frame well lit and later
+  retries dark, a short floodlight window rather than a coverage or aiming
+  problem is the likely explanation.
+
 ## 6. Rollback
 
 Every change is one command. To restore the exact state found at 22:31 on
