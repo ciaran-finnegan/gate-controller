@@ -18,8 +18,10 @@ from .authorisation import (
 from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
+from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
+from .net_probe import NetProbeWorker, load_net_probe_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
 from .plate_region import parse_plate_region
 from .trigger_capture import (
@@ -105,12 +107,10 @@ def main() -> None:
     local_recognizer = build_local_recognizer(os.environ, plate_region=plate_region)
     if local_recognizer is not None:
         local_recognizer.start()
-    background_workers, _, _ = build_background_workers(
-        store, relay, latest_image=latest_image, coordinator=coordinator,
-        authorised=authorised, camera_directory=arguments.directory,
-        hot_stream=hot_stream, match_policy=match_policy,
-        local_recognizer=local_recognizer,
-    )
+    # trigger_capture is built before the background workers so the heartbeat
+    # status closure can see it. Building it afterwards is what left
+    # presence.unresolved, dropped_frames and lost_verdicts incrementing on
+    # the Pi and never reaching the cloud, while the docs claimed otherwise.
     trigger_capture_config = load_trigger_capture_config(
         os.environ, Path(arguments.database).resolve().parent,
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
@@ -119,6 +119,13 @@ def main() -> None:
     trigger_capture = (
         TriggerFrameCapture(trigger_capture_config, frame_source=clear_keyframes)
         if trigger_capture_config.enabled else None
+    )
+    background_workers, _, _ = build_background_workers(
+        store, relay, latest_image=latest_image, coordinator=coordinator,
+        authorised=authorised, camera_directory=arguments.directory,
+        hot_stream=hot_stream, match_policy=match_policy,
+        local_recognizer=local_recognizer,
+        trigger_capture=trigger_capture,
     )
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
@@ -203,10 +210,15 @@ def main() -> None:
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
+    net_probe = next(
+        (worker for worker in background_workers if isinstance(worker, NetProbeWorker)),
+        None,
+    )
+
     def shutdown():
         return _shutdown_controller_with_hot_stream(
             hot_stream, processor, relay, trigger_capture=trigger_capture,
-            clear_keyframes=clear_keyframes,
+            clear_keyframes=clear_keyframes, net_probe=net_probe,
         )
 
     run_worker(
@@ -335,7 +347,13 @@ def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
 
 
 def _shutdown_controller_with_hot_stream(hot_stream, processor, relay,
-                                         trigger_capture=None, clear_keyframes=None) -> bool:
+                                         trigger_capture=None, clear_keyframes=None,
+                                         net_probe=None) -> bool:
+    try:
+        if net_probe is not None:
+            net_probe.close()
+    except BaseException:
+        logging.getLogger(__name__).warning("net_probe_close_failed", exc_info=True)
     try:
         if trigger_capture is not None:
             trigger_capture.close()
@@ -414,7 +432,7 @@ def _quiet_window(value: str) -> float:
 def build_background_workers(store, relay, *, environment=None, latest_image=None,
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
-                             local_recognizer=None):
+                             local_recognizer=None, trigger_capture=None):
     environment = os.environ if environment is None else environment
     latest_image = latest_image if latest_image is not None else {}
     prompt_player = PromptPlayer(_configured_prompts(environment))
@@ -422,6 +440,8 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     telemetry_retention_days = _telemetry_retention_days(environment)
+    net_probe_config = load_net_probe_config(environment)
+    net_probe = NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
     if coordinator is not None:
@@ -441,11 +461,13 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             controller_id=controller_id,
             telemetry_retention_days=telemetry_retention_days,
         ))
+        plates_worker = None
         if authorised is not None:
-            workers.append(AuthorisationRefreshWorker(
+            plates_worker = AuthorisationRefreshWorker(
                 authorised, CloudflarePlateFetcher(cloudflare_client, controller_id),
                 poll_interval=float(environment.get("GATE_AUTHORISATION_REFRESH_SECONDS", "30")),
-            ))
+            )
+            workers.append(plates_worker)
         if match_policy is not None:
             workers.append(SettingsRefreshWorker(
                 match_policy,
@@ -454,16 +476,24 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                     environment.get("GATE_SETTINGS_REFRESH_SECONDS", "60")
                 ),
             ))
+        # heartbeat_worker is late-bound on purpose: the status it reports
+        # includes the round trip of the POST the worker itself makes.
+        heartbeat_worker = None
         status = lambda: _controller_status(
             store, prompt_player, latest_image, authorised, relay=relay,
             camera_directory=camera_directory,
             camera_stale_seconds=camera_stale_seconds,
             hot_stream=hot_stream, match_policy=match_policy,
             local_recognizer=local_recognizer,
+            trigger_capture=trigger_capture,
+            net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
         )
-        workers.append(HeartbeatWorker(
+        heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
-        ))
+        )
+        workers.append(heartbeat_worker)
+        if net_probe is not None:
+            workers.append(net_probe)
         return tuple(workers), prompt_player, status
     outbox_url = (environment.get("GATE_OUTBOX_URL") or "").strip()
     if outbox_url:
@@ -482,11 +512,14 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         workers.append(TelemetryRetentionWorker(
             store, retention_days=telemetry_retention_days,
         ))
+    if net_probe is not None:
+        workers.append(net_probe)
     return tuple(workers), prompt_player, lambda: _controller_status(
         store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
         hot_stream=hot_stream, local_recognizer=local_recognizer,
+        trigger_capture=trigger_capture, net_probe=net_probe,
     )
 
 
@@ -537,9 +570,12 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
                        hot_stream=None, match_policy=None, local_recognizer=None,
+                       trigger_capture=None, net_probe=None,
+                       heartbeat=None, plates=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        module_path=Path(__file__),
-                       managed_releases_root=MANAGED_RELEASES_ROOT, clock=None) -> dict:
+                       managed_releases_root=MANAGED_RELEASES_ROOT,
+                       host_metrics=read_host_metrics, clock=None) -> dict:
     now = (clock or (lambda: datetime.now(timezone.utc)))()
     camera_upload_recent = _camera_is_fresh(
         latest_image.get("received_at"), now, camera_stale_seconds
@@ -548,7 +584,13 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     camera_upload_ready = camera_configured and Path(camera_directory).is_dir()
     status = {
         "last_seen_at": now.isoformat(),
-        "latest_camera_image": latest_image.get("path"),
+        # The absolute path of the latest frame is deliberately not sent: a
+        # filesystem path has no business in D1. A boolean and an age carry
+        # everything the app needs.
+        "latest_camera_image_available": bool(latest_image.get("path")),
+        "latest_camera_image_age_seconds": _age_seconds(
+            latest_image.get("received_at"), now
+        ),
         "last_camera_upload_at": latest_image.get("received_at"),
         "queue_depth": store.pending_outbox_count(),
         "audio_available": prompt_player.available,
@@ -564,6 +606,16 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
             "local_shadow": _local_recognizer_status(local_recognizer),
         },
     }
+    trigger_capture_status = _trigger_capture_status(trigger_capture)
+    if trigger_capture_status is not None:
+        status["recognition"]["trigger_capture"] = trigger_capture_status
+    host = _host_status(host_metrics, net_probe)
+    if host:
+        status["host"] = host
+    network = _network_status(net_probe)
+    if network is not None:
+        status["network"] = network
+    status["cloud"] = _cloud_status(store, heartbeat, plates, now)
     release_sha = _managed_release_sha(
         module_path, releases_root=managed_releases_root
     )
@@ -589,6 +641,90 @@ def _local_recognizer_status(local_recognizer) -> dict:
         return default
     measured["ready"] = measured.get("state") == "ready"
     return measured
+
+
+def _age_seconds(timestamp: str | None, now: datetime) -> float | None:
+    if not timestamp:
+        return None
+    try:
+        observed_at = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age = (now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc))
+    return round(max(0.0, age.total_seconds()), 1)
+
+
+def _trigger_capture_status(trigger_capture) -> dict | None:
+    """The presence and skip counters that already exist on the Pi.
+
+    Eleven `gate_presence stage=unresolved` warnings in one week, each a
+    vehicle at a gate that stayed shut, were being counted and discarded.
+    """
+    read_status = getattr(trigger_capture, "status", None)
+    if not callable(read_status):
+        return None
+    try:
+        measured = read_status()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
+
+
+def _host_status(host_metrics, net_probe) -> dict:
+    """Bounded /proc and /sys reads; an absent field means the read failed."""
+    throttled = None
+    read_throttled = getattr(net_probe, "throttled_flags", None)
+    if callable(read_throttled):
+        try:
+            throttled = read_throttled()
+        except Exception:
+            throttled = None
+    try:
+        measured = host_metrics(throttled=throttled)
+    except Exception:
+        return {}
+    return measured if isinstance(measured, dict) else {}
+
+
+def _network_status(net_probe) -> dict | None:
+    read_status = getattr(net_probe, "status", None)
+    if not callable(read_status):
+        return None
+    try:
+        measured = read_status()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
+
+
+def _cloud_status(store, heartbeat, plates, now: datetime) -> dict:
+    cloud: dict = {
+        "heartbeat_rtt_ms": None,
+        "heartbeat_consecutive_failures": None,
+        "plates_consecutive_failures": None,
+        "oldest_pending_outbox_age_s": None,
+    }
+    read_metrics = getattr(heartbeat, "metrics", None)
+    if callable(read_metrics):
+        try:
+            measured = read_metrics()
+        except Exception:
+            measured = None
+        if isinstance(measured, dict):
+            cloud["heartbeat_rtt_ms"] = measured.get("heartbeat_rtt_ms")
+            cloud["heartbeat_consecutive_failures"] = measured.get(
+                "heartbeat_consecutive_failures"
+            )
+    failures = getattr(plates, "consecutive_failures", None)
+    if isinstance(failures, int):
+        cloud["plates_consecutive_failures"] = failures
+    try:
+        cloud["oldest_pending_outbox_age_s"] = store.oldest_pending_outbox_age_seconds(now=now)
+    except Exception:
+        cloud["oldest_pending_outbox_age_s"] = None
+    return cloud
 
 
 def _hot_stream_status(hot_stream) -> dict:

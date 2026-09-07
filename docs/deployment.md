@@ -246,6 +246,76 @@ transitions with the returned HTTP status, repeated at most every ten minutes,
 followed by `stage=*_recovered` when the path returns. Check those lines first
 when the app shows the controller as not reporting.
 
+### Heartbeat Health Blocks
+
+The 15 s heartbeat is the only telemetry that survives a Pi the owner cannot
+SSH into, so it carries host health as well as capabilities. **Deploy the app
+before the controller starts sending these.** The heartbeat's allow-list
+*drops* keys it does not know rather than rejecting the body, so an out-of-date
+Worker still answers `200` and still records the heartbeat — it silently
+discards `host`, `network`, `cloud` and `recognition.trigger_capture`, and the
+status header reads "unknown" indefinitely. That is a quiet failure of exactly
+the instrument this work exists to provide, which is why the ordering matters
+even though nothing breaks.
+
+`POST /api/controller/metrics` is the stricter one: an unrecognised key there
+rejects the whole body with `400`. Nothing in this phase posts to it yet, but
+the same rule applies when the phase-2 rollup does.
+
+| Block | What it carries |
+| --- | --- |
+| `host` | `soc_temp_c`, `throttled` (raw hex plus `under_voltage` / `arm_capped` / `currently_throttled`), `load_1m/5m/15m`, `mem_total_kib` / `mem_available_kib` / `swap_free_kib`, `disk_free_bytes` / `disk_total_bytes`, `oom_kill_total`, `uptime_seconds`, `process_uptime_seconds`, `disk_sectors_written` |
+| `network` | the last completed probe cycle: `router.rtt_ms` / `router.loss`, `tls.handshake_ms`, `uplink.receive_bytes_per_s` / `.transmit_bytes_per_s`, `skipped_reason`, `age_seconds` |
+| `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s` |
+| `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
+
+Everything here degrades to an absent field rather than to a healthy-looking
+default. An unreadable `/proc` file omits its metric; a failed probe omits its
+block; a wedged capture worker omits `trigger_capture`. The heartbeat still
+goes out. The app must render an absent field as "unknown".
+
+Two measurements name the failures that prompted this. `oom_kill_total` is the
+kernel's monotonic counter and needs no threshold: any increase means
+something on the board was killed, which is what happened on 2026-09-07.
+`process_uptime_seconds` falling below `uptime_seconds` means
+`file-monitor.service` restarted without the board rebooting.
+
+Nothing in the heartbeat carries a filesystem path, a plate, an image digest,
+a credential or an IP address. The absolute path of the latest camera frame
+used to be sent as `latest_camera_image`; it is now reported as
+`latest_camera_image_available` plus `latest_camera_image_age_seconds`. The
+default gateway is read from `/proc/net/route` and used only as a ping target,
+never reported.
+
+### Network Probe
+
+`GATE_NET_PROBE_ENABLED` (default `true`) adds **one** thread on a 60 s poll
+inside the existing controller process — no new systemd unit. It pings the
+default gateway (`5 x 64 B`), handshakes TLS to Plate Recognizer every 300 s
+(no HTTP request, so no lookup is billed), and reads the `/proc/net/dev` delta.
+There is deliberately **no throughput test**: the uplink is about 4.5 Mbit/s
+and OCR uploads already saturate it, so a speed test would compete with the
+thing it measures.
+
+The board is fanless, idles at 71-74 C and hardware-throttles at 85 C, so the
+probe is governed. Before every cycle it skips entirely — recording
+`network.skipped_reason` so the gap is explicit rather than silent — when
+
+* `soc_temp_c >= GATE_NET_PROBE_MAX_TEMP_C` (default 80.0), or
+* `load_1m >= GATE_NET_PROBE_MAX_LOAD` (default 3.0), or
+* available memory is under 300 MB.
+
+At most one child process is ever alive (a `BoundedSemaphore(1)`), each child
+runs under `RLIMIT_AS` of 64 MiB with a 3 s kill-and-reap deadline, a capped
+stdout and `stderr` to `/dev/null`. ffmpeg, image or video decode, numpy,
+onnxruntime, model loads, `journalctl` and throughput tests are permanently
+forbidden in `gate_controller/net_probe.py` and `host_metrics.py`, and
+`tests/test_net_probe.py` asserts it along with the measured ceilings: under
+5 MB of steady-state growth and under 0.5 % of one core.
+
+Set `GATE_NET_PROBE_ENABLED=false` to remove the thread entirely; the rest of
+the heartbeat is unaffected.
+
 The Worker deployment owns evidence retention. Store accepted JPEGs only in a
 private R2 bucket under the verified digest, keep bucket access limited to the
 Worker and approved operators, and configure the site's approved R2 lifecycle

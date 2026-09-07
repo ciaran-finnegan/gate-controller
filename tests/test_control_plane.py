@@ -80,3 +80,73 @@ class ControlPlaneTests(unittest.TestCase):
 
         with self.assertLogs("gate_controller.control_plane", level="WARNING"):
             self.assertFalse(HeartbeatWorker(FailingReporter(), lambda: {}).run_once())
+
+
+class HeartbeatRoundTripTests(unittest.TestCase):
+    """The Pi to Cloudflare round trip is timed, not probed: zero extra traffic."""
+
+    def test_no_round_trip_is_reported_before_the_first_post(self):
+        worker = HeartbeatWorker(
+            CloudflareStatusReporter(FakeClient(), "primary"), dict,
+        )
+
+        self.assertEqual(
+            {"heartbeat_rtt_ms": None, "heartbeat_consecutive_failures": 0},
+            worker.metrics(),
+        )
+
+    def test_the_post_the_worker_already_makes_is_the_measurement(self):
+        elapsed = iter([0.0, 0.1842])
+        worker = HeartbeatWorker(
+            CloudflareStatusReporter(FakeClient(), "primary"), dict,
+            clock=lambda: next(elapsed),
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertEqual(184.2, worker.metrics()["heartbeat_rtt_ms"])
+
+    def test_a_failed_post_still_reports_its_duration_and_the_failure_count(self):
+        class FailingReporter:
+            @staticmethod
+            def heartbeat(status):
+                raise TimeoutError("offline")
+
+        elapsed = iter([0.0, 3.0, 3.0, 6.0])
+        worker = HeartbeatWorker(FailingReporter(), dict, clock=lambda: next(elapsed))
+
+        self.assertFalse(worker.run_once())
+        self.assertFalse(worker.run_once())
+
+        self.assertEqual(3000.0, worker.metrics()["heartbeat_rtt_ms"])
+        self.assertEqual(2, worker.metrics()["heartbeat_consecutive_failures"])
+
+    def test_recovery_clears_the_consecutive_failure_count(self):
+        reporter = CloudflareStatusReporter(FakeClient(), "primary")
+        failing = True
+
+        class Flaky:
+            @staticmethod
+            def heartbeat(status):
+                if failing:
+                    raise TimeoutError("offline")
+                reporter.heartbeat(status)
+
+        worker = HeartbeatWorker(Flaky(), dict)
+        worker.run_once()
+        self.assertEqual(1, worker.metrics()["heartbeat_consecutive_failures"])
+
+        failing = False
+        worker.run_once()
+
+        self.assertEqual(0, worker.metrics()["heartbeat_consecutive_failures"])
+
+    def test_a_clock_that_misbehaves_costs_the_measurement_not_the_heartbeat(self):
+        def bad_clock():
+            raise RuntimeError("no monotonic clock")
+
+        reporter = CloudflareStatusReporter(FakeClient(), "primary")
+        worker = HeartbeatWorker(reporter, lambda: {"queue_depth": 2}, clock=bad_clock)
+
+        self.assertTrue(worker.run_once())
+        self.assertEqual(1, len(reporter.client.requests))
+        self.assertIsNone(worker.metrics()["heartbeat_rtt_ms"])

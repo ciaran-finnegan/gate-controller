@@ -283,8 +283,9 @@ queue can hold ahead of it, plus the one being decided) plus an allowance for
 the relay pulse, measured from the injection — journals `gate_presence
 stage=verdict_overdue pending=N` once per session at warning level, and
 carries on. The frame's paths are kept, so a verdict that does arrive late
-still settles the session. Both are counted in the status heartbeat under
-`presence.dropped_frames` and `presence.lost_verdicts`.
+still settles the session. Both are counted and reported in the 15 s status
+heartbeat under `recognition.trigger_capture.presence.dropped_frames` and
+`.lost_verdicts`.
 
 ### Scene Awareness And Frame Gating
 
@@ -342,8 +343,17 @@ either.
 When a presence session ends by window, budget, or departure without the
 gate opening, the controller journals
 `gate_presence stage=unresolved reason=… event_type=…` at warning level and
-counts it in the status heartbeat under `presence.unresolved`. That is the
-one line to look for when a vehicle was at the gate and it did not open.
+counts it in the status heartbeat under
+`recognition.trigger_capture.presence.unresolved`. That is the one line to look
+for when a vehicle was at the gate and it did not open.
+
+Until 2026-09 this document was wrong about that. `TriggerFrameCapture.status()`
+was built and never called: `build_background_workers()` ran before
+`trigger_capture` was constructed, so the heartbeat closure could not see it and
+every one of these counters was discarded. Eleven `stage=unresolved` warnings in
+one week — eleven vehicles at a gate that stayed shut — reached the journal and
+nothing else. The construction order is now the other way round and the whole
+`status()` dict, including the `skipped` counters, reaches the heartbeat.
 
 Two related changes make transient failures survivable inside a single
 burst as well: a burst now waits for a busy OCR slot for as long as its own
