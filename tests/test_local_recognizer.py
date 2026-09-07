@@ -5,6 +5,7 @@ engine seam is faked, exactly as it is on a CI runner where those wheels are
 not installed.
 """
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,8 @@ from gate_controller.local_recognizer import (
     classify_agreement,
     load_local_recognizer_config,
 )
-from gate_controller.models import PlateObservation, RelayResult
+from gate_controller.corpus import TrainingCorpus
+from gate_controller.models import RelayResult
 from gate_controller.ocr import PlateRecognizerClient
 from gate_controller.processor import GateProcessor
 from gate_controller.store import LocalStore
@@ -316,14 +318,58 @@ class SerialisationTests(unittest.TestCase):
         local = recognizer(
             [read("12D3456", 0.99) for _ in range(4)], tracker=tracker,
         )
-        frames = [
-            local.begin(b"frame", trace_id=f"t{index}", authorised={"12D3456"})
-            for index in range(4)
-        ]
-        for frame in frames:
+        for index in range(4):
+            frame = local.begin(
+                b"frame", trace_id=f"t{index}", authorised={"12D3456"},
+            )
             frame.result(5)
 
         self.assertEqual(tracker.peak, 1, "the pool has exactly one worker")
+        local.close()
+
+    def test_a_frame_is_declined_rather_than_queued_behind_a_running_read(self):
+        # A stalled inference must not make every later frame wait its turn
+        # before falling back to the cloud, and a queue would pin each JPEG.
+        gate = Event()
+        tracker = ConcurrencyTracker()
+        local = recognizer(
+            [read("12D3456", 0.99) for _ in range(3)], gate=gate, tracker=tracker,
+        )
+        first = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
+        second = local.begin(b"frame", trace_id="t1", authorised={"12D3456"})
+
+        self.assertEqual(
+            second.result(5).status, "unavailable",
+            "the second frame is answered at once, not queued",
+        )
+        gate.set()
+        self.assertEqual(first.result(5).plate, "12D3456")
+        self.assertEqual(local.status()["busy"], 1)
+
+        # Admission is released once the read finishes.
+        third = local.begin(b"frame", trace_id="t2", authorised={"12D3456"})
+        self.assertEqual(third.result(5).plate, "12D3456")
+        self.assertEqual(tracker.peak, 1)
+        local.close()
+
+
+class EventIsolationTests(unittest.TestCase):
+    def test_untraced_frames_never_pool_into_one_two_frame_match(self):
+        # A disabled trace means no event identity. Two unrelated frames must
+        # not satisfy the two-frame fuzzy rule between them.
+        local = recognizer(
+            [read("11WH2S71", 0.99), read("11WH2S71", 0.99)], mode="active",
+        )
+        first = local.begin(b"frame", trace_id=None, authorised={"11WH2571"})
+        first.result(5)
+        second = local.begin(b"frame", trace_id=None, authorised={"11WH2571"})
+        recognition = second.result(5)
+
+        self.assertEqual(len(second.local_observations()), 1)
+        self.assertFalse(
+            local.decides(second, recognition),
+            "a lone fuzzy frame must not authorise on a previous event's read",
+        )
         local.close()
 
 
@@ -535,7 +581,7 @@ class OcrClientIntegrationTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         local.close()
 
-    def test_cloud_always_still_labels_the_frame_off_the_decision_path(self):
+    def test_cloud_always_labels_the_frame_and_still_lets_the_local_read_decide(self):
         logger = RecordingLogger()
         local = recognizer(
             [read("12D3456", 0.99)], mode="active", cloud="always", logger=logger,
@@ -547,19 +593,99 @@ class OcrClientIntegrationTests(unittest.TestCase):
         observation = client.recognise(self.path, trace_id="trace-always")
 
         self.assertEqual(observation.source, "local", "the local read decided")
-        for _ in range(300):
-            if logger.line("active"):
-                break
-            sleep(0.01)
-        self.assertEqual(len(session.calls), 1, "the label request still ran")
+        self.assertEqual(len(session.calls), 1, "the frame was still labelled")
         line = logger.line("active")
         self.assertIn("decision_source=local", line)
         self.assertIn(
             "cloud_score=0.930", line,
-            "the line waits for the label request rather than settling empty",
+            "the label answer reaches the journal line for comparison",
         )
-        self.assertEqual(corpus.records[-1]["local"]["plate"], "12D3456")
+        record = corpus.records[-1]
+        self.assertEqual(record["extra"]["cloud"], "requested")
+        self.assertEqual(record["local"]["plate"], "12D3456")
         local.close()
+
+    def test_a_cloud_failure_cannot_undo_a_local_decision_in_always_mode(self):
+        local = recognizer([read("12D3456", 0.99)], mode="active", cloud="always")
+        session = FakeSession([FakeResponse({"results": []}, status_code=503)])
+        client = self._client(local, session)
+
+        observation = client.recognise(self.path, trace_id="trace-always-fail")
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertEqual(
+            observation.source, "local",
+            "the label request failed; the decision was already made locally",
+        )
+        local.close()
+
+
+class RealCorpusTests(unittest.TestCase):
+    """Against the real TrainingCorpus, not a fake that records kwargs."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.path = self.root / "frame.jpg"
+        Image.new("L", (64, 32), color=128).save(self.path, format="JPEG")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _sidecar(self, corpus):
+        sidecars = sorted(Path(corpus.directory).glob("*.json"))
+        self.assertTrue(sidecars, "a sidecar was written")
+        return json.loads(sidecars[-1].read_text())
+
+    def test_the_local_read_is_written_beside_the_cloud_read(self):
+        local = recognizer([read("12D3456", 0.99)])
+        corpus = TrainingCorpus(self.root / "corpus")
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse(cloud_payload("12D3456"))]),
+            local_recognizer=local, authorised=lambda: {"12D3456"}, corpus=corpus,
+        )
+
+        client.recognise(self.path, trace_id="trace-real")
+
+        sidecar = self._sidecar(corpus)
+        self.assertEqual(sidecar["ocr"]["plate"], "12D3456")
+        self.assertEqual(sidecar["local"]["plate"], "12D3456")
+        self.assertEqual(sidecar["local"]["status"], "recognized")
+        self.assertEqual(sidecar["local"]["score"], 0.99)
+        self.assertEqual(len(sidecar["local"]["box"]), 4)
+        self.assertIn("total", sidecar["local"]["latency_ms"])
+        self.assertEqual(sidecar["extra"]["local_ocr"], "shadow")
+        local.close()
+
+    def test_a_locally_decided_frame_is_kept_with_no_cloud_answer(self):
+        local = recognizer([read("12D3456", 0.99)], mode="active")
+        corpus = TrainingCorpus(self.root / "corpus")
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([]), local_recognizer=local,
+            authorised=lambda: {"12D3456"}, corpus=corpus,
+        )
+
+        client.recognise(self.path, trace_id="trace-real-local")
+
+        sidecar = self._sidecar(corpus)
+        self.assertEqual(sidecar["source"], "local_recognizer")
+        self.assertEqual(sidecar["ocr"]["results"], [])
+        self.assertEqual(sidecar["local"]["plate"], "12D3456")
+        self.assertEqual(sidecar["extra"]["cloud"], "skipped")
+        local.close()
+
+    def test_a_frame_with_no_local_read_keeps_the_sidecar_it_always_had(self):
+        corpus = TrainingCorpus(self.root / "corpus")
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse(cloud_payload("12D3456"))]),
+            corpus=corpus,
+        )
+
+        client.recognise(self.path)
+
+        sidecar = self._sidecar(corpus)
+        self.assertNotIn("local", sidecar)
+        self.assertEqual(sidecar["ocr"]["plate"], "12D3456")
 
 
 class RecordingRelay:

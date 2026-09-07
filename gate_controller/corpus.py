@@ -65,11 +65,18 @@ class TrainingCorpus:
             "geometry": _geometry_fields(geometry),
             "ocr": _ocr_fields(payload),
         }
+        local_fields = _local_fields(local)
+        if local_fields is not None:
+            sidecar["local"] = local_fields
         if isinstance(extra, dict):
             sidecar["extra"] = {k: v for k, v in extra.items() if _json_safe(v)}
         encoded = json.dumps(sidecar, sort_keys=True).encode("utf-8")
         if len(encoded) > MAX_SIDECAR_BYTES:
             sidecar["ocr"] = {"truncated": True, "plate": sidecar["ocr"].get("plate")}
+            if "local" in sidecar:
+                sidecar["local"] = {
+                    "truncated": True, "plate": sidecar["local"].get("plate"),
+                }
             encoded = json.dumps(sidecar, sort_keys=True).encode("utf-8")
         with self._lock:
             image_path = _write_private(directory, stem + ".jpg", bytes(image))
@@ -156,6 +163,22 @@ def _geometry_fields(geometry) -> dict | None:
         if _json_safe(value):
             fields[key] = value
     return fields or None
+
+
+KEEP_LOCAL_KEYS = ("status", "plate", "score", "box", "latency_ms", "candidates")
+
+
+def _local_fields(local) -> dict | None:
+    """The on-device read, kept beside ``ocr`` and bounded the same way.
+
+    The local answer is a second pseudo-label, not truth, so it is stored
+    next to the cloud one rather than merged into it: a review pass can then
+    see where the two disagreed on the very same frame.
+    """
+    if not isinstance(local, dict):
+        return None
+    return {key: local[key] for key in KEEP_LOCAL_KEYS
+            if key in local and _json_safe(local[key])} or None
 
 
 def _ocr_fields(payload) -> dict:

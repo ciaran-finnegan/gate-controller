@@ -308,10 +308,9 @@ class PlateRecognizerClient:
 
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None,
                   trace_id: str | None = None) -> PlateObservation:
-        return self._recognise(path, timeout, trace_id, run_local=True)
+        return self._recognise(path, timeout, trace_id)
 
-    def _recognise(self, path: Path, timeout, trace_id, *, run_local: bool,
-                   local_record=None) -> PlateObservation:
+    def _recognise(self, path: Path, timeout, trace_id) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
@@ -327,7 +326,6 @@ class PlateRecognizerClient:
                 try:
                     return self._recognise_once(
                         path, timeout, generation, trace_id, state,
-                        run_local=run_local, local_record=local_record,
                     )
                 except _RetryableFailure as failure:
                     if retries >= MAX_TRANSIENT_RETRIES:
@@ -338,10 +336,17 @@ class PlateRecognizerClient:
                     _log_retry(failure.cause, failure.interval)
                     if failure.cause in RETRYABLE_TRANSPORT_CAUSES:
                         self._recycle_session()
+        except Exception:
+            # In `always` mode the local read has already answered for this
+            # frame; a cloud request that then fails costs a label, not the
+            # decision.
+            decided = state.get("local_observation")
+            if decided is None:
+                raise
+            return decided
         finally:
             # Whatever happened to the cloud request, the shadow line is
-            # still owed once the local read lands. A frame whose cloud half
-            # was handed to a background labelling request settles there.
+            # still owed once the local read lands.
             frame = state.get("frame")
             if frame is not None:
                 frame.abandon_cloud()
@@ -445,8 +450,7 @@ class PlateRecognizerClient:
 
     def _recognise_once(
         self, path: Path, timeout: tuple[float, float] | None, generation: int,
-        trace_id: str | None = None, state: dict | None = None, *,
-        run_local: bool = False, local_record=None,
+        trace_id: str | None = None, state: dict | None = None,
     ) -> PlateObservation:
         state = {} if state is None else state
         self._recycle_if_idle()
@@ -490,9 +494,7 @@ class PlateRecognizerClient:
                 )
         upload = self._open_upload(path)
         geometry = self._upload_geometry
-        local_enabled = (
-            run_local and self._local is not None and self._local.enabled
-        )
+        local_enabled = self._local is not None and self._local.enabled
         corpus_image = (
             self._corpus_image(upload)
             if self._corpus is not None or local_enabled else None
@@ -505,11 +507,20 @@ class PlateRecognizerClient:
             )
             state["frame"] = frame
             local_observation = self._local_decision(
-                path, timeout, trace_id, frame, corpus_image,
+                path, timeout, trace_id, frame, corpus_image, geometry,
             )
             if local_observation is not None:
-                upload.close()
-                return local_observation
+                if self._local.config.cloud != CLOUD_ALWAYS:
+                    upload.close()
+                    return local_observation
+                # `always`: the local read is the answer, but the cloud
+                # request still runs here, on this thread, so the frame is
+                # labelled for the corpus. Keeping it on the decision path is
+                # deliberate - a second thread would share this client's
+                # pacing window and upload geometry with a gate-critical
+                # request, and a stray 429 there is worse than the latency
+                # this mode gives up.
+                state["local_observation"] = local_observation
         # Preparing a downscaled upload can outlast the decision deadline;
         # never post a request the processor has already abandoned.
         with self._session_lock:
@@ -578,12 +589,13 @@ class PlateRecognizerClient:
                 "OCR service response has invalid results", CAUSE_INVALID_RESULTS
             )
         self._record_corpus(
-            corpus_image, payload, path,
-            local=local_record if local_record is not None else frame.settled(),
+            corpus_image, payload, path, geometry, local=frame.settled(),
         )
         if not results:
             frame.complete_cloud(None, 0.0, decided=False)
-            return PlateObservation(plate=None, confidence=0.0)
+            return state.get("local_observation") or PlateObservation(
+                plate=None, confidence=0.0,
+            )
         first_result = results[0]
         if not isinstance(first_result, Mapping):
             raise _response_error(
@@ -591,7 +603,7 @@ class PlateRecognizerClient:
             )
         plate = first_result.get("plate")
         score = first_result.get("score")
-        self._log_plate_box(first_result.get("box"))
+        self._log_plate_box(first_result.get("box"), geometry)
         if not isinstance(plate, str) or not normalise_plate(plate):
             raise _response_error(
                 "OCR service response has no usable plate", CAUSE_NO_USABLE_PLATE
@@ -606,10 +618,13 @@ class PlateRecognizerClient:
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
-        frame.complete_cloud(observation.plate, observation.confidence)
-        return observation
+        decided = state.get("local_observation")
+        frame.complete_cloud(
+            observation.plate, observation.confidence, decided=decided is None,
+        )
+        return decided or observation
 
-    def _local_decision(self, path: Path, timeout, trace_id, frame, image):
+    def _local_decision(self, path: Path, timeout, trace_id, frame, image, geometry):
         """The local read, when it may answer for this frame. Else None.
 
         Only ``GATE_LOCAL_OCR_MODE=active`` reaches past the first line. The
@@ -624,37 +639,12 @@ class PlateRecognizerClient:
         if not self._local.decides(frame, recognition):
             return None
         frame.decided_locally()
-        if self._local.config.cloud == CLOUD_ALWAYS:
-            # Labels only: the answer is already decided, so the request runs
-            # off the decision path purely to feed the corpus.
-            frame.defer_cloud()
-            self._start_label_request(path, timeout, trace_id, recognition, frame)
-        else:
+        if self._local.config.cloud != CLOUD_ALWAYS:
             frame.cloud_skipped()
             self._record_corpus(
-                image, None, path, local=recognition, cloud="skipped",
+                image, None, path, geometry, local=recognition, cloud="skipped",
             )
         return recognition.observation()
-
-    def _start_label_request(self, path: Path, timeout, trace_id, recognition,
-                             frame) -> None:
-        def label():
-            try:
-                observation = self._recognise(
-                    path, timeout, trace_id, run_local=False,
-                    local_record=recognition,
-                )
-            except Exception:
-                frame.complete_cloud(None, 0.0, decided=False)
-                return
-            frame.complete_cloud(
-                observation.plate, observation.confidence, decided=False,
-            )
-
-        try:
-            Thread(target=label, name="gate-ocr-label", daemon=True).start()
-        except Exception:
-            frame.complete_cloud(None, 0.0, decided=False)
 
     def local_ocr_summary(self, trace_id: str | None):
         """The compact per-event local block for the telemetry payload."""
@@ -683,8 +673,8 @@ class PlateRecognizerClient:
         except Exception:
             return None
 
-    def _record_corpus(self, image: bytes | None, payload, path: Path, *,
-                       local=None, cloud: str = "requested") -> None:
+    def _record_corpus(self, image: bytes | None, payload, path: Path, geometry,
+                       *, local=None, cloud: str = "requested") -> None:
         if self._corpus is None or not image:
             return
         extra = {
@@ -696,7 +686,7 @@ class PlateRecognizerClient:
             self._corpus.record(
                 image, payload=payload,
                 source="local_recognizer" if payload is None else "plate_recognizer",
-                geometry=self._upload_geometry, extra=extra,
+                geometry=geometry, extra=extra,
                 local=local.to_sidecar() if local is not None else None,
             )
         except Exception:
@@ -770,13 +760,12 @@ class PlateRecognizerClient:
         )
         return buffer
 
-    def _log_plate_box(self, box) -> None:
+    def _log_plate_box(self, box, geometry) -> None:
         """Journal where the plate sat, as fractions of the whole camera frame.
 
         Boxes accumulate in the journal so GATE_PLATE_REGION can be set, and
         later tightened, from where plates were actually read.
         """
-        geometry = self._upload_geometry
         if geometry is None or not isinstance(box, Mapping):
             return
         try:

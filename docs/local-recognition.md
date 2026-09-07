@@ -126,17 +126,26 @@ same situation the rule was written for.
 | variable | default | meaning |
 | --- | --- | --- |
 | `GATE_LOCAL_OCR_MODE` | `off` | `off`, `shadow` or `active`. |
-| `GATE_LOCAL_OCR_CLOUD` | `fallback` | `fallback`: in active mode the cloud request is skipped entirely once the local read has answered - the lookup is not spent and the uplink is not used. `always`: the cloud request still runs, but on a background thread purely to label the frame for the training corpus; it never delays or changes the decision. |
+| `GATE_LOCAL_OCR_CLOUD` | `fallback` | `fallback`: in active mode the cloud request is skipped entirely once the local read has answered - the lookup is not spent, the uplink is not used, and the frame's latency drops to the local read. `always`: the cloud request still runs, so the frame is labelled for the training corpus, but the local read is still what decides. |
 | `GATE_LOCAL_OCR_DETECTOR` | `yolo-v9-t-384-license-plate-end2end` | Any detector registered in `open-image-models`. |
 | `GATE_LOCAL_OCR_RECOGNISER` | `cct-xs-v2-global-model` | Any OCR model registered in `fast-plate-ocr`. |
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
 | `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.95` | The confidence gate. In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 
-`GATE_LOCAL_OCR_CLOUD=always` costs a Plate Recognizer lookup per frame and
-takes a slot in the API's one-request-per-second window, which can delay the
-*next* frame's cloud request. It exists to keep collecting pseudo-labels while
-active mode is being proven, not as a steady state.
+`GATE_LOCAL_OCR_CLOUD=always` keeps the labelling but gives up the latency win:
+the cloud request runs on the decision path exactly as it does today, and the
+frame is only answered once it returns.
+
+That is deliberate, and it is the one place where the obvious design was the
+wrong one. Moving the label request to a background thread would have it share
+this client's one-request-per-second pacing window and its upload geometry with
+a gate-critical request on the *next* vehicle; a stray 429 on the request that
+opens the gate is a far worse outcome than the latency this mode gives up. So
+`always` exists to keep collecting pseudo-labels while active mode is being
+proven, not as a steady state - the mode that actually makes the gate faster is
+`fallback`. If the cloud request fails here, the local read still decides, and
+only the label is lost.
 
 ## The model directory
 
@@ -289,6 +298,13 @@ not counted.
 > allowlist before enabling any mode on a controller that delivers to
 > Cloudflare.** Nothing is emitted while the mode is `off`.
 
+**Bounded admission.** Only one local read is ever outstanding. A frame that
+arrives while another is still being read is answered immediately as
+`unavailable` and goes to the cloud, rather than queueing behind it: a stalled
+inference must not make every later frame spend its guard timeout waiting, and
+a queue would pin one JPEG per waiting frame. The `busy` counter in the status
+block says how often that happened.
+
 **Training corpus.** Each corpus sidecar gains a `local` block alongside `ocr`,
 with the local plate, its score, the box in whole-frame fractions, the
 per-stage latencies and the candidate reads, plus `extra.local_ocr` (the mode)
@@ -313,7 +329,8 @@ load and warm-up timings and the state.
 4. Read the agreement and authorisation counts. Look at every mismatch.
 5. Only then `GATE_LOCAL_OCR_MODE=active`, first with
    `GATE_LOCAL_OCR_CLOUD=always` so the corpus keeps growing while the local
-   path decides, then `fallback` once the lookups are no longer wanted.
+   path decides - that stage proves the decision, not the latency - then
+   `fallback`, which is where the lookup and the wait for it both go away.
 6. The kill switch is `GATE_LOCAL_OCR_MODE=off` and a restart.
 
 ## What is deliberately not here

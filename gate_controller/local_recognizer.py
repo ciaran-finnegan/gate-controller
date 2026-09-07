@@ -516,7 +516,6 @@ class LocalFrame:
         self._authorised = authorised
         self._lock = Lock()
         self._accumulated = False
-        self._deferred = False
         self._local: LocalRecognition | None = None
         self._cloud_settled = False
         self._cloud_plate: str | None = None
@@ -587,21 +586,8 @@ class LocalFrame:
             self._decision_source = DECISION_LOCAL
         self._maybe_log()
 
-    def defer_cloud(self) -> None:
-        """A background labelling request owns the cloud half of this line.
-
-        Without this the decision path, which has already returned, would
-        settle the frame with no cloud answer and the line would lose the
-        label the request is being made for.
-        """
-        with self._lock:
-            self._deferred = True
-
     def abandon_cloud(self) -> None:
-        """The cloud attempt ended without an answer. Deferred frames wait."""
-        with self._lock:
-            if self._deferred:
-                return
+        """The cloud attempt ended without an answer for this frame."""
         self.complete_cloud(None, 0.0, decided=False)
 
     def cloud_skipped(self) -> None:
@@ -649,9 +635,6 @@ class _NullFrame(LocalFrame):
     def complete_cloud(self, plate=None, score=0.0, *, decided: bool = True) -> None:
         return
 
-    def defer_cloud(self) -> None:
-        return
-
     def abandon_cloud(self) -> None:
         return
 
@@ -693,8 +676,10 @@ class LocalRecognizer:
         self._summary_order: list[str] = []
         self._observations: dict[str, list] = {}
         self._observation_order: list[str] = []
+        self._inflight = 0
         self._counts = {
             "frames": 0, "recognised": 0, "errors": 0, "unavailable": 0,
+            "busy": 0,
             AGREEMENT_MATCH: 0, AGREEMENT_MISMATCH: 0, AGREEMENT_LOCAL_ONLY: 0,
             AGREEMENT_CLOUD_ONLY: 0, AGREEMENT_BOTH_NONE: 0,
             "local_decisions": 0,
@@ -802,14 +787,32 @@ class LocalRecognizer:
         if pool is None:
             return NULL_FRAME
         if state == STATUS_UNAVAILABLE:
-            self._count("unavailable")
-            future: Future = Future()
-            future.set_result(unavailable_recognition())
-            return LocalFrame(self, trace_id, future, plates)
+            return self._declined(trace_id, plates)
+        with self._lock:
+            # One outstanding read, never a queue. A stalled inference must
+            # not make every later frame wait its turn before falling back to
+            # the cloud, and queued frames would each pin a JPEG in memory.
+            if self._inflight:
+                busy = True
+            else:
+                busy = False
+                self._inflight += 1
+        if busy:
+            self._count("busy")
+            return self._declined(trace_id, plates)
         try:
             future = pool.submit(self._read, image, geometry)
         except RuntimeError:
+            with self._lock:
+                self._inflight -= 1
             return NULL_FRAME
+        return LocalFrame(self, trace_id, future, plates)
+
+    def _declined(self, trace_id, plates) -> LocalFrame:
+        """A frame the local reader could not take, answered immediately."""
+        self._count("unavailable")
+        future: Future = Future()
+        future.set_result(unavailable_recognition())
         return LocalFrame(self, trace_id, future, plates)
 
     def recognise(self, image: bytes, *, trace_id=None, geometry=None,
@@ -839,7 +842,12 @@ class LocalRecognizer:
             recognition is not None and recognition.recognised
             and recognition.score >= self._config.min_confidence
         )
-        key = trace_id or ""
+        if not trace_id:
+            # No trace id means no event identity. A shared bucket would let
+            # two unrelated frames satisfy the two-frame fuzzy rule between
+            # them, so a frame without a trace stands alone.
+            return (recognition.observation(),) if confident else ()
+        key = trace_id
         with self._lock:
             observations = self._observations.setdefault(key, [])
             if key not in self._observation_order:
@@ -851,6 +859,13 @@ class LocalRecognizer:
             return tuple(observations)
 
     def _read(self, image: bytes, geometry) -> LocalRecognition:
+        try:
+            return self._read_once(image, geometry)
+        finally:
+            with self._lock:
+                self._inflight = max(0, self._inflight - 1)
+
+    def _read_once(self, image: bytes, geometry) -> LocalRecognition:
         started = self._clock()
         with self._lock:
             engine, state = self._engine, self._state
@@ -1002,6 +1017,7 @@ class LocalRecognizer:
             "local_decisions": counts["local_decisions"],
             "errors": counts["errors"],
             "unavailable": counts["unavailable"],
+            "busy": counts["busy"],
             "latency_ms": {
                 "samples": len(latencies),
                 "mean": round(mean, 1),
