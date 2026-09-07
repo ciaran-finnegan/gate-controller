@@ -191,21 +191,41 @@ hardware decode, crop and scale: a 5 fps session costs about 60% of one core
 while it runs; 10 fps about 116%, so 5 is the default.
 
 The session decoder is never pointed at RTSP directly. It reads an Annex-B
-pipe fed by a packet copy of the stream (another 5% of a core) that forwards
-nothing until the first keyframe. Decoding straight from RTSP produced flat
-green frames: MediaMTX hands a new reader the middle of a GOP, the SDP
-already carries the codec parameters, so ffmpeg decodes those inter pictures
-against reference frames it never received. In software libavcodec fills the
-substitute reference with mid-grey; on the `drm` hardware path it does not
-fill it at all, so every block the picture did not code copies an
-uninitialised buffer — RGB(0,135,0), what an all-zero YUV frame renders as —
-and only the moving vehicle comes out real. Measured on a synthesised 10 fps
-stream joined mid-GOP, the first three sampled frames are 98%, 95% and 93%
-one flat colour; through the keyframe gate the worst is 15%. The cost is
-that the first session frame waits for the next keyframe, up to a second at
-the camera's 1x interval; the buffered keyframe covers that gap as it always
-did. The status heartbeat carries `session.keyframe_start`, false while a
-session is still waiting for one.
+pipe fed by a packet copy of the stream (another 5% of a core). Decoding
+straight from RTSP produced flat green frames: MediaMTX hands a new reader
+the middle of a GOP, the SDP already carries the codec parameters, so ffmpeg
+decodes those inter pictures against reference frames it never received. In
+software libavcodec fills the substitute reference with mid-grey; on the
+`drm` hardware path it does not fill it at all, so every block the picture
+did not code copies an uninitialised buffer — RGB(0,135,0), what an all-zero
+YUV frame renders as — and only the moving vehicle comes out real. Measured
+on a synthesised 10 fps stream joined mid-GOP, the first three sampled frames
+are 98%, 95% and 93% one flat colour.
+
+The copy is what fixes it, and it fixes it by itself: `-c:v copy` discards
+leading non-keyframe packets unless asked for `-copyinkf`, and the parser
+bundles the parameter sets into the IDR packet, so the copy's first bytes are
+`VPS,SPS,PPS,IDR_W_RADL`. A start gate in front of the decoder asserts that
+this held — it drops anything ahead of the first keyframe start code and then
+hands chunks straight through without reframing them — and the assertion is
+journaled as `session.keyframe_start` in the status heartbeat, false while a
+session is still waiting for a keyframe. A session that ends without ever
+seeing one is journaled at warning level, with the tail of the decoder's own
+stderr on the line, so a decoder that rejected the pipe outright does not
+read as an ordinary end of stream. The cost of starting at a keyframe is that
+the first session frame can wait up to a second at the camera's 1x interval;
+the buffered keyframe covers that gap as it always did.
+
+The pipe carries no timestamps of its own, so the decoder is told the rate it
+is being fed at (`-r`) and everything else about the input is left unprobed
+(`-analyzeduration 0 -probesize 32 -fpsprobesize 0`; the default probe costs
+about two seconds at 4K). That rate is `GATE_CLEAR_STREAM_SOURCE_FPS` (10),
+and **it must match the camera's main-stream frame rate**. Nothing detects a
+mismatch, and nothing in the pipe could: `fps=N` against a stated rate `R`
+keeps `N/R` of the pictures, whatever rate they really arrive at. A camera
+reconfigured to 15 fps and left stated at 10 would run its "5 fps" session at
+7.5 — half again the frames and half again the core it was measured at —
+while one dropped to 5 fps would run it at 2.5.
 
 While a session runs, each capture slot takes the *stillest* frame of the
 last second, the one that differs least from its predecessor, rather than
@@ -272,18 +292,34 @@ as a *large* scene difference (flat green is nothing like the idle drive)
 and as a normal exposure, so neither of the other two stops it: on
 2026-09-07 one reached OCR, was billed for, and was stored as evidence as a
 green thumbnail. A frame whose plate band is more than
-`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION` (0.6; `0` disables) within a small
+`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION` (0.8; `0` disables) within a small
 tolerance of one colour is skipped as
 `gate_trigger_capture outcome=skipped_corrupt event_type=… source=…
-flat_fraction=…` and counted in the heartbeat under `skipped.corrupt`. The
-default comes from measuring every frame in the corpus and the incident
-folders — day, dusk and night, empty drive and vehicle at the gate: the
-highest a real capture reaches is 0.22, the green frame measures 0.91 and a
-picture concealed against a substituted grey reference 0.87. Near-black
-pixels are excluded and a band that is mostly near-black scores 0, so an
-IR-off night frame with nothing but a headlit plate is never rejected for
-being dark. A frame blown out to near-white does read as flat and is skipped
-under this name rather than as `skipped_clipped`; it carries no plate
+flat_fraction=…` and counted in the heartbeat under `skipped.corrupt`.
+
+The default is set from the two measured distributions, over 4,469 real
+frames on one side and the broken frames from the incident folders on the
+other:
+
+| | frames | flat fraction |
+| --- | --- | --- |
+| real, camera as configured now | 367 | up to **0.632**, with 20 between 0.5 and 0.6 |
+| real, infrared night, empty drive | 20 of those 367 | 0.5–0.6 (IR bloom and mist) |
+| broken decodes | 4 | **0.913**, 0.969, 0.994, 1.000 |
+
+0.8 sits in the gap: 0.17 above the highest real frame and 0.11 below the
+least flat broken one. An earlier 0.6 was inside the real distribution rather
+than above it, and would have thrown away those 20 infrared night frames of
+an empty drive — the frames night recognition can least afford to lose. The
+real distribution runs that high partly because of how the measure is taken:
+it decodes a 480×270 draft and averages that down to 64×36 before comparing
+colours, and the resample smooths genuine texture toward flatness. That is
+why the headroom above the real frames has to be the generous side.
+
+Near-black pixels are excluded and a band that is mostly near-black scores 0,
+so an IR-off night frame with nothing but a headlit plate is never rejected
+for being dark. A frame blown out to near-white does read as flat and is
+skipped under this name rather than as `skipped_clipped`; it carries no plate
 either.
 
 When a presence session ends by window, budget, or departure without the

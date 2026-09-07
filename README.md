@@ -123,6 +123,9 @@ recogniser.
 The clear stream is held compressed while idle and decoded only for events
 (`GATE_CLEAR_STREAM_MODE`, `GATE_SESSION_FPS`, `GATE_SESSION_SECONDS`); each
 capture takes the stillest frame of the last second of the live session.
+`GATE_CLEAR_STREAM_SOURCE_FPS` (10) must match the camera's main-stream frame
+rate - the session decoder reads a pipe with no timestamps, so nothing
+detects a mismatch.
 Frames that show an empty drive are never sent to OCR (`GATE_EMPTY_SCENE_THRESHOLD`),
 frames the decoder could not finish - mostly one flat colour - are skipped as
 `outcome=skipped_corrupt` (`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION`),

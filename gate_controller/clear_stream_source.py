@@ -11,13 +11,15 @@ scene baseline current. When a camera event arrives it:
    ``session_seconds`` so the capture loop can pick the stillest frame of
    each second instead of hoping a fixed offset lands on a stopped car.
 
-The session copies the stream's packets and gates them at the first keyframe
-before they reach a decoder, so the decoder never sees a picture whose
-reference frames it missed. Decoding straight from RTSP does: the media
-server hands a new reader the middle of a GOP and the SDP already carries the
-codec parameters, so ffmpeg decodes those inter pictures against a reference
-it never received. Under hardware decode that reference is an uninitialised
-buffer, and the frame comes out flat green.
+The session decoder is fed by a packet copy of the stream rather than
+pointed at RTSP, so it never sees a picture whose reference frames it
+missed. Decoding straight from RTSP does: the media server hands a new
+reader the middle of a GOP and the SDP already carries the codec parameters,
+so ffmpeg decodes those inter pictures against a reference it never
+received. Under hardware decode that reference is an uninitialised buffer,
+and the frame comes out flat green. ``-c:v copy`` starts the copy at a
+keyframe by itself; ``IrapStartGate`` in front of the decoder is the
+assertion that it did, journaled as ``session.keyframe_start``.
 
 Measured on the RLC-810A stream with hardware decode, crop and scale: a
 5 fps session costs about 60% of one core while it runs; 10 fps about 116%.
@@ -40,13 +42,21 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_SESSION_FPS = 5.0
 DEFAULT_SESSION_SECONDS = 45.0
 DEFAULT_BASELINE_SECONDS = 30.0
-# The clear stream's own frame rate. An Annex-B pipe carries no timestamps,
-# so the session decoder has to be told the rate it is being fed at for the
-# ``fps=`` filter to sample the fraction of pictures it is asked for.
+# The clear stream's own frame rate, which must match the camera's main
+# stream. An Annex-B pipe carries no timestamps, so the session decoder has
+# to be told the rate it is being fed at: ``fps=N`` against a stated rate R
+# keeps N/R of the pictures, whatever they really are. Nothing anywhere
+# checks the answer, so a camera reconfigured to 15 fps and left stated at
+# 10 would run a "5 fps" session at 7.5 (5 x 15/10) and cost half again the
+# core it was measured at, while one dropped to 5 fps would run it at 2.5.
+# It is settable as GATE_CLEAR_STREAM_SOURCE_FPS for exactly that reason.
 DEFAULT_SOURCE_FPS = 10.0
 SESSION_RING_FRAMES = 12
 KEYFRAME_DECODE_TIMEOUT = 3.0
 SESSION_CHUNK_BYTES = 64 * 1024
+# Enough of the decoder's complaint to name it in the stop line. A decoder
+# that rejects the pipe says so in one line and then exits.
+SESSION_STDERR_TAIL = 300
 
 
 class ClearStreamSource:
@@ -93,6 +103,7 @@ class ClearStreamSource:
         self._session_started_at: float | None = None
         self._session_frames = 0
         self._session_gate_open = False
+        self._session_stderr = ""
         self._last_baseline_at: float | None = None
         self._closed = False
 
@@ -230,6 +241,7 @@ class ClearStreamSource:
             self._session_started_at = self._clock()
             self._session_frames = 0
             self._session_gate_open = False
+            self._session_stderr = ""
             stop = self._session_stop
             ring = self._session_ring
         thread = Thread(target=self._run_session, args=(ring, stop), name="gate-clear-session", daemon=True)
@@ -244,6 +256,9 @@ class ClearStreamSource:
             stop = self._session_stop
             processes = (self._session_source_process, self._session_process)
             ring = self._session_ring
+            frames = self._session_frames
+            keyframe_start = self._session_gate_open
+            decoder_error = self._session_stderr
             self._session_ring = None
             self._session_process = None
             self._session_source_process = None
@@ -252,9 +267,15 @@ class ClearStreamSource:
             if process is not None:
                 _terminate(process)
         if ring is not None:
-            LOGGER.info(
-                "gate_clear_stream session=stopped reason=%s frames=%d keyframe_start=%s",
-                reason, self._session_frames, self._session_gate_open,
+            # A session that never reached a keyframe produced nothing the
+            # decoder could turn into a picture, so it is a fault however
+            # tidily it ended - a decoder that rejected the pipe outright
+            # otherwise reads as an ordinary `stream_ended`.
+            LOGGER.log(
+                logging.INFO if keyframe_start else logging.WARNING,
+                "gate_clear_stream session=stopped reason=%s frames=%d keyframe_start=%s "
+                "decoder_error=%s",
+                reason, frames, keyframe_start, decoder_error or "none",
             )
 
     def _session_commands(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -284,9 +305,12 @@ class ClearStreamSource:
             self.stop_session("spawn_failed")
             return
         try:
+            # The decoder's stderr is read, not discarded: this is the only
+            # place that says why a decoder rejected the pipe, and without it
+            # that failure is indistinguishable from an ordinary end of stream.
             decoder = self._popen(
                 decode, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, env=self.child_environment, close_fds=True,
+                stderr=subprocess.PIPE, env=self.child_environment, close_fds=True,
             )
         except (OSError, ValueError):
             _terminate(source)
@@ -305,6 +329,10 @@ class ClearStreamSource:
             name="gate-clear-session-feed", daemon=True,
         )
         feeder.start()
+        Thread(
+            target=self._collect_session_errors, args=(decoder,),
+            name="gate-clear-session-stderr", daemon=True,
+        ).start()
         parser = JpegStreamParser(self._max_frame_bytes)
         try:
             while not stop.is_set():
@@ -327,8 +355,11 @@ class ClearStreamSource:
     def _feed_session(self, source, decoder, stop: Event) -> None:
         """Copy packets into the decoder, starting at the first keyframe.
 
-        Everything before it is dropped on the floor: the decoder cannot
-        reconstruct those pictures, and what it produces instead is a flat
+        ``-c:v copy`` already drops the leading non-keyframe packets, so the
+        gate normally opens on the copy's very first bytes and spends the
+        rest of the session handing chunks straight through. What it adds is
+        the assertion, journaled as ``session.keyframe_start``: if the
+        decoder is ever fed the middle of a GOP again it produces a flat
         frame that passes every downstream check and costs a plate lookup.
         """
         gate = IrapStartGate()
@@ -340,8 +371,9 @@ class ClearStreamSource:
                 payload = gate.feed(chunk)
                 if not payload:
                     continue
-                if not self._session_gate_open and not stop.is_set():
-                    self._session_gate_open = True
+                if not stop.is_set():
+                    with self._session_lock:
+                        self._session_gate_open = True
                 decoder.stdin.write(payload)
                 decoder.stdin.flush()
         except (OSError, ValueError):
@@ -353,12 +385,34 @@ class ClearStreamSource:
                 pass
             _terminate(source)
 
+    def _collect_session_errors(self, decoder) -> None:
+        """Keep the tail of the decoder's stderr for the session's stop line."""
+        stderr = getattr(decoder, "stderr", None)
+        if stderr is None:
+            return
+        try:
+            for line in iter(stderr.readline, b""):
+                text = line.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                with self._session_lock:
+                    joined = f"{self._session_stderr} {text}".strip()
+                    self._session_stderr = joined[-SESSION_STDERR_TAIL:]
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stderr.close()
+            except (OSError, ValueError):
+                pass
+
     # -- status / shutdown ------------------------------------------------
     def status(self) -> dict:
         now = self._clock()
         with self._session_lock:
             active = self._session_ring is not None
             started = self._session_started_at
+            keyframe_start = self._session_gate_open
         return {
             "enabled": True,
             "stream": "clear",
@@ -375,7 +429,7 @@ class ClearStreamSource:
                 "frames": self._session_frames,
                 # False while the session is still waiting for the keyframe
                 # that lets its decoder produce a picture at all.
-                "keyframe_start": self._session_gate_open,
+                "keyframe_start": keyframe_start,
             },
             "scene": self.scene.status(now),
         }

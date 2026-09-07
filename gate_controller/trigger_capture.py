@@ -54,6 +54,12 @@ KEYFRAME_MAX_AGE_SECONDS = 1.6
 CLEAR_STREAM_MODES = frozenset({"compressed", "decoded"})
 MIN_SESSION_FPS, MAX_SESSION_FPS = 1.0, 10.0
 MIN_SESSION_SECONDS, MAX_SESSION_SECONDS = 5.0, 300.0
+# The camera's own main-stream frame rate. The session decoder reads a raw
+# HEVC pipe, which carries no timestamps at all, so it has to be told this,
+# and nothing verifies the answer: the sampling filter keeps a fixed
+# fraction of the pictures, so a real rate that is not the stated one moves
+# the live session's rate in proportion, silently.
+MIN_SOURCE_FPS, MAX_SOURCE_FPS = 1.0, 60.0
 # Presence session: after the series, keep offering fresh frames while the
 # vehicle is still at the gate and nothing has read its plate yet.
 MAX_PRESENCE_WINDOW_SECONDS = 120.0
@@ -68,13 +74,24 @@ MAX_PRESENCE_FRAMES = 10
 DEFAULT_EMPTY_SCENE_THRESHOLD = 0.03
 MAX_EMPTY_SCENE_THRESHOLD = 0.5
 # Fraction of the plate band that may be one single flat colour before the
-# frame is treated as a broken decode rather than a picture. Measured over
-# every frame in the corpus - day, dusk and night, empty drive and vehicle at
-# the gate - the highest a real capture reaches is 0.22; the partially
-# decoded frame that started this measures 0.91, and a picture concealed
-# against a substituted grey reference 0.87. 0.6 leaves nearly a factor of
-# three above the real frames and a third below the broken ones.
-DEFAULT_MAX_FLAT_FRACTION = 0.6
+# frame is treated as a broken decode rather than a picture. The two
+# distributions this sits between were measured over 4,469 real frames and
+# the broken frames from the incident folders:
+#
+#   real     367 frames from the camera as it is configured now reach 0.632
+#            at the top, and 20 of them - infrared night, empty drive, IR
+#            bloom and mist - land between 0.5 and 0.6.
+#   broken   0.913, 0.969, 0.994 and 1.000.
+#
+# 0.6 is inside the real distribution, not above it: it would have thrown
+# away those 20 night frames, which are exactly the frames night recognition
+# cannot spare. 0.8 clears the real maximum by 0.17 and stays 0.11 below the
+# least flat broken frame. The measure is deliberately unhurried about real
+# texture - it averages a 480x270 draft down to 64x36 before comparing, and
+# that resample smooths genuine detail toward flatness - so the headroom
+# above the real frames is what has to be generous, not the margin below the
+# broken ones.
+DEFAULT_MAX_FLAT_FRACTION = 0.8
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
@@ -147,6 +164,9 @@ class TriggerCaptureConfig:
     # Live decode rate and length of the per-event session in compressed mode.
     session_fps: float = 5.0
     session_seconds: float = 45.0
+    # What the camera's main stream actually runs at, so the session decoder
+    # can time an Annex-B pipe that carries no timestamps of its own.
+    source_fps: float = 10.0
     # Skip frames that barely differ from the idle scene (no vehicle in the
     # plate band yet, or it has left). 0 disables the check.
     empty_scene_threshold: float = DEFAULT_EMPTY_SCENE_THRESHOLD
@@ -246,6 +266,9 @@ def load_trigger_capture_config(
     session_seconds = _number(
         environment.get("GATE_SESSION_SECONDS", "45"), MIN_SESSION_SECONDS, MAX_SESSION_SECONDS,
     )
+    source_fps = _number(
+        environment.get("GATE_CLEAR_STREAM_SOURCE_FPS", "10"), MIN_SOURCE_FPS, MAX_SOURCE_FPS,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -271,6 +294,7 @@ def load_trigger_capture_config(
         clear_stream_mode=clear_stream_mode,
         session_fps=session_fps,
         session_seconds=session_seconds,
+        source_fps=source_fps,
     )
 
 

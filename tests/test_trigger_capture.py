@@ -200,6 +200,26 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
+    def test_the_source_rate_the_session_decoder_is_told_follows_the_camera(self):
+        """A raw HEVC pipe has no timestamps, so nothing detects a mismatch.
+
+        The demuxer would assume 25 fps left to itself, which is why the rate
+        is stated at all. Stating it wrongly is just as silent: the filter
+        keeps a fixed fraction of the pictures, so a camera reconfigured to
+        15 fps and left stated at 10 runs its "5 fps" session at 7.5.
+        """
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.source_fps, 10.0)
+        retimed = load_trigger_capture_config(
+            {"GATE_CLEAR_STREAM_SOURCE_FPS": "15"}, Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual(retimed.source_fps, 15.0)
+        for value in ("0", "120", "not a number"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_trigger_capture_config(
+                    {"GATE_CLEAR_STREAM_SOURCE_FPS": value}, Path("/u"), webhook_enabled=True,
+                )
+
     def test_output_directory_lives_in_the_state_root_not_the_upload_tree(self):
         config = load_trigger_capture_config(
             {}, Path("/var/lib/gate-controller"), webhook_enabled=True,
@@ -774,7 +794,7 @@ class TriggerFrameCaptureTests(unittest.TestCase):
             r"outcome=skipped_corrupt event_type=vehicle source=keyframe flat_fraction=0\.\d+",
         )
         self.assertEqual(capture.status()["skipped"]["corrupt"], 1)
-        self.assertEqual(capture.status()["skipped"]["max_flat_fraction"], 0.6)
+        self.assertEqual(capture.status()["skipped"]["max_flat_fraction"], 0.8)
         self.assertEqual(len(self.injected), 1, "only the good frame was injected")
         self.assertEqual(
             sorted(self.config.output_directory.iterdir()), sorted(self.injected[0]),

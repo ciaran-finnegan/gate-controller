@@ -240,6 +240,7 @@ def _clear_stream_source(config):
         max_frame_bytes=config.max_frame_bytes,
         session_fps=config.session_fps,
         session_seconds=config.session_seconds,
+        source_fps=config.source_fps,
     )
 
 

@@ -55,12 +55,27 @@ class Stdout:
         return self.chunks.pop(0) if self.chunks else b""
 
 
+class Stderr:
+    """A child's stderr pipe, drained a line at a time by the session."""
+
+    def __init__(self, lines=()):
+        self.lines = list(lines)
+        self.closed = False
+
+    def readline(self):
+        return self.lines.pop(0) if self.lines else b""
+
+    def close(self):
+        self.closed = True
+
+
 class FakeProcess:
     """A child that streams the given stdout chunks, or answers communicate()."""
 
-    def __init__(self, chunks=(), output=b"", hang=False):
+    def __init__(self, chunks=(), output=b"", hang=False, errors=()):
         self.stdout = Stdout(chunks)
         self.stdin = Stdin()
+        self.stderr = Stderr(errors)
         self.output = output
         self.hang = hang
         self.terminated = False
@@ -164,10 +179,10 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertEqual(source.status()["decodes"], 2)
         self.assertEqual(source.status()["mode"], "compressed_ring")
 
-    def _session_factory(self, jpegs, packets, done):
+    def _session_factory(self, jpegs, packets, done, errors=()):
         """A packet copy and a decoder behind it, as the session spawns them."""
         source_process = FakeProcess(chunks=packets)
-        decoder_process = FakeProcess()
+        decoder_process = FakeProcess(errors=errors)
 
         class DecoderStdout:
             def __init__(self):
@@ -261,7 +276,7 @@ class ClearStreamSourceTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertTrue(source.status()["session"]["keyframe_start"])
         self.assertEqual(
-            bytes(decoder.stdin.written), STREAM[:-len(SC)],
+            bytes(decoder.stdin.written), STREAM,
             "parameter sets and everything from the keyframe on, and nothing before it",
         )
         done.set()
@@ -269,27 +284,71 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertTrue(decoder.stdin.closed, "the decoder is flushed, not left hanging")
 
     def test_a_session_that_never_sees_a_keyframe_feeds_the_decoder_nothing(self):
+        """And says so at warning level, with whatever the decoder complained.
+
+        A decoder that rejects the pipe outright exits at once and its
+        session ends as an ordinary `stream_ended`; without its stderr and
+        without the level, a session that produced nothing reads exactly like
+        one that ran to its natural end.
+        """
+        import time
         done = Event()
         factory, source_process, decoder = self._session_factory(
             [jpeg()], [MID_GOP, MID_GOP, MID_GOP + SC], done,
+            errors=[b"[hevc @ 0x0] Invalid data found when processing input\n"],
         )
         source, _popen = self.source(factory)
         self.assertTrue(source.start_session())
         for _ in range(50):
-            if source_process.stdout.chunks == []:
+            if source_process.stdout.chunks == [] and decoder.stderr.closed:
                 break
-            import time
             time.sleep(0.02)
         self.assertEqual(bytes(decoder.stdin.written), b"")
         self.assertFalse(source.status()["session"]["keyframe_start"])
+        with self.assertLogs("gate_controller.clear_stream_source", level="WARNING") as logs:
+            self._finish_session(source, done)
+        self.assertIn("session=stopped", logs.output[0])
+        self.assertIn("keyframe_start=False", logs.output[0])
+        self.assertIn("Invalid data found when processing input", logs.output[0])
+
+    def test_a_session_that_ran_normally_is_not_journaled_as_a_fault(self):
+        import time
+        done = Event()
+        factory, _source_process, _decoder = self._session_factory([jpeg()], [STREAM], done)
+        source, _popen = self.source(factory)
+        self.assertTrue(source.start_session())
+        for _ in range(50):
+            if source.status()["session"]["keyframe_start"]:
+                break
+            time.sleep(0.02)
+        with self.assertLogs("gate_controller.clear_stream_source", level="INFO") as logs:
+            self._finish_session(source, done)
+        self.assertEqual({record.levelname for record in logs.records}, {"INFO"})
+        self.assertIn("keyframe_start=True decoder_error=none", logs.output[0])
+
+    @staticmethod
+    def _finish_session(source, done):
+        """Let the session end on its own, then make sure it has."""
+        import time
         done.set()
+        for _ in range(100):
+            if not source.session_active():
+                break
+            time.sleep(0.02)
         source.stop_session("test")
+
+    def test_the_configured_source_rate_is_what_the_decoder_is_told(self):
+        source, _popen = self.source(lambda command: FakeProcess(), source_fps=15.0)
+        _copy, decode = source._session_commands()
+        self.assertEqual(decode[decode.index("-r") + 1], "15")
 
     def test_arguments_are_validated_and_close_stops_everything(self):
         with self.assertRaises(ValueError):
             ClearStreamSource("rtsp://127.0.0.1:8554/clear", session_fps=0)
         with self.assertRaises(ValueError):
             ClearStreamSource("rtsp://127.0.0.1:8554/clear", session_seconds=0)
+        with self.assertRaises(ValueError):
+            ClearStreamSource("rtsp://127.0.0.1:8554/clear", source_fps=0)
         source, popen = self.source(lambda command: FakeProcess())
         source.close()
         self.assertFalse(source.start_session(), "a closed source starts no session")

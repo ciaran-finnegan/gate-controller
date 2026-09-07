@@ -17,16 +17,19 @@ QUALITY_UNAVAILABLE_DIGEST = hashlib.sha256(b"quality_unavailable").hexdigest()
 Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
 # Flatness sampling. The grid is coarse on purpose: a broken decode leaves
 # whole regions untouched, so 2304 samples resolve it, and the draft decode
-# that produces them costs about the same as the quality proxies.
+# that produces them costs about the same as the quality proxies. It is
+# coarse at a cost, though, and the threshold has to be set knowing it: a
+# 480x270 draft averaged down to 64x36 smooths real texture toward flatness,
+# so a real frame scores higher here than it would at full resolution. That
+# is why the measured real distribution runs as high as it does.
 FLAT_DRAFT_SIZE = (480, 270)
 FLAT_SAMPLE_SIZE = (64, 36)
 # How far from the modal colour a pixel may sit and still count as the same
 # flat colour. A region the decoder never wrote is bit-identical, so this
 # only has to cover the JPEG round trip and the resample. Kept tight for a
 # reason: real tarmac and sky sit within a wide-ish band of one grey, and
-# every step up widens what counts as flat faster for a real scene than for a
-# broken one. Over the corpus the highest a real frame reaches is 0.22 at a
-# tolerance of 8, but 0.30 at 12 and 0.42 at 16.
+# every step up widens what counts as flat faster for a real scene than for
+# a broken one, which narrows the gap the threshold has to sit in.
 FLAT_TOLERANCE = 8
 # With the IR illuminator off, most of a night frame is legitimately
 # near-black and a headlit plate can still be read out of it. Those pixels
@@ -101,8 +104,11 @@ def measure_flat_fraction(frame: bytes, region: PlateRegion | None = None) -> fl
     hardware path is zeroes - a flat green - while the blocks it did decode
     carry real content. That reads as a busy scene to the empty-scene check
     and as a normal exposure to the clipping check, so it needs its own
-    measure. Real camera frames, day or night, never hold one colour across
-    most of the band: over every frame in the corpus the highest is 0.22.
+    measure. Real camera frames do hold a fair amount of one colour - over
+    4,469 of them the top of the distribution is 0.632, and infrared night
+    frames of an empty drive reach well into the 0.5s - but never the
+    near-unanimity of a picture that was never written, which measures 0.913
+    and up. ``trigger_capture`` sets its threshold in that gap.
 
     Near-black pixels are left out and a band that is mostly near-black
     scores ``0.0``: a night scene with the IR illuminator off is flat black

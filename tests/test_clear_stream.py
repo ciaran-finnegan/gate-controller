@@ -5,8 +5,8 @@ from io import BytesIO
 from PIL import Image
 
 from gate_controller.clear_stream import (
-    AnnexBSplitter, HevcPacketRing, IrapStartGate, decode_command, decode_frames, nal_type,
-    record_command,
+    NAL_SPS, AnnexBSplitter, HevcPacketRing, IrapStartGate, decode_command, decode_frames,
+    nal_type, record_command,
 )
 
 
@@ -109,6 +109,11 @@ class IrapStartGateTests(unittest.TestCase):
     reference is an uninitialised buffer, so what comes out is a flat green
     frame carrying only the blocks that happened to be coded: a valid JPEG,
     wildly different from the scene baseline, and a paid plate lookup.
+
+    ``ffmpeg -c:v copy`` in front of the gate already starts at a keyframe,
+    so in practice the gate opens on the first chunk and does nothing for the
+    rest of the session. It is the assertion that this happened, not the
+    mechanism the fix rests on, and it must cost nothing once it has opened.
     """
 
     def test_nothing_before_the_first_keyframe_reaches_the_decoder(self):
@@ -120,12 +125,12 @@ class IrapStartGateTests(unittest.TestCase):
         keyframe = stream(VPS, SPS, PPS, IDR, P)
         forwarded = gate.feed(keyframe + SC)
         self.assertTrue(gate.started)
-        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR) + SC + P)
+        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR, P) + SC)
 
     def test_parameter_sets_seen_before_the_keyframe_are_emitted_with_it(self):
         gate = IrapStartGate()
         self.assertEqual(gate.feed(stream(VPS, SPS, PPS) + SC), b"", "held, not forwarded")
-        self.assertEqual(gate.feed(stream(IDR) + SC), stream(VPS, SPS, PPS, IDR))
+        self.assertEqual(gate.feed(stream(IDR) + SC), stream(VPS, SPS, PPS, IDR) + SC)
 
     def test_a_keyframe_without_its_parameter_sets_is_not_a_starting_point(self):
         gate = IrapStartGate()
@@ -137,7 +142,7 @@ class IrapStartGateTests(unittest.TestCase):
         data = stream(P, VPS, SPS, PPS, IDR, P) + SC
         forwarded = b"".join(gate.feed(data[i:i + 3]) for i in range(0, len(data), 3))
         self.assertTrue(gate.started)
-        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR, P))
+        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR, P) + SC)
 
     def test_a_later_slice_of_the_keyframe_picture_is_not_a_starting_point(self):
         # first_slice_segment_in_pic_flag is clear, so this NAL continues a
@@ -148,10 +153,34 @@ class IrapStartGateTests(unittest.TestCase):
         )
         self.assertFalse(gate.started)
 
-    def test_delimiters_and_sei_are_dropped_like_the_ring_drops_them(self):
+    def test_an_open_gate_hands_back_the_caller_s_own_bytes_unexamined(self):
+        """The hot path must not reframe the stream, or even copy it.
+
+        A splitter can only release a NAL once the *next* start code arrives,
+        and this camera codes two slices per picture, so an access unit would
+        not close until the following one landed about 100 ms later - on top
+        of the blocking read in front of it. Nothing downstream would report
+        that as latency either: ``captured_at`` is stamped when a frame comes
+        out of the decoder, so the delay is subtracted from every
+        ``frame_age_ms`` in the journal instead of showing up in it.
+        """
         gate = IrapStartGate()
-        gate.feed(stream(VPS, SPS, PPS, IDR) + SC)
-        self.assertEqual(gate.feed(stream(nal(35), nal(39), P) + SC), SC + P)
+        gate.feed(stream(VPS, SPS, PPS, IDR))
+        self.assertTrue(gate.started)
+        chunk = stream(nal(35), nal(39), P)[:-2]  # a picture cut mid-unit
+        self.assertIs(gate.feed(chunk), chunk, "passed through, not reassembled")
+
+    def test_the_keyframe_goes_out_without_waiting_for_the_unit_after_it(self):
+        gate = IrapStartGate()
+        opening = stream(VPS, SPS, PPS) + SC + IDR[:4]  # the IDR still arriving
+        self.assertEqual(gate.feed(opening), opening)
+        self.assertTrue(gate.started)
+
+    def test_the_prefix_scan_does_not_grow_without_bound(self):
+        gate = IrapStartGate(max_prefix_bytes=64)
+        # A parameter set that never ends is not one; it must not be held.
+        self.assertEqual(gate.feed(SC + bytes([NAL_SPS << 1, 1]) + b"x" * 4096), b"")
+        self.assertEqual(gate.feed(stream(VPS, SPS, PPS, IDR)), stream(VPS, SPS, PPS, IDR))
 
 
 class DecodeTests(unittest.TestCase):
@@ -167,6 +196,16 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(decode[decode.index("-vf") + 1], "hwdownload,fps=5")
         self.assertEqual(decode[decode.index("-frames:v") + 1], "1")
         self.assertNotIn("-r", decode)
+
+    def test_the_decoder_does_not_probe_the_pipe_it_is_handed(self):
+        # The default probe costs about two seconds at 4K and learns nothing
+        # the command has not already stated. Every other clear-stream
+        # command skips it; the session decoder used to be the exception.
+        decode = decode_command()
+        self.assertEqual(decode[decode.index("-analyzeduration") + 1], "0")
+        self.assertEqual(decode[decode.index("-probesize") + 1], "32")
+        self.assertEqual(decode[decode.index("-fpsprobesize") + 1], "0")
+        self.assertLess(decode.index("-probesize"), decode.index("-i"), "an input option")
 
     def test_a_sampled_decode_is_told_the_rate_the_pipe_is_fed_at(self):
         # An Annex-B pipe carries no timestamps, so the raw demuxer invents
