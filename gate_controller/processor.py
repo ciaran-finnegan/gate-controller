@@ -15,11 +15,12 @@ from time import monotonic
 
 from .actuation import ActuationCoordinator
 from .images import measure_frame_quality
+from .match_policy import DEFAULT_POLICY
 from .matching import decide_access, normalise_plate
 from .models import GateEvent, ProcessingResult
 from .ocr import classify_failure_cause
 from .telemetry import (
-    OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
+    MatchPolicyTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
     ftp_fallback_trigger,
 )
 
@@ -59,7 +60,8 @@ class GateProcessor:
                  decision_timeout: float = 4.0,
                  activation_guard_seconds: float | None = None,
                  decision_clock=None,
-                 telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None):
+                 telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
+                 match_policy=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -86,6 +88,9 @@ class GateProcessor:
             lambda: datetime.now(timezone.utc)
         )
         self._trace_factory = trace_factory or ProcessingTrace
+        # A callable is re-read for every decision so a schedule refreshed in
+        # the background takes effect without restarting the processor.
+        self._match_policy = match_policy
         self._coordinator = coordinator or ActuationCoordinator(store, relay, cooldown, self._clock)
         self._ocr_slot = BoundedSemaphore(1)
         self._ocr_slot_lock = Lock()
@@ -215,7 +220,10 @@ class GateProcessor:
                 colour=observation.colour,
             ))
             observations.append(observation)
-            decision = decide_access(observations, authorised)
+            decision = decide_access(
+                observations, authorised, self._current_match_policy(),
+                now=self._clock(),
+            )
             if self._decision_clock() - started >= self._decision_timeout:
                 timed_out = True
                 break
@@ -234,6 +242,7 @@ class GateProcessor:
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
             )
+        trace.set_match_policy(MatchPolicyTelemetry.from_decision(decision))
         decision_at = self._clock()
         if timed_out:
             trace.mark_decision("denied", "decision_timeout")
@@ -318,6 +327,19 @@ class GateProcessor:
             trace,
             ProcessingResult(execution.opened, execution.reason, execution.event_id, decision),
         )
+
+    def _current_match_policy(self):
+        """Return the matching policy in force, falling back to the default."""
+        policy = self._match_policy
+        if callable(policy):
+            try:
+                policy = policy()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "match_policy status=unavailable using=default"
+                )
+                return DEFAULT_POLICY
+        return policy or DEFAULT_POLICY
 
     def record_skipped(self, paths: Iterable[Path], reason: str,
                        received_at: datetime | None = None,
@@ -591,6 +613,13 @@ class _BestEffortTrace:
         operation = getattr(self._trace, "set_trigger", None)
         if callable(operation):
             self._call("set_trigger", trigger)
+
+    def set_match_policy(self, match_policy) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "set_match_policy", None)
+        if callable(operation):
+            self._call("set_match_policy", match_policy)
 
     def seed_upstream(
         self, received_at: datetime | None, decision_started_at: float | None,

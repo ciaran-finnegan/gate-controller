@@ -19,10 +19,13 @@ MAX_DIMENSION = 16_384
 MAX_DELIVERY_ATTEMPT = 1_000
 MAX_UPSTREAM_INTERVAL_SECONDS = MAX_DURATION_MS / 1_000
 MAX_CLOCK_SKEW_SECONDS = 0.1
+MAX_EDIT_DISTANCE = 8
 
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FAILURE_CAUSE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_BAND_LABEL = re.compile(r"^(?:[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]|[a-z_]{1,32})$")
+_LOCAL_TIME = re.compile(r"^[0-2][0-9]:[0-5][0-9]$")
 _TRIGGER_EVENT_TYPES = frozenset({
     "line_crossing", "vehicle", "manual_test", "other", "unverified",
 })
@@ -80,6 +83,18 @@ def _optional_failure_cause(value: object | None) -> str | None:
     if isinstance(value, str) and _FAILURE_CAUSE.fullmatch(value):
         return value
     return None
+
+
+def _band_label(value: object) -> str:
+    if isinstance(value, str) and _BAND_LABEL.fullmatch(value):
+        return value
+    return "unknown"
+
+
+def _local_time(value: object) -> str:
+    if isinstance(value, str) and _LOCAL_TIME.fullmatch(value):
+        return value
+    return "unknown"
 
 
 def _trace_id(value: object) -> str:
@@ -157,6 +172,76 @@ class OcrAttemptTelemetry:
             "make": _optional_string(self.make),
             "colour": _optional_string(self.colour),
         }
+
+
+@dataclass(frozen=True)
+class MatchPolicyTelemetry:
+    """The fuzziness band and level that produced one decision.
+
+    Wire keys are frozen by the ingest contract. Do not add fields here
+    without first extending the Worker's ``MATCH_POLICY_KEYS`` allowlist.
+    """
+
+    band: str
+    level: str
+    timezone_name: str
+    local_time: str
+    #: ``exact``, ``ocr_confusion``, or ``edit_distance``; absent on a denial.
+    rule: str | None = None
+    edit_distance: int | None = None
+    observed_plate: str | None = None
+    authorised_plate: str | None = None
+    #: On a denial, the closest authorised plate and how far away it was, so
+    #: the owner can tell a schedule denial from a camera failure.
+    near_miss_plate: str | None = None
+    near_miss_distance: int | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "band": _band_label(self.band),
+            "level": _token(self.level),
+            "timezone": _optional_string(self.timezone_name) or "unknown",
+            "local_time": _local_time(self.local_time),
+        }
+        if self.rule is not None:
+            payload["rule"] = _token(self.rule)
+        if self.edit_distance is not None:
+            payload["edit_distance"] = _rounded_int(
+                self.edit_distance, 0, MAX_EDIT_DISTANCE, 0
+            )
+        for key, value in (
+            ("observed_plate", self.observed_plate),
+            ("authorised_plate", self.authorised_plate),
+            ("near_miss_plate", self.near_miss_plate),
+        ):
+            encoded = _optional_string(value)
+            if encoded is not None:
+                payload[key] = encoded
+        if self.near_miss_distance is not None:
+            payload["near_miss_distance"] = _rounded_int(
+                self.near_miss_distance, 0, MAX_EDIT_DISTANCE, 0
+            )
+        return payload
+
+    @classmethod
+    def from_decision(cls, decision) -> "MatchPolicyTelemetry | None":
+        """Build telemetry from a :class:`~gate_controller.models.MatchDecision`."""
+        level = getattr(decision, "policy_level", None)
+        band = getattr(decision, "policy_band", None)
+        if not isinstance(level, str) or not isinstance(band, str):
+            return None
+        return cls(
+            band=band,
+            level=level,
+            timezone_name=getattr(decision, "policy_timezone", None) or "unknown",
+            local_time=getattr(decision, "policy_local_time", None) or "unknown",
+            rule=getattr(decision, "match_rule", None),
+            edit_distance=getattr(decision, "edit_distance", None),
+            observed_plate=getattr(decision, "observed_plate", None),
+            authorised_plate=getattr(decision, "authorised_plate", None),
+            near_miss_plate=getattr(decision, "near_miss_plate", None),
+            near_miss_distance=getattr(decision, "near_miss_distance", None),
+        )
 
 
 @dataclass(frozen=True)
@@ -282,6 +367,7 @@ class EventTelemetry:
     delivery_state: str
     stage_timestamps: StageTimestamps = field(default_factory=StageTimestamps)
     trigger: TriggerTelemetry | None = None
+    match_policy: MatchPolicyTelemetry | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
@@ -332,6 +418,8 @@ class EventTelemetry:
             payload["stage_timestamps"] = timestamps
         if self.trigger is not None:
             payload["trigger"] = self.trigger.to_wire()
+        if self.match_policy is not None:
+            payload["match_policy"] = self.match_policy.to_wire()
         return payload
 
 
@@ -371,6 +459,7 @@ class ProcessingTrace:
         self._actuation_attempted = False
         self._relay_outcome = "not_attempted"
         self._trigger: TriggerTelemetry | None = None
+        self._match_policy: MatchPolicyTelemetry | None = None
         self._finished_telemetry: EventTelemetry | None = None
 
     def seed_upstream(
@@ -408,6 +497,10 @@ class ProcessingTrace:
 
     def set_trigger(self, trigger: TriggerTelemetry | None) -> None:
         self._trigger = trigger
+
+    def set_match_policy(self, match_policy: MatchPolicyTelemetry | None) -> None:
+        """Record the fuzziness band and level this decision was taken under."""
+        self._match_policy = match_policy
 
     def add_frame(self, frame: FrameTelemetry) -> None:
         if len(self._frames) < MAX_ITEMS:
@@ -525,6 +618,7 @@ class ProcessingTrace:
                 processing_finished_at=self._wall_at(self._finished),
             ),
             trigger=self._trigger,
+            match_policy=self._match_policy,
         )
         return self._finished_telemetry
 

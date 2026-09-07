@@ -8,8 +8,14 @@ staleness window, after which authorization fails closed.
 
 ## Safety Model
 
-- Exact normalised authorised plates may open the gate; fuzzy matches require
-  two high-confidence frames and one recognised OCR-confusion substitution.
+- Exact normalised authorised plates may open the gate. How far a read may
+  stray beyond that is a cloud-managed *level* on a schedule of local-time
+  bands, so a site can run one rule by day and exact-only overnight. With no
+  schedule configured the controller keeps its shipped behaviour: a fuzzy match
+  needs two high-confidence frames, one recognised OCR-confusion substitution,
+  and a single authorised candidate. See [docs/plate-matching.md](docs/plate-matching.md).
+- An unreadable schedule, an unknown level, or an unloadable timezone fails
+  closed to stricter matching, never to a wider one.
 - OCR, parsing, network, cloud, and audio failures leave the gate closed.
 - A durable global activation marker is committed before GPIO is energized;
   optional event delivery remains off the recognition path.

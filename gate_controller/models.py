@@ -23,6 +23,21 @@ class MatchDecision:
     authorised_plate: str | None = None
     observed_plate: str | None = None
     confidence: float = 0.0
+    #: Which rule admitted the match: ``exact``, ``ocr_confusion``, or
+    #: ``edit_distance``. ``None`` on a denial.
+    match_rule: str | None = None
+    #: Characters between the read and the authorised plate it matched.
+    edit_distance: int | None = None
+    #: The fuzziness band and level in force when this decision was taken,
+    #: plus the local wall time that selected them.
+    policy_band: str | None = None
+    policy_level: str | None = None
+    policy_timezone: str | None = None
+    policy_local_time: str | None = None
+    #: On a denial, the closest authorised plate and its distance. Recorded
+    #: for review only; it never widens a match.
+    near_miss_plate: str | None = None
+    near_miss_distance: int | None = None
 
 
 @dataclass(frozen=True)
