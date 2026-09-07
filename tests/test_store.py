@@ -830,3 +830,52 @@ class LocalStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutboxBacklogAgeTests(unittest.TestCase):
+    """delivery_lag_ms p99 is pinned at the 600 s clamp; queue_depth alone
+    cannot tell a draining queue from a stalled one."""
+
+    def store(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return LocalStore(Path(directory.name) / "gate.db")
+
+    def event(self, received_at):
+        return GateEvent(
+            source="ocr", reason="no_match", opened=False,
+            idempotency_key=None, received_at=received_at,
+        )
+
+    def test_an_empty_outbox_reports_no_backlog_rather_than_zero(self):
+        self.assertIsNone(self.store().oldest_pending_outbox_age_seconds())
+
+    def test_the_age_is_measured_from_the_oldest_undelivered_row(self):
+        store = self.store()
+        now = datetime.now(timezone.utc)
+        store.record_event_with_outbox(self.event(now), {"schema_version": 3})
+        store.record_event_with_outbox(self.event(now), {"schema_version": 3})
+
+        age = store.oldest_pending_outbox_age_seconds(now=now + timedelta(seconds=41 * 60))
+
+        self.assertAlmostEqual(2460.0, age, delta=5.0)
+
+    def test_a_clock_that_runs_backwards_never_reports_a_negative_backlog(self):
+        store = self.store()
+        now = datetime.now(timezone.utc)
+        store.record_event_with_outbox(self.event(now), {"schema_version": 3})
+
+        self.assertEqual(0.0, store.oldest_pending_outbox_age_seconds(
+            now=now - timedelta(hours=1)
+        ))
+
+    def test_a_delivered_outbox_row_no_longer_counts_as_a_backlog(self):
+        store = self.store()
+        now = datetime.now(timezone.utc)
+        event_id = store.record_event_with_outbox(self.event(now), {"schema_version": 3})
+        for outbox_id, _ in store.pending_outbox_items():
+            store.complete_outbox_item(outbox_id)
+
+        self.assertIsNone(store.oldest_pending_outbox_age_seconds())
+        self.assertEqual(0, store.pending_outbox_count())
+        self.assertIsInstance(event_id, int)

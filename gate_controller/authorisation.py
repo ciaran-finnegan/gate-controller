@@ -174,6 +174,11 @@ class AuthorisationRefreshWorker:
         self._poll_interval = poll_interval
         self._health = health or TransitionLogger(LOGGER, "plates_refresh")
 
+    @property
+    def consecutive_failures(self) -> int:
+        """Failed plate refreshes since the last success, for the heartbeat."""
+        return self._health.consecutive_failures
+
     def run_once(self) -> bool:
         try:
             rows = self._fetch()

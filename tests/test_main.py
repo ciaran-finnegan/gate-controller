@@ -16,6 +16,7 @@ from gate_controller.__main__ import (
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
+from gate_controller.net_probe import NetProbeWorker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
@@ -423,7 +424,8 @@ class MainConfigurationTests(unittest.TestCase):
 
         self.assertEqual(
             [type(worker).__name__ for worker in workers],
-            ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker"],
+            ["OutboxWorker", "AuthorisationRefreshWorker", "HeartbeatWorker",
+             "NetProbeWorker"],
         )
         self.assertEqual(workers[0]._telemetry_retention_days, 14)
         self.assertEqual(0, status()["queue_depth"])
@@ -662,7 +664,19 @@ class MainConfigurationTests(unittest.TestCase):
             "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
         })
 
+        self.assertEqual([type(worker) for worker in workers], [OutboxWorker, NetProbeWorker])
+
+    def test_network_probe_can_be_switched_off_without_disturbing_the_workers(self):
+        store = self.create_store()
+
+        workers, _, status = build_background_workers(store, relay=object(), environment={
+            "GATE_OUTBOX_URL": "http://127.0.0.1:54321/events",
+            "GATE_OUTBOX_BEARER_TOKEN": "event-secret",
+            "GATE_NET_PROBE_ENABLED": "false",
+        })
+
         self.assertEqual([type(worker) for worker in workers], [OutboxWorker])
+        self.assertNotIn("network", status())
 
     def test_runtime_path_defaults_use_the_writable_state_directory(self):
         authorised, database = default_runtime_paths({})
@@ -741,3 +755,222 @@ class AuthorisationStalenessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeartbeatObservabilityTests(unittest.TestCase):
+    """Phase 1 of the observability plan: host health, network, cloud, counters."""
+
+    def create_store(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return LocalStore(Path(directory.name) / "gate.db")
+
+    def prompt(self):
+        return type("Prompt", (), {"available": False})()
+
+    def test_the_presence_counters_reach_the_heartbeat_instead_of_only_the_journal(self):
+        """Eleven vehicles were at the gate while it stayed shut and the only
+        record was the journal. The counters already existed; nothing read them."""
+        class TriggerCapture:
+            @staticmethod
+            def status():
+                return {
+                    "enabled": True,
+                    "captures": 42,
+                    "failures": 1,
+                    "presence": {
+                        "unresolved": 11, "dropped_frames": 4, "lost_verdicts": 2,
+                        "retries": 3, "window_seconds": 12.0,
+                        "spacing_seconds": 1.0, "max_frames": 6,
+                    },
+                    "skipped": {"empty_scene": 7, "clipped": 0,
+                                "empty_scene_threshold": 0.03,
+                                "max_highlight_clipping": 0},
+                }
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, trigger_capture=TriggerCapture(),
+        )
+
+        presence = status["recognition"]["trigger_capture"]["presence"]
+        self.assertEqual(11, presence["unresolved"])
+        self.assertEqual(4, presence["dropped_frames"])
+        self.assertEqual(2, presence["lost_verdicts"])
+        self.assertEqual(7, status["recognition"]["trigger_capture"]["skipped"]["empty_scene"])
+
+    def test_a_controller_without_trigger_capture_omits_the_block_entirely(self):
+        status = gate_main._controller_status(self.create_store(), self.prompt(), {})
+
+        self.assertNotIn("trigger_capture", status["recognition"])
+
+    def test_a_trigger_capture_that_raises_cannot_stop_the_heartbeat(self):
+        class Exploding:
+            @staticmethod
+            def status():
+                raise RuntimeError("capture worker is wedged")
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, trigger_capture=Exploding(),
+        )
+
+        self.assertNotIn("trigger_capture", status["recognition"])
+        self.assertEqual(0, status["queue_depth"])
+
+    def test_main_builds_trigger_capture_before_the_status_closure_needs_it(self):
+        """The ordering bug: build_background_workers ran before trigger_capture
+        existed, so the status closure could never see it."""
+        captured = {}
+        trigger_capture = Mock(name="TriggerFrameCapture")
+
+        def record(*args, **kwargs):
+            captured.update(kwargs)
+            return ((), object(), object())
+
+        with patch.dict(os.environ, {
+            "PLATE_RECOGNIZER_API_TOKEN": "token",
+            "GATE_REOLINK_WEBHOOK_SECRET": "correct-horse-battery-staple",
+            "GATE_TRIGGER_CAPTURE_ENABLED": "true",
+        }, clear=True), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "_clear_stream_source", return_value=None,
+        ), patch.object(
+            gate_main, "TriggerFrameCapture", return_value=trigger_capture,
+        ), patch.object(
+            gate_main, "build_background_workers", side_effect=record,
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker"):
+            gate_main.main()
+
+        self.assertIs(trigger_capture, captured["trigger_capture"])
+
+    def test_the_heartbeat_never_carries_an_absolute_filesystem_path(self):
+        now = datetime(2026, 9, 7, 10, 20, tzinfo=timezone.utc)
+        latest_image = {
+            "path": "/var/lib/gate-controller/uploads/DRIVEWAY_00_20260907102000.jpg",
+            "received_at": (now - timedelta(seconds=12)).isoformat(),
+        }
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), latest_image, clock=lambda: now,
+        )
+
+        self.assertNotIn("latest_camera_image", status)
+        self.assertTrue(status["latest_camera_image_available"])
+        self.assertEqual(12.0, status["latest_camera_image_age_seconds"])
+        self.assertNotIn("/var/lib", str(status))
+        self.assertNotIn(".jpg", str(status))
+
+    def test_an_absent_camera_frame_reports_unavailable_rather_than_a_stale_age(self):
+        status = gate_main._controller_status(self.create_store(), self.prompt(), {})
+
+        self.assertFalse(status["latest_camera_image_available"])
+        self.assertIsNone(status["latest_camera_image_age_seconds"])
+
+    def test_host_metrics_reach_the_heartbeat_with_the_probe_s_throttle_word(self):
+        class Probe:
+            @staticmethod
+            def throttled_flags():
+                return {"raw": "0xe0006", "arm_capped": True}
+
+            @staticmethod
+            def status():
+                return {"probed": True, "router": {"rtt_ms": 12.4, "loss": 0.0}}
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, net_probe=Probe(),
+            host_metrics=lambda **kwargs: {"soc_temp_c": 82.0, **(
+                {"throttled": kwargs["throttled"]} if kwargs.get("throttled") else {}
+            )},
+        )
+
+        self.assertEqual(82.0, status["host"]["soc_temp_c"])
+        self.assertTrue(status["host"]["throttled"]["arm_capped"])
+        self.assertEqual(12.4, status["network"]["router"]["rtt_ms"])
+
+    def test_a_failed_host_read_still_lets_the_heartbeat_go_out_without_the_block(self):
+        def explode(**_):
+            raise OSError("/proc is unavailable")
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, host_metrics=explode,
+        )
+
+        self.assertNotIn("host", status)
+        self.assertNotIn("network", status)
+        self.assertEqual(0, status["queue_depth"])
+
+    def test_an_empty_host_read_omits_the_block_rather_than_looking_healthy(self):
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, host_metrics=lambda **_: {},
+        )
+
+        self.assertNotIn("host", status)
+
+    def test_the_cloud_block_carries_the_backlog_and_the_failure_counters(self):
+        class Heartbeat:
+            @staticmethod
+            def metrics():
+                return {"heartbeat_rtt_ms": 184.2, "heartbeat_consecutive_failures": 3}
+
+        class Plates:
+            consecutive_failures = 7
+
+        store = self.create_store()
+        store.record_event_with_outbox(
+            gate_main_gate_event(datetime.now(timezone.utc)), {"schema_version": 3},
+        )
+        # The outbox row is stamped when it is queued, so the clock advances
+        # rather than the event being backdated.
+        now = datetime.now(timezone.utc) + timedelta(seconds=90)
+
+        status = gate_main._controller_status(
+            store, self.prompt(), {}, heartbeat=Heartbeat(), plates=Plates(),
+            clock=lambda: now,
+        )
+
+        self.assertEqual(184.2, status["cloud"]["heartbeat_rtt_ms"])
+        self.assertEqual(3, status["cloud"]["heartbeat_consecutive_failures"])
+        self.assertEqual(7, status["cloud"]["plates_consecutive_failures"])
+        self.assertGreater(status["cloud"]["oldest_pending_outbox_age_s"], 0)
+
+    def test_an_empty_outbox_reports_no_backlog_rather_than_zero_age(self):
+        status = gate_main._controller_status(self.create_store(), self.prompt(), {})
+
+        self.assertIsNone(status["cloud"]["oldest_pending_outbox_age_s"])
+        self.assertIsNone(status["cloud"]["heartbeat_rtt_ms"])
+        self.assertIsNone(status["cloud"]["plates_consecutive_failures"])
+
+    def test_a_store_that_cannot_be_read_does_not_break_the_cloud_block(self):
+        class BrokenStore:
+            @staticmethod
+            def pending_outbox_count():
+                return 0
+
+            @staticmethod
+            def oldest_pending_outbox_age_seconds(*, now=None):
+                raise RuntimeError("database is locked")
+
+        status = gate_main._controller_status(BrokenStore(), self.prompt(), {})
+
+        self.assertIsNone(status["cloud"]["oldest_pending_outbox_age_s"])
+
+
+def gate_main_gate_event(received_at):
+    from gate_controller.models import GateEvent
+
+    return GateEvent(
+        source="ocr", reason="no_match", opened=False,
+        idempotency_key=None, received_at=received_at,
+    )
