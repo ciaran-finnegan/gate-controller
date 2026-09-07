@@ -887,7 +887,12 @@ class OcrPacingAndRetryTests(unittest.TestCase):
         self.assertEqual(kwargs["payload"], payload)
         self.assertEqual(kwargs["source"], "plate_recognizer")
         self.assertEqual(kwargs["geometry"].upload_width, 1920)
-        self.assertEqual(kwargs["extra"], {"precropped": False})
+        self.assertEqual(
+            kwargs["extra"],
+            {"precropped": False, "cloud": "requested", "local_ocr": "off"},
+            "the sidecar records what actually ran for this frame",
+        )
+        self.assertIsNone(kwargs["local"])
 
         empty = PlateRecognizerClient(
             "token", session=FakeSession(response=FakeResponse(payload={"results": []})), corpus=Corpus(),

@@ -16,6 +16,10 @@ UPDATER_HELPER=/usr/local/libexec/gate-controller/gate-controller-updater.py
 MEDIA_BOOTSTRAP_ROOT=/usr/local/libexec/gate-media-bootstrap
 STATE_ROOT=/var/lib/gate-controller
 UPLOAD_ROOT=$STATE_ROOT/uploads
+# Where the on-device recogniser caches its ONNX weights. ProtectHome=true
+# hides ~/.cache from the service, so the state directory is the only place
+# the gate-controller user can keep them.
+MODEL_ROOT=$STATE_ROOT/models
 FTP_USER=ftp-user
 ENV_FILE=/etc/gate-controller.env
 UPDATE_LOCK=/run/gate-controller-updater/update.lock
@@ -1910,6 +1914,10 @@ usermod -aG gpio gate-controller
 
 configure_upload_directory \
   "$STATE_ROOT" "$UPLOAD_ROOT" "$FTP_USER" gate-controller gate-controller
+
+# GATE_LOCAL_OCR_MODEL_DIR defaults here. Creating it costs nothing when local
+# recognition is off, and means the first run with it on only has to download.
+install -d -o gate-controller -g gate-controller -m 0700 "$MODEL_ROOT"
 
 migrate_legacy_authorised_plates \
   /opt/gate-controller/authorised_licence_plates.csv \

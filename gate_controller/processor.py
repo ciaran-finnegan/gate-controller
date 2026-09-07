@@ -99,6 +99,11 @@ class GateProcessor:
         self._closed = False
         self._recognise_call = self._recognizer.recognise
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
+        # The on-device recogniser journals per trace; a recogniser that does
+        # not take the id (every existing fake) is called exactly as before.
+        self._recognizer_accepts_trace_id = _accepts_keyword(
+            self._recognise_call, "trace_id"
+        )
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
@@ -183,6 +188,7 @@ class GateProcessor:
             try:
                 observation = self._recognise(
                     path, deadline, mark_ocr_start, first_attempt=sequence == 0,
+                    trace_id=trace.trace_id,
                 )
             except _OcrBusy:
                 trace.add_ocr_rejection(OcrAttemptTelemetry(
@@ -261,7 +267,8 @@ class GateProcessor:
                 trace, ProcessingResult(False, "stale_burst", event_id, decision)
             )
         event = GateEvent(
-            source="ocr", reason=decision.reason, opened=False, idempotency_key=idempotency_key,
+            source=_decision_source(observations, decision), reason=decision.reason,
+            opened=False, idempotency_key=idempotency_key,
             received_at=received_at, decision_at=decision_at,
             authorised_plate=decision.authorised_plate, observed_plate=decision.observed_plate,
             ocr_confidence=decision.confidence,
@@ -388,6 +395,7 @@ class GateProcessor:
     def _finish_result(
         self, trace: _BestEffortTrace, result: ProcessingResult
     ) -> ProcessingResult:
+        self._attach_local_ocr(trace)
         telemetry = trace.finish()
         if telemetry is None:
             self._release_outbox_without_telemetry(result.event_id)
@@ -403,6 +411,32 @@ class GateProcessor:
                 )
                 self._release_outbox_without_telemetry(result.event_id)
         return completed
+
+    def _attach_local_ocr(self, trace: _BestEffortTrace) -> None:
+        """Copy the on-device recogniser's per-event block onto the trace.
+
+        Best effort by construction: in shadow mode a frame's local read may
+        still be running when the cloud has already decided, and the block
+        then simply reports the frames that did finish.
+        """
+        summary_of = getattr(self._recognizer, "local_ocr_summary", None)
+        if not callable(summary_of):
+            return
+        trace_id = trace.trace_id
+        if not trace_id:
+            return
+        try:
+            summary = summary_of(trace_id)
+        except Exception:
+            return
+        if summary:
+            trace.set_local_ocr(summary)
+        forget = getattr(self._recognizer, "forget_local_ocr", None)
+        if callable(forget):
+            try:
+                forget(trace_id)
+            except Exception:
+                return
 
     def _release_outbox_without_telemetry(self, event_id: int | None) -> None:
         if not self._outbox_enabled or event_id is None:
@@ -441,11 +475,15 @@ class GateProcessor:
         return payload
 
     def _recognise(self, path: Path, deadline: float, on_start=None, *,
-                   first_attempt: bool = False):
+                   first_attempt: bool = False, trace_id: str | None = None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
-        operation = lambda: self._recognise_call(path)
+        extra = (
+            {"trace_id": trace_id}
+            if self._recognizer_accepts_trace_id and trace_id else {}
+        )
+        operation = lambda: self._recognise_call(path, **extra)
         if not self._recognizer_accepts_timeout:
             return self._run_ocr_bounded(operation, deadline, on_start)
         # Give the dial and handshake half of what is left, bounded above:
@@ -460,7 +498,7 @@ class GateProcessor:
             else OCR_READ_TIMEOUT_SECONDS
         )
         read = min(read_cap, max(MIN_OCR_TIMEOUT_SECONDS, remaining - connect))
-        operation = lambda: self._recognise_call(path, timeout=(connect, read))
+        operation = lambda: self._recognise_call(path, timeout=(connect, read), **extra)
         return self._run_ocr_bounded(operation, deadline, on_start)
 
     def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
@@ -607,6 +645,11 @@ class _BestEffortTrace:
     def mark_burst(self) -> None:
         self._call("mark_burst")
 
+    @property
+    def trace_id(self):
+        trace = self._trace
+        return getattr(trace, "trace_id", None) if trace is not None else None
+
     def set_trigger(self, trigger) -> None:
         if self._trace is None:
             return
@@ -620,6 +663,13 @@ class _BestEffortTrace:
         operation = getattr(self._trace, "set_match_policy", None)
         if callable(operation):
             self._call("set_match_policy", match_policy)
+
+    def set_local_ocr(self, local_ocr) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "set_local_ocr", None)
+        if callable(operation):
+            self._call("set_local_ocr", local_ocr)
 
     def seed_upstream(
         self, received_at: datetime | None, decision_started_at: float | None,
@@ -668,6 +718,18 @@ class _BestEffortTrace:
 
     def finish(self):
         return self._call("finish")
+
+
+def _decision_source(observations, decision) -> str:
+    """Which reader answered: the local recogniser, or the cloud.
+
+    The decision is re-evaluated after every observation, so the observation
+    that completed it is the last one appended. Matching itself never looks
+    at the reader; this only labels the event for the app.
+    """
+    if not decision or not decision.allowed or not observations:
+        return "ocr"
+    return "local" if getattr(observations[-1], "source", "cloud") == "local" else "ocr"
 
 
 def _event_key(paths: tuple[Path, ...]) -> str:

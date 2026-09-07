@@ -19,6 +19,7 @@ from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
+from .local_recognizer import build_local_recognizer
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
 from .plate_region import parse_plate_region
 from .trigger_capture import (
@@ -99,10 +100,16 @@ def main() -> None:
     match_policy = MatchPolicyCache(
         Path(arguments.database).resolve().parent / "match-policy.json"
     )
+    plate_region = parse_plate_region(os.environ.get("GATE_PLATE_REGION"))
+    # Off unless GATE_LOCAL_OCR_MODE is set: nothing is imported or loaded.
+    local_recognizer = build_local_recognizer(os.environ, plate_region=plate_region)
+    if local_recognizer is not None:
+        local_recognizer.start()
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream, match_policy=match_policy,
+        local_recognizer=local_recognizer,
     )
     trigger_capture_config = load_trigger_capture_config(
         os.environ, Path(arguments.database).resolve().parent,
@@ -115,8 +122,10 @@ def main() -> None:
     )
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
-        plate_region=parse_plate_region(os.environ.get("GATE_PLATE_REGION")),
+        plate_region=plate_region,
         corpus=_training_corpus(os.environ),
+        local_recognizer=local_recognizer,
+        authorised=authorised.get,
         # Frames the keyframe decoder already cropped must not be cropped again.
         precropped_directory=(
             trigger_capture_config.output_directory
@@ -398,7 +407,8 @@ def _quiet_window(value: str) -> float:
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,
                              coordinator=None, authorised=None, camera_directory=None,
-                             hot_stream=None, match_policy=None):
+                             hot_stream=None, match_policy=None,
+                             local_recognizer=None):
     environment = os.environ if environment is None else environment
     latest_image = latest_image if latest_image is not None else {}
     prompt_player = PromptPlayer(_configured_prompts(environment))
@@ -443,6 +453,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             camera_directory=camera_directory,
             camera_stale_seconds=camera_stale_seconds,
             hot_stream=hot_stream, match_policy=match_policy,
+            local_recognizer=local_recognizer,
         )
         workers.append(HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -469,7 +480,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         store, prompt_player, latest_image, relay=relay,
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
-        hot_stream=hot_stream,
+        hot_stream=hot_stream, local_recognizer=local_recognizer,
     )
 
 
@@ -519,7 +530,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
-                       hot_stream=None, match_policy=None,
+                       hot_stream=None, match_policy=None, local_recognizer=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        module_path=Path(__file__),
                        managed_releases_root=MANAGED_RELEASES_ROOT, clock=None) -> dict:
@@ -544,7 +555,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         "media": read_media_capabilities(media_capabilities_path),
         "recognition": {
             "hot_stream": _hot_stream_status(hot_stream),
-            "local_shadow": {"mode": "disabled", "ready": False},
+            "local_shadow": _local_recognizer_status(local_recognizer),
         },
     }
     release_sha = _managed_release_sha(
@@ -557,6 +568,21 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if match_policy is not None:
         status["match_policy"] = match_policy.status()
     return status
+
+
+def _local_recognizer_status(local_recognizer) -> dict:
+    """The on-device recogniser's counters, or the disabled placeholder."""
+    default = {"mode": "disabled", "ready": False}
+    if local_recognizer is None:
+        return default
+    try:
+        measured = local_recognizer.status()
+    except Exception:
+        return default
+    if not isinstance(measured, dict):
+        return default
+    measured["ready"] = measured.get("state") == "ready"
+    return measured
 
 
 def _hot_stream_status(hot_stream) -> dict:

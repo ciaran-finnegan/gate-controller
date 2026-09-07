@@ -14,6 +14,10 @@ class PlateObservation:
     confidence: float
     make: str | None = None
     colour: str | None = None
+    #: Which reader produced this observation: the cloud OCR service, or the
+    #: on-device recogniser. Matching never looks at it; it only tells the
+    #: event and the app which reader opened the gate.
+    source: str = "cloud"
 
 
 @dataclass(frozen=True)

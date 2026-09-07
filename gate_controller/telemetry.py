@@ -289,6 +289,70 @@ def ftp_fallback_trigger() -> TriggerTelemetry:
     )
 
 
+_LOCAL_OCR_AGREEMENTS = frozenset({
+    "match", "mismatch", "local_only", "cloud_only", "both_none",
+})
+_LOCAL_OCR_AUTHORISED = frozenset({"local_match", "cloud_match", "both", "none"})
+_LOCAL_OCR_DECISION = frozenset({"local", "cloud", "none"})
+_LOCAL_OCR_MODES = frozenset({"shadow", "active"})
+_LOCAL_OCR_STATUSES = frozenset({"recognized", "no_plate", "unavailable", "error"})
+
+
+@dataclass(frozen=True)
+class LocalOcrTelemetry:
+    """What the on-device recogniser did for this event, in one small block.
+
+    Deliberately compact and closed-vocabulary: it travels the same route as
+    ``frames`` and ``trigger``, so every value here is a bounded token, a
+    bounded duration or a plate string.
+    """
+
+    mode: str = "shadow"
+    frames: int = 0
+    plate: str | None = None
+    score: float | None = None
+    latency_ms: float | None = None
+    agreement: str = "both_none"
+    authorised: str = "none"
+    decision_source: str = "none"
+    status: str = "no_plate"
+
+    @classmethod
+    def from_block(cls, block: object) -> "LocalOcrTelemetry | None":
+        if not isinstance(block, dict):
+            return None
+        return cls(
+            mode=str(block.get("mode", "shadow")),
+            frames=block.get("frames", 0),
+            plate=block.get("plate"),
+            score=block.get("score"),
+            latency_ms=block.get("latency_ms"),
+            agreement=str(block.get("agreement", "both_none")),
+            authorised=str(block.get("authorised", "none")),
+            decision_source=str(block.get("decision_source", "none")),
+            status=str(block.get("status", "no_plate")),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "mode": self.mode if self.mode in _LOCAL_OCR_MODES else "shadow",
+            "frames": _rounded_int(self.frames, 0, MAX_ITEMS, 0),
+            "plate": _optional_string(self.plate),
+            "score": None if self.score is None else _ratio(self.score),
+            "latency_ms": _duration(self.latency_ms) or 0,
+            "agreement": (
+                self.agreement if self.agreement in _LOCAL_OCR_AGREEMENTS else "both_none"
+            ),
+            "authorised": (
+                self.authorised if self.authorised in _LOCAL_OCR_AUTHORISED else "none"
+            ),
+            "decision_source": (
+                self.decision_source if self.decision_source in _LOCAL_OCR_DECISION else "none"
+            ),
+            "status": self.status if self.status in _LOCAL_OCR_STATUSES else "no_plate",
+        }
+
+
 @dataclass(frozen=True)
 class StageTimestamps:
     filesystem_ingress_at: datetime | None = None
@@ -368,6 +432,7 @@ class EventTelemetry:
     stage_timestamps: StageTimestamps = field(default_factory=StageTimestamps)
     trigger: TriggerTelemetry | None = None
     match_policy: MatchPolicyTelemetry | None = None
+    local_ocr: LocalOcrTelemetry | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
@@ -420,6 +485,8 @@ class EventTelemetry:
             payload["trigger"] = self.trigger.to_wire()
         if self.match_policy is not None:
             payload["match_policy"] = self.match_policy.to_wire()
+        if self.local_ocr is not None:
+            payload["local_ocr"] = self.local_ocr.to_wire()
         return payload
 
 
@@ -460,6 +527,7 @@ class ProcessingTrace:
         self._relay_outcome = "not_attempted"
         self._trigger: TriggerTelemetry | None = None
         self._match_policy: MatchPolicyTelemetry | None = None
+        self._local_ocr: LocalOcrTelemetry | None = None
         self._finished_telemetry: EventTelemetry | None = None
 
     def seed_upstream(
@@ -501,6 +569,14 @@ class ProcessingTrace:
     def set_match_policy(self, match_policy: MatchPolicyTelemetry | None) -> None:
         """Record the fuzziness band and level this decision was taken under."""
         self._match_policy = match_policy
+
+    def set_local_ocr(self, local_ocr) -> None:
+        """Attach the on-device recogniser's block; a plain dict is accepted."""
+        if local_ocr is None:
+            return
+        if not isinstance(local_ocr, LocalOcrTelemetry):
+            local_ocr = LocalOcrTelemetry.from_block(local_ocr)
+        self._local_ocr = local_ocr
 
     def add_frame(self, frame: FrameTelemetry) -> None:
         if len(self._frames) < MAX_ITEMS:
@@ -619,6 +695,7 @@ class ProcessingTrace:
             ),
             trigger=self._trigger,
             match_policy=self._match_policy,
+            local_ocr=self._local_ocr,
         )
         return self._finished_telemetry
 

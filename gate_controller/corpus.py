@@ -38,16 +38,19 @@ class TrainingCorpus:
         self._total_bytes: int | None = None
 
     def record(self, image: bytes, *, payload, source: str, geometry=None,
-               extra: dict | None = None) -> Path | None:
+               extra: dict | None = None, local: dict | None = None) -> Path | None:
         """Write one image/sidecar pair. Returns the JPEG path, or None on failure."""
         try:
-            return self._record(image, payload=payload, source=source, geometry=geometry, extra=extra)
+            return self._record(
+                image, payload=payload, source=source, geometry=geometry,
+                extra=extra, local=local,
+            )
         except Exception:
             self._failures += 1
             LOGGER.warning("gate_corpus outcome=failed", exc_info=False)
             return None
 
-    def _record(self, image, *, payload, source, geometry, extra):
+    def _record(self, image, *, payload, source, geometry, extra, local=None):
         if not isinstance(image, (bytes, bytearray)) or not image[:3] == b"\xff\xd8\xff":
             raise ValueError("corpus images must be JPEG bytes")
         directory = self._ensure_directory()

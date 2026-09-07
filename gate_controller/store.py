@@ -1268,6 +1268,8 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
         payload["trigger"] = dict(raw["trigger"])
     if "match_policy" in raw:
         payload["match_policy"] = dict(raw["match_policy"])
+    if "local_ocr" in raw:
+        payload["local_ocr"] = dict(raw["local_ocr"])
     return payload
 
 
@@ -1376,6 +1378,9 @@ def _decode_telemetry_payload(encoded: object) -> dict:
         or any(not isinstance(value, str) for value in stage_timestamps.values())
     ):
         raise _MalformedTelemetry("telemetry stage timestamps are invalid")
+    local_ocr = telemetry.get("local_ocr")
+    if local_ocr is not None and not isinstance(local_ocr, dict):
+        raise _MalformedTelemetry("telemetry local_ocr block is invalid")
     return telemetry
 
 

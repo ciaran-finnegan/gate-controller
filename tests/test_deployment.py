@@ -233,7 +233,7 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertIn("-m gate_controller.relay_safe", service.get("ExecStopPost", ""))
         self.assertFalse(service.get("ExecStopPost", "").startswith("-"))
         self.assertEqual("always", service.get("Restart"))
-        self.assertEqual("512M", service.get("MemoryMax"))
+        self.assertEqual("1G", service.get("MemoryMax"))
 
     def test_application_service_uses_the_bounded_low_latency_quiet_window(self):
         service = read_unit("file-monitor.service")["Service"]
@@ -3461,6 +3461,11 @@ class DependencyLockTests(unittest.TestCase):
             "idna": "3.18",
             "urllib3": "2.7.0",
             "rpi-lgpio": "0.6",
+            # On-device recognition, arm64 only: the versions measured on the
+            # gate Pi and the Mac, where the reads were byte-identical.
+            "onnxruntime": "1.29.0",
+            "open-image-models": "0.6.0",
+            "fast-plate-ocr": "1.1.0",
         }
         pinned_versions = {}
         for line in (REPOSITORY_ROOT / "requirements.txt").read_text(
