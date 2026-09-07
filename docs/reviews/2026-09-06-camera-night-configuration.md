@@ -23,6 +23,14 @@ Plate Recognizer returned no plate on any frame. Night recognition has been
 roughly 0-3% for two years. The controller journalled `clipping=0.09-0.16` with
 `brightness≈0.40` on those frames.
 
+The camera was in its black-and-white night mode for both frames, so the
+visible illumination was IR plus the car's own headlights. There is also a
+PIR-triggered white floodlight at the gate, separate from the camera; whether
+it was lit for this approach, whether its coverage reaches the stop position
+in front of the camera, and its trigger delay relative to a stopping vehicle
+are all unverified from these frames — see the Floodlight subsection in
+section 5, and section 10 for what to check on the next night entry.
+
 The empty scene alone, before any change, already accounted for most of that:
 
 | region | mean brightness | clipped ≥250 | clipped ≥240 |
@@ -134,9 +142,12 @@ What the table says:
   its budget on gain rather than shutter time.
 - **Turning IR off removes the blaze completely** — 0.0745 to 0.0000
   whole-frame, 0.2248 to 0.0000 in the left third — **and removes the scene
-  with it.** Row 01: brightness 0.0109, 99.6% of pixels below 33. There is
-  effectively no ambient light at the gate. Everything visible in the "before"
-  image was IR.
+  with it.** Row 01: brightness 0.0109, 99.6% of pixels below 33. This is an
+  empty scene with nobody moving, so the site's PIR-triggered white floodlight
+  was also off; with that qualification, there is effectively no other ambient
+  light at the gate, and everything visible in the "before" image was IR. See
+  the Floodlight subsection in section 5 for what that floodlight would change
+  if it turns out to cover the scene.
 
 The single most useful image is `13-irON-manual-s4-g16.jpg`. At a third of the
 original exposure the veiling haze across the driveway is gone and the fence
@@ -237,13 +248,18 @@ The instruction was to disable the IR illuminator *and* keep the scene
 detectable. The measurement shows those two are in direct conflict at this
 site, and the conflict is total rather than marginal: with IR off the empty
 scene reads brightness 0.0180 and 99.6% of pixels below level 33. There is no
-street lighting, no house light and no useful skyglow in the field of view.
-Everything the camera saw at night was its own IR.
+street lighting, no house light and no useful skyglow in the field of view —
+on this empty, nobody-moving scene, which also left the site's PIR-triggered
+white floodlight untriggered and off. Everything the camera saw at night, in
+this measurement, was its own IR.
 
-So the configuration now deployed is honest about what it is: **the camera has
-no night illumination of its own, and both the trigger and the plate light now
-come from the approaching vehicle's headlights.** The manual 1/250 s exposure
-is set so that a headlight-lit plate lands in range rather than blown.
+So the configuration now deployed is honest about what the *measured* scene
+is: **absent the floodlight firing, the camera has no night illumination of
+its own, and both the trigger and the plate light now come from the
+approaching vehicle's headlights.** Whether the floodlight in fact covers the
+stop position and fires in time to matter is unverified — see the Floodlight
+subsection below. The manual 1/250 s exposure is set so that a headlight-lit
+plate lands in range rather than blown.
 
 The reasoning behind `s4 g16` specifically — and this part is reasoning, not
 measurement, because no car could be tested tonight: the IR return off the near
@@ -272,8 +288,29 @@ The competing option, kept on the record: leaving IR on and running `Manual
 s4 g16` anyway (row 13) contains the blaze from 0.2248 to 0.0871 — a 61%
 reduction — while leaving a dim but non-empty scene at brightness 0.1159 for
 the AI. That is the configuration to fall back to if IR off proves to kill the
-trigger and the white light is not yet installed. It is strictly better than
-the state found tonight in both respects.
+trigger and no reliable white light covers the stop position. It is strictly
+better than the state found tonight in both respects.
+
+### Floodlight
+
+There is a separate PIR-triggered white floodlight at the gate — distinct
+from the camera's own IR illuminator and from the non-existent white LED
+probed in section 2. Nothing in this document's measurements exercises it:
+the empty-scene rows above were taken with nobody moving, so the floodlight's
+own motion sensor had nothing to trigger on and it was off throughout; the
+22:16 failure frames (section 1) show IR plus headlights in black-and-white
+night mode, not the floodlight. Whether it fires reliably for an arriving
+vehicle, whether its coverage reaches the stop position in front of the
+camera, and its trigger delay relative to a stopping vehicle are all
+unverified — first things to check on the next night entry (section 10).
+
+If it turns out to reliably light the stop position, that changes the
+configuration on offer here. With a dependable white light already on the
+plate, `Isp.dayNight` can be forced to `Color` instead of left at `Auto`, so
+the camera does not switch into IR/black-and-white mode at night at all, and
+IR stays off regardless of `IrLights.state`. The plate then reads under
+ordinary colour exposure, as it would in daytime, rather than depending on
+the headlight-lit manual exposure this document deploys as a fallback.
 
 ## 6. Rollback
 
@@ -357,15 +394,19 @@ The API work has taken the blaze out and made the exposure predictable. It
 cannot create light, and that is now the binding constraint.
 
 1. **White light on the stop position.** This is the blocking item, not an
-   optional improvement. The measurements prove the site has no night
-   illumination whatsoever once the camera's own IR is off (brightness 0.0180,
-   99.6% dark), and the RLC-810A has no spotlight to fall back on — the
-   `GetWhiteLed` probe in section 2 settles that. A modest warm white lamp
-   aimed at the stop position, not at the camera, makes the AI trigger reliable
-   again, lets the plate be lit by something other than the car's own
-   headlights, and would allow gain to come back down for a cleaner crop. Until
-   it exists, the system depends on every arriving vehicle having its headlights
-   on.
+   optional improvement. The measurements prove that, absent anything firing on
+   the empty test scene, the site has no night illumination once the camera's
+   own IR is off (brightness 0.0180, 99.6% dark), and the RLC-810A has no
+   spotlight of its own to fall back on — the `GetWhiteLed` probe in section 2
+   settles that. There is a separate PIR-triggered white floodlight at the
+   gate, but whether it reliably covers the stop position is unverified (see
+   the Floodlight subsection in section 5); if it does, it may already satisfy
+   this item. A modest warm white lamp aimed at the stop position, not at the
+   camera, makes the AI trigger reliable again, lets the plate be lit by
+   something other than the car's own headlights, and would allow gain to come
+   back down for a cleaner crop. Until a light reliably covers the stop
+   position, the system depends on every arriving vehicle having its
+   headlights on.
 2. **Get the near gate post out of the IR beam.** Shielding, a hood, or
    re-aiming so the post about 1 m from the lens is no longer in the
    illuminator's cone. Row 13's image is the evidence for why this is a
@@ -553,3 +594,10 @@ experiment, and these are the things to read off it.
   interesting problem.
 - **False alarms overnight** at sensitivity 80: tonight's 20:27 vehicle-AI
   firing should not recur, its cause (the IR blob) being switched off.
+- **Whether the PIR floodlight fired at all**, whether its light reaches the
+  stop position in front of the camera, and how its trigger delay lines up
+  against the vehicle stopping and the capture frames — none of this is
+  established by tonight's work (see the Floodlight subsection in section 5).
+  If it did fire and covers the stop position, that changes the recommended
+  configuration: forcing `Isp.dayNight` to `Color` becomes viable, letting the
+  plate read in colour instead of IR/black-and-white.
