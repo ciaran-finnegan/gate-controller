@@ -86,7 +86,13 @@ def main() -> None:
     relay = RelayController(PiRelayAdapter())
     store = LocalStore(arguments.database)
     store.recover_interrupted_actuations()
-    coordinator = ActuationCoordinator(store, relay, timedelta(seconds=20))
+    # Off unless GATE_AUDIO_CAPTURE_ENABLED is set: no thread, no child, and
+    # nothing recorded. Built before the coordinator because the coordinator is
+    # the sole owner of the relay, and the relay is what labels the clips.
+    audio_capture = _audio_capture_recorder(os.environ)
+    coordinator = ActuationCoordinator(
+        store, relay, timedelta(seconds=20), activation_observer=audio_capture,
+    )
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
@@ -148,9 +154,11 @@ def main() -> None:
     )
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
         os.environ,
-        on_accepted=_camera_event_handler(trigger_capture, recognizer),
+        on_accepted=_camera_event_handler(trigger_capture, recognizer, audio_capture),
     )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
+    if audio_capture is not None:
+        background_workers += (audio_capture,)
     if hot_stream is not None:
         background_workers += (hot_stream,)
     if clear_keyframes is not None:
@@ -219,6 +227,7 @@ def main() -> None:
         return _shutdown_controller_with_hot_stream(
             hot_stream, processor, relay, trigger_capture=trigger_capture,
             clear_keyframes=clear_keyframes, net_probe=net_probe,
+            audio_capture=audio_capture,
         )
 
     run_worker(
@@ -279,14 +288,18 @@ def _clear_stream_source(config):
 
 
 
-def _camera_event_handler(trigger_capture, recognizer):
+def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
     """Warm the OCR connection the instant the camera fires, then capture.
 
-    The prewarm is fire-and-forget and must never delay or break capture.
+    The prewarm is fire-and-forget and must never delay or break capture, and
+    so is the audio request: it only puts a note in a slot and sets an event,
+    and its return value is deliberately ignored so nothing about audio can
+    change what the frame path does.
     """
     prewarm = getattr(recognizer, "prewarm", None)
     capture = trigger_capture.on_camera_event if trigger_capture is not None else None
-    if capture is None and not callable(prewarm):
+    audio = audio_capture.on_camera_event if audio_capture is not None else None
+    if capture is None and audio is None and not callable(prewarm):
         return None
 
     def handle(event):
@@ -295,11 +308,31 @@ def _camera_event_handler(trigger_capture, recognizer):
                 prewarm()
             except Exception:
                 pass
+        if audio is not None:
+            try:
+                audio(event)
+            except Exception:
+                pass
         if capture is not None:
             return capture(event)
         return None
 
     return handle
+
+
+def _audio_capture_recorder(environment):
+    """A bounded recorder of gate audio around each event, or None when off.
+
+    When the switch is off this returns None and the controller runs exactly as
+    it did: no thread, no child process, nothing recorded. The configuration is
+    still parsed, so a malformed setting is refused at startup rather than
+    silently ignored until somebody switches capture on.
+    """
+    from .audio_capture import AudioClipRecorder, load_audio_capture_config
+
+    corpus_directory = (environment.get("GATE_TRAINING_CORPUS_DIR") or "").strip()
+    config = load_audio_capture_config(environment, corpus_directory or None)
+    return AudioClipRecorder(config) if config.enabled else None
 
 
 
@@ -348,7 +381,12 @@ def _shutdown_controller(processor, relay, *, relay_timeout: float = 0.5,
 
 def _shutdown_controller_with_hot_stream(hot_stream, processor, relay,
                                          trigger_capture=None, clear_keyframes=None,
-                                         net_probe=None) -> bool:
+                                         net_probe=None, audio_capture=None) -> bool:
+    try:
+        if audio_capture is not None:
+            audio_capture.close()
+    except BaseException:
+        logging.getLogger(__name__).warning("audio_capture_close_failed", exc_info=True)
     try:
         if net_probe is not None:
             net_probe.close()
