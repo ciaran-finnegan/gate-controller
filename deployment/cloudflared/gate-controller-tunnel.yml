@@ -5,4 +5,8 @@ ingress:
     service: http://127.0.0.1:8765
   - hostname: gate-media.example.com
     service: http://127.0.0.1:8891
+  # Separate hostname so camera control gets its own Cloudflare Access
+  # application and its own service token, not the gate-command blast radius.
+  - hostname: gate-camera.example.com
+    service: http://127.0.0.1:8767
   - service: http_status:404

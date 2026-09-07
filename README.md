@@ -243,6 +243,16 @@ The Pi performance harness is documented in
 [Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
 is intentionally deferred until reliable on-site network access is available.
 
+Camera *settings* are changed by a separate isolated service,
+`gate-camera-control`, which owns the only camera API credentials on the Pi and
+exposes a bounded loopback HTTP surface for the IR illuminator and an on-demand
+4K still. The controller gains no camera credentials from it; it only reads the
+nonsecret state the service publishes. Its HTTP contract, environment file,
+journal lines, security model, and rollback are in
+[Gate camera control](docs/camera-control.md). Every IR change is a bounded lease
+that reverts to the configured default, because IR on at night degrades plate
+recognition rather than helping it.
+
 Make and colour returned by OCR are reserved for telemetry and operator review;
 they are intentionally not gate authorization factors. This service does not
 implement live video or two-way audio. It only exposes camera/prompt capability

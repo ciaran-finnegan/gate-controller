@@ -28,6 +28,9 @@ from .plate_region import parse_plate_region
 from .trigger_capture import (
     ClearKeyframeBuffer, TriggerFrameCapture, load_trigger_capture_config,
 )
+from .camera_control_state import (
+    CAMERA_CONTROL_STATE_PATH, read_camera_control_state,
+)
 from .media_capabilities import read_media_capabilities
 from .ocr import PlateRecognizerClient
 from .outbox import (
@@ -675,6 +678,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
+                       camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
                        managed_releases_root=MANAGED_RELEASES_ROOT,
                        host_metrics=read_host_metrics, clock=None) -> dict:
@@ -703,6 +707,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         "camera_connected": None,
         "relay": _relay_status(relay),
         "media": read_media_capabilities(media_capabilities_path),
+        "camera_control": read_camera_control_state(camera_control_state_path),
         "recognition": {
             "hot_stream": _hot_stream_status(hot_stream),
             "local_shadow": _local_recognizer_status(local_recognizer),

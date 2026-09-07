@@ -1,0 +1,366 @@
+# Gate Camera Control
+
+`gate-camera-control` is the only process in the deployment that holds Reolink
+camera API credentials. It exposes a small loopback HTTP surface so the Gate Mate
+Worker can read the IR illuminator state, take a bounded IR lease, and fetch one
+on-demand 4K still — without the browser, the Worker, or the gate controller ever
+holding a camera credential.
+
+Companion issues: gate-controller#92 (this service) and access-gate-ui#33 (the
+Worker routes, the D1 audit, and the Live UI).
+
+## Safety: IR is a recognition control, not a brightness control
+
+Read [Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
+before changing anything here.
+
+- IR has been **Off** by deliberate, measured configuration since 2026-09-06.
+  With IR off the empty scene reads brightness 0.0180 with 99.6% of pixels below
+  level 33: the AI trigger and the plate both depend on the vehicle's headlights.
+- IR **on** re-creates the specular return off the near gate post about 1 m from
+  the lens (left-third clipping 0.2248), which is what caused the 22:16 denial.
+- `GetIrLights` `range` is exactly `["Auto", "Off"]`. There is no brightness and
+  no zone control: it is all or nothing.
+
+Therefore every change this service accepts is a **bounded lease** that reverts
+to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart. The
+service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
+exposure is a measured setting and stays a reviewed, on-Pi operation. The camera
+command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`, `Snap`, and
+no request body can widen it.
+
+## Security model
+
+| Property | How it is enforced |
+| --- | --- |
+| Camera credentials exist in exactly one file | `/etc/gate-camera-control.env`, root:root 0600, read through `gate_media_config._open_trusted_file` |
+| The controller never gains camera credentials | `file-monitor.service` reads no camera env; it learns the IR state only from the nonsecret `/run/gate-camera/state.json` |
+| The media gateway secret is not widened | The camera env is a **separate** file. `validate_gateway_static_environment()` pins the gateway key set, so camera-API keys cannot be bolted onto it, and the service is not in group `gate-media` |
+| Its own identity | System user and group `gate-camera-control`; the installer refuses to run if that account shares a group with the media or controller services, or with `gpio` |
+| Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the installer-rendered drop-in `gate-camera-control.service.d/10-camera-address.conf`. `GATE_CAMERA_HOST` must be one exact reachable IP so that pin is verifiable |
+| Its own remote door | A separate Cloudflare Tunnel hostname (`gate-camera.*`) with its own Access application and its own service token — deliberately not the `gate-command` token |
+| No camera payloads leak | Every response is a bounded JSON status (or JPEG bytes); no camera payload, URL, token, or credential appears in a response or in the journal |
+| Loopback only | Binds `127.0.0.1:8767`; `--host` refuses anything else |
+
+The camera presents a self-signed certificate, so TLS verification is disabled
+for the camera connection exactly as `curl -k` does today. The trust boundary is
+the network pin above: the service can open a connection to nothing but loopback
+and that one address.
+
+## HTTP contract
+
+Base URL on the Pi: `http://127.0.0.1:8767`. Remotely: the `gate-camera` tunnel
+hostname, behind its own Access service token, called from the Worker the same
+way `worker/piCommandClient.ts` calls `POST /commands`.
+
+Every response carries `Cache-Control: no-store`. Request bodies are JSON only,
+at most 4096 bytes. Any query string or fragment is a `404`; this service takes
+no parameters in the URL.
+
+### `GET /camera/state` — also served at `GET /camera/ir`
+
+```json
+{
+  "observed_at": "2026-09-07T21:04:11+00:00",
+  "ir": {
+    "state": "Auto",
+    "default": "Off",
+    "effective_until": "2026-09-07T21:14:11+00:00",
+    "lease_seconds_remaining": 600,
+    "revert_failed": false,
+    "last_error": null
+  }
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `observed_at` | RFC 3339 UTC string | when this answer was produced |
+| `ir.state` | `"Auto"` \| `"Off"` \| `"unknown"` | the camera's observed state; `"unknown"` whenever it could not be confirmed within 60 s. **Never** assume `"Off"` from `"unknown"` |
+| `ir.default` | `"Auto"` \| `"Off"` | `GATE_CAMERA_IR_DEFAULT`, the state every lease reverts to |
+| `ir.effective_until` | RFC 3339 UTC string \| `null` | when the current lease expires; `null` when no lease is outstanding |
+| `ir.lease_seconds_remaining` | integer \| `null` | seconds left on the lease, for a countdown |
+| `ir.revert_failed` | boolean | a revert has failed and is being retried with backoff |
+| `ir.last_error` | `"camera_busy"` \| `"camera_unreachable"` \| `"camera_error"` \| `null` | the last camera failure seen |
+
+A read refreshes the observation from the camera when it is older than 5 s;
+otherwise it answers from the cached observation. The refresh is subject to the
+same breaker and login throttle as any other call, so polling cannot cause a
+login storm.
+
+### `POST /camera/ir`
+
+Request body — unknown fields are rejected:
+
+```json
+{"state": "Auto", "lease_minutes": 10, "idempotency_key": "01J..."}
+```
+
+| Field | Required | Rules |
+| --- | --- | --- |
+| `state` | yes | exactly `"Auto"` or `"Off"` |
+| `lease_minutes` | no | integer 1–`GATE_CAMERA_IR_LEASE_MAX_MINUTES` (default max 60). Omitted means `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` (default 10) |
+| `ttl_seconds` | no | compatibility alias for callers that speak seconds: a whole number of minutes, 60–`max × 60`. Sending both `lease_minutes` and `ttl_seconds` is a `400` |
+| `idempotency_key` | no | 1–128 characters. A replay within 300 s returns the first response and does not call the camera again |
+
+Response `200`: the `GET /camera/state` document plus `"status": "completed"`,
+and `"idempotency_key"` echoed when one was supplied.
+
+Setting `state` to the configured default cancels the lease immediately — that
+is the "revert now" action.
+
+### `GET /camera/snap` — also served at `GET`/`POST /camera/snapshot`
+
+Returns `200` with `Content-Type: image/jpeg` and one bounded 4K JPEG from the
+camera's `Snap` API (a few hundred KB, about 0.45 s). Rate limited to **one per
+2 s** service-wide. The service stores nothing; retention, if any, is the
+Worker's decision.
+
+### Errors
+
+| Status | Body | When |
+| --- | --- | --- |
+| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds |
+| `404` | `{"error":"not_found"}` | unknown path, or any query string |
+| `405` | `{"error":"method_not_allowed"}` | wrong method for a known path |
+| `413` | `{"error":"request_too_large"}` | body over 4096 bytes |
+| `429` | `{"error":"rate_limited","retry_after":2}` | snapshot rate limit; `Retry-After` header set |
+| `502` | `{"error":"camera_error"}` | the camera answered, but not usably |
+| `503` | `{"error":"camera_busy","retry_after":60}` | circuit breaker open after a camera 502, or the 60 s login throttle is holding; `Retry-After` header set. **Do not retry** — surface the wait |
+| `503` | `{"error":"camera_unreachable"}` | the camera did not answer at all |
+| `500` | `{"error":"internal_error"}` | unexpected; nothing about the camera is disclosed |
+
+## Token cache, throttle, and circuit breaker
+
+The RLC-810A firmware answers **HTTP 502 for about a minute** after repeated
+`Login` calls. The client therefore:
+
+- holds **one** token plus its `leaseTime` in memory and reuses it for every call,
+  refreshing only within 60 s of expiry or after an authentication failure;
+- persists it to `/run/gate-camera/token.json` (0600, owner-checked on read) so
+  `Restart=always` cannot cause a login storm;
+- allows exactly **one in-flight login** — concurrent callers wait on the same
+  lock and then reuse the resulting token;
+- enforces a **60 s minimum re-login interval**; a login needed sooner answers
+  `503 camera_busy` with the remaining seconds;
+- on a camera `502`/`503` opens a **circuit breaker for 60 s** and answers
+  `503 camera_busy` without any retry.
+
+## State published to the controller
+
+The service atomically rewrites `/run/gate-camera/state.json` (0644) every 5 s
+from its cached observation — it never calls the camera to publish:
+
+```json
+{
+  "observed_at": 1757279051,
+  "camera_control": {
+    "available": true,
+    "reason": "ready",
+    "ir": {
+      "state": "Off",
+      "default": "Off",
+      "effective_until": null,
+      "revert_failed": false
+    }
+  }
+}
+```
+
+`reason` is one of `ready`, `camera_busy`, `camera_unreachable`, `camera_error`.
+`available` is true exactly when `ir.state` is a real state and `reason` is
+`ready`. The file names no camera, no address, and no credential.
+
+`gate_controller/camera_control_state.py` reads it the way
+`gate_controller/media_capabilities.py` reads the media snapshot: `O_NOFOLLOW`,
+8 KiB size cap, 30 s freshness cap, exact key sets, and coherence checks. It
+falls back to `not_configured` when the file is absent and `service_unhealthy`
+for anything else, both with `ir.state: "unknown"`. That block appears as
+`camera_control` in `_controller_status()` beside `media` and `recognition`, and
+reaches the app through the 15 s heartbeat.
+
+Worst-case heartbeat staleness is Pi heartbeat 15 s plus UI poll 15 s ≈ **30 s**,
+so the app must confirm a toggle with a direct read rather than waiting for a
+heartbeat.
+
+## Environment
+
+`/etc/gate-camera-control.env`, root:root 0600, validated by
+`gate_media_config.validate_camera_control_environment()`. The key set is closed:
+anything outside this table is rejected. Template:
+[`deployment/gate-camera-control.env.example`](../deployment/gate-camera-control.env.example).
+
+| Key | Required | Default | Rules |
+| --- | --- | --- | --- |
+| `GATE_CAMERA_HOST` | yes | — | exactly one reachable IP address; loopback, unspecified, multicast, link-local and reserved are rejected, and hostnames are rejected so the systemd `/32` pin stays verifiable |
+| `GATE_CAMERA_USERNAME` | yes | — | 1–256 bytes |
+| `GATE_CAMERA_PASSWORD` | yes | — | 1–256 bytes |
+| `GATE_CAMERA_IR_DEFAULT` | no | `Off` | exactly `Auto` or `Off` |
+| `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum |
+| `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
+
+Validate a file without starting the service:
+
+```bash
+sudo python3 gate_media_config.py camera-control --env /etc/gate-camera-control.env
+```
+
+## Journal
+
+Every change, revert, camera error, and breaker event is one structured line on
+stdout, which systemd captures. The prefix is always `gate_camera_control` and
+values are stripped to `[A-Za-z0-9-_.:+]`, so no field can inject another:
+
+```text
+gate_camera_control stage=started ir_default=Off lease_default_minutes=10 lease_max_minutes=60 port=8767
+gate_camera_control stage=login lease_seconds=3600
+gate_camera_control stage=login_throttled retry_after=41
+gate_camera_control stage=ir_set lease_seconds=600 outcome=completed state=Auto
+gate_camera_control stage=ir_revert outcome=completed state=Off
+gate_camera_control stage=ir_revert attempt=2 outcome=camera_busy retry_after=10 state=Off
+gate_camera_control stage=startup_revert state=Off
+gate_camera_control stage=breaker_open retry_after=60
+gate_camera_control stage=camera_busy retry_after=60
+gate_camera_control stage=camera_unreachable
+gate_camera_control stage=camera_error
+gate_camera_control stage=snapshot bytes=284119 outcome=completed
+gate_camera_control stage=snapshot_rate_limited retry_after=2
+```
+
+No credential, token, camera address, or camera payload ever appears — the same
+rule as the webhook listener.
+
+```bash
+journalctl -u gate-camera-control -f
+journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
+```
+
+## Failure modes
+
+| Failure | Behaviour |
+| --- | --- |
+| Camera 502 after a login storm | breaker 60 s, `503 camera_busy` with `retry_after`, no auto-retry |
+| Camera unreachable | `503 camera_unreachable`; `state.json` keeps `last_error` and its own `observed_at`, so the app says "unknown", never "Off" |
+| Service restart mid-lease | the lease is persisted to `/run/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. With no lease record on disk the camera is not touched at all, so a restart loop cannot become a login storm. A lost revert timer can never leave IR in the temporary state |
+| A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |
+| Revert call itself fails | retried with 5/10/20/40/60 s backoff for the life of the process; `ir.revert_failed` stays true in `state.json`; every attempt is journaled |
+| Two operators toggling at once | serialised under one lock, last write wins, both journaled |
+| Heartbeat lag | heartbeat-derived state can be ~30 s stale; confirm with `GET /camera/state` after a toggle |
+| Camera push interval | the firmware minimum webhook interval is **20 s**, so "did the change help the trigger?" cannot be answered faster than that. Do not imply instant confirmation |
+
+## Install
+
+The service is installed separately from the media stack; it shares no state,
+no user, and no environment file with it.
+
+```bash
+sudo install -o root -g root -m 0600 /dev/null /etc/gate-camera-control.env
+sudoedit /etc/gate-camera-control.env      # see the template above
+sudo deployment/install-camera-control.sh --source "$PWD"
+```
+
+The installer creates the `gate-camera-control` system user, refuses it if it is
+in `gpio` or shares a group with the media or controller services, publishes
+`/usr/local/lib/gate-camera-control`, installs the unit and the `/32` drop-in
+derived from `GATE_CAMERA_HOST`, creates `/run/gate-camera` through
+`/etc/tmpfiles.d/gate-camera.conf`, then enables and starts the service. If the
+environment file is empty or invalid the installer publishes the artifacts,
+removes the address drop-in, leaves the service **disabled**, and says so.
+
+Then add the tunnel hostname (see
+`deployment/cloudflared/gate-controller-tunnel.yml`) and create a **separate**
+Cloudflare Access application for it with its own service token. Do not reuse the
+`gate-command` token: the blast radius is different.
+
+Check it:
+
+```bash
+systemctl status gate-camera-control
+curl -s http://127.0.0.1:8767/camera/state
+curl -s -X POST http://127.0.0.1:8767/camera/ir \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"Auto","lease_minutes":5}'
+curl -s -o /tmp/gate-snap.jpg -w '%{http_code} %{content_type}\n' \
+  http://127.0.0.1:8767/camera/snap
+```
+
+## Rollback
+
+The service is additive: nothing else in the pipeline depends on it. Removing it
+returns the deployment to exactly today's behaviour, except that the app's
+`camera_control` heartbeat block reads `not_configured`.
+
+```bash
+# 1. Make sure IR is back at the configured default before stopping the service,
+#    because a stopped service cannot run its revert.
+curl -s -X POST http://127.0.0.1:8767/camera/ir \
+  -H 'Content-Type: application/json' -d '{"state":"Off"}'
+
+# 2. Stop and disable.
+sudo systemctl disable --now gate-camera-control.service
+
+# 3. Optional: remove the artifacts and the credentials.
+sudo rm -f /etc/systemd/system/gate-camera-control.service
+sudo rm -rf /etc/systemd/system/gate-camera-control.service.d
+sudo rm -f /etc/tmpfiles.d/gate-camera.conf
+sudo rm -rf /usr/local/lib/gate-camera-control /run/gate-camera
+sudo rm -f /etc/gate-camera-control.env
+sudo systemctl daemon-reload
+```
+
+If IR was left `Auto` and the service is already gone, set it back from the Pi
+with the documented rollback in
+[Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
+§ rollback, or from the camera web interface.
+
+Finally, remove the `gate-camera` ingress hostname from the tunnel config and
+delete its Access application and service token.
+
+## Not implemented: the "clearer" live stream
+
+Issue #92 §5 proposes a second, sharper live path. It is **not** implemented here,
+and it should not be attempted until one measurement is taken, because 4K live is
+not deliverable to a phone over this link:
+
+- clear/main is 3840x2160 H.265 at 6144 Kbit/s while the property uplink measures
+  about 4.5 Mbit/s — the stream alone exceeds the uplink, before TURN overhead;
+- browsers have effectively no H.265 WebRTC support, so `-c:v copy` cannot serve
+  the clear path;
+- the Pi 5 has no hardware H.264 encoder, and 4K software decode alone already
+  measures 8.2 s of CPU per second of work next to the recognition workload.
+
+So the only honest sharp option today is the **4K still** above, which this
+service does implement.
+
+**The open question is whether this firmware exposes a third (`ext`/balanced)
+encoder profile** — typically 1280x720 H.264 at about 1 Mbit/s, which would fit
+the uplink and could be copied rather than transcoded. Check it on the Pi:
+
+```bash
+python3 /root/camtool.py raw '[{"cmd":"GetEnc","action":1,"param":{"channel":0}}]'
+```
+
+If `GetEnc` reports an `extStream` block with an H.264 profile at roughly 1 Mbit/s
+or less, the work is a `-c:v copy` path and is worth doing:
+
+- `deployment/media/mediamtx.yml`: add a `clear_view` source path and a
+  `gate_clear` publisher path;
+- `gate_media_transcoder/__main__.py`: select between **two fixed** pipelines by
+  `argv[1]` (`gate` | `gate_clear`) — never accept a URL, and keep it
+  credential-free;
+- `deployment/systemd/gate-media-transcoder.service` becomes the template unit
+  `gate-media-transcoder@.service`; each instance costs the current `CPUQuota=20%`
+  Opus encode again;
+- `gate_media_auth/__main__.py`: extend `_allows_local_rtsp` with
+  `("publish","gate_clear")` and `("read","clear_view")`, and `_allows_viewer_read`
+  to accept path `gate_clear`;
+- `gate_media_auth/token.py`: `_validate_claims` currently pins `claims["path"]`
+  to `"gate"`; accept the exact set `{"gate","gate_clear"}` and keep every other
+  claim pinned;
+- `deployment/media/nginx-whep-locations.conf.template`: add the `/gate_clear/whep`
+  create and teardown locations.
+
+If `GetEnc` shows no such profile, live selection reduces to "Fluent live plus the
+on-demand 4K still", and the app should not render a `Clearer` option at all
+(access-gate-ui#33 §4 hides it unless the controller reports the second path
+ready).

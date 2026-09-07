@@ -47,6 +47,20 @@ _GATEWAY_KEYS = _GATEWAY_STATIC_KEYS | _RUNTIME_TURN_KEYS
 _LEGACY_GATEWAY_SOURCE_KEY = "MTX_PATHS_GATE_SOURCE"
 _TURN_KEYS = frozenset({"TURN_KEY_ID", "TURN_KEY_API_TOKEN"})
 _BOOLEAN_AUTH_KEYS = _AUTH_KEYS - {"GATE_MEDIA_HMAC_SECRET"}
+_CAMERA_CONTROL_REQUIRED_KEYS = frozenset({
+    "GATE_CAMERA_HOST",
+    "GATE_CAMERA_USERNAME",
+    "GATE_CAMERA_PASSWORD",
+})
+_CAMERA_CONTROL_DEFAULTS = {
+    "GATE_CAMERA_IR_DEFAULT": "Off",
+    "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
+    "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+}
+_CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
+_CAMERA_IR_STATES = frozenset({"Auto", "Off"})
+_CAMERA_CREDENTIAL_KEYS = ("GATE_CAMERA_USERNAME", "GATE_CAMERA_PASSWORD")
+_MAX_CAMERA_LEASE_MINUTES = 60
 
 
 class MediaConfigError(ValueError):
@@ -299,6 +313,66 @@ def validate_turn_environment(values: Mapping[str, str]) -> dict[str, str]:
     return selected
 
 
+def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, str]:
+    """Validate the root-only camera API credential source for gate-camera-control.
+
+    The camera credentials never join the media gateway file: that file's key set
+    is pinned, and widening it would widen who can read the RTSP secret.
+    """
+    selected = dict(values)
+    _validate_effective_values(selected)
+    if not _CAMERA_CONTROL_REQUIRED_KEYS <= set(selected) <= _CAMERA_CONTROL_KEYS:
+        raise MediaConfigError("camera control environment has missing or forbidden keys")
+    for key, default in _CAMERA_CONTROL_DEFAULTS.items():
+        selected.setdefault(key, default)
+    _validate_camera_host(selected["GATE_CAMERA_HOST"])
+    if any(not 1 <= len(selected[key].encode("utf-8")) <= 256
+           for key in _CAMERA_CREDENTIAL_KEYS):
+        raise MediaConfigError("camera credentials must be 1 to 256 bytes")
+    if selected["GATE_CAMERA_IR_DEFAULT"] not in _CAMERA_IR_STATES:
+        raise MediaConfigError("the IR default must be exactly Auto or Off")
+    default_minutes = _bounded_lease_minutes(
+        selected["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"]
+    )
+    max_minutes = _bounded_lease_minutes(selected["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
+    if default_minutes > max_minutes:
+        raise MediaConfigError("the default IR lease must not exceed the maximum")
+    return selected
+
+
+def relevant_camera_control_environment(
+    environment: Mapping[str, str]
+) -> dict[str, str]:
+    """Select only the exact camera-control keys, never a prefix match."""
+    return {
+        key: value for key, value in environment.items() if key in _CAMERA_CONTROL_KEYS
+    }
+
+
+def _validate_camera_host(value: str) -> None:
+    """The camera host must be one exact reachable private address.
+
+    The systemd unit pins the service's egress to loopback plus this address, so
+    a hostname would make that pin unverifiable.
+    """
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise MediaConfigError("camera host must be one exact IP address") from error
+    if (str(address) != value or address.is_unspecified or address.is_loopback
+            or address.is_multicast or address.is_link_local or address.is_reserved):
+        raise MediaConfigError("camera host must be one exact reachable IP address")
+
+
+def _bounded_lease_minutes(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", value):
+        raise MediaConfigError("IR lease minutes must be a whole number of minutes")
+    minutes = int(value)
+    if not 1 <= minutes <= _MAX_CAMERA_LEASE_MINUTES:
+        raise MediaConfigError("IR lease minutes must be between 1 and 60")
+    return minutes
+
+
 def relevant_auth_environment(environment: Mapping[str, str]) -> dict[str, str]:
     return {
         key: value for key, value in environment.items()
@@ -529,6 +603,9 @@ def main(argv=None) -> int:
     split_gateway.add_argument("--runtime-turn", required=True)
     turn = subparsers.add_parser("turn")
     turn.add_argument("--env", required=True)
+    camera_control = subparsers.add_parser("camera-control")
+    camera_control.add_argument("--env", required=True)
+    camera_control.add_argument("--print-host", action="store_true")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "checksum":
@@ -543,6 +620,12 @@ def main(argv=None) -> int:
             )
         elif arguments.command == "turn":
             validate_turn_environment(parse_trusted_environment(arguments.env))
+        elif arguments.command == "camera-control":
+            settings = validate_camera_control_environment(
+                parse_trusted_environment(arguments.env)
+            )
+            if arguments.print_host:
+                print(settings["GATE_CAMERA_HOST"])
         else:
             migrate_gateway_environments(
                 arguments.gateway, arguments.runtime_turn

@@ -956,6 +956,27 @@ SDP only; it does not carry RTP/RTCP media. Actual media must traverse the exact
 ICE listeners or the configured TURN relay. Do not expose API, metrics, the auth
 sidecar, WHIP, RTSP serving, or camera administration.
 
+## Camera Control Service
+
+Camera *settings* (the IR illuminator and the on-demand 4K still) are owned by a
+separate isolated service, `gate-camera-control`, installed with
+`deployment/install-camera-control.sh --source "$PWD"`. It is the only process
+that holds camera API credentials, in its own root-owned mode-0600
+`/etc/gate-camera-control.env`. Those credentials are deliberately not added to
+`/etc/gate-media-gateway.env`: that file's key set is pinned by
+`validate_gateway_static_environment()` and holds the RTSP secret, so widening it
+would widen who can read that secret. The service runs as its own
+`gate-camera-control` user, binds `127.0.0.1:8767`, and its unit denies all
+network egress except loopback plus the camera's exact `/32`. The controller
+gains no camera credentials and no camera host from it; it only reads the
+nonsecret `/run/gate-camera/state.json` into the `camera_control` heartbeat
+block, exactly as it reads `/run/gate-media/capabilities.json` into `media`.
+
+Expose it through its own tunnel hostname with its own Cloudflare Access
+application and service token — not the `gate-command` token. The full HTTP
+contract, environment keys, journal lines, failure modes, and rollback are in
+[Gate camera control](camera-control.md).
+
 Keep rollback-only Supabase credentials outside `/etc/gate-controller.env`, for
 example in root-owned mode-0600 `/etc/gate-controller.rollback.env`. The active
 environment rejects every non-empty `SUPABASE_URL` or
