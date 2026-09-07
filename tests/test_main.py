@@ -1206,7 +1206,10 @@ class HeartbeatObservabilityTests(unittest.TestCase):
 
             @staticmethod
             def status():
-                return {"probed": True, "router": {"rtt_ms": 12.4, "loss": 0.0}}
+                return {"probed": True, "mode": "full", "hops": {
+                    "lan": {"state": "ok", "loss": 0.0, "p95_ms": 0.63},
+                    "router": {"state": "ok", "loss": 0.04, "p95_ms": 228.44},
+                }}
 
         status = gate_main._controller_status(
             self.create_store(), self.prompt(), {}, net_probe=Probe(),
@@ -1217,7 +1220,9 @@ class HeartbeatObservabilityTests(unittest.TestCase):
 
         self.assertEqual(82.0, status["host"]["soc_temp_c"])
         self.assertTrue(status["host"]["throttled"]["arm_capped"])
-        self.assertEqual(12.4, status["network"]["router"]["rtt_ms"])
+        # The distribution reaches the app, not a mean that hides the tail.
+        self.assertEqual(0.63, status["network"]["hops"]["lan"]["p95_ms"])
+        self.assertEqual(228.44, status["network"]["hops"]["router"]["p95_ms"])
 
     def test_a_failed_host_read_still_lets_the_heartbeat_go_out_without_the_block(self):
         def explode(**_):
