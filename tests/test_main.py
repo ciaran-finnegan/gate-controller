@@ -71,6 +71,10 @@ def _guarded_roots(paths):
     - so the very path that blocks the Pi arrives here as
     ``/private/var/lib/gate-controller/...``. Matching only the declared spelling
     would make this guard a no-op on the machine the fix is written on.
+
+    This is the one place the suite names these roots to the kernel, and it is
+    safe: ``realpath`` is non-strict, so it resolves what it can and returns the
+    rest unchanged rather than raising on the unprivileged build user's EACCES.
     """
     roots = []
     for path in paths:
@@ -155,6 +159,41 @@ def no_live_state_access():
 
 
 class MainConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        """Point the status heartbeat's two device paths at a temporary tree.
+
+        ``_controller_status`` defaults ``media_capabilities_path`` to
+        ``/run/gate-media/capabilities.json`` and ``managed_releases_root`` to
+        ``/opt/gate-controller-deploy/releases``, and
+        ``build_background_workers`` builds its ``status`` callable without
+        overriding either. Both reads swallow ``OSError``, so this never failed
+        the way the match-policy marker did - on the device it quietly read the
+        *running* media gateway's capability file, and resolved the *running*
+        release root, into the dict the test then asserted on. A nonexistent
+        temporary path gives every machine the answer CI already gets.
+
+        Explicit arguments still win, so the tests that supply their own
+        capability file or release root are untouched.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.device_paths = Path(directory.name)
+        original_status = gate_main._controller_status
+
+        def controller_status(*arguments, **keywords):
+            keywords.setdefault(
+                "media_capabilities_path",
+                self.device_paths / "gate-media" / "capabilities.json",
+            )
+            keywords.setdefault(
+                "managed_releases_root", self.device_paths / "releases"
+            )
+            return original_status(*arguments, **keywords)
+
+        patcher = patch.object(gate_main, "_controller_status", controller_status)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def isolated_state_environment(self, **overrides):
         """A startup environment whose every controller path is temporary.
 
@@ -897,16 +936,18 @@ class MainConfigurationTests(unittest.TestCase):
         ), no_live_state_access():
             marker.exists()
 
-        for path in LIVE_CONTROLLER_PATHS:
-            with self.subTest(path=path):
-                self.assertIsNotNone(live_controller_path(path))
-                self.assertIsNotNone(live_controller_path(f"{path}/child"))
-                # ``main`` resolves before deriving the state directory, so the
-                # symlink-resolved spelling has to be caught as well - on a Mac
-                # that is /private/var/lib/gate-controller.
-                self.assertIsNotNone(
-                    live_controller_path(f"{os.path.realpath(path)}/child")
-                )
+        # Both spellings of every root, the declared one and the
+        # symlink-resolved one - ``main`` resolves before deriving the state
+        # directory, and on a Mac that turns /var into /private/var. Read from
+        # the table computed at import so this assertion does not itself stat a
+        # device path.
+        for spelling, root in _GUARDED_ROOTS:
+            with self.subTest(path=spelling):
+                self.assertEqual(root, live_controller_path(spelling))
+                self.assertEqual(root, live_controller_path(f"{spelling}/child"))
+        self.assertEqual(
+            set(LIVE_CONTROLLER_PATHS), {root for _, root in _GUARDED_ROOTS}
+        )
         self.assertIsNone(live_controller_path("/var/lib/gate-controller-other"))
         self.assertIsNone(live_controller_path(0))
 
