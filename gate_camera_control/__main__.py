@@ -8,6 +8,7 @@ caller, exactly as the controller's own loopback command server does not.
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -36,8 +37,15 @@ TOKEN_PATH = f"{RUNTIME_ROOT}/token.json"
 LEASE_PATH = f"{RUNTIME_ROOT}/lease.json"
 SNAPSHOT_MIN_INTERVAL_SECONDS = 2.0
 IDEMPOTENCY_TTL_SECONDS = 300.0
+IDEMPOTENCY_WAIT_SECONDS = 15.0
 MAX_IDEMPOTENCY_ENTRIES = 64
 MAX_IDEMPOTENCY_KEY_LENGTH = 128
+# Generous for one operator on one page, and far below what it takes to keep a
+# 5 s camera call permanently in front of an expiring lease's revert.
+STATE_BURST = 10
+STATE_REFILL_PER_SECOND = 2.0
+IR_BURST = 6
+IR_REFILL_PER_SECOND = 0.5
 _IR_BODY_FIELDS = frozenset({"state", "lease_minutes", "ttl_seconds", "idempotency_key"})
 _STATE_PATHS = frozenset({"/camera/state", "/camera/ir"})
 _SNAPSHOT_PATHS = frozenset({"/camera/snap", "/camera/snapshot"})
@@ -66,7 +74,8 @@ class CameraControlService:
     """Everything the HTTP layer is allowed to do, with no camera details leaked."""
 
     def __init__(self, controller, client, *, clock=time.time, logger=None,
-                 snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS):
+                 snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS,
+                 state_rate=None, ir_rate=None):
         self._controller = controller
         self._client = client
         self._clock = clock
@@ -74,6 +83,15 @@ class CameraControlService:
         self._snapshot_min_interval = float(snapshot_min_interval)
         self._snapshot_lock = threading.Lock()
         self._last_snapshot_at = None
+        # Reads and lease changes are bounded independently of the snapshot.
+        # Nothing behind this service scales: an unbounded read loop used to put
+        # a fresh 5 s camera call in front of an expired lease's revert.
+        self._state_limiter = state_rate or _RateLimiter(
+            STATE_BURST, STATE_REFILL_PER_SECOND, clock=clock
+        )
+        self._ir_limiter = ir_rate or _RateLimiter(
+            IR_BURST, IR_REFILL_PER_SECOND, clock=clock
+        )
         self._idempotency = OrderedDict()
         self._idempotency_lock = threading.Lock()
 
@@ -82,23 +100,48 @@ class CameraControlService:
         return self._controller
 
     def state(self) -> dict:
+        self._admit(self._state_limiter, "state_rate_limited")
         snapshot = self._controller.state(refresh_max_age=DIRECT_READ_MAX_AGE_SECONDS)
         return self._envelope(snapshot)
 
     def set_ir(self, payload) -> dict:
         request = _parse_ir_request(payload, self._controller.max_lease_minutes)
         key = request["idempotency_key"]
-        if key is not None:
-            replay = self._replayed(key)
-            if replay is not None:
-                return replay
-        snapshot = self._controller.set_state(request["state"], request["lease_minutes"])
-        response = self._envelope(snapshot)
-        response["status"] = "completed"
-        if key is not None:
-            response["idempotency_key"] = key
-            self._remember(key, response)
+        if key is None:
+            self._admit(self._ir_limiter, "ir_rate_limited")
+            return self._completed(
+                self._controller.set_state(request["state"], request["lease_minutes"])
+            )
+        # Reserved before the camera is touched, so two concurrent posts of one
+        # key produce one lease, not two: the loser waits for the winner and
+        # then answers from the lease the winner actually created.
+        first = self._reserve(key)
+        if not first.wait_if_replay():
+            return self._replay(key)
+        try:
+            self._admit(self._ir_limiter, "ir_rate_limited")
+            snapshot = self._controller.set_state(
+                request["state"], request["lease_minutes"]
+            )
+        except BaseException:
+            self._forget(key)
+            raise
+        first.complete()
+        response = self._completed(snapshot)
+        response["idempotency_key"] = key
         return response
+
+    def _completed(self, ir_snapshot) -> dict:
+        response = self._envelope(ir_snapshot)
+        response["status"] = "completed"
+        return response
+
+    def _admit(self, limiter, stage) -> None:
+        retry_after = limiter.reject_after()
+        if retry_after is None:
+            return
+        journal(self._logger, stage, retry_after=retry_after)
+        raise RateLimited(retry_after)
 
     def snapshot(self) -> bytes:
         with self._snapshot_lock:
@@ -122,18 +165,36 @@ class CameraControlService:
             "ir": ir_snapshot,
         }
 
-    def _replayed(self, key):
+    def _replay(self, key) -> dict:
+        """Answer a repeat post from the live lease, never from a frozen copy.
+
+        A stored response would keep serving the `observed_at` and the
+        `lease_seconds_remaining` of the original call, so a client that retried
+        a minute later would be told the lease had a minute more left than it
+        really did -- and would leave IR on trusting it.
+        """
+        response = self._completed(self._controller.snapshot())
+        response["idempotency_key"] = key
+        return response
+
+    def _reserve(self, key):
         with self._idempotency_lock:
             self._expire_locked()
             entry = self._idempotency.get(key)
-            return None if entry is None else dict(entry[1])
-
-    def _remember(self, key, response) -> None:
-        with self._idempotency_lock:
-            self._expire_locked()
-            self._idempotency[key] = (self._clock(), dict(response))
+            if entry is not None:
+                return _Reservation(entry[1], owned=False)
+            reservation = _Reservation(threading.Event(), owned=True)
+            self._idempotency[key] = (self._clock(), reservation.event)
             while len(self._idempotency) > MAX_IDEMPOTENCY_ENTRIES:
                 self._idempotency.popitem(last=False)
+            return reservation
+
+    def _forget(self, key) -> None:
+        """Drop a reservation whose call failed, so the caller may retry it."""
+        with self._idempotency_lock:
+            entry = self._idempotency.pop(key, None)
+        if entry is not None:
+            entry[1].set()
 
     def _expire_locked(self) -> None:
         cutoff = self._clock() - IDEMPOTENCY_TTL_SECONDS
@@ -141,12 +202,59 @@ class CameraControlService:
             self._idempotency.pop(key, None)
 
 
-class SnapshotRateLimited(Exception):
-    """One snapshot per interval; the caller is told exactly how long to wait."""
+class _Reservation:
+    """One idempotency key held by whichever request reached the camera first."""
+
+    def __init__(self, event, *, owned: bool):
+        self.event = event
+        self._owned = owned
+
+    def wait_if_replay(self) -> bool:
+        """True when this caller owns the key; False once the winner has landed."""
+        if self._owned:
+            return True
+        self.event.wait(timeout=IDEMPOTENCY_WAIT_SECONDS)
+        return False
+
+    def complete(self) -> None:
+        self.event.set()
+
+
+class _RateLimiter:
+    """A token bucket: `burst` requests at once, then `refill` a second."""
+
+    def __init__(self, burst: int, refill_per_second: float, *, clock=time.time):
+        self._burst = float(burst)
+        self._refill = float(refill_per_second)
+        self._clock = clock
+        self._tokens = float(burst)
+        self._updated_at = clock()
+        self._lock = threading.Lock()
+
+    def reject_after(self):
+        """Spend one token, or return the whole seconds until one exists."""
+        with self._lock:
+            now = self._clock()
+            self._tokens = min(
+                self._burst, self._tokens + (now - self._updated_at) * self._refill
+            )
+            self._updated_at = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return None
+            return max(1, math.ceil((1.0 - self._tokens) / self._refill))
+
+
+class RateLimited(Exception):
+    """The caller is over its budget and is told exactly how long to wait."""
 
     def __init__(self, retry_after: int):
         super().__init__("rate_limited")
         self.retry_after = max(1, int(retry_after))
+
+
+class SnapshotRateLimited(RateLimited):
+    """One snapshot per interval; the caller is told exactly how long to wait."""
 
 
 def _parse_ir_request(payload, max_lease_minutes) -> dict:
@@ -225,6 +333,28 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             200, self.server.service.set_ir(payload)
         ))
 
+    def do_HEAD(self):  # noqa: N802 - required by BaseHTTPRequestHandler
+        """Answer the headers of the matching GET, and no body.
+
+        Without this, BaseHTTPRequestHandler answers 501 through `send_error`,
+        and the body it writes for a HEAD desynchronises a keep-alive
+        connection -- through cloudflared, the next response on that connection
+        is read as the tail of this one.
+        """
+        path = self._route()
+        if path is None:
+            return
+        if path in _STATE_PATHS:
+            self._guarded(lambda: self._respond_json(
+                200, self.server.service.state(), body_only_headers=True
+            ))
+        elif path in _SNAPSHOT_PATHS:
+            # Deliberately not a snapshot: a HEAD must not spend the camera's
+            # one-every-two-seconds budget to report a length nobody reads.
+            self._respond(200, "image/jpeg", b"", body_only_headers=True)
+        else:
+            self._respond_json(404, {"error": "not_found"}, body_only_headers=True)
+
     def do_PUT(self):  # noqa: N802 - required by BaseHTTPRequestHandler
         self._respond_json(405, {"error": "method_not_allowed"})
 
@@ -235,6 +365,18 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         """Access logging is suppressed; the service journals its own decisions."""
 
     def send_error(self, *_arguments, **_keywords):
+        """Answer every framing failure with one bounded JSON body, then close.
+
+        `send_error` is the path a malformed request line, an over-long header
+        block or an unsupported method takes. On that path the parser has left
+        `request_version` at HTTP/0.9, under which `send_response_only` and
+        `send_header` emit nothing at all -- so the old override answered a bad
+        request line with a bare JSON body and no status line. The connection is
+        then closed, because a request that never parsed leaves no way to know
+        where the next one on this connection begins.
+        """
+        self.request_version = self.protocol_version
+        self.close_connection = True
         self._respond_json(400, {"error": "invalid_request"})
 
     def _route(self):
@@ -277,7 +419,7 @@ class CameraControlHandler(BaseHTTPRequestHandler):
     def _guarded(self, action) -> None:
         try:
             action()
-        except SnapshotRateLimited as error:
+        except RateLimited as error:
             self._respond_json(
                 429, {"error": "rate_limited", "retry_after": error.retry_after},
                 retry_after=error.retry_after,
@@ -300,11 +442,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             journal(self.server.logger, "internal_error")
             self._respond_json(500, {"error": "internal_error"})
 
-    def _respond_json(self, status, payload, *, retry_after=None) -> None:
+    def _respond_json(self, status, payload, *, retry_after=None,
+                      body_only_headers=False) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self._respond(status, "application/json", body, retry_after=retry_after)
+        self._respond(status, "application/json", body, retry_after=retry_after,
+                      body_only_headers=body_only_headers)
 
-    def _respond(self, status, content_type, body, *, retry_after=None) -> None:
+    def _respond(self, status, content_type, body, *, retry_after=None,
+                 body_only_headers=False) -> None:
         try:
             self.send_response_only(status)
             self.send_header("Content-Type", content_type)
@@ -312,8 +457,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             if retry_after is not None:
                 self.send_header("Retry-After", str(int(retry_after)))
+            if self.close_connection:
+                # Announced rather than merely done, so an intermediary stops
+                # reusing the connection instead of reading the next response
+                # off a socket we are about to drop.
+                self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            if not body_only_headers:
+                self.wfile.write(body)
         except OSError:
             self.close_connection = True
 
@@ -381,12 +532,22 @@ def main(argv=None) -> int:
     except MediaConfigError as error:
         parser.error(str(error))
     os.makedirs(RUNTIME_ROOT, mode=0o755, exist_ok=True)
+    # `mode=` is masked by the unit's UMask=0077, so a directory this call had
+    # to create lands at 0700 and the controller loses the read access the whole
+    # heartbeat path depends on. tmpfiles.d normally gets there first; this is
+    # the case where it did not.
+    os.chmod(RUNTIME_ROOT, 0o755)
     service = build_service(settings, logger=logger)
     # A lease that outlived the previous process must never leave IR on.
     service.controller.restore_default_on_start()
     server = CameraControlServer((arguments.host, arguments.port), service, logger=logger)
     reverts = RevertWorker(service.controller)
-    publisher = StatePublisher(arguments.state_path, service.controller.snapshot)
+    publisher = StatePublisher(
+        arguments.state_path, service.controller.snapshot,
+        # One bounded observation behind the publication, so an idle camera is
+        # reported as it is rather than as never-observed until someone asks.
+        refresher=service.controller.refresh_observation,
+    )
     journal(logger, "started", port=arguments.port,
             ir_default=service.controller.default_state,
             lease_default_minutes=service.controller.default_lease_minutes,

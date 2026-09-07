@@ -14,8 +14,14 @@ from .atomic import atomic_write
 
 STATE_PATH = "/run/gate-camera/state.json"
 PUBLISH_INTERVAL_SECONDS = 5.0
+# One bounded GetIrLights on the cached token, roughly twice a minute. Without
+# it a healthy camera reads as `camera_unreachable` at rest, because nothing but
+# an operator's own request ever observed it.
+REFRESH_INTERVAL_SECONDS = 30.0
 IR_STATES = ("Auto", "Off")
-REASONS = ("ready", "camera_busy", "camera_unreachable", "camera_error")
+REASONS = (
+    "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
+)
 
 
 def default_state() -> dict:
@@ -23,7 +29,7 @@ def default_state() -> dict:
         "observed_at": int(time.time()),
         "camera_control": {
             "available": False,
-            "reason": "camera_unreachable",
+            "reason": "not_observed",
             "ir": {
                 "state": "unknown",
                 "default": "Off",
@@ -44,7 +50,11 @@ def state_document(ir_snapshot, *, now=None) -> dict:
         default = "Off"
     last_error = ir_snapshot.get("last_error")
     if state == "unknown":
-        reason = last_error if last_error in REASONS else "camera_unreachable"
+        # A camera nobody has looked at yet is not a camera that failed. Saying
+        # `camera_unreachable` here made a healthy camera look broken after
+        # every restart, and the app hid the control until someone opened the
+        # page and forced a read.
+        reason = last_error if last_error in REASONS else "not_observed"
     else:
         reason = "ready"
     effective_until = ir_snapshot.get("effective_until")
@@ -72,13 +82,25 @@ def write_state(path, document: dict) -> None:
 
 
 class StatePublisher:
-    """Publishes the last known IR state without ever calling the camera itself."""
+    """Publishes the IR state, and keeps one slow observation behind it.
+
+    The snapshot itself never calls the camera.  The optional `refresher` does,
+    once every `refresh_interval_seconds`, on the cached login token and behind
+    the client's breaker -- enough that a camera nobody has touched still reads
+    as `ready` rather than sitting at `not_observed` until a request arrives.
+    """
 
     def __init__(self, path, snapshot_provider, *,
-                 interval_seconds=PUBLISH_INTERVAL_SECONDS):
+                 interval_seconds=PUBLISH_INTERVAL_SECONDS,
+                 refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
+                 clock=time.time):
         self._path = path
         self._snapshot_provider = snapshot_provider
         self._interval_seconds = float(interval_seconds)
+        self._refresher = refresher
+        self._refresh_interval_seconds = float(refresh_interval_seconds)
+        self._clock = clock
+        self._last_refresh_at = None
         self._stopped = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="camera-control-state", daemon=True
@@ -94,8 +116,26 @@ class StatePublisher:
     def publish_once(self) -> None:
         write_state(self._path, state_document(self._snapshot_provider()))
 
+    def refresh_if_due(self) -> bool:
+        """Observe the camera at most once per refresh interval. True if it ran."""
+        if self._refresher is None:
+            return False
+        now = self._clock()
+        if (self._last_refresh_at is not None
+                and now - self._last_refresh_at < self._refresh_interval_seconds):
+            return False
+        self._last_refresh_at = now
+        self._refresher()
+        return True
+
     def _run(self) -> None:
         while not self._stopped.is_set():
+            try:
+                self.refresh_if_due()
+            except Exception:
+                # A camera that will not answer is already recorded as the
+                # controller's last error; it must never stop publication.
+                pass
             try:
                 self.publish_once()
             except (OSError, TypeError, ValueError):

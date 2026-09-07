@@ -6,6 +6,7 @@ lease.  The lease is persisted before the camera is touched, so a restart in the
 middle of a lease still reverts to the configured default.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -24,6 +25,7 @@ OBSERVATION_MAX_AGE_SECONDS = 60.0
 DIRECT_READ_MAX_AGE_SECONDS = 5.0
 REVERT_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 MAX_LEASE_FILE_BYTES = 4 * 1024
+BACKGROUND_REFRESH_SECONDS = 30.0
 
 
 class IrController:
@@ -43,7 +45,13 @@ class IrController:
         self._max_lease_minutes = int(max_lease_minutes)
         self._clock = clock
         self._journal = journal or (lambda *_arguments, **_keywords: None)
+        # Two locks, and never one held across a camera call for a read.
+        # `_lock` guards the published state only; `_camera_lock` serialises the
+        # camera itself, with writers queueing ahead of readers.
         self._lock = threading.RLock()
+        self._camera_lock = threading.Lock()
+        self._writers_waiting_lock = threading.Lock()
+        self._writers_waiting = 0
         self._observed_state = None
         self._observed_at = None
         self._last_error = None
@@ -69,21 +77,49 @@ class IrController:
         with self._lock:
             if self._lease is None:
                 return
-            self._journal("startup_revert", state=self._default_state)
-            self._revert_locked(stage="startup_revert")
+        self._journal("startup_revert", state=self._default_state)
+        self._revert(stage="startup_revert")
 
     def state(self, *, refresh_max_age=OBSERVATION_MAX_AGE_SECONDS) -> dict:
-        """Return the published state, refreshing the observation when it is stale."""
+        """Return the published state, refreshing a stale observation first.
+
+        The camera call happens outside `_lock`, single-flighted, and is skipped
+        outright while a revert or a set is queued.  Readers used to make their
+        own 5 s calls while holding the state lock, so a handful of concurrent
+        readers could hold an expired lease's revert off the camera for over
+        half a minute -- IR staying on past expiry, the exact failure the lease
+        exists to prevent.
+        """
+        if self._observation_is_stale(refresh_max_age):
+            self.refresh_observation()
+        return self.snapshot()
+
+    def refresh_observation(self) -> bool:
+        """Observe the camera once, outside the state lock. True if it answered.
+
+        Returns False without touching the camera when a writer is queued, when
+        another refresh is already in flight, or when the client's breaker is
+        open.  None of those is an error; each is a reason to keep what we have.
+        """
+        if self._writers_waiting or self._breaker_is_open():
+            return False
+        # Single-flight: a second reader publishes the first reader's answer
+        # rather than putting a second call on the camera.
+        if not self._camera_lock.acquire(blocking=False):
+            return False
+        try:
+            state = self._client.ir_state()
+        except CameraError as error:
+            with self._lock:
+                self._record_error_locked(error)
+            return False
+        finally:
+            self._camera_lock.release()
         with self._lock:
-            now = self._clock()
-            stale = (self._observed_at is None
-                     or now - self._observed_at > refresh_max_age)
-            if stale:
-                try:
-                    self._observe_locked()
-                except CameraError as error:
-                    self._record_error_locked(error)
-            return self._snapshot_locked()
+            self._observed_state = state
+            self._observed_at = self._clock()
+            self._last_error = None
+        return True
 
     def snapshot(self) -> dict:
         """Return the last known state without ever touching the camera."""
@@ -95,53 +131,58 @@ class IrController:
         if state not in IR_STATES:
             raise ValueError("IR state must be Auto or Off")
         minutes = self._bounded_lease_minutes(lease_minutes)
-        with self._lock:
-            now = self._clock()
-            expires_at = now + minutes * 60
-            reverting = state == self._default_state
-            # Persist the lease before the camera changes so a crash between the
-            # two still reverts on the next start.
-            self._write_lease(None if reverting else {
-                "state": state, "expires_at": expires_at, "set_at": now,
-            })
+        with self._camera_writer():
+            with self._lock:
+                now = self._clock()
+                expires_at = now + minutes * 60
+                reverting = state == self._default_state
+                previous_lease = self._lease
+                # Persist the lease before the camera changes so a crash between
+                # the two still reverts on the next start.
+                self._write_lease(None if reverting else {
+                    "state": state, "expires_at": expires_at, "set_at": now,
+                })
             try:
                 self._client.set_ir_state(state)
             except CameraError as error:
-                self._record_error_locked(error)
-                # A failed call is indeterminate: the camera may have applied it.
-                # Keep whichever record guarantees a later revert - the new lease
-                # when one was requested, the previous lease when this was itself
-                # a revert - rather than the record that assumes success.
+                with self._lock:
+                    self._record_error_locked(error)
+                    # A failed call is indeterminate: the camera may have applied
+                    # it. Keep whichever record guarantees a later revert - the
+                    # new lease when one was requested, the previous lease when
+                    # this was itself a revert - rather than the record that
+                    # assumes success.
+                    if reverting:
+                        self._write_lease(previous_lease)
+                    else:
+                        self._lease = {
+                            "state": state, "expires_at": expires_at, "set_at": now,
+                        }
+                    self._journal(
+                        "ir_set", state=state, lease_seconds=minutes * 60,
+                        outcome=error.code,
+                    )
+                raise
+            with self._lock:
+                self._observed_state = state
+                self._observed_at = now
+                self._last_error = None
                 if reverting:
-                    self._write_lease(self._lease)
+                    self._lease = None
+                    self._revert_failed = False
+                    self._revert_attempts = 0
+                    self._journal("ir_revert", state=state, outcome="completed")
                 else:
                     self._lease = {
                         "state": state, "expires_at": expires_at, "set_at": now,
                     }
-                self._journal(
-                    "ir_set", state=state, lease_seconds=minutes * 60,
-                    outcome=error.code,
-                )
-                raise
-            self._observed_state = state
-            self._observed_at = now
-            self._last_error = None
-            if reverting:
-                self._lease = None
-                self._revert_failed = False
-                self._revert_attempts = 0
-                self._journal("ir_revert", state=state, outcome="completed")
-            else:
-                self._lease = {
-                    "state": state, "expires_at": expires_at, "set_at": now,
-                }
-                self._revert_failed = False
-                self._revert_attempts = 0
-                self._journal(
-                    "ir_set", state=state, lease_seconds=minutes * 60,
-                    outcome="completed",
-                )
-            return self._snapshot_locked()
+                    self._revert_failed = False
+                    self._revert_attempts = 0
+                    self._journal(
+                        "ir_set", state=state, lease_seconds=minutes * 60,
+                        outcome="completed",
+                    )
+                return self._snapshot_locked()
 
     def revert_now(self) -> dict:
         """Cancel any lease immediately and return to the configured default."""
@@ -158,7 +199,7 @@ class IrController:
                     return False
             elif now < self._lease["expires_at"]:
                 return False
-            return self._revert_locked(stage="ir_revert")
+        return self._revert(stage="ir_revert")
 
     def seconds_until_next_revert(self):
         with self._lock:
@@ -169,37 +210,72 @@ class IrController:
                    else self._lease["expires_at"])
             return max(0.0, due - now)
 
-    def _revert_locked(self, *, stage: str) -> bool:
-        try:
-            self._client.set_ir_state(self._default_state)
-        except CameraError as error:
-            self._record_error_locked(error)
-            self._revert_failed = True
-            self._revert_attempts += 1
-            backoff = REVERT_RETRY_SECONDS[
-                min(self._revert_attempts, len(REVERT_RETRY_SECONDS)) - 1
-            ]
-            self._next_revert_attempt_at = self._clock() + backoff
-            self._journal(
-                stage, state=self._default_state, outcome=error.code,
-                attempt=self._revert_attempts, retry_after=int(backoff),
-            )
-            return False
-        self._observed_state = self._default_state
-        self._observed_at = self._clock()
-        self._last_error = None
-        self._revert_failed = False
-        self._revert_attempts = 0
-        self._lease = None
-        self._write_lease(None)
-        self._journal(stage, state=self._default_state, outcome="completed")
-        return True
+    def _revert(self, *, stage: str) -> bool:
+        """Put the camera back to the default. The priority path: readers wait."""
+        with self._camera_writer():
+            with self._lock:
+                if self._lease is None:
+                    return False
+            try:
+                self._client.set_ir_state(self._default_state)
+            except CameraError as error:
+                with self._lock:
+                    self._record_error_locked(error)
+                    self._revert_failed = True
+                    self._revert_attempts += 1
+                    backoff = REVERT_RETRY_SECONDS[
+                        min(self._revert_attempts, len(REVERT_RETRY_SECONDS)) - 1
+                    ]
+                    self._next_revert_attempt_at = self._clock() + backoff
+                    self._journal(
+                        stage, state=self._default_state, outcome=error.code,
+                        attempt=self._revert_attempts, retry_after=int(backoff),
+                    )
+                return False
+            with self._lock:
+                self._observed_state = self._default_state
+                self._observed_at = self._clock()
+                self._last_error = None
+                self._revert_failed = False
+                self._revert_attempts = 0
+                self._lease = None
+                self._write_lease(None)
+                self._journal(stage, state=self._default_state, outcome="completed")
+            return True
 
-    def _observe_locked(self) -> None:
-        state = self._client.ir_state()
-        self._observed_state = state
-        self._observed_at = self._clock()
-        self._last_error = None
+    @contextlib.contextmanager
+    def _camera_writer(self):
+        """Serialise camera writes, and hold readers off while one is queued.
+
+        A revert that is late is the failure this module exists to prevent, so a
+        waiting writer takes precedence over any read: reads see the counter and
+        stand aside rather than putting another bounded call in front of it.
+        """
+        with self._writers_waiting_lock:
+            self._writers_waiting += 1
+        try:
+            self._camera_lock.acquire()
+        finally:
+            with self._writers_waiting_lock:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            self._camera_lock.release()
+
+    def _observation_is_stale(self, max_age: float) -> bool:
+        with self._lock:
+            return (self._observed_at is None
+                    or self._clock() - self._observed_at > max_age)
+
+    def _breaker_is_open(self) -> bool:
+        remaining = getattr(self._client, "breaker_seconds_remaining", None)
+        if not callable(remaining):
+            return False
+        try:
+            return remaining() > 0
+        except Exception:
+            return False
 
     def _record_error_locked(self, error) -> None:
         self._last_error = error.code

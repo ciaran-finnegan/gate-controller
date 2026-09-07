@@ -31,6 +31,7 @@ MAX_TOKEN_LEASE_SECONDS = 24 * 60 * 60
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 MAX_TOKEN_FILE_BYTES = 4 * 1024
+_TOKEN_FILE_KEYS = frozenset({"token", "expires_at", "last_login_at"})
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _AUTH_ERROR_CODES = frozenset({-6, -7, -14})
 
@@ -59,7 +60,14 @@ class CameraUnreachable(CameraError):
 
 
 class TokenCache:
-    """Owner-only persistence for one login token across service restarts."""
+    """Owner-only persistence for one login token, and for the last login attempt.
+
+    The last login *attempt* is persisted separately from the token because the
+    two fail apart: a restart that finds no usable token would otherwise start
+    with no memory of how recently this service last hit ``Login``, and this
+    firmware answers 502 for about a minute after repeated logins.  A crash loop
+    would then log in on every start and hold the camera in that 502 window.
+    """
 
     def __init__(self, path):
         self._path = None if path is None else os.fspath(path)
@@ -69,7 +77,11 @@ class TokenCache:
         return self._path
 
     def load(self):
-        """Return ``(token, expires_at)`` or ``None``; a bad file is simply ignored."""
+        """Return ``(token, expires_at, last_login_at)`` or ``None``.
+
+        ``token`` is ``None`` when the file records only a login attempt.  A bad
+        file is simply ignored.
+        """
         if self._path is None:
             return None
         flags = os.O_RDONLY | os.O_NONBLOCK
@@ -94,30 +106,36 @@ class TokenCache:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return None
-        if not isinstance(decoded, dict) or set(decoded) != {"token", "expires_at"}:
+        if (not isinstance(decoded, dict)
+                or not {"token", "expires_at"} <= set(decoded) <= _TOKEN_FILE_KEYS):
             return None
         token, expires_at = decoded["token"], decoded["expires_at"]
-        if (not isinstance(token, str) or not 0 < len(token) <= 512
-                or isinstance(expires_at, bool)
-                or not isinstance(expires_at, (int, float))):
+        if token is not None and (not isinstance(token, str)
+                                  or not 0 < len(token) <= 512):
             return None
-        return token, float(expires_at)
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return None
+        last_login_at = decoded.get("last_login_at")
+        if last_login_at is not None and (isinstance(last_login_at, bool)
+                                          or not isinstance(last_login_at,
+                                                            (int, float))):
+            return None
+        return (
+            token,
+            float(expires_at),
+            None if last_login_at is None else float(last_login_at),
+        )
 
-    def save(self, token: str, expires_at: float) -> None:
+    def save(self, token, expires_at: float, last_login_at=None) -> None:
+        """Record the token, if any, and when the last login was attempted."""
         if self._path is None:
             return
-        body = json.dumps(
-            {"token": token, "expires_at": float(expires_at)}, separators=(",", ":")
-        ).encode("utf-8")
+        body = json.dumps({
+            "token": token,
+            "expires_at": float(expires_at),
+            "last_login_at": (None if last_login_at is None else float(last_login_at)),
+        }, separators=(",", ":")).encode("utf-8")
         atomic_write(self._path, body, 0o600)
-
-    def clear(self) -> None:
-        if self._path is None:
-            return
-        try:
-            os.unlink(self._path)
-        except OSError:
-            pass
 
 
 class ReolinkClient:
@@ -147,7 +165,13 @@ class ReolinkClient:
         self.login_count = 0
         cached = self._cache.load()
         if cached is not None:
-            self._token, self._token_expires_at = cached
+            token, expires_at, last_login_at = cached
+            if token is not None:
+                self._token, self._token_expires_at = token, expires_at
+            # Restored even when the token is gone: without it a restart with no
+            # usable token logs in immediately, and a crash loop becomes a login
+            # storm the camera answers with 502 for a minute at a time.
+            self._last_login_at = last_login_at
 
     @property
     def host(self):
@@ -232,11 +256,15 @@ class ReolinkClient:
                 self._journal("login_throttled", retry_after=max(1, math.ceil(remaining)))
                 raise CameraBusy(math.ceil(remaining))
             self._last_login_at = now
+            # Persisted before the call, not after: a login that hangs, fails or
+            # takes the process down with it still has to count against the
+            # re-login floor on the next start.
+            self._cache.save(None, 0.0, now)
             token, lease_seconds = self._login()
             self._token = token
             self._token_expires_at = now + lease_seconds
             self.login_count += 1
-            self._cache.save(token, self._token_expires_at)
+            self._cache.save(token, self._token_expires_at, now)
             self._journal("login", lease_seconds=int(lease_seconds))
             return token
 
@@ -266,7 +294,9 @@ class ReolinkClient:
         with self._lock:
             self._token = None
             self._token_expires_at = 0.0
-        self._cache.clear()
+            # Drop the token but keep the login timestamp, so discarding a
+            # rejected token cannot buy a caller a free re-login on restart.
+            self._cache.save(None, 0.0, self._last_login_at)
 
     def _raise_if_breaker_open(self) -> None:
         remaining = self._breaker_until - self._clock()
@@ -299,6 +329,12 @@ class ReolinkClient:
         except CameraError:
             raise
         except (OSError, HTTPException) as error:
+            # A camera that does not answer opens the breaker exactly as a 502
+            # does. Without this, every read retried a 5 s connect attempt, and
+            # an expired lease's revert queued behind those attempts -- IR
+            # staying on past its expiry is the one failure the lease exists to
+            # prevent.
+            self._open_breaker()
             raise CameraUnreachable("camera did not answer") from error
         finally:
             try:

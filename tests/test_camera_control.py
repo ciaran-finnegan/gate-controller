@@ -1,4 +1,8 @@
 import json
+import shutil
+import socket
+import ssl
+import subprocess
 import threading
 import time
 import unittest
@@ -24,29 +28,52 @@ from gate_camera_control.reolink import (
     ReolinkClient,
     TokenCache,
 )
-from gate_camera_control.state import state_document
+from gate_camera_control.state import StatePublisher, state_document
 from gate_media_config import MediaConfigError, validate_camera_control_environment
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
 
 
+def self_signed_certificate(directory):
+    """One throwaway self-signed certificate, exactly what the camera presents."""
+    path = Path(directory) / "camera.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(path), "-out", str(path), "-days", "1",
+            "-subj", "/CN=camera.invalid",
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return path
+
+
 class FakeCamera:
     """A stand-in for the RLC-810A api.cgi surface, with its 502 login behaviour."""
 
-    def __init__(self):
+    def __init__(self, *, certificate=None):
         self.ir_state = "Off"
         self.logins = 0
         self.commands = []
         self.tokens = set()
         self.login_status = 200
         self.command_status = 200
+        # The firmware's own behaviour: past this many logins it stops answering
+        # Login at all and returns 502 for about a minute.
+        self.login_502_after = None
         self.expire_next_token = False
         self.snapshot_body = JPEG
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCameraHandler)
         self._server.camera = self
         self._server.daemon_threads = True
+        if certificate is not None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certificate)
+            self._server.socket = context.wrap_socket(
+                self._server.socket, server_side=True
+            )
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -66,6 +93,9 @@ class FakeCamera:
         with self._lock:
             if command == "Login":
                 self.logins += 1
+                if (self.login_502_after is not None
+                        and self.logins > self.login_502_after):
+                    return 502, b""
                 if self.login_status != 200:
                     return self.login_status, b""
                 name = f"token-{self.logins}"
@@ -144,6 +174,30 @@ def _authentication_failure(command):
     return json.dumps([
         {"cmd": command, "code": 1, "error": {"rspCode": -6, "detail": "login required"}}
     ]).encode("utf-8")
+
+
+class _SlowCamera:
+    """Wraps a client so one read blocks, standing in for a slow 5 s camera."""
+
+    def __init__(self, camera, released):
+        self._camera = camera
+        self._released = released
+        self.reads = 0
+        self.first_call_started = threading.Event()
+        self._lock = threading.Lock()
+
+    def breaker_seconds_remaining(self):
+        return 0
+
+    def ir_state(self):
+        with self._lock:
+            self.reads += 1
+        self.first_call_started.set()
+        self._released.wait(timeout=10)
+        return self._camera.ir_state
+
+    def set_ir_state(self, state):
+        self._camera.ir_state = state
 
 
 class ManualClock:
@@ -320,12 +374,91 @@ class ReolinkClientTests(unittest.TestCase):
         self.assertEqual(["Off"] * 8, results)
         self.assertEqual(1, self.camera.logins)
 
+    def test_the_camera_stops_answering_logins_of_its_own_accord(self):
+        """The 502 the firmware really produces: too many logins, not a toggle.
+
+        Nothing in this test sets a status by hand. The camera simply refuses to
+        log anyone in past the third attempt, exactly as the RLC-810A does, and
+        the client has to stop asking rather than hammering it for a minute.
+        """
+        client = self.client(min_login_interval=0.0)
+        self.camera.login_502_after = 2
+
+        # A token the camera drops costs a re-login. Twice is all it tolerates.
+        self.camera.expire_next_token = True
+        self.assertEqual("Off", client.ir_state())
+        self.assertEqual(2, self.camera.logins)
+
+        self.camera.expire_next_token = True
+        with self.assertRaises(CameraBusy) as busy:
+            client.ir_state()
+
+        self.assertEqual(3, self.camera.logins)
+        self.assertEqual(60, busy.exception.retry_after)
+
+        # The breaker, not politeness: further calls never reach the camera.
+        for _ in range(5):
+            with self.assertRaises(CameraBusy):
+                client.ir_state()
+        self.assertEqual(3, self.camera.logins)
+
+    def test_the_re_login_floor_survives_a_restart_that_finds_no_token(self):
+        client = self.client()
+        client.ir_state()
+        self.assertEqual(1, self.camera.logins)
+        client._invalidate_token()
+
+        # A crash loop is a restart with the token gone but the camera still
+        # inside its post-login 502 window. The floor has to be remembered.
+        restarted = self.client()
+        with self.assertRaises(CameraBusy):
+            restarted.ir_state()
+        self.assertEqual(1, self.camera.logins)
+
+        self.clock.advance(60)
+        self.assertEqual("Off", self.client().ir_state())
+        self.assertEqual(2, self.camera.logins)
+
     def test_an_unreachable_camera_is_distinguished_from_a_busy_one(self):
         client = self.client()
         self.camera.close()
 
         with self.assertRaises(CameraUnreachable):
             client.ir_state()
+
+    def test_an_unreachable_camera_opens_the_breaker_exactly_as_a_502_does(self):
+        client = self.client()
+        client.ir_state()
+        self.camera.close()
+
+        with self.assertRaises(CameraUnreachable):
+            client.ir_state()
+
+        # Without this, every reader paid a fresh 5 s connect attempt and a due
+        # revert queued behind all of them.
+        self.assertEqual(60, client.breaker_seconds_remaining())
+        with self.assertRaises(CameraBusy):
+            client.ir_state()
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is required")
+    def test_the_real_https_path_accepts_the_cameras_self_signed_certificate(self):
+        certificate = self_signed_certificate(self.directory.name)
+        camera = FakeCamera(certificate=certificate)
+        self.addCleanup(camera.close)
+        # No connection_factory override: this goes through _https_connection,
+        # whose CERT_NONE context is what lets the camera's own certificate work
+        # while the unit pins the reachable peers to its address.
+        client = ReolinkClient(
+            camera.host, "gate", "s3cret",
+            token_path=Path(self.directory.name) / "tls-token.json",
+            clock=self.clock,
+        )
+
+        self.assertEqual("Off", client.ir_state())
+        client.set_ir_state("Auto")
+
+        self.assertEqual("Auto", camera.ir_state)
+        self.assertEqual(1, camera.logins)
 
     def test_snapshot_returns_jpeg_bytes_and_rejects_anything_else(self):
         client = self.client()
@@ -515,6 +648,41 @@ class IrLeaseTests(unittest.TestCase):
         self.assertEqual("camera_unreachable", snapshot["last_error"])
         self.assertEqual("Off", snapshot["default"])
 
+    def test_a_due_revert_is_not_starved_by_concurrent_readers(self):
+        """The measured failure: readers held an expired lease's revert off.
+
+        Reads used to make a bounded camera call while holding the state lock,
+        so a handful of them in flight kept the revert waiting and IR stayed on
+        well past its expiry. The revert now takes priority and the reads that
+        cannot get the camera answer from the last observation instead.
+        """
+        controller = self.build(clock=time.time, default_lease_minutes=1)
+        controller.set_state("Auto", 1)
+        released = threading.Event()
+        slow = _SlowCamera(self.camera, released)
+        controller._client = slow
+        controller._lease["expires_at"] = time.time() - 1
+
+        readers = [
+            threading.Thread(target=controller.state, daemon=True) for _ in range(6)
+        ]
+        for reader in readers:
+            reader.start()
+        slow.first_call_started.wait(timeout=5)
+
+        started = time.monotonic()
+        reverted = controller.run_due_revert()
+        elapsed = time.monotonic() - started
+        released.set()
+        for reader in readers:
+            reader.join(timeout=5)
+
+        self.assertTrue(reverted)
+        self.assertEqual("Off", self.camera.ir_state)
+        # One in-flight read at most, never six queued in front of the revert.
+        self.assertLess(elapsed, 2.0)
+        self.assertLessEqual(slow.reads, 1)
+
     def test_concurrent_operators_are_serialised_and_both_journaled(self):
         controller = self.build()
 
@@ -619,15 +787,103 @@ class CameraControlHttpTests(unittest.TestCase):
 
         self.assertEqual(600, payload["ir"]["lease_seconds_remaining"])
 
-    def test_a_replayed_idempotency_key_returns_the_first_response(self):
+    def test_a_replayed_idempotency_key_answers_from_the_live_lease(self):
         body = {"state": "Auto", "lease_minutes": 5, "idempotency_key": "abc-123"}
 
         _status, first, _ = self.json_request("POST", "/camera/ir", body)
         commands = len(self.camera.commands)
+        # Wind the lease back, as if the replay had arrived four minutes later.
+        self.service.controller._lease["expires_at"] -= 240
         _status, second, _ = self.json_request("POST", "/camera/ir", body)
 
-        self.assertEqual(first, second)
         self.assertEqual(commands, len(self.camera.commands))
+        self.assertEqual("completed", second["status"])
+        self.assertEqual("abc-123", second["idempotency_key"])
+        # A frozen copy would still promise the original 300 s.
+        self.assertEqual(300, first["ir"]["lease_seconds_remaining"])
+        self.assertEqual(60, second["ir"]["lease_seconds_remaining"])
+
+    def test_two_concurrent_posts_of_one_key_reach_the_camera_once(self):
+        body = {"state": "Auto", "lease_minutes": 5, "idempotency_key": "same-key"}
+        results = []
+        lock = threading.Lock()
+
+        def post():
+            _status, payload, _ = self.json_request("POST", "/camera/ir", body)
+            with lock:
+                results.append(payload)
+
+        threads = [threading.Thread(target=post) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertEqual(4, len(results))
+        self.assertEqual(1, self.camera.commands.count("SetIrLights"))
+        self.assertTrue(all(payload["status"] == "completed" for payload in results))
+        self.assertTrue(all(
+            payload["ir"]["effective_until"] == results[0]["ir"]["effective_until"]
+            for payload in results
+        ))
+
+    def test_head_returns_the_headers_of_the_get_and_no_body(self):
+        connection = HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(connection.close)
+
+        connection.request("HEAD", "/camera/state")
+        response = connection.getresponse()
+        body = response.read()
+
+        self.assertEqual(200, response.status)
+        self.assertEqual("application/json", response.getheader("Content-Type"))
+        self.assertEqual(b"", body)
+        self.assertNotEqual("0", response.getheader("Content-Length"))
+
+        # The connection is still framed: the next request on it is answered.
+        connection.request("GET", "/camera/state", headers={"Connection": "close"})
+        self.assertEqual(200, connection.getresponse().status)
+
+    def test_a_malformed_request_line_gets_a_status_line_and_a_close(self):
+        raw = socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]), timeout=10
+        )
+        self.addCleanup(raw.close)
+
+        raw.sendall(b"NOT-A-REQUEST-LINE\r\n\r\n")
+        answer = b""
+        while b"\r\n\r\n" not in answer:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            answer += chunk
+
+        # Previously the body was written with no status line at all, and the
+        # connection was then left open for a reply nothing could parse.
+        self.assertTrue(answer.startswith(b"HTTP/1.1 400"), answer[:64])
+        self.assertIn(b'{"error":"invalid_request"}', answer)
+        self.assertIn(b"Connection: close", answer)
+
+    def test_reads_and_lease_changes_are_rate_limited(self):
+        for _ in range(10):
+            self.assertEqual(200, self.json_request("GET", "/camera/state")[0])
+
+        status, payload, headers = self.json_request("GET", "/camera/state")
+
+        self.assertEqual(429, status)
+        self.assertEqual("rate_limited", payload["error"])
+        self.assertEqual(str(payload["retry_after"]), headers["Retry-After"])
+
+        commands = len(self.camera.commands)
+        for _ in range(6):
+            self.json_request("POST", "/camera/ir", {"state": "Auto"})
+        status, payload, _ = self.json_request("POST", "/camera/ir", {"state": "Auto"})
+
+        self.assertEqual(429, status)
+        self.assertEqual("rate_limited", payload["error"])
+        self.assertEqual(6, len(self.camera.commands) - commands)
 
     def test_bad_input_is_rejected_without_reaching_the_camera(self):
         commands = len(self.camera.commands)
@@ -783,6 +1039,46 @@ class StateDocumentTests(unittest.TestCase):
         self.assertEqual("camera_busy", block["reason"])
         self.assertEqual("unknown", block["ir"]["state"])
         self.assertTrue(block["ir"]["revert_failed"])
+
+    def test_a_camera_nobody_has_looked_at_is_not_reported_unreachable(self):
+        """`not_observed` and `camera_unreachable` are different claims.
+
+        At rest, with no lease and no request since a restart, nothing has
+        called the camera. Reporting that as unreachable made a healthy camera
+        look broken and the app hid the control until someone opened the page.
+        """
+        document = state_document({
+            "state": "unknown", "default": "Off", "effective_until": None,
+            "lease_seconds_remaining": None, "revert_failed": False,
+            "last_error": None,
+        }, now=1_757_000_000)
+
+        block = document["camera_control"]
+
+        self.assertEqual("not_observed", block["reason"])
+        self.assertFalse(block["available"])
+        # A real failure still says so.
+        self.assertEqual("camera_unreachable", state_document({
+            "state": "unknown", "default": "Off", "effective_until": None,
+            "lease_seconds_remaining": None, "revert_failed": False,
+            "last_error": "camera_unreachable",
+        })["camera_control"]["reason"])
+
+    def test_the_publisher_observes_the_camera_on_its_own_slow_timer(self):
+        clock = ManualClock()
+        refreshes = []
+        publisher = StatePublisher(
+            "/dev/null", dict, refresher=lambda: refreshes.append(clock.now),
+            refresh_interval_seconds=30.0, clock=clock,
+        )
+
+        self.assertTrue(publisher.refresh_if_due())
+        clock.advance(29)
+        self.assertFalse(publisher.refresh_if_due())
+        clock.advance(2)
+        self.assertTrue(publisher.refresh_if_due())
+
+        self.assertEqual(2, len(refreshes))
 
     def test_the_published_document_names_no_camera_and_no_credential(self):
         document = state_document({

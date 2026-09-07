@@ -17,6 +17,8 @@ SYSTEMD_ROOT=/etc/systemd/system
 CAMERA_DROPIN_DIR=$SYSTEMD_ROOT/$CAMERA_SERVICE.d
 CAMERA_DROPIN=$CAMERA_DROPIN_DIR/10-camera-address.conf
 SOURCE=
+STAGED_CAMERA_DROPIN=
+CAMERA_LIBRARY_PUBLISHED=0
 
 usage() {
   cat <<'EOF'
@@ -65,13 +67,15 @@ reject_gpio_membership() {
   done
 }
 
+# Validation reads the validator out of the source tree, not out of
+# $CAMERA_LIBRARY: an environment file this installer is about to reject must
+# not first cause a new library to be published over the running one.
 camera_environment_configured() {
-  python3 "$CAMERA_LIBRARY/gate_media_config.py" camera-control --env "$CAMERA_ENV" \
-    >/dev/null
+  python3 "$SOURCE/gate_media_config.py" camera-control --env "$CAMERA_ENV" >/dev/null
 }
 
 camera_host() {
-  python3 "$CAMERA_LIBRARY/gate_media_config.py" camera-control --env "$CAMERA_ENV" \
+  python3 "$SOURCE/gate_media_config.py" camera-control --env "$CAMERA_ENV" \
     --print-host
 }
 
@@ -89,8 +93,35 @@ preflight() {
   [[ -d $SOURCE && ! -L $SOURCE ]] || fail "--source must be a directory"
   [[ -f $SOURCE/deployment/systemd/$CAMERA_SERVICE ]] \
     || fail "the camera control unit is missing from the source tree"
+  [[ -f $SOURCE/gate_media_config.py ]] \
+    || fail "the configuration validator is missing from the source tree"
   [[ -d $SOURCE/gate_camera_control ]] \
     || fail "the gate_camera_control package is missing from the source tree"
+}
+
+cleanup_camera_install() {
+  if [[ -n $STAGED_CAMERA_DROPIN && $STAGED_CAMERA_DROPIN == "$CAMERA_DROPIN".new.* ]]
+  then
+    rm -f -- "$STAGED_CAMERA_DROPIN"
+  fi
+  STAGED_CAMERA_DROPIN=
+}
+
+on_camera_install_failure() {
+  local status=$?
+  [[ $status -ne 0 ]] || status=1
+  trap - ERR INT TERM
+  cleanup_camera_install
+  # A half-published library with no working unit is the one state that leaves
+  # camera credentials on disk with nothing reverting an IR lease, so the
+  # service is stopped rather than left enabled against unknown code.
+  if [[ $CAMERA_LIBRARY_PUBLISHED -eq 1 ]]; then
+    disable_camera_service
+    remove_camera_address_dropin
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  printf 'gate camera control install: failed; the service is left disabled.\n' >&2
+  return "$status"
 }
 
 ensure_account() {
@@ -139,11 +170,18 @@ EOF
 
 publish_camera_address_dropin() {
   local host=$1
+  [[ -n $host ]] || fail "the camera address drop-in needs a host"
   install -d -o root -g root -m 0755 "$CAMERA_DROPIN_DIR"
-  install -o root -g root -m 0644 /dev/stdin "$CAMERA_DROPIN" <<EOF
+  # Written aside and moved into place, so an interrupted install never leaves a
+  # truncated IPAddressAllow= and a service whose egress pin is wider than the
+  # camera's own address.
+  STAGED_CAMERA_DROPIN=$CAMERA_DROPIN.new.$$
+  install -o root -g root -m 0644 /dev/stdin "$STAGED_CAMERA_DROPIN" <<EOF
 [Service]
 IPAddressAllow=$host/32
 EOF
+  mv -f -- "$STAGED_CAMERA_DROPIN" "$CAMERA_DROPIN"
+  STAGED_CAMERA_DROPIN=
 }
 
 remove_camera_address_dropin() {
@@ -168,6 +206,8 @@ activate() {
 }
 
 main() {
+  trap on_camera_install_failure ERR INT TERM
+  trap cleanup_camera_install EXIT
   while [[ $# -gt 0 ]]; do
     case $1 in
       --source)
@@ -189,9 +229,10 @@ main() {
   preflight
   ensure_account
   ensure_environment_file
-  publish_library
-  publish_unit
 
+  # The environment is judged before anything is published. An installer that
+  # published first and validated second replaced the running library on its way
+  # to telling the operator the configuration was unusable.
   if [[ ! -s $CAMERA_ENV ]] || ! camera_environment_configured; then
     disable_camera_service
     remove_camera_address_dropin
@@ -202,12 +243,23 @@ main() {
       "GATE_CAMERA_PASSWORD and optionally GATE_CAMERA_IR_DEFAULT," \
       "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES, GATE_CAMERA_IR_LEASE_MAX_MINUTES," \
       "then re-run this installer. See docs/camera-control.md."
+    trap - ERR INT TERM
     return 0
   fi
 
-  publish_camera_address_dropin "$(camera_host)"
+  # Assigned on its own line, so a validator that fails here aborts under
+  # `set -e`. As an argument the substitution's exit status is discarded, and
+  # the drop-in would be written with an empty IPAddressAllow= prefix.
+  local host
+  host=$(camera_host) || fail "the camera address could not be read"
+
+  publish_library
+  CAMERA_LIBRARY_PUBLISHED=1
+  publish_unit
+  publish_camera_address_dropin "$host"
   activate || fail "the camera control service could not be activated"
   printf 'gate-camera-control is active on 127.0.0.1:8767.\n'
+  trap - ERR INT TERM
 }
 
 main "$@"

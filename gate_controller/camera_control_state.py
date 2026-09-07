@@ -14,7 +14,7 @@ from pathlib import Path
 CAMERA_CONTROL_STATE_PATH = Path("/run/gate-camera/state.json")
 _IR_STATES = frozenset({"Auto", "Off"})
 _REASONS = frozenset({
-    "ready", "not_configured", "service_unhealthy",
+    "ready", "not_configured", "service_unhealthy", "not_observed",
     "camera_busy", "camera_unreachable", "camera_error",
 })
 _MAX_STATE_BYTES = 8 * 1024

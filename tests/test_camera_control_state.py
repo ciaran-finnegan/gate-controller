@@ -178,6 +178,23 @@ class ControllerHeartbeatTests(unittest.TestCase):
         self.assertEqual("Auto", status["camera_control"]["ir"]["state"])
         self.assertTrue(status["camera_control"]["available"])
 
+    def test_an_un_observed_camera_reaches_the_heartbeat_as_not_observed(self):
+        """A running service that has not called the camera yet is not a fault.
+
+        The app hides the control on `camera_unreachable`, so a restart with no
+        lease used to hide it until somebody opened the page and forced a read.
+        """
+        write_state(self.path, state_document({
+            "state": "unknown", "default": "Off", "effective_until": None,
+            "lease_seconds_remaining": None, "revert_failed": False,
+            "last_error": None,
+        }, now=time.time()))
+
+        block = self.status()["camera_control"]
+
+        self.assertEqual("not_observed", block["reason"])
+        self.assertFalse(block["available"])
+
     def test_a_broken_state_file_cannot_break_the_heartbeat(self):
         self.path.write_text("not-json", encoding="utf-8")
 
@@ -264,11 +281,22 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertIn("reject_gpio_membership", installer)
 
     def test_the_release_verifier_syntax_checks_the_camera_installer(self):
+        """The check must be presence-guarded, like every other file check.
+
+        An unconditional `bash -n` on a release that predates the installer
+        exits 127, and a verifier that fails defers every future update
+        forever -- the auto-update freeze this list exists to avoid.
+        """
+        from deployment.gate_controller_updater import OPTIONAL_SHELL_SYNTAX_CHECKS
+
+        self.assertIn(
+            ("/bin/bash", "deployment/install-camera-control.sh"),
+            OPTIONAL_SHELL_SYNTAX_CHECKS,
+        )
         updater = (
             REPOSITORY_ROOT / "deployment/gate_controller_updater.py"
         ).read_text(encoding="utf-8")
-
-        self.assertIn(
+        self.assertNotIn(
             '["/bin/bash", "-n", "deployment/install-camera-control.sh"]', updater
         )
 
