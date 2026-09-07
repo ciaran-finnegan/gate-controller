@@ -81,6 +81,50 @@ class CloudflareServiceClient:
                 if callable(close):
                     close()
 
+    def post_stream(
+        self,
+        path,
+        chunks,
+        *,
+        content_type,
+        headers=None,
+        max_response_bytes=64 * 1024,
+        timeout=None,
+    ):
+        """POST a body the caller produces chunk by chunk.
+
+        The corpus uploader needs a body it can pace and abandon: a generator
+        lets it hold the transfer to a fraction of the uplink and raise out of
+        the middle of a request the instant a vehicle arrives, rather than
+        finishing a send nobody is waiting for. ``timeout`` widens the read
+        deadline for a body that is deliberately slow; the connect deadline is
+        always the client's own.
+        """
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("Cloudflare response size limit must be a positive integer")
+        request_headers = dict(headers or {})
+        request_headers["Content-Type"] = content_type
+        response = self.session.post(
+            self._service_url(path),
+            headers=self._headers(request_headers),
+            data=chunks,
+            timeout=self._require_bounded_timeout(timeout) if timeout is not None else self.timeout,
+            allow_redirects=False,
+            stream=True,
+        )
+        try:
+            self._raise_for_redirect(response)
+            response.raise_for_status()
+            return json.loads(self._read_bounded(response, max_response_bytes))
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
     @staticmethod
     def _raise_for_redirect(response):
         if 300 <= response.status_code < 400:

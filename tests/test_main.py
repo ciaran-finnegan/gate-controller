@@ -1116,6 +1116,57 @@ class HeartbeatObservabilityTests(unittest.TestCase):
         self.assertEqual(2, presence["lost_verdicts"])
         self.assertEqual(7, status["recognition"]["trigger_capture"]["skipped"]["empty_scene"])
 
+    def test_the_corpus_backlog_reaches_the_heartbeat(self):
+        """A buffer filling because uploads fail is the failure to surface.
+
+        `pending` climbing while `last_success_at` stands still is the shape
+        of a corpus that is back to being one copy on one SD card.
+        """
+        class Corpus:
+            @staticmethod
+            def status():
+                return {"bytes": 11 * 1024 * 1024, "records": 94, "discarded": 40}
+
+        class Upload:
+            @staticmethod
+            def status():
+                return {
+                    "enabled": True, "pending": 54, "oldest_pending_age_s": 7200.0,
+                    "last_success_at": None, "consecutive_failures": 6,
+                    "last_blocked_by": "event_delivery",
+                }
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {},
+            corpus=Corpus(), corpus_upload=Upload(),
+            activity=gate_main.ActivityGate(quiet_seconds=60.0),
+        )
+
+        self.assertEqual(54, status["corpus"]["upload"]["pending"])
+        self.assertIsNone(status["corpus"]["upload"]["last_success_at"])
+        self.assertEqual(7200.0, status["corpus"]["upload"]["oldest_pending_age_s"])
+        self.assertEqual(94, status["corpus"]["local"]["records"])
+        self.assertEqual(60.0, status["corpus"]["backpressure"]["quiet_window_seconds"])
+
+    def test_a_controller_without_a_corpus_omits_the_block_entirely(self):
+        status = gate_main._controller_status(self.create_store(), self.prompt(), {})
+
+        self.assertNotIn("corpus", status)
+
+    def test_a_corpus_uploader_that_raises_cannot_stop_the_heartbeat(self):
+        class Exploding:
+            @staticmethod
+            def status():
+                raise RuntimeError("the card is gone")
+
+        status = gate_main._controller_status(
+            self.create_store(), self.prompt(), {},
+            corpus=Exploding(), corpus_upload=Exploding(),
+        )
+
+        self.assertEqual({"local": {}, "upload": {}}, status["corpus"])
+        self.assertEqual(0, status["queue_depth"])
+
     def test_a_controller_without_trigger_capture_omits_the_block_entirely(self):
         status = gate_main._controller_status(self.create_store(), self.prompt(), {})
 

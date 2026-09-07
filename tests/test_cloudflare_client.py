@@ -54,8 +54,92 @@ class Request:
         self.headers = kwargs["headers"]
         self.timeout = kwargs["timeout"]
         self.json = kwargs.get("json")
+        self.data = kwargs.get("data")
         self.allow_redirects = kwargs["allow_redirects"]
         self.stream = kwargs.get("stream", False)
+
+
+class PostStreamTests(unittest.TestCase):
+    """The corpus needs a body it can pace and walk away from."""
+
+    def client(self, response, **kwargs):
+        self.session = RecordingSession(response)
+        return CloudflareServiceClient(
+            "https://gate.example.com", "client-id", "client-secret",
+            session=self.session, **kwargs,
+        )
+
+    def test_the_caller_produces_the_body_and_keeps_the_access_headers(self):
+        client = self.client(RecordingResponse({"artefactId": "a" * 64, "stored": True}))
+
+        result = client.post_stream(
+            "/api/controller/corpus", iter([b'{"a":', b"1}"]),
+            content_type="application/json",
+            headers={"Idempotency-Key": "key"},
+        )
+
+        self.assertEqual(result, {"artefactId": "a" * 64, "stored": True})
+        request = self.session.requests[0]
+        self.assertEqual(b"".join(request.data), b'{"a":1}')
+        self.assertEqual(request.headers["Content-Type"], "application/json")
+        self.assertEqual(request.headers["Idempotency-Key"], "key")
+        self.assertEqual(request.headers["CF-Access-Client-Id"], "client-id")
+        self.assertFalse(request.allow_redirects)
+        self.assertTrue(request.stream)
+
+    def test_an_exception_from_the_body_reaches_the_caller_unchanged(self):
+        """Abandoning mid-body must tear the request down, not be swallowed."""
+        class Aborted(Exception):
+            pass
+
+        class Failing:
+            def post(self, url, **kwargs):
+                for _ in kwargs["data"]:
+                    pass
+                raise AssertionError("the body should have raised first")
+
+        def body():
+            yield b"{"
+            raise Aborted("a gate event started")
+
+        client = CloudflareServiceClient(
+            "https://gate.example.com", "id", "secret", session=Failing(),
+        )
+
+        with self.assertRaises(Aborted):
+            client.post_stream(
+                "/api/controller/corpus", body(), content_type="application/json",
+            )
+
+    def test_a_slow_body_may_widen_only_the_read_deadline(self):
+        client = self.client(RecordingResponse({"ok": True}), timeout=(2, 4))
+
+        client.post_stream(
+            "/api/controller/corpus", iter([b"{}"]),
+            content_type="application/json", timeout=(2, 120),
+        )
+
+        self.assertEqual(self.session.requests[0].timeout, (2, 120))
+        with self.assertRaises(ValueError):
+            client.post_stream(
+                "/api/controller/corpus", iter([b"{}"]),
+                content_type="application/json", timeout=(0, 120),
+            )
+
+    def test_a_redirect_or_an_oversized_response_is_refused(self):
+        redirect = self.client(RecordingResponse({}, status_code=302))
+        with self.assertRaises(requests.HTTPError):
+            redirect.post_stream(
+                "/api/controller/corpus", iter([b"{}"]),
+                content_type="application/json",
+            )
+
+        oversized = self.client(RecordingResponse({"padding": "x" * 100}))
+        with self.assertRaises(ValueError):
+            oversized.post_stream(
+                "/api/controller/corpus", iter([b"{}"]),
+                content_type="application/json", max_response_bytes=16,
+            )
 
 
 class CloudflareServiceClientTests(unittest.TestCase):

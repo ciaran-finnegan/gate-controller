@@ -889,7 +889,12 @@ class OcrPacingAndRetryTests(unittest.TestCase):
         self.assertEqual(kwargs["geometry"].upload_width, 1920)
         self.assertEqual(
             kwargs["extra"],
-            {"precropped": False, "cloud": "requested", "local_ocr": "off"},
+            {
+                "precropped": False, "cloud": "requested", "local_ocr": "off",
+                # No authorised-plate provider was configured, so the frame's
+                # own label is honestly unknown rather than guessed at.
+                "authorised": None,
+            },
             "the sidecar records what actually ran for this frame",
         )
         self.assertIsNone(kwargs["local"])
