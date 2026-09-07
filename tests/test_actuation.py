@@ -410,3 +410,105 @@ class ActuationCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "actuation_inhibit_error")
         self.assertEqual(relay.calls, [])
+
+
+class NotifyingRelay:
+    """A relay that takes an activation callback, as the real one does."""
+
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result or RelayResult(True, "activated")
+
+    def trigger(self, source, idempotency_key=None, *, on_activation=None, **kwargs):
+        self.calls.append((source, idempotency_key))
+        if on_activation is not None:
+            on_activation()
+        return self.result
+
+
+class RecordingObserver:
+    def __init__(self, raises=False):
+        self.actuations = []
+        self.outcomes = []
+        self._raises = raises
+
+    def note_actuation(self, **fields):
+        if self._raises:
+            raise RuntimeError("the observer is broken")
+        self.actuations.append(fields)
+
+    def note_actuation_outcome(self, **fields):
+        if self._raises:
+            raise RuntimeError("the observer is broken")
+        self.outcomes.append(fields)
+
+
+class ActivationObserverTests(unittest.TestCase):
+    """The audio corpus labels itself from here: the coordinator is the sole
+    owner of the relay, so an observer on it sees every actuation."""
+
+    def actuate(self, relay, observer, database):
+        now = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
+        return ActuationCoordinator(
+            LocalStore(database), relay, clock=lambda: now,
+            activation_observer=observer,
+        ).actuate(GateEvent(
+            source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-1",
+            received_at=now, decision_at=now, observed_plate="11wh2571",
+            authorised_plate="11WH2571",
+        ))
+
+    def test_the_observer_is_told_when_the_relay_energises_and_how_it_finished(self):
+        observer = RecordingObserver()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.actuate(
+                NotifyingRelay(), observer, Path(directory) / "gate.db",
+            )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(len(observer.actuations), 1)
+        self.assertEqual(observer.actuations[0]["idempotency_key"], "ocr-1")
+        self.assertEqual(observer.actuations[0]["source"], "ocr")
+        self.assertEqual(observer.actuations[0]["authorised_plate"], "11WH2571")
+        self.assertEqual(len(observer.outcomes), 1)
+        self.assertEqual(observer.outcomes[0]["status"], "completed")
+        self.assertEqual(observer.outcomes[0]["idempotency_key"], "ocr-1")
+
+    def test_a_relay_without_an_activation_callback_still_labels_the_clip(self):
+        observer = RecordingObserver()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.actuate(
+                RecordingRelay(), observer, Path(directory) / "gate.db",
+            )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(len(observer.actuations), 1)
+        self.assertEqual(observer.actuations[0]["idempotency_key"], "ocr-1")
+
+    def test_a_relay_that_never_activated_is_never_reported_as_one_that_did(self):
+        observer = RecordingObserver()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.actuate(
+                RecordingRelay(RelayResult(False, "relay_latched", latched=True)),
+                observer, Path(directory) / "gate.db",
+            )
+
+        self.assertFalse(result.opened)
+        self.assertEqual(observer.actuations, [])
+        self.assertEqual(observer.outcomes, [])
+
+    def test_a_broken_observer_can_never_stop_the_gate_opening(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.actuate(
+                NotifyingRelay(), RecordingObserver(raises=True),
+                Path(directory) / "gate.db",
+            )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.reason, "exact_match")
+
+    def test_no_observer_leaves_the_actuation_path_exactly_as_it_was(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.actuate(NotifyingRelay(), None, Path(directory) / "gate.db")
+
+        self.assertTrue(result.opened)

@@ -11,7 +11,8 @@ class ActuationCoordinator:
     """The sole in-process owner of claim, cooldown, relay, and finalization."""
 
     def __init__(self, store, relay, cooldown: timedelta = timedelta(seconds=20), clock=None,
-                 monotonic_clock=None, boot_id: str | None = None):
+                 monotonic_clock=None, boot_id: str | None = None,
+                 activation_observer=None):
         self._store = store
         self._relay = relay
         self._cooldown = cooldown
@@ -20,6 +21,12 @@ class ActuationCoordinator:
         self._boot_id = _linux_boot_id() if boot_id is None else boot_id
         self._last_attempt_monotonic: float | None = None
         self._lock = Lock()
+        # Notified when the relay energises and again once the outcome is
+        # known. This is the sole in-process owner of the relay, so an
+        # observer placed here sees every actuation -- the recognition
+        # pipeline's and the command server's alike. It must never raise and
+        # never block: the first notification runs while the relay is on.
+        self._activation_observer = activation_observer
 
     def actuate(self, event: GateEvent, *, outbox_payload: dict | None = None,
                 command_ack: tuple[str, datetime] | None = None,
@@ -106,14 +113,30 @@ class ActuationCoordinator:
                     return inhibition
 
                 relay_kwargs["pre_activation_inhibit"] = check_inhibition
-            if on_activation is not None and _accepts_keyword(
+            observer = self._activation_observer
+            observed = []
+            if (on_activation is not None or observer is not None) and _accepts_keyword(
                 self._relay.trigger, "on_activation"
             ):
                 def notify_activation():
-                    try:
-                        on_activation()
-                    except Exception:
-                        pass
+                    if on_activation is not None:
+                        try:
+                            on_activation()
+                        except Exception:
+                            pass
+                    if observer is not None:
+                        observed.append(True)
+                        try:
+                            observer.note_actuation(
+                                activated_at=self._clock(),
+                                source=event.source,
+                                reason=event.reason,
+                                idempotency_key=key,
+                                observed_plate=event.observed_plate,
+                                authorised_plate=event.authorised_plate,
+                            )
+                        except Exception:
+                            pass
 
                 relay_kwargs["on_activation"] = notify_activation
             if on_deactivation is not None and _accepts_keyword(
@@ -158,6 +181,27 @@ class ActuationCoordinator:
                 )
             except Exception:
                 return ActuationExecution(False, "indeterminate_claim", None, "failed", "indeterminate_claim")
+            if observer is not None and relay_result.activated:
+                # After the pulse and after the store write, so nothing here is
+                # on the relay's critical path. Only the terminal outcome is
+                # new; the activation instant was recorded above -- unless the
+                # relay does not take an activation callback at all, in which
+                # case record it now rather than lose the label.
+                try:
+                    if not observed:
+                        observer.note_actuation(
+                            activated_at=relay_result.activated_at or self._clock(),
+                            source=event.source, reason=finalized.reason,
+                            idempotency_key=key,
+                            observed_plate=event.observed_plate,
+                            authorised_plate=event.authorised_plate,
+                        )
+                    observer.note_actuation_outcome(
+                        idempotency_key=key, status=status, detail=detail,
+                        event_id=event_id, reason=finalized.reason,
+                    )
+                except Exception:
+                    pass
             return ActuationExecution(relay_result.activated, finalized.reason, event_id, status, detail)
 
     def _reconcile_outbox(self, event_id: int | None, payload: dict | None) -> None:

@@ -316,6 +316,63 @@ forbidden in `gate_controller/net_probe.py` and `host_metrics.py`, and
 Set `GATE_NET_PROBE_ENABLED=false` to remove the thread entirely; the rest of
 the heartbeat is unaffected.
 
+### Gate Audio Capture
+
+`GATE_AUDIO_CAPTURE_ENABLED` (default `false`) records a short clip of the gate
+around each event. It exists because the controller currently fires the relay
+and *assumes* the gate moved: if the motor failed, the relay stuck or the gate
+jammed, the event log would still read `activated` and nothing would know
+otherwise. This collects the evidence that would close that gap. There is no
+classifier, no inference and no detection claim — it collects data and verifies
+the capture works.
+
+**Every clip labels itself.** The controller knows the instant it energised the
+relay, so the actuation time, source, plate and outcome are written into the
+sidecar as the event happens. A clip with an actuation is a labelled positive;
+a clip without one is a negative, and among those, a passage where the gate
+moved anyway is a remote, keypad or manual opening — which is the direct
+explanation for gate openings with no recognition event.
+
+The audio track is already inside the Pi: MediaMTX carries MPEG-4 Audio on both
+the `camera` and `clear` paths, so nothing new is pulled from the camera and
+nothing is added to the 4.5 Mbit/s uplink. The stream is AAC-LC, 16 kHz, mono,
+~65 kbit/s — about 8 KB/s, so a 40 s clip is roughly 325 KB.
+
+**Nothing is ever decoded.** The capture is `-vn -c:a copy`: video is dropped
+before any packet reaches a decoder and the AAC packets are remuxed untouched.
+No pixel, no PCM sample, no resample, no analysis on the device. This is the
+same command measured on the live board on 2026-09-07 for no measurable thermal
+cost (69.2 C before, 69.2 C after).
+
+The same governor as the network probe skips a capture — journalling the reason
+so the gap in the corpus is explicit — when
+
+* `soc_temp_c >= GATE_AUDIO_CAPTURE_MAX_TEMP_C` (default 80.0), or
+* `load_1m >= GATE_AUDIO_CAPTURE_MAX_LOAD` (default 3.0), or
+* available memory is under 300 MB.
+
+One thread owns all spawning, so exactly one capture can exist at a time; a
+second request while one is in flight is coalesced and counted, never queued.
+A capture that cannot start is skipped and journalled and **never retried**, so
+no failure can become a loop. Length is bounded three times over — ffmpeg's own
+`-t`, a wall-clock read deadline, and a byte cap that stops a runaway stream
+without ever holding it — and the child runs at `nice 19` under `RLIMIT_AS`.
+Both trigger points are non-blocking by construction, which matters most for
+the relay one: it runs while the relay is energised, so it does nothing but
+take an uncontended lock and write a few fields.
+
+Clips are written as `<stem>.aac` plus `<stem>.json` with the same stem
+convention, permissions (0700 directory, 0600 files) and pruning as the image
+corpus, in an `audio` directory beside `GATE_TRAINING_CORPUS_DIR` unless
+`GATE_AUDIO_CAPTURE_DIR` overrides it. An exporter that walks the corpus root
+pairing a payload with its sidecar therefore carries audio without a second
+uploader; `kind: "gate_audio"` is what tells the two apart.
+
+**Retention.** Clips are kept for `GATE_AUDIO_CAPTURE_RETENTION_DAYS` (default
+30) inside a `GATE_AUDIO_CAPTURE_MAX_TOTAL_BYTES` cap (default 256 MiB),
+whichever bites first, pruned oldest first. They are recordings of the owner's
+own gate on his own premises, held on his own hardware.
+
 The Worker deployment owns evidence retention. Store accepted JPEGs only in a
 private R2 bucket under the verified digest, keep bucket access limited to the
 Worker and approved operators, and configure the site's approved R2 lifecycle
