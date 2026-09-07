@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+from math import isfinite
 import os
 from pathlib import Path
 import tempfile
@@ -203,6 +204,12 @@ def _ocr_fields(payload) -> dict:
 
 def _json_safe(value, depth: int = 0) -> bool:
     if depth > 6:
+        return False
+    if isinstance(value, float) and not isfinite(value):
+        # json.dumps would emit NaN/Infinity, which no strict JSON reader will
+        # parse. A sidecar nothing can read is worse than a missing field, and
+        # a recogniser confidence is exactly the kind of float that can arrive
+        # non-finite.
         return False
     if value is None or isinstance(value, (bool, int, float, str)):
         return True

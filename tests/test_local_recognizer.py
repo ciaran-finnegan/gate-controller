@@ -620,6 +620,10 @@ class OcrClientIntegrationTests(unittest.TestCase):
         local.close()
 
 
+def _reject_constant(token):
+    raise ValueError(f"non-standard JSON token: {token}")
+
+
 class RealCorpusTests(unittest.TestCase):
     """Against the real TrainingCorpus, not a fake that records kwargs."""
 
@@ -672,6 +676,22 @@ class RealCorpusTests(unittest.TestCase):
         self.assertEqual(sidecar["ocr"]["results"], [])
         self.assertEqual(sidecar["local"]["plate"], "12D3456")
         self.assertEqual(sidecar["extra"]["cloud"], "skipped")
+        local.close()
+
+    def test_a_non_finite_confidence_never_makes_a_sidecar_unreadable(self):
+        # json.dumps would happily write NaN, which no strict reader parses.
+        local = recognizer([read("12D3456", float("nan"))])
+        corpus = TrainingCorpus(self.root / "corpus")
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse(cloud_payload("12D3456"))]),
+            local_recognizer=local, authorised=lambda: {"12D3456"}, corpus=corpus,
+        )
+
+        client.recognise(self.path, trace_id="trace-nan")
+
+        raw = sorted(Path(corpus.directory).glob("*.json"))[-1].read_text()
+        json.loads(raw, parse_constant=_reject_constant)
+        self.assertNotIn("score", json.loads(raw)["local"])
         local.close()
 
     def test_a_frame_with_no_local_read_keeps_the_sidecar_it_always_had(self):

@@ -126,7 +126,7 @@ same situation the rule was written for.
 | variable | default | meaning |
 | --- | --- | --- |
 | `GATE_LOCAL_OCR_MODE` | `off` | `off`, `shadow` or `active`. |
-| `GATE_LOCAL_OCR_CLOUD` | `fallback` | `fallback`: in active mode the cloud request is skipped entirely once the local read has answered - the lookup is not spent, the uplink is not used, and the frame's latency drops to the local read. `always`: the cloud request still runs, so the frame is labelled for the training corpus, but the local read is still what decides. |
+| `GATE_LOCAL_OCR_CLOUD` | `fallback` | `fallback`: the cloud request is skipped only for a frame the local read actually answered - one that cleared the confidence gate and authorised. Frames the local reader declined, read below the threshold, failed on, or could not take still go to the cloud exactly as today. `always`: the cloud request still runs, so the frame is labelled for the training corpus, but the local read is still what decides. |
 | `GATE_LOCAL_OCR_DETECTOR` | `yolo-v9-t-384-license-plate-end2end` | Any detector registered in `open-image-models`. |
 | `GATE_LOCAL_OCR_RECOGNISER` | `cct-xs-v2-global-model` | Any OCR model registered in `fast-plate-ocr`. |
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
@@ -330,7 +330,8 @@ load and warm-up timings and the state.
 5. Only then `GATE_LOCAL_OCR_MODE=active`, first with
    `GATE_LOCAL_OCR_CLOUD=always` so the corpus keeps growing while the local
    path decides - that stage proves the decision, not the latency - then
-   `fallback`, which is where the lookup and the wait for it both go away.
+   `fallback`, where the lookup and the wait for it go away for every frame
+   the local reader answers - and only those.
 6. The kill switch is `GATE_LOCAL_OCR_MODE=off` and a restart.
 
 ## What is deliberately not here
