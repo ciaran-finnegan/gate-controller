@@ -312,6 +312,20 @@ IR stays off regardless of `IrLights.state`. The plate then reads under
 ordinary colour exposure, as it would in daytime, rather than depending on
 the headlight-lit manual exposure this document deploys as a fallback.
 
+**Status 2026-09-07 09:10.** The owner is setting the floodlight's hold
+timer to one minute and aiming it at the stop position before tonight, and
+asked for colour mode now. `Isp.dayNight` was set from `Auto` to `Color`
+through the API (`SetIsp` with the full `Isp` block round-tripped; every
+other field verified unchanged afterwards: exposure `Manual`, shutter 4,
+gain 16, `antiFlicker` `Off`). Backup `/root/camera-isp-before-2026-09-07-colour.json`
+on the Pi; rollback is the same call with `dayNight` `Auto`. Daytime
+snapshot after the change: `camera-tests/2026-09-07-colour-mode-day.jpg`
+(whole-frame clipping 0.4%, plate band 2.7%). What tonight should show: the
+first frames of an arriving car in colour with the plate white-lit; if the
+frames are dark and colourless instead, the floodlight did not fire or does
+not reach the stop position, and the fallback is `dayNight` `Auto` with IR
+restored.
+
 The owner also reports the floodlight's hold timer is short: it stays lit for
 only a few seconds after triggering, not the whole time a vehicle is stopped
 at the gate. That changes what "reliably covers the stop position" needs to
