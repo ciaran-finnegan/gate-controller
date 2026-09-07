@@ -287,6 +287,60 @@ systemd to restart the fixed service.
 Bootstrap acquires that same non-blocking lock before staging or refreshing
 trust anchors, so it cannot race the timer-driven updater.
 
+Before switching, the updater atomically writes and fsyncs
+`pending-activation.json` with the candidate and previous release SHAs. It then
+atomically replaces and fsyncs `current`, restarts the fixed application service,
+and checks that it remains active every second for the configured health window.
+The marker is removed and that removal is fsynced only after confirmed health.
+
+Every updater start reconciles an existing marker before contacting GitHub. If
+`current` is the candidate, it restarts and health-checks the candidate rather
+than accepting the matching SHA. Failed health durably rolls back to the recorded
+previous release and confirms it. If `current` is already the previous release,
+the updater confirms that deterministic rollback state. Malformed records,
+symlinked records/releases, missing releases, or any unrelated `current` target
+fail closed and leave the marker present.
+
+The updater systemd sandbox makes the host filesystem read-only except for the
+managed deployment and private runtime-lock directories. It has no device access
+or privilege escalation and retains only the capabilities needed to change
+release ownership and drop candidate commands to `gate-controller-build`.
+
+The active release plus two prior releases are retained by default. Pruning only
+runs after successful activation and only removes inactive directories whose
+names are full commit SHAs.
+
+To stop automatic adoption without stopping the gate controller:
+
+```sh
+sudo systemctl disable --now gate-controller-updater.timer
+```
+
+To retry a poll manually:
+
+```sh
+sudo systemctl start gate-controller-updater.service
+sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
+```
+
+For manual rollback to a retained managed release, disable the timer first,
+select a SHA directory, atomically replace only `current`, and restart the fixed
+application service:
+
+```sh
+sudo systemctl disable --now gate-controller-updater.timer
+release=/opt/gate-controller-deploy/releases/REPLACE_WITH_FULL_SHA
+sudo test -d "$release"
+sudo ln -s "$release" /opt/gate-controller-deploy/current.manual
+sudo mv -Tf /opt/gate-controller-deploy/current.manual /opt/gate-controller-deploy/current
+sudo systemctl restart file-monitor.service
+sudo systemctl is-active file-monitor.service
+```
+
+Replace the example SHA before running those commands. The updater never pulses
+the relay as a deployment health check; health means the supervised controller
+process remained active, not that a physical gate cycle was attempted.
+
 ## What On-Device Verification Checks
 
 The updater deliberately does not repeat the unit suite that GitHub CI has
@@ -358,60 +412,6 @@ bounded tail of the command's own output:
 ```sh
 sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 ```
-
-Before switching, the updater atomically writes and fsyncs
-`pending-activation.json` with the candidate and previous release SHAs. It then
-atomically replaces and fsyncs `current`, restarts the fixed application service,
-and checks that it remains active every second for the configured health window.
-The marker is removed and that removal is fsynced only after confirmed health.
-
-Every updater start reconciles an existing marker before contacting GitHub. If
-`current` is the candidate, it restarts and health-checks the candidate rather
-than accepting the matching SHA. Failed health durably rolls back to the recorded
-previous release and confirms it. If `current` is already the previous release,
-the updater confirms that deterministic rollback state. Malformed records,
-symlinked records/releases, missing releases, or any unrelated `current` target
-fail closed and leave the marker present.
-
-The updater systemd sandbox makes the host filesystem read-only except for the
-managed deployment and private runtime-lock directories. It has no device access
-or privilege escalation and retains only the capabilities needed to change
-release ownership and drop candidate commands to `gate-controller-build`.
-
-The active release plus two prior releases are retained by default. Pruning only
-runs after successful activation and only removes inactive directories whose
-names are full commit SHAs.
-
-To stop automatic adoption without stopping the gate controller:
-
-```sh
-sudo systemctl disable --now gate-controller-updater.timer
-```
-
-To retry a poll manually:
-
-```sh
-sudo systemctl start gate-controller-updater.service
-sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
-```
-
-For manual rollback to a retained managed release, disable the timer first,
-select a SHA directory, atomically replace only `current`, and restart the fixed
-application service:
-
-```sh
-sudo systemctl disable --now gate-controller-updater.timer
-release=/opt/gate-controller-deploy/releases/REPLACE_WITH_FULL_SHA
-sudo test -d "$release"
-sudo ln -s "$release" /opt/gate-controller-deploy/current.manual
-sudo mv -Tf /opt/gate-controller-deploy/current.manual /opt/gate-controller-deploy/current
-sudo systemctl restart file-monitor.service
-sudo systemctl is-active file-monitor.service
-```
-
-Replace the example SHA before running those commands. The updater never pulses
-the relay as a deployment health check; health means the supervised controller
-process remained active, not that a physical gate cycle was attempted.
 
 ## Dependency Pinning And Package Trust
 
