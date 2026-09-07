@@ -265,7 +265,7 @@ the same rule applies when the phase-2 rollup does.
 | Block | What it carries |
 | --- | --- |
 | `host` | `soc_temp_c`, `throttled` (raw hex plus `under_voltage` / `arm_capped` / `currently_throttled`), `load_1m/5m/15m`, `mem_total_kib` / `mem_available_kib` / `swap_free_kib`, `disk_free_bytes` / `disk_total_bytes`, `oom_kill_total`, `uptime_seconds`, `process_uptime_seconds`, `disk_sectors_written` |
-| `network` | the last completed probe cycle: `router.rtt_ms` / `router.loss`, `tls.handshake_ms`, `uplink.receive_bytes_per_s` / `.transmit_bytes_per_s`, `skipped_reason`, `age_seconds` |
+| `network` | the last completed probe cycle: `mode`, `skipped_reason`, `age_seconds`, `hops.lan` / `hops.router` (`state`, `loss`, `samples`, `min_ms` / `p50_ms` / `p95_ms` / `max_ms` / `mean_ms` / `jitter_ms`), `hops.internet` (`state`, `dns_ms`, `connect_ms`, `tls_ms`, `total_ms`, `age_seconds`), `interface` (`name`, `link_mbps`, receive/transmit bytes, packets, dropped and error **rates**, `receive_dropped_pct`) |
 | `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s` |
 | `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
 
@@ -290,28 +290,133 @@ never reported.
 ### Network Probe
 
 `GATE_NET_PROBE_ENABLED` (default `true`) adds **one** thread on a 60 s poll
-inside the existing controller process — no new systemd unit. It pings the
-default gateway (`5 x 64 B`), handshakes TLS to Plate Recognizer every 300 s
-(no HTTP request, so no lookup is billed), and reads the `/proc/net/dev` delta.
-There is deliberately **no throughput test**: the uplink is about 4.5 Mbit/s
-and OCR uploads already saturate it, so a speed test would compete with the
-thing it measures.
+inside the existing controller process — no new systemd unit.
 
-The board is fanless, idles at 71-74 C and hardware-throttles at 85 C, so the
-probe is governed. Before every cycle it skips entirely — recording
-`network.skipped_reason` so the gap is explicit rather than silent — when
+#### Three hops, because only the comparison is diagnostic
 
-* `soc_temp_c >= GATE_NET_PROBE_MAX_TEMP_C` (default 80.0), or
-* `load_1m >= GATE_NET_PROBE_MAX_LOAD` (default 3.0), or
-* available memory is under 300 MB.
+The probe cannot answer "is the network bad"; it can answer "which hop", and
+that is the question worth asking. Each cycle measures, and labels:
+
+| Hop | Target | What it isolates |
+| --- | --- | --- |
+| `lan` | `GATE_NET_PROBE_LAN_HOST`, normally the camera | the gate switch alone — this traffic never crosses the powerline bridge |
+| `router` | the default gateway from `/proc/net/route` | the same switch **plus** the powerline bridge |
+| `internet` | `GATE_NET_PROBE_TLS_HOST` | the whole path, end to end |
+
+`lan` clean beside `router` lossy isolates the bridge. `lan` and `router`
+equally clean exonerates it, and the fault is somewhere else. Both are useful
+answers, which is why the same-switch hop is not optional in practice: leave
+`GATE_NET_PROBE_LAN_HOST` unset and the hop reports `lan=unconfigured`, the
+comparison is unavailable, and the probe can neither prove nor disprove the
+claim. **Set it to the camera's address.** It is never sent to the cloud and
+never appears in the heartbeat.
+
+#### Distributions, not a single number
+
+Each ping hop sends `GATE_NET_PROBE_PING_COUNT` packets (default 10, at
+0.2 s) and reports loss plus `min`, `p50`, `p95`, `max`, `mean` and jitter.
+The tail is the point. A router at a 167 ms mean is imperceptible in a camera
+web console — one small request — and ruinous for a recognition upload, which
+pays several round trips plus a bulk transfer and so pays `p95` and every
+retransmit. Percentiles are linearly interpolated so `p95` is not silently the
+maximum, and jitter is the mean absolute difference between *consecutive*
+round trips, not deviation from the mean.
+
+Per-cycle loss is quantised at `1 / ping_count`, so a single cycle reading
+`10 %` means one packet of ten. The signal is the rate across cycles: 60
+cycles an hour is 600 packets a hop.
+
+#### Interface counters as rates
+
+`rx_dropped`, `rx_errors`, `tx_errors`, packets, bytes and the negotiated
+`link_mbps` come from `/proc/net/dev` and `/sys/class/net/<iface>/speed`.
+Lifetime totals are never reported — 2.9 M dropped frames after a month of
+uptime says nothing about today — only the delta over the cycle.
+
+Read `rx_dropped` carefully. On this board `rx_errors` is `0` while
+`rx_dropped` climbs on **both** `eth0` and `wlan0`, which is the signature of
+the kernel discarding frames no socket wanted, not of a damaged link. A drop
+rate is evidence only when it moves with the ping loss on the same hop, or
+when `rx_errors` moves with it. The probe reports both and draws no conclusion.
+
+#### No throughput test, ever
+
+The uplink is about 4.5 Mbit/s and OCR uploads already saturate it, so a speed
+test would compete with the thing it measures. The `internet` hop opens one
+connection and times DNS, TCP connect and TLS separately — no HTTP request, so
+nothing is billed and no quota is consumed against the one-request-per-second
+throttle. `/proc/net/dev` carries the actual load.
+
+#### Two tiers, and an honest governor
+
+The board idles at 66–75 C against an 80 C ceiling and a four-core load
+average around 0.5. A single governor at those thresholds withheld the *whole*
+cycle exactly when a recognition burst made the network interesting, which
+biases the record towards looking healthy. So:
+
+* the **ping tier always runs**. Two `ping` children under a 64 MiB
+  address-space limit are nothing like the 4K decode that OOM-killed this
+  board. It is withheld only below a hard floor — `soc_temp_c >= 85.0`, the
+  firmware throttle point, or under 96 MB available — and then the whole cycle
+  logs `outcome=skipped reason=critical_temp` / `critical_memory`;
+* the **expensive extras** (the `internet` hop and `vcgencmd get_throttled`)
+  stay behind the original governor: `soc_temp_c >= GATE_NET_PROBE_MAX_TEMP_C`
+  (80.0), `load_1m >= GATE_NET_PROBE_MAX_LOAD` (3.0), or under 300 MB
+  available. The cycle then logs `mode=ping` with `reason=hot` / `loaded` /
+  `low_memory`, so the gap is explicit rather than silent.
 
 At most one child process is ever alive (a `BoundedSemaphore(1)`), each child
-runs under `RLIMIT_AS` of 64 MiB with a 3 s kill-and-reap deadline, a capped
-stdout and `stderr` to `/dev/null`. ffmpeg, image or video decode, numpy,
-onnxruntime, model loads, `journalctl` and throughput tests are permanently
-forbidden in `gate_controller/net_probe.py` and `host_metrics.py`, and
+runs under `RLIMIT_AS` of 64 MiB with a capped stdout and `stderr` to
+`/dev/null`. `ping` carries its own `-w` deadline so it ends itself; the
+parent's kill-and-reap deadline is derived from the ping plan and hard-capped
+at 10 s. ffmpeg, image or video decode, numpy, onnxruntime, model loads,
+`journalctl` and throughput tests are permanently forbidden in
+`gate_controller/net_probe.py` and `host_metrics.py`, and
 `tests/test_net_probe.py` asserts it along with the measured ceilings: under
 5 MB of steady-state growth and under 0.5 % of one core.
+
+#### The journal line
+
+Every cycle writes exactly one `key=value` line at `INFO`, successes included,
+so the device is diagnosable over SSH with no cloud involvement and with no
+health page in the app:
+
+```
+journalctl -u file-monitor -f | grep gate_net_probe
+```
+
+```
+gate_net_probe outcome=ok mode=full lan=ok lan_loss_pct=0 lan_n=10 lan_min_ms=0.31 \
+ lan_p50_ms=0.37 lan_p95_ms=0.63 lan_max_ms=0.82 lan_jitter_ms=0.14 \
+ router=ok router_loss_pct=10 router_n=9 router_min_ms=70.1 router_p50_ms=154.2 \
+ router_p95_ms=228.44 router_max_ms=245 router_jitter_ms=85.15 \
+ internet=ok internet_dns_ms=12.4 internet_connect_ms=38.1 internet_tls_ms=96.2 \
+ internet_total_ms=146.7 internet_age_s=0 \
+ iface=eth0 link_mbps=100 rx_bytes_per_s=120400 tx_bytes_per_s=8100 \
+ rx_pkt_per_s=332.9 tx_pkt_per_s=20 rx_drop_per_s=0.4 rx_drop_pct=0.12 \
+ rx_err_per_s=0 tx_err_per_s=0
+```
+
+(One line on the device; wrapped here.) `outcome` describes the *cycle*, not
+the network: `ok` means it ran, and the per-hop `state` says what happened.
+A hop is `ok`, `lost` (it answered with 100 % loss), `failed` (`ping` itself
+produced no usable output — deliberately *not* reported as 100 % loss, because
+a broken child is not a broken network) or `unconfigured`. **A measurement
+that could not be taken is an absent key, never a zero**, so `lan_loss_pct=0`
+and no `lan_loss_pct` at all mean different things.
+
+To answer "is the gate's network actually a problem", compare over a day:
+
+```
+journalctl -u file-monitor --since -24h | grep -o 'lan_loss_pct=[0-9.]*' | sort | uniq -c
+journalctl -u file-monitor --since -24h | grep -o 'router_loss_pct=[0-9.]*' | sort | uniq -c
+journalctl -u file-monitor --since -24h | grep -o 'router_p95_ms=[0-9.]*' | sort -t= -k2 -n | tail
+```
+
+If `lan_loss_pct` is `0` in every cycle while `router_loss_pct` is not, the
+powerline bridge is the fault and the switch is fine. If both are `0` and
+`router_p95_ms` stays low, the network is not the problem and the OCR latency
+has another cause — which is the answer the record should be allowed to give.
 
 Set `GATE_NET_PROBE_ENABLED=false` to remove the thread entirely; the rest of
 the heartbeat is unaffected.
