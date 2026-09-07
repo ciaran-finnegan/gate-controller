@@ -73,7 +73,14 @@ local camera upload directory must match `GATE_WATCH_DIRECTORY`.
 Automatic deployment is outbound and pull-based. Every five minutes the Pi
 checks the exact commit at the configured release branch (`master` by default) and
 adopts it only after that SHA's complete
-`Gate Controller CI` push workflow succeeds. Network, GitHub, rate-limit,
+`Gate Controller CI` push workflow succeeds. Because that workflow has already
+run the complete unit suite against the exact candidate commit, on-device
+verification does not repeat it. It runs only what CI cannot: building the
+release virtual environment, installing dependencies for this architecture,
+importing the modules the service loads at startup, compiling sources, and
+checking the
+candidate's shell scripts. Set `GATE_UPDATE_RUN_TESTS=1` to run the full suite on
+the Pi as well. Network, GitHub, rate-limit,
 dependency, staging, or verification failures leave the running release
 untouched; activation failures restore the previous managed symlink. The root
 updater helper and all systemd units are fixed copies installed only by explicit

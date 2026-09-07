@@ -3519,7 +3519,9 @@ class DependencyLockTests(unittest.TestCase):
         )
         self.assertNotIn(
             "lgpio", wheel_only,
-            "lgpio has no aarch64 wheel and must keep building from source",
+            "lgpio's aarch64 wheel is manylinux_2_34, so it needs glibc 2.34 "
+            "or newer; on an older image the seconds-long source build is the "
+            "only way to install it and must stay available",
         )
         self.assertNotIn(
             ":all:", wheel_only,
