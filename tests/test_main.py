@@ -1,7 +1,9 @@
 import argparse
+import builtins
 import unittest
 import os
 import tempfile
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Thread
@@ -22,7 +24,199 @@ from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
 
 
+#: Absolute paths the running controller owns on the device. No unit test may
+#: reach one, not even to stat it.
+#:
+#: The Pi's release verifier runs this suite as the unprivileged
+#: ``gate-controller-build`` user, for whom ``/var/lib/gate-controller`` is not
+#: traversable at all. ``Path.exists()`` there does not return ``False``: it
+#: raises ``PermissionError``, because pathlib swallows ENOENT and never
+#: EACCES. A GitHub runner has no such directory, so the same call returns
+#: ``False`` and CI stays green while every release is blocked on the device.
+#: That asymmetry is exactly why the guard below lives in the suite rather than
+#: in the pipeline.
+LIVE_CONTROLLER_PATHS = (
+    "/var/lib/gate-controller",
+    "/etc/gate-controller.env",
+    "/opt/gate-controller-deploy",
+    "/run/gate-controller-updater",
+    "/run/gate-media",
+    "/home/ftp-user",
+)
+
+#: The filesystem entry points startup can reach. ``pathlib`` and ``tempfile``
+#: both look these up as module attributes at call time, so patching them here
+#: also covers ``Path.exists``/``stat``/``mkdir``/``unlink`` and ``mkstemp``.
+_GUARDED_FILESYSTEM_CALLS = (
+    ("builtins", "open"),
+    ("os", "listdir"),
+    ("os", "lstat"),
+    ("os", "makedirs"),
+    ("os", "mkdir"),
+    ("os", "open"),
+    ("os", "remove"),
+    ("os", "rename"),
+    ("os", "replace"),
+    ("os", "rmdir"),
+    ("os", "scandir"),
+    ("os", "stat"),
+    ("os", "unlink"),
+)
+
+
+def _guarded_roots(paths):
+    """``paths`` plus their symlink-resolved forms.
+
+    ``main`` resolves the database path before deriving the state directory
+    from it, and on a development Mac ``/var`` is a symlink to ``/private/var``
+    - so the very path that blocks the Pi arrives here as
+    ``/private/var/lib/gate-controller/...``. Matching only the declared spelling
+    would make this guard a no-op on the machine the fix is written on.
+
+    This is the one place the suite names these roots to the kernel, and it is
+    safe: ``realpath`` is non-strict, so it resolves what it can and returns the
+    rest unchanged rather than raising on the unprivileged build user's EACCES.
+    """
+    roots = []
+    for path in paths:
+        for spelling in (path, os.path.realpath(path)):
+            # Report the declared root either way, so the failure message names
+            # the path a reader will recognise from the deployment.
+            if (spelling, path) not in roots:
+                roots.append((spelling, path))
+    return tuple(roots)
+
+
+_GUARDED_ROOTS = _guarded_roots(LIVE_CONTROLLER_PATHS)
+
+
+def live_controller_path(candidate):
+    """Return the device root ``candidate`` falls under, or ``None``."""
+    try:
+        text = os.fsdecode(candidate)
+    except TypeError:
+        return None  # A file descriptor or a socket, not a path.
+    for spelling, root in _GUARDED_ROOTS:
+        if text == spelling or text.startswith(spelling + "/"):
+            return root
+    return None
+
+
+@contextmanager
+def no_live_state_access():
+    """Fail loudly if the wrapped code touches the running controller's state.
+
+    Production behaviour is deliberate and unchanged: the service owns
+    ``/var/lib/gate-controller`` and is entitled to write there. This guard
+    exists so a *test* that exercises the real startup wiring can never
+    silently resolve the real state directory instead of a temporary one.
+
+    The offending call raises immediately, so nothing is created or removed on
+    a developer machine that happens to have the directory. The recorded list
+    is re-raised on exit as well, so a swallowed ``AssertionError`` inside a
+    broad ``except`` still fails the test rather than passing quietly.
+    """
+    touched = []
+
+    def guarded(name, original):
+        def wrapper(*args, **kwargs):
+            # Every positional argument, not just the first: os.replace and
+            # os.rename carry the interesting path second as often as first.
+            target, root = None, None
+            for argument in args:
+                root = live_controller_path(argument)
+                if root is not None:
+                    target = argument
+                    break
+            if root is not None:
+                touched.append(f"{name}({target!r})")
+                raise AssertionError(
+                    f"{name}() reached {target!r}, which belongs to the running "
+                    f"gate controller under {root}. Point the test's state "
+                    "directory at a temporary one - main() derives every state "
+                    "path from GATE_DATABASE and GATE_AUTHORISED_PLATES, so "
+                    "MainConfigurationTests.isolated_state_environment() is "
+                    "enough. On the Pi this call raises PermissionError for the "
+                    "unprivileged build user and blocks the release; on CI the "
+                    "directory does not exist, so nothing is noticed."
+                )
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    with ExitStack() as stack:
+        for module, attribute in _GUARDED_FILESYSTEM_CALLS:
+            namespace = builtins if module == "builtins" else os
+            stack.enter_context(patch(
+                f"{module}.{attribute}",
+                guarded(f"{module}.{attribute}", getattr(namespace, attribute)),
+            ))
+        yield touched
+    if touched:
+        raise AssertionError(
+            "the running gate controller's state was touched during a unit "
+            "test: " + ", ".join(touched)
+        )
+
+
 class MainConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        """Point the status heartbeat's two device paths at a temporary tree.
+
+        ``_controller_status`` defaults ``media_capabilities_path`` to
+        ``/run/gate-media/capabilities.json`` and ``managed_releases_root`` to
+        ``/opt/gate-controller-deploy/releases``, and
+        ``build_background_workers`` builds its ``status`` callable without
+        overriding either. Both reads swallow ``OSError``, so this never failed
+        the way the match-policy marker did - on the device it quietly read the
+        *running* media gateway's capability file, and resolved the *running*
+        release root, into the dict the test then asserted on. A nonexistent
+        temporary path gives every machine the answer CI already gets.
+
+        Explicit arguments still win, so the tests that supply their own
+        capability file or release root are untouched.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.device_paths = Path(directory.name)
+        original_status = gate_main._controller_status
+
+        def controller_status(*arguments, **keywords):
+            keywords.setdefault(
+                "media_capabilities_path",
+                self.device_paths / "gate-media" / "capabilities.json",
+            )
+            keywords.setdefault(
+                "managed_releases_root", self.device_paths / "releases"
+            )
+            return original_status(*arguments, **keywords)
+
+        patcher = patch.object(gate_main, "_controller_status", controller_status)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def isolated_state_environment(self, **overrides):
+        """A startup environment whose every controller path is temporary.
+
+        ``main`` resolves the match-policy cache, the trigger-capture output
+        directory and the plate snapshot from the database path
+        (:func:`default_runtime_paths`, then ``Path(database).resolve().parent``),
+        so redirecting ``GATE_DATABASE`` and ``GATE_AUTHORISED_PLATES`` - the
+        seam production itself reads - moves the whole state tree into a
+        per-test directory. Nothing about the production defaults changes.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name)
+        environment = {
+            "PLATE_RECOGNIZER_API_TOKEN": "token",
+            "GATE_DATABASE": str(state / "gate-controller.db"),
+            "GATE_AUTHORISED_PLATES": str(state / "authorised_licence_plates.csv"),
+            "GATE_WATCH_DIRECTORY": str(state / "uploads"),
+        }
+        environment.update(overrides)
+        return environment
+
     def test_hot_stream_close_failure_cannot_skip_controller_safety_shutdown(self):
         calls = []
 
@@ -59,7 +253,7 @@ class MainConfigurationTests(unittest.TestCase):
         hot_config = type("Config", (), {"enabled": True})()
         base_worker = object()
         with patch.dict(
-            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+            os.environ, self.isolated_state_environment(), clear=True
         ), patch("sys.argv", ["gate-controller"]), patch.object(
             gate_main, "require_python_version"
         ), patch.object(
@@ -81,7 +275,9 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
             gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker") as run_worker:
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
             gate_main.main()
 
         self.assertIn(hot_buffer, run_worker.call_args.kwargs["background_workers"])
@@ -129,7 +325,7 @@ class MainConfigurationTests(unittest.TestCase):
         correlator = Mock()
         base_worker = object()
         with patch.dict(
-            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+            os.environ, self.isolated_state_environment(), clear=True
         ), patch("sys.argv", ["gate-controller"]), patch.object(
             gate_main, "require_python_version"
         ), patch.object(
@@ -150,7 +346,9 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
             gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker") as run_worker:
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
             gate_main.main()
 
         self.assertEqual(
@@ -178,7 +376,7 @@ class MainConfigurationTests(unittest.TestCase):
 
     def test_candidate_release_defaults_to_200ms_without_a_refreshed_service_argument(self):
         with patch.dict(
-            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+            os.environ, self.isolated_state_environment(), clear=True
         ), patch("sys.argv", ["gate-controller"]), patch.object(
             gate_main, "require_python_version"
         ), patch.object(
@@ -195,7 +393,9 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
             gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker") as run_worker:
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
             gate_main.main()
 
         self.assertEqual(0.2, run_worker.call_args.kwargs["quiet_window"])
@@ -262,7 +462,7 @@ class MainConfigurationTests(unittest.TestCase):
             return store
 
         with patch.dict(
-            os.environ, {"PLATE_RECOGNIZER_API_TOKEN": "token"}, clear=True
+            os.environ, self.isolated_state_environment(), clear=True
         ), patch("sys.argv", ["gate-controller"]), patch.object(
             gate_main, "require_python_version"
         ), patch.object(
@@ -281,7 +481,7 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "GateProcessor", return_value=processor
         ), patch.object(
             gate_main, "run_worker", side_effect=lambda *args, **kwargs: kwargs["shutdown"]()
-        ):
+        ), no_live_state_access():
             gate_main.main()
 
         self.assertLess(calls.index("relay"), calls.index("store"))
@@ -685,6 +885,85 @@ class MainConfigurationTests(unittest.TestCase):
             authorised, Path("/var/lib/gate-controller/authorised_licence_plates.csv")
         )
         self.assertEqual(database, Path("/var/lib/gate-controller/gate-controller.db"))
+
+    def test_startup_wiring_keeps_every_state_file_in_a_temporary_directory(self):
+        """The whole of ``main`` runs without touching the device's own state.
+
+        The four ``main`` tests above patch away the collaborators they are
+        each about to assert on; this one leaves the state-owning ones real -
+        ``MatchPolicyCache`` in particular, whose rejection marker is what
+        escaped onto the Pi - so the guard is exercised against the code that
+        actually resolves paths. Everything must land under the temporary
+        directory, and nothing at all may reach ``/var/lib/gate-controller``.
+        """
+        environment = self.isolated_state_environment()
+        state_directory = Path(environment["GATE_DATABASE"]).parent
+        real_cache, cache_paths = gate_main.MatchPolicyCache, []
+
+        def record_cache_path(path, **keywords):
+            cache_paths.append(Path(path))
+            return real_cache(path, **keywords)
+
+        with patch.dict(
+            os.environ, environment, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "MatchPolicyCache", side_effect=record_cache_path
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(gate_main, "run_worker"), no_live_state_access() as touched:
+            gate_main.main()
+
+        self.assertEqual(touched, [])
+        # ``main`` resolves the database path, so compare resolved paths: on a
+        # Mac the temporary directory is reached through a /var symlink.
+        self.assertEqual(
+            cache_paths,
+            [state_directory.resolve() / "match-policy.json"],
+        )
+
+    def test_live_state_guard_fails_loudly_on_the_real_state_directory(self):
+        """The guard is only worth having if it actually fires.
+
+        This is the exact call that blocked every release: pathlib re-raises
+        EACCES from ``exists()``, so on the Pi the unprivileged build user got
+        ``PermissionError`` for the settings rejection marker while CI, where
+        the directory is absent, saw a quiet ``False``.
+        """
+        marker = Path("/var/lib/gate-controller/match-policy.json.rejected")
+
+        with self.assertRaisesRegex(
+            AssertionError, r"match-policy\.json\.rejected"
+        ), no_live_state_access():
+            marker.exists()
+
+        # Both spellings of every root, the declared one and the
+        # symlink-resolved one - ``main`` resolves before deriving the state
+        # directory, and on a Mac that turns /var into /private/var. Read from
+        # the table computed at import so this assertion does not itself stat a
+        # device path.
+        for spelling, root in _GUARDED_ROOTS:
+            with self.subTest(path=spelling):
+                self.assertEqual(root, live_controller_path(spelling))
+                self.assertEqual(root, live_controller_path(f"{spelling}/child"))
+        self.assertEqual(
+            set(LIVE_CONTROLLER_PATHS), {root for _, root in _GUARDED_ROOTS}
+        )
+        self.assertIsNone(live_controller_path("/var/lib/gate-controller-other"))
+        self.assertIsNone(live_controller_path(0))
 
     def test_example_authorisation_snapshot_uses_the_writable_state_directory(self):
         example = Path(".env.example").read_text(encoding="utf-8")
