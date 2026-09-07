@@ -32,6 +32,9 @@ from .outbox import (
 )
 from .processor import GateProcessor
 from .relay import PiRelayAdapter, RelayController
+from .settings import (
+    CloudflareSettingsFetcher, MatchPolicyCache, SettingsRefreshWorker,
+)
 from .reolink_events import (
     ReolinkEventCorrelator, ReolinkWebhookWorker,
     load_reolink_webhook_config,
@@ -93,10 +96,13 @@ def main() -> None:
         ),
     )
     latest_image = {"path": None, "received_at": None}
+    match_policy = MatchPolicyCache(
+        Path(arguments.database).resolve().parent / "match-policy.json"
+    )
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
-        hot_stream=hot_stream,
+        hot_stream=hot_stream, match_policy=match_policy,
     )
     trigger_capture_config = load_trigger_capture_config(
         os.environ, Path(arguments.database).resolve().parent,
@@ -140,6 +146,7 @@ def main() -> None:
         coordinator=coordinator,
         max_image_age=timedelta(seconds=max_image_age),
         decision_timeout=decision_timeout,
+        match_policy=match_policy.get,
     )
 
     def process(paths, received_at=None, decision_started_at=None,
@@ -391,7 +398,7 @@ def _quiet_window(value: str) -> float:
 
 def build_background_workers(store, relay, *, environment=None, latest_image=None,
                              coordinator=None, authorised=None, camera_directory=None,
-                             hot_stream=None):
+                             hot_stream=None, match_policy=None):
     environment = os.environ if environment is None else environment
     latest_image = latest_image if latest_image is not None else {}
     prompt_player = PromptPlayer(_configured_prompts(environment))
@@ -423,11 +430,19 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                 authorised, CloudflarePlateFetcher(cloudflare_client, controller_id),
                 poll_interval=float(environment.get("GATE_AUTHORISATION_REFRESH_SECONDS", "30")),
             ))
+        if match_policy is not None:
+            workers.append(SettingsRefreshWorker(
+                match_policy,
+                CloudflareSettingsFetcher(cloudflare_client, controller_id),
+                poll_interval=float(
+                    environment.get("GATE_SETTINGS_REFRESH_SECONDS", "60")
+                ),
+            ))
         status = lambda: _controller_status(
             store, prompt_player, latest_image, authorised, relay=relay,
             camera_directory=camera_directory,
             camera_stale_seconds=camera_stale_seconds,
-            hot_stream=hot_stream,
+            hot_stream=hot_stream, match_policy=match_policy,
         )
         workers.append(HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -504,7 +519,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
-                       hot_stream=None,
+                       hot_stream=None, match_policy=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        module_path=Path(__file__),
                        managed_releases_root=MANAGED_RELEASES_ROOT, clock=None) -> dict:
@@ -539,6 +554,8 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         status["software"] = {"release_sha": release_sha}
     if authorised is not None:
         status["authorisation"] = authorised.status()
+    if match_policy is not None:
+        status["match_policy"] = match_policy.status()
     return status
 
 
