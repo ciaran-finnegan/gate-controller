@@ -1949,6 +1949,9 @@ TRUST_ANCHOR_HANDOFF=$BACKUP_DIR/trust-anchors
 create_fixed_trust_anchor_handoff "$STAGING" "$TRUST_ANCHOR_HANDOFF"
 chown -R gate-controller-build:gate-controller-build "$STAGING"
 run_candidate_command python3 -m venv "$STAGING/.venv"
+# No --only-binary flag here, matching the updater: requirements.txt names the
+# heavy recognition stack itself, and a blanket :all: would break lgpio's
+# source-build fallback on any image older than Bookworm.
 run_candidate_command "$STAGING/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-input -r "$STAGING/requirements.txt"
 verify_candidate_release "$STAGING"

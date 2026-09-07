@@ -9,7 +9,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deployment.gate_controller_updater import (
+    IMPORT_SMOKE_PROGRAM,
     LOGGER,
+    SMOKE_IMPORT_MODULES,
     ReleaseEntry,
     UpdateError,
     UpdateConfig,
@@ -18,6 +20,7 @@ from deployment.gate_controller_updater import (
     _atomic_write,
     _command_environment,
     _github_json,
+    _run_command,
     _main_commit_payload,
     _legacy_command_state,
     _systemctl_is,
@@ -239,6 +242,28 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(3, config.keep_releases)
         self.assertEqual("ciaran-finnegan/gate-controller", config.repository)
         self.assertEqual("master", config.branch)
+
+    def test_on_device_unit_suite_is_opt_in(self):
+        self.assertFalse(UpdateConfig.from_mapping({}).run_full_test_suite)
+        for enabled in ("1", "true", "YES", "on"):
+            with self.subTest(value=enabled):
+                self.assertTrue(
+                    UpdateConfig.from_mapping(
+                        {"GATE_UPDATE_RUN_TESTS": enabled}
+                    ).run_full_test_suite
+                )
+        for disabled in ("", "0", "false", "OFF"):
+            with self.subTest(value=disabled):
+                self.assertFalse(
+                    UpdateConfig.from_mapping(
+                        {"GATE_UPDATE_RUN_TESTS": disabled}
+                    ).run_full_test_suite
+                )
+
+    def test_rejects_an_unreadable_test_suite_flag(self):
+        for value in ("maybe", "2", "on-device"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                UpdateConfig.from_mapping({"GATE_UPDATE_RUN_TESTS": value})
 
     def test_accepts_an_explicit_release_branch(self):
         self.assertEqual(
@@ -1117,6 +1142,237 @@ class ActivationRecoveryTests(unittest.TestCase):
             self.assertTrue(outside_record.is_file())
 
 
+class CommandDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        previously_disabled = LOGGER.disabled
+        LOGGER.disabled = True
+        self.addCleanup(setattr, LOGGER, "disabled", previously_disabled)
+        self.config = UpdateConfig.from_mapping({})
+
+    def test_failure_names_the_exit_status_and_carries_the_output_tail(self):
+        with self.assertRaises(UpdateError) as raised:
+            _run_command(
+                ["/bin/sh", "-c", "echo diagnostic-detail >&2; exit 3"],
+                config=self.config,
+                timeout=60,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("failed with exit status 3", message)
+        self.assertNotIn("timed out", message)
+        self.assertIn("diagnostic-detail", message)
+
+    def test_timeout_is_distinguishable_and_decodes_captured_bytes(self):
+        expired = subprocess.TimeoutExpired(
+            ["/bin/sh"], 60, output=b"partial-progress\n"
+        )
+
+        with patch(
+            "deployment.gate_controller_updater.subprocess.run",
+            side_effect=expired,
+        ), self.assertRaises(UpdateError) as raised:
+            _run_command(["/bin/sh", "-c", "sleep 600"], config=self.config, timeout=60)
+
+        message = str(raised.exception)
+        self.assertIn("timed out after 60s", message)
+        self.assertNotIn("exit status", message)
+        self.assertIn("partial-progress", message)
+
+    def test_reported_output_tail_is_bounded(self):
+        with self.assertRaises(UpdateError) as raised:
+            _run_command(
+                ["/bin/sh", "-c", "yes noisy-output | head -c 40000; exit 1"],
+                config=self.config,
+                timeout=60,
+            )
+
+        self.assertLess(len(str(raised.exception)), 4000)
+        self.assertIn("noisy-output", str(raised.exception))
+
+    def test_a_command_that_cannot_start_still_reports_the_command(self):
+        with self.assertRaises(UpdateError) as raised:
+            _run_command(
+                ["/nonexistent/gate-controller-command"],
+                config=self.config,
+                timeout=60,
+            )
+
+        self.assertIn("/nonexistent/gate-controller-command", str(raised.exception))
+
+
+class ReleaseVerificationTests(unittest.TestCase):
+    def setUp(self):
+        previously_disabled = LOGGER.disabled
+        LOGGER.disabled = True
+        self.addCleanup(setattr, LOGGER, "disabled", previously_disabled)
+
+    def build_release(self, temporary_directory, *, scripts=("file_monitor.sh",)):
+        release = Path(temporary_directory)
+        python = release / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        (release / "gate_controller").mkdir()
+        for script in scripts:
+            path = release / script
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        return release
+
+    def verify(self, release, values=None, command=None):
+        config = replace(
+            UpdateConfig.from_mapping(values or {}), install_root=release.parent
+        )
+        recorded = []
+
+        def record(arguments, **options):
+            recorded.append([str(argument) for argument in arguments])
+            if command is not None:
+                return command(recorded[-1], **options)
+            return ""
+
+        with patch(
+            "deployment.gate_controller_updater._run_command", side_effect=record
+        ):
+            verify_release(release, config)
+        return recorded
+
+    def test_import_smoke_check_covers_the_service_startup_modules(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory)
+
+            recorded = self.verify(release)
+
+            smoke = [
+                command
+                for command in recorded
+                if "-c" in command and IMPORT_SMOKE_PROGRAM in command
+            ]
+            self.assertEqual(1, len(smoke))
+            self.assertEqual(str(release / ".venv/bin/python"), smoke[0][0])
+            self.assertEqual(
+                [str(release), *SMOKE_IMPORT_MODULES],
+                smoke[0][smoke[0].index(IMPORT_SMOKE_PROGRAM) + 1:],
+            )
+
+    def test_import_smoke_modules_match_what_the_service_starts(self):
+        unit = Path("file-monitor.service").read_text(encoding="utf-8")
+        wrapper = Path("file_monitor.sh").read_text(encoding="utf-8")
+
+        self.assertIn("-m gate_controller.relay_safe", unit)
+        self.assertIn("-m gate_controller ", unit)
+        self.assertIn("-m gate_controller ", wrapper)
+        self.assertEqual(
+            (
+                "gate_controller",
+                "gate_controller.relay_safe",
+                "gate_controller.__main__",
+            ),
+            SMOKE_IMPORT_MODULES,
+        )
+
+    def test_a_failing_import_fails_verification_before_anything_else_runs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory)
+
+            def fail_the_import(command, **_options):
+                if IMPORT_SMOKE_PROGRAM in command:
+                    raise UpdateError(
+                        "command failed with exit status 1: import smoke; "
+                        "last output: ModuleNotFoundError: No module named 'PIL'"
+                    )
+                return ""
+
+            with self.assertRaises(UpdateError) as raised:
+                self.verify(release, command=fail_the_import)
+
+            self.assertIn("No module named 'PIL'", str(raised.exception))
+
+    def test_the_full_unit_suite_does_not_run_by_default(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory)
+
+            recorded = self.verify(release)
+
+            self.assertFalse(
+                [command for command in recorded if "unittest" in command],
+                "the CI-proven unit suite must not be repeated on the device",
+            )
+
+    def test_the_full_unit_suite_runs_when_explicitly_opted_in(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory)
+
+            recorded = self.verify(release, values={"GATE_UPDATE_RUN_TESTS": "1"})
+
+            self.assertIn(
+                [
+                    str(release / ".venv/bin/python"),
+                    "-m",
+                    "unittest",
+                    "discover",
+                    "-s",
+                    "tests",
+                    "-v",
+                ],
+                recorded,
+            )
+
+    def test_absent_optional_scripts_and_trees_are_skipped_not_failed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory, scripts=())
+
+            recorded = self.verify(release)
+
+            self.assertFalse(
+                [command for command in recorded if "-n" in command],
+                "a release without those scripts must not be syntax checked",
+            )
+            compile_commands = [
+                command for command in recorded if "compileall" in command
+            ]
+            self.assertEqual(1, len(compile_commands))
+            self.assertEqual(["gate_controller"], compile_commands[0][4:])
+
+    def test_present_optional_scripts_are_still_syntax_checked(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(
+                temporary_directory,
+                scripts=("file_monitor.sh", "deployment/install.sh"),
+            )
+
+            recorded = self.verify(release)
+
+            self.assertIn(["/bin/sh", "-n", "file_monitor.sh"], recorded)
+            self.assertIn(["/bin/bash", "-n", "deployment/install.sh"], recorded)
+
+    def test_dependency_install_leaves_the_wheel_policy_to_requirements(self):
+        # The heavy packages are named on requirements.txt's own
+        # `--only-binary=` line, so a missing opencv or onnxruntime wheel still
+        # fails fast. A blanket `--only-binary=:all:` on the command line would
+        # additionally cover lgpio, whose aarch64 wheel is manylinux_2_34 and
+        # therefore uninstallable on an image older than Bookworm - turning a
+        # working seconds-long source build into an install failure, and making
+        # verify_release defer every release for good.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = self.build_release(temporary_directory)
+            (release / ".venv/bin/python").unlink()
+
+            recorded = self.verify(release)
+
+            installs = [command for command in recorded if "pip" in command]
+            self.assertEqual(1, len(installs))
+            self.assertFalse(
+                [argument for argument in installs[0] if "only-binary" in argument],
+                "the wheel policy belongs in requirements.txt, not on the "
+                "command line, so lgpio keeps its source-build fallback",
+            )
+            self.assertIn("-r", installs[0])
+            self.assertEqual(
+                str(release / "requirements.txt"),
+                installs[0][installs[0].index("-r") + 1],
+            )
+
+
 class ReleaseStagingTests(unittest.TestCase):
     def test_every_candidate_verification_command_runs_as_build_user(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1127,8 +1383,15 @@ class ReleaseStagingTests(unittest.TestCase):
             (release / "file-monitor.service").write_text(
                 "[Service]\nExecStart=/bin/true\n", encoding="utf-8"
             )
+            (release / "gate_controller").mkdir()
+            (release / "deployment").mkdir()
+            (release / "file_monitor.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (release / "deployment/install.sh").write_text(
+                "#!/bin/bash\n", encoding="utf-8"
+            )
             config = replace(
-                UpdateConfig.from_mapping({}), install_root=release.parent
+                UpdateConfig.from_mapping({"GATE_UPDATE_RUN_TESTS": "1"}),
+                install_root=release.parent,
             )
             command_users = []
 

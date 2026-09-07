@@ -32,6 +32,42 @@ MAX_API_RESPONSE_BYTES = 5 * 1024 * 1024
 LOGGER = logging.getLogger("gate-controller-updater")
 BUILD_USER = "gate-controller-build"
 LEGACY_COMMAND_SERVICE = "gate-command-server.service"
+MAX_LOGGED_OUTPUT_CHARACTERS = 8000
+MAX_ERROR_OUTPUT_CHARACTERS = 2000
+
+# Modules the managed release must import before file-monitor.service can start:
+# the unit runs `python -m gate_controller.relay_safe` and then
+# `python -m gate_controller`, and file_monitor.sh runs the latter.
+SMOKE_IMPORT_MODULES: tuple[str, ...] = (
+    "gate_controller",
+    "gate_controller.relay_safe",
+    "gate_controller.__main__",
+)
+
+# Executed by the candidate's own interpreter. It fails loudly on the first
+# module that will not import against the wheels installed on this device.
+IMPORT_SMOKE_PROGRAM = (
+    "import importlib\n"
+    "import sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "for name in sys.argv[2:]:\n"
+    "    importlib.import_module(name)\n"
+    "    sys.stdout.write('imported %s\\n' % name)\n"
+)
+
+# Optional: a release that adds or removes any one of these is still a valid
+# release, and CI already compiles and syntax-checks whichever ones it contains.
+# Checking an absent path would exit non-zero and defer every update forever.
+OPTIONAL_COMPILE_TARGETS: tuple[str, ...] = (
+    "gate_controller",
+    "deployment",
+    "tests",
+    "scripts",
+)
+OPTIONAL_SHELL_SYNTAX_CHECKS: tuple[tuple[str, str], ...] = (
+    ("/bin/sh", "file_monitor.sh"),
+    ("/bin/bash", "deployment/install.sh"),
+)
 
 
 class UpdateError(RuntimeError):
@@ -79,6 +115,7 @@ class UpdateConfig:
     command_timeout_seconds: int
     health_seconds: int
     github_token: str | None
+    run_full_test_suite: bool = False
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> "UpdateConfig":
@@ -118,6 +155,9 @@ class UpdateConfig:
         health_seconds = _bounded_integer(
             values, "GATE_UPDATE_HEALTH_SECONDS", 15, 5, 120
         )
+        run_full_test_suite = _boolean_flag(
+            values, "GATE_UPDATE_RUN_TESTS", default=False
+        )
         service_name = values.get("GATE_UPDATE_SERVICE", "file-monitor.service")
         if re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", service_name) is None:
             raise ValueError("GATE_UPDATE_SERVICE must be a systemd service name")
@@ -133,6 +173,7 @@ class UpdateConfig:
             command_timeout_seconds=command_timeout,
             health_seconds=health_seconds,
             github_token=token,
+            run_full_test_suite=run_full_test_suite,
         )
 
     @property
@@ -162,6 +203,20 @@ def _bounded_integer(
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _boolean_flag(values: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = values.get(name)
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text == "":
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be 1 or 0")
 
 
 def read_main_sha(payload: object) -> str:
@@ -341,6 +396,33 @@ def _command_environment(
     return environment
 
 
+def _captured_output(error: BaseException) -> str:
+    """Return whatever the failed child wrote, as text.
+
+    ``TimeoutExpired.output`` stays bytes even for a text-mode run, so both
+    representations have to be handled here.
+    """
+    for attribute in ("stdout", "output"):
+        value = getattr(error, attribute, None)
+        if not value:
+            continue
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8", "replace")
+        return str(value)
+    return ""
+
+
+def _command_failure(
+    command: Sequence[str], *, reason: str, output: str
+) -> UpdateError:
+    """Build an error that names the failure mode and carries the output tail."""
+    message = f"command {reason}: {' '.join(command)}"
+    tail = output.strip()[-MAX_ERROR_OUTPUT_CHARACTERS:]
+    if tail:
+        message = f"{message}; last output: {tail}"
+    return UpdateError(message)
+
+
 def _run_command(
     arguments: Sequence[str | os.PathLike[str]],
     *,
@@ -351,6 +433,7 @@ def _run_command(
     run_as_user: str | None = None,
 ) -> str:
     command = [os.fspath(argument) for argument in arguments]
+    effective_timeout = timeout or config.command_timeout_seconds
     LOGGER.info("Running %s", " ".join(command))
     try:
         process_options: dict[str, object] = {}
@@ -370,21 +453,45 @@ def _run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout or config.command_timeout_seconds,
+            timeout=effective_timeout,
             check=True,
             **process_options,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        output = getattr(error, "stdout", None) or getattr(error, "output", None) or ""
+    except subprocess.TimeoutExpired as error:
+        output = _captured_output(error)
         if output:
-            LOGGER.error("Command output:\n%s", output[-8000:])
-        raise UpdateError(f"command failed: {' '.join(command)}") from error
+            LOGGER.error("Command output:\n%s", output[-MAX_LOGGED_OUTPUT_CHARACTERS:])
+        raise _command_failure(
+            command,
+            reason=f"timed out after {effective_timeout}s",
+            output=output,
+        ) from error
+    except (OSError, subprocess.CalledProcessError) as error:
+        output = _captured_output(error)
+        if output:
+            LOGGER.error("Command output:\n%s", output[-MAX_LOGGED_OUTPUT_CHARACTERS:])
+        status = getattr(error, "returncode", None)
+        reason = "failed" if status is None else f"failed with exit status {status}"
+        raise _command_failure(command, reason=reason, output=output) from error
     if completed.stdout:
-        LOGGER.info("Command output:\n%s", completed.stdout[-8000:])
+        LOGGER.info(
+            "Command output:\n%s", completed.stdout[-MAX_LOGGED_OUTPUT_CHARACTERS:]
+        )
     return completed.stdout.strip()
 
 
 def verify_release(release: Path, config: UpdateConfig) -> None:
+    """Run the device-specific checks that GitHub CI cannot perform.
+
+    CI already runs the complete unit suite on the exact candidate SHA, and
+    ``has_successful_ci_run`` refuses to stage a commit without it, so repeating
+    that suite here only re-proves what is already proven. What CI genuinely
+    cannot prove is that this board's architecture and installed wheels work:
+    the virtual environment build, the dependency install for this
+    architecture, and an import of the modules the service actually loads at
+    startup. Set
+    ``GATE_UPDATE_RUN_TESTS=1`` to restore the full on-device suite.
+    """
     python = release / ".venv/bin/python"
     if not python.is_file():
         _run_command(
@@ -400,6 +507,14 @@ def verify_release(release: Path, config: UpdateConfig) -> None:
                 "install",
                 "--disable-pip-version-check",
                 "--no-input",
+                # requirements.txt carries its own `--only-binary=` line naming
+                # the heavy recognition stack, so a missing wheel there fails
+                # fast instead of starting an hour-long source build on the Pi.
+                # No `:all:` here on purpose: lgpio's aarch64 wheel is
+                # manylinux_2_34, so on an image older than Bookworm pip has to
+                # fall back to its seconds-long source build, and a blanket
+                # wheels-only rule would turn that into a hard install failure
+                # that made verify_release reject every release.
                 "-r",
                 release / "requirements.txt",
             ],
@@ -407,29 +522,53 @@ def verify_release(release: Path, config: UpdateConfig) -> None:
             cwd=release,
             run_as_user=BUILD_USER,
         )
+    _run_import_smoke_check(release, python, config)
+    if config.run_full_test_suite:
+        _run_command(
+            [python, "-m", "unittest", "discover", "-s", "tests", "-v"],
+            config=config,
+            cwd=release,
+            run_as_user=BUILD_USER,
+        )
+    else:
+        LOGGER.info(
+            "Skipping the on-device unit suite; CI already ran it for this "
+            "exact commit. Set GATE_UPDATE_RUN_TESTS=1 to run it anyway."
+        )
+    compile_targets = [
+        target for target in OPTIONAL_COMPILE_TARGETS if (release / target).is_dir()
+    ]
+    if compile_targets:
+        _run_command(
+            [python, "-m", "compileall", "-q", *compile_targets],
+            config=config,
+            cwd=release,
+            run_as_user=BUILD_USER,
+        )
+    for interpreter, script in OPTIONAL_SHELL_SYNTAX_CHECKS:
+        # A release that simply does not contain the script must not turn into a
+        # 127 exit status, which would defer every future update forever.
+        if not (release / script).is_file():
+            LOGGER.info("Skipping syntax check for absent %s", script)
+            continue
+        _run_command(
+            [interpreter, "-n", script],
+            config=config,
+            cwd=release,
+            run_as_user=BUILD_USER,
+        )
+
+
+def _run_import_smoke_check(
+    release: Path, python: Path, config: UpdateConfig
+) -> None:
+    """Import the service's startup modules against the installed wheels.
+
+    This is the check the full suite was really standing in for on this device:
+    it catches an arm64 import failure in seconds rather than tens of minutes.
+    """
     _run_command(
-        [python, "-m", "unittest", "discover", "-s", "tests", "-v"],
-        config=config,
-        cwd=release,
-        run_as_user=BUILD_USER,
-    )
-    _run_command(
-        [
-            python, "-m", "compileall", "-q", "gate_controller", "deployment",
-            "tests", "scripts",
-        ],
-        config=config,
-        cwd=release,
-        run_as_user=BUILD_USER,
-    )
-    _run_command(
-        ["/bin/sh", "-n", "file_monitor.sh"],
-        config=config,
-        cwd=release,
-        run_as_user=BUILD_USER,
-    )
-    _run_command(
-        ["/bin/bash", "-n", "deployment/install.sh"],
+        [python, "-c", IMPORT_SMOKE_PROGRAM, release, *SMOKE_IMPORT_MODULES],
         config=config,
         cwd=release,
         run_as_user=BUILD_USER,

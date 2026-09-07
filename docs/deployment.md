@@ -278,14 +278,86 @@ per hour.
 Each run is serialized by `/usr/bin/flock` using
 `/run/gate-controller-updater/update.lock`. A candidate is fetched by immutable
 SHA into a temporary directory, checked out detached, and verified before the
-`current` symlink is touched. Git checkout, package installation, tests,
-compilation, and candidate shell syntax checks all run as the unprivileged
-`gate-controller-build` account. The root helper only prepares ownership,
-durably records activation, switches the managed symlink, and asks systemd to
-restart the fixed service.
+`current` symlink is touched. Git checkout, package installation, the import
+smoke check, compilation, and candidate shell syntax checks all run as the
+unprivileged `gate-controller-build` account. The root helper only prepares
+ownership, durably records activation, switches the managed symlink, and asks
+systemd to restart the fixed service.
 
 Bootstrap acquires that same non-blocking lock before staging or refreshing
 trust anchors, so it cannot race the timer-driven updater.
+
+## What On-Device Verification Checks
+
+The updater deliberately does not repeat the unit suite that GitHub CI has
+already run. A candidate is not staged at all until a completed, successful
+`Gate Controller CI` push workflow exists for that exact 40-character commit,
+and that workflow runs the whole suite on Python 3.10 and 3.11. On-device
+verification therefore runs only the checks CI cannot perform, because they
+depend on this board's architecture and its installed wheels:
+
+- Building the release-local virtual environment.
+- Installing `requirements.txt`. This is the single most valuable
+  device-specific check: it catches a missing or incompatible `aarch64` wheel.
+  The wheels-only policy lives in `requirements.txt` itself, on an
+  `--only-binary=` line naming the heavy recognition stack — onnxruntime,
+  opencv-python-headless, numpy, protobuf, flatbuffers and their closure — so a
+  missing wheel for any of those fails in seconds rather than starting a source
+  build that could not finish inside the command timeout. It is deliberately
+  not `--only-binary=:all:`: `lgpio` publishes its `aarch64` wheel as
+  `manylinux_2_34`, which installs on Bookworm's glibc 2.36 but not on an older
+  image, where pip falls back to a source build that takes seconds. A blanket
+  wheels-only rule would turn that working fallback into a hard install
+  failure, and `verify_release` would then reject every release — exactly the
+  silent freeze this section exists to prevent.
+- An import smoke check that imports exactly what `file-monitor.service` loads
+  at startup — `gate_controller`, `gate_controller.relay_safe`, and
+  `gate_controller.__main__` — against the freshly installed wheels. This is the
+  real device-specific failure mode, and it takes well under a second.
+- `compileall` over whichever of `gate_controller`, `deployment`, `tests`, and
+  `scripts` the candidate contains.
+- `sh -n file_monitor.sh` and `bash -n deployment/install.sh`, each run only
+  when the candidate actually contains that file. A check for an absent script
+  would exit 127, and the updater treats a failed verification as a deferral, so
+  an unconditional check against a file a future release removes would freeze
+  automatic updates indefinitely while still logging success.
+
+What this trades away is honest and worth stating: the Pi no longer independently
+re-proves the test suite against its own interpreter build, so a defect that only
+appears on `linux/arm64` and is not an import error can now reach the gate. CI is
+the gate. If the required checks on the release branch are ever removed or
+weakened, this verification will not catch it. In exchange, an update no longer
+pegs all four cores for 15 to 40 minutes at 84 °C against an 85 °C throttle limit
+while a live recognition session is competing for the same CPU.
+
+To restore the old behaviour and run the complete suite on the device as well,
+add `GATE_UPDATE_RUN_TESTS=1` to `/etc/gate-controller-updater.env`:
+
+```sh
+sudo install -m 0600 -o root -g root /dev/null /etc/gate-controller-updater.env
+sudoedit /etc/gate-controller-updater.env
+```
+
+Budget for it. The suite is roughly 850 tests and grows; the updater unit allows
+45 minutes per run and `GATE_UPDATE_COMMAND_TIMEOUT_SECONDS` (default 900,
+maximum 3600) bounds each individual command. Leave it unset for normal
+operation.
+
+One-time bootstrap through `deployment/install.sh` is unchanged and still runs
+the complete suite. Bootstrap is manual, infrequent, and supervised, and it is
+the only path that does not consult CI, so the extra confidence is worth the
+wall-clock cost there. It runs the same plain
+`pip install -r requirements.txt` as the updater, so both inherit the same
+named wheels-only policy from `requirements.txt` and agree on what counts as
+installable on this board.
+
+When a verification command does fail, the deferral warning in the journal now
+carries the failing command, whether it exited non-zero or timed out, and a
+bounded tail of the command's own output:
+
+```sh
+sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
+```
 
 Before switching, the updater atomically writes and fsyncs
 `pending-activation.json` with the candidate and previous release SHAs. It then
