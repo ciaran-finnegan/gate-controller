@@ -1056,6 +1056,28 @@ if __name__ == "__main__":
 class HeartbeatObservabilityTests(unittest.TestCase):
     """Phase 1 of the observability plan: host health, network, cloud, counters."""
 
+    def isolated_state_environment(self, **overrides):
+        """The same temporary state tree MainConfigurationTests uses.
+
+        This class drives ``main()`` too, so it needs the identical seam:
+        ``main`` derives the match-policy cache and its ``.rejected`` marker
+        from ``GATE_DATABASE``, and a bare ``clear=True`` environment falls
+        back to ``/var/lib/gate-controller``. On the Pi the unprivileged build
+        user cannot traverse that directory, ``Path.exists()`` re-raises EACCES
+        rather than answering False, and the release is deferred.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name)
+        environment = {
+            "PLATE_RECOGNIZER_API_TOKEN": "token",
+            "GATE_DATABASE": str(state / "gate-controller.db"),
+            "GATE_AUTHORISED_PLATES": str(state / "authorised_licence_plates.csv"),
+            "GATE_WATCH_DIRECTORY": str(state / "uploads"),
+        }
+        environment.update(overrides)
+        return environment
+
     def create_store(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1122,11 +1144,13 @@ class HeartbeatObservabilityTests(unittest.TestCase):
             captured.update(kwargs)
             return ((), object(), object())
 
-        with patch.dict(os.environ, {
-            "PLATE_RECOGNIZER_API_TOKEN": "token",
-            "GATE_REOLINK_WEBHOOK_SECRET": "correct-horse-battery-staple",
-            "GATE_TRIGGER_CAPTURE_ENABLED": "true",
-        }, clear=True), patch("sys.argv", ["gate-controller"]), patch.object(
+        environment = self.isolated_state_environment(
+            GATE_REOLINK_WEBHOOK_SECRET="correct-horse-battery-staple",
+            GATE_TRIGGER_CAPTURE_ENABLED="true",
+        )
+        with patch.dict(
+            os.environ, environment, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
             gate_main, "require_python_version"
         ), patch.object(
             gate_main, "PiRelayAdapter", return_value=object()
@@ -1146,7 +1170,7 @@ class HeartbeatObservabilityTests(unittest.TestCase):
             gate_main, "PlateRecognizerClient", return_value=object()
         ), patch.object(
             gate_main, "GateProcessor", return_value=object()
-        ), patch.object(gate_main, "run_worker"):
+        ), patch.object(gate_main, "run_worker"), no_live_state_access():
             gate_main.main()
 
         self.assertIs(trigger_capture, captured["trigger_capture"])
