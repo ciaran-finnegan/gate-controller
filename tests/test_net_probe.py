@@ -1,6 +1,7 @@
 import ast
 import os
 import resource
+import ssl
 import subprocess
 import tempfile
 import time
@@ -14,6 +15,7 @@ from gate_controller.net_probe import (
     DEFAULT_MAX_TEMP_C, DEFAULT_MIN_AVAILABLE_BYTES, MAX_CHILD_OUTPUT_BYTES,
     NetProbeConfig, NetProbeWorker, _limit_address_space, default_gateway,
     default_interface, interface_counters, load_net_probe_config, parse_ping,
+    tls_context,
 )
 
 
@@ -373,6 +375,15 @@ class MeasurementTests(unittest.TestCase):
         worker.run_once()
         self.assertEqual(2, len(handshakes))
         self.assertTrue(worker.status()["tls"]["ok"])
+
+    def test_the_handshake_is_measured_over_a_protocol_we_would_actually_use(self):
+        # A handshake timed over TLS 1.0 would be a number for a connection the
+        # OCR client would refuse, which is worse than reporting none.
+        context = tls_context()
+
+        self.assertEqual(ssl.TLSVersion.TLSv1_2, context.minimum_version)
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
 
     def test_a_refused_handshake_is_reported_rather_than_raised(self):
         def refuse(host):

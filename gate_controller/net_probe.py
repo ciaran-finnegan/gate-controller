@@ -469,10 +469,23 @@ class NetProbeWorker:
         return buffer.decode("utf-8", "replace")
 
 
+def tls_context() -> ssl.SSLContext:
+    """A verifying context pinned to TLS 1.2 or better.
+
+    `ssl.create_default_context()` alone leaves TLS 1.0 and 1.1 reachable on
+    some builds. This probe exists to measure a handshake, so the handshake it
+    measures must be one the OCR client would actually be willing to make;
+    a number obtained over a protocol we would refuse is worse than no number.
+    """
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def _tls_handshake_ms(host: str, *, port: int = 443,
                       timeout: float = CHILD_TIMEOUT_SECONDS) -> float | None:
     """Time one TLS handshake and close. No HTTP request, no lookup billed."""
-    context = ssl.create_default_context()
+    context = tls_context()
     started = time.perf_counter()
     try:
         with socket.create_connection((host, port), timeout=timeout) as raw:
