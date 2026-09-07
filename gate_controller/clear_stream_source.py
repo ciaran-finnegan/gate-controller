@@ -11,8 +11,17 @@ scene baseline current. When a camera event arrives it:
    ``session_seconds`` so the capture loop can pick the stillest frame of
    each second instead of hoping a fixed offset lands on a stopped car.
 
+The session copies the stream's packets and gates them at the first keyframe
+before they reach a decoder, so the decoder never sees a picture whose
+reference frames it missed. Decoding straight from RTSP does: the media
+server hands a new reader the middle of a GOP and the SDP already carries the
+codec parameters, so ffmpeg decodes those inter pictures against a reference
+it never received. Under hardware decode that reference is an uninitialised
+buffer, and the frame comes out flat green.
+
 Measured on the RLC-810A stream with hardware decode, crop and scale: a
 5 fps session costs about 60% of one core while it runs; 10 fps about 116%.
+The packet copy in front of it adds about 5% of a core.
 """
 from collections.abc import Callable
 import logging
@@ -20,7 +29,9 @@ import subprocess
 from threading import Event, Lock, Thread
 from time import monotonic
 
-from .clear_stream import HevcPacketRing, decode_command, decode_frames, record_command
+from .clear_stream import (
+    HevcPacketRing, IrapStartGate, decode_command, decode_frames, record_command,
+)
 from .hot_stream import FFMPEG_BINARY, HotFrameRing, JpegStreamParser
 from .scene import SceneBaseline, frame_thumbnail, thumbnail_difference
 
@@ -29,8 +40,13 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_SESSION_FPS = 5.0
 DEFAULT_SESSION_SECONDS = 45.0
 DEFAULT_BASELINE_SECONDS = 30.0
+# The clear stream's own frame rate. An Annex-B pipe carries no timestamps,
+# so the session decoder has to be told the rate it is being fed at for the
+# ``fps=`` filter to sample the fraction of pictures it is asked for.
+DEFAULT_SOURCE_FPS = 10.0
 SESSION_RING_FRAMES = 12
 KEYFRAME_DECODE_TIMEOUT = 3.0
+SESSION_CHUNK_BYTES = 64 * 1024
 
 
 class ClearStreamSource:
@@ -41,12 +57,15 @@ class ClearStreamSource:
                  session_fps: float = DEFAULT_SESSION_FPS,
                  session_seconds: float = DEFAULT_SESSION_SECONDS,
                  baseline_seconds: float = DEFAULT_BASELINE_SECONDS,
+                 source_fps: float = DEFAULT_SOURCE_FPS,
                  popen=subprocess.Popen, clock: Callable[[], float] = monotonic,
                  ring: HevcPacketRing | None = None, scene: SceneBaseline | None = None):
         if not (0 < session_fps <= 10):
             raise ValueError("session_fps must be between 0 and 10")
         if not (0 < session_seconds <= 300):
             raise ValueError("session_seconds must be between 0 and 300")
+        if not (0 < source_fps <= 60):
+            raise ValueError("source_fps must be between 0 and 60")
         self.source_url = source_url
         self._decoder_arguments = tuple(decoder_arguments)
         self._filters = tuple(filters)
@@ -54,6 +73,7 @@ class ClearStreamSource:
         self.session_fps = session_fps
         self.session_seconds = session_seconds
         self.baseline_seconds = baseline_seconds
+        self.source_fps = source_fps
         self._popen = popen
         self._clock = clock
         self.ring = ring or HevcPacketRing(clock=clock)
@@ -67,10 +87,12 @@ class ClearStreamSource:
         self._session_lock = Lock()
         self._session_ring: HotFrameRing | None = None
         self._session_process = None
+        self._session_source_process = None
         self._session_thread: Thread | None = None
         self._session_stop = Event()
         self._session_started_at: float | None = None
         self._session_frames = 0
+        self._session_gate_open = False
         self._last_baseline_at: float | None = None
         self._closed = False
 
@@ -207,6 +229,7 @@ class ClearStreamSource:
             self._session_stop = Event()
             self._session_started_at = self._clock()
             self._session_frames = 0
+            self._session_gate_open = False
             stop = self._session_stop
             ring = self._session_ring
         thread = Thread(target=self._run_session, args=(ring, stop), name="gate-clear-session", daemon=True)
@@ -219,49 +242,73 @@ class ClearStreamSource:
     def stop_session(self, reason: str = "ended") -> None:
         with self._session_lock:
             stop = self._session_stop
-            process = self._session_process
+            processes = (self._session_source_process, self._session_process)
             ring = self._session_ring
             self._session_ring = None
             self._session_process = None
+            self._session_source_process = None
         stop.set()
-        if process is not None:
-            _terminate(process)
+        for process in processes:
+            if process is not None:
+                _terminate(process)
         if ring is not None:
             LOGGER.info(
-                "gate_clear_stream session=stopped reason=%s frames=%d", reason, self._session_frames,
+                "gate_clear_stream session=stopped reason=%s frames=%d keyframe_start=%s",
+                reason, self._session_frames, self._session_gate_open,
             )
 
-    def _run_session(self, ring: HotFrameRing, stop: Event) -> None:
+    def _session_commands(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The packet copy that feeds the session, and the decoder behind it."""
         # Sample before the hardware download so a dropped frame never costs
         # the 4K copy out of the decoder, let alone a crop or scale.
         filters = (f"fps={self.session_fps:g}",) + tuple(
             f for f in self._filters if not f.startswith("fps=")
         )
-        command = (
-            FFMPEG_BINARY, "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-analyzeduration", "0", "-probesize", "32",
-            *self._decoder_arguments, "-i", self.source_url, "-map", "0:v:0", "-an",
-            "-t", f"{self.session_seconds:g}", "-vf", ",".join(filters),
-            "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
+        return (
+            record_command(self.source_url, FFMPEG_BINARY, duration=self.session_seconds),
+            decode_command(
+                ffmpeg=FFMPEG_BINARY, decoder_arguments=self._decoder_arguments,
+                filters=filters, input_framerate=self.source_fps,
+            ),
         )
-        parser = JpegStreamParser(self._max_frame_bytes)
+
+    def _run_session(self, ring: HotFrameRing, stop: Event) -> None:
+        source_command, decode = self._session_commands()
         try:
-            process = self._popen(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            source = self._popen(
+                source_command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, env=self.child_environment, close_fds=True,
             )
         except (OSError, ValueError):
-            LOGGER.warning("gate_clear_stream session=failed reason=spawn")
+            LOGGER.warning("gate_clear_stream session=failed reason=spawn stage=source")
+            self.stop_session("spawn_failed")
+            return
+        try:
+            decoder = self._popen(
+                decode, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=self.child_environment, close_fds=True,
+            )
+        except (OSError, ValueError):
+            _terminate(source)
+            LOGGER.warning("gate_clear_stream session=failed reason=spawn stage=decoder")
             self.stop_session("spawn_failed")
             return
         with self._session_lock:
             if self._session_ring is not ring:
-                _terminate(process)
+                _terminate(source)
+                _terminate(decoder)
                 return
-            self._session_process = process
+            self._session_source_process = source
+            self._session_process = decoder
+        feeder = Thread(
+            target=self._feed_session, args=(source, decoder, stop),
+            name="gate-clear-session-feed", daemon=True,
+        )
+        feeder.start()
+        parser = JpegStreamParser(self._max_frame_bytes)
         try:
             while not stop.is_set():
-                chunk = process.stdout.read(64 * 1024)
+                chunk = decoder.stdout.read(SESSION_CHUNK_BYTES)
                 if not chunk:
                     break
                 for frame in parser.feed(chunk):
@@ -270,11 +317,41 @@ class ClearStreamSource:
         except (OSError, ValueError):
             pass
         finally:
-            _terminate(process)
+            _terminate(source)
+            _terminate(decoder)
             with self._session_lock:
                 still_current = self._session_ring is ring
             if still_current and not stop.is_set():
                 self.stop_session("stream_ended")
+
+    def _feed_session(self, source, decoder, stop: Event) -> None:
+        """Copy packets into the decoder, starting at the first keyframe.
+
+        Everything before it is dropped on the floor: the decoder cannot
+        reconstruct those pictures, and what it produces instead is a flat
+        frame that passes every downstream check and costs a plate lookup.
+        """
+        gate = IrapStartGate()
+        try:
+            while not stop.is_set():
+                chunk = source.stdout.read(SESSION_CHUNK_BYTES)
+                if not chunk:
+                    break
+                payload = gate.feed(chunk)
+                if not payload:
+                    continue
+                if not self._session_gate_open and not stop.is_set():
+                    self._session_gate_open = True
+                decoder.stdin.write(payload)
+                decoder.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                decoder.stdin.close()
+            except (OSError, ValueError):
+                pass
+            _terminate(source)
 
     # -- status / shutdown ------------------------------------------------
     def status(self) -> dict:
@@ -296,6 +373,9 @@ class ClearStreamSource:
                 "seconds": self.session_seconds,
                 "age_seconds": None if not active or started is None else round(now - started, 1),
                 "frames": self._session_frames,
+                # False while the session is still waiting for the keyframe
+                # that lets its decoder produce a picture at all.
+                "keyframe_start": self._session_gate_open,
             },
             "scene": self.scene.status(now),
         }

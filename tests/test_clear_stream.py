@@ -5,7 +5,8 @@ from io import BytesIO
 from PIL import Image
 
 from gate_controller.clear_stream import (
-    AnnexBSplitter, HevcPacketRing, decode_command, decode_frames, nal_type, record_command,
+    AnnexBSplitter, HevcPacketRing, IrapStartGate, decode_command, decode_frames, nal_type,
+    record_command,
 )
 
 
@@ -99,15 +100,81 @@ class HevcPacketRingTests(unittest.TestCase):
             HevcPacketRing(max_gops=0)
 
 
+class IrapStartGateTests(unittest.TestCase):
+    """Nothing reaches the decoder until it can decode a picture on its own.
+
+    Handed the middle of a GOP - which is what a media server gives a reader
+    that connects mid-stream - the decoder still produces pictures, against
+    reference frames it never received. Under hardware decode the substitute
+    reference is an uninitialised buffer, so what comes out is a flat green
+    frame carrying only the blocks that happened to be coded: a valid JPEG,
+    wildly different from the scene baseline, and a paid plate lookup.
+    """
+
+    def test_nothing_before_the_first_keyframe_reaches_the_decoder(self):
+        gate = IrapStartGate()
+        mid_gop = stream(P, nal(1, b"tail", first_slice=False), P)
+        self.assertEqual(gate.feed(mid_gop + SC), b"")
+        self.assertFalse(gate.started)
+
+        keyframe = stream(VPS, SPS, PPS, IDR, P)
+        forwarded = gate.feed(keyframe + SC)
+        self.assertTrue(gate.started)
+        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR) + SC + P)
+
+    def test_parameter_sets_seen_before_the_keyframe_are_emitted_with_it(self):
+        gate = IrapStartGate()
+        self.assertEqual(gate.feed(stream(VPS, SPS, PPS) + SC), b"", "held, not forwarded")
+        self.assertEqual(gate.feed(stream(IDR) + SC), stream(VPS, SPS, PPS, IDR))
+
+    def test_a_keyframe_without_its_parameter_sets_is_not_a_starting_point(self):
+        gate = IrapStartGate()
+        self.assertEqual(gate.feed(stream(VPS, SPS, IDR, P) + SC), b"")
+        self.assertFalse(gate.started)
+
+    def test_the_gate_opens_on_a_keyframe_split_across_chunks(self):
+        gate = IrapStartGate()
+        data = stream(P, VPS, SPS, PPS, IDR, P) + SC
+        forwarded = b"".join(gate.feed(data[i:i + 3]) for i in range(0, len(data), 3))
+        self.assertTrue(gate.started)
+        self.assertEqual(forwarded, stream(VPS, SPS, PPS, IDR, P))
+
+    def test_a_later_slice_of_the_keyframe_picture_is_not_a_starting_point(self):
+        # first_slice_segment_in_pic_flag is clear, so this NAL continues a
+        # picture whose beginning went past before the reader connected.
+        gate = IrapStartGate()
+        self.assertEqual(
+            gate.feed(stream(VPS, SPS, PPS, nal(19, b"rest", first_slice=False)) + SC), b"",
+        )
+        self.assertFalse(gate.started)
+
+    def test_delimiters_and_sei_are_dropped_like_the_ring_drops_them(self):
+        gate = IrapStartGate()
+        gate.feed(stream(VPS, SPS, PPS, IDR) + SC)
+        self.assertEqual(gate.feed(stream(nal(35), nal(39), P) + SC), SC + P)
+
+
 class DecodeTests(unittest.TestCase):
     def test_commands_copy_without_decoding_and_decode_from_stdin(self):
         record = record_command("rtsp://127.0.0.1:8554/clear")
         self.assertIn("copy", record)
         self.assertNotIn("-vf", record)
+        self.assertNotIn("-t", record)
+        bounded = record_command("rtsp://127.0.0.1:8554/clear", duration=45.0)
+        self.assertEqual(bounded[bounded.index("-t") + 1], "45")
         decode = decode_command(decoder_arguments=("-hwaccel", "drm"), filters=("hwdownload", "fps=5"), frames=1)
         self.assertEqual(decode[decode.index("-i") + 1], "pipe:0")
         self.assertEqual(decode[decode.index("-vf") + 1], "hwdownload,fps=5")
         self.assertEqual(decode[decode.index("-frames:v") + 1], "1")
+        self.assertNotIn("-r", decode)
+
+    def test_a_sampled_decode_is_told_the_rate_the_pipe_is_fed_at(self):
+        # An Annex-B pipe carries no timestamps, so the raw demuxer invents
+        # them at 25 fps: fps=5 off that assumption samples every fifth
+        # picture of a 10 fps stream, which is 2 fps, not 5.
+        decode = decode_command(filters=("fps=5",), input_framerate=10.0)
+        self.assertEqual(decode[decode.index("-r") + 1], "10")
+        self.assertLess(decode.index("-r"), decode.index("-i"), "an input option")
 
     def test_decode_frames_returns_the_jpegs_the_child_wrote_and_bounds_a_hang(self):
         output = BytesIO()

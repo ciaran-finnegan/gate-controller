@@ -22,6 +22,29 @@ def nal(kind, payload=b"\x01", first_slice=True):
 
 SC = b"\x00\x00\x01"
 STREAM = b"".join(SC + u for u in (nal(32), nal(33), nal(34), nal(19, b"key"), nal(1, b"p1"), nal(1, b"p2"))) + SC
+# The tail of the GOP a new reader joins in the middle of: inter pictures
+# whose reference frames went past before the reader connected.
+MID_GOP = b"".join(SC + u for u in (nal(1, b"m1"), nal(1, b"m2", first_slice=False)))
+
+
+class Stdin:
+    """A child's stdin pipe, so what the session feeds the decoder is visible."""
+
+    def __init__(self):
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data):
+        if self.closed:
+            raise BrokenPipeError("write to a closed pipe")
+        self.written += data
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
 
 
 class Stdout:
@@ -37,6 +60,7 @@ class FakeProcess:
 
     def __init__(self, chunks=(), output=b"", hang=False):
         self.stdout = Stdout(chunks)
+        self.stdin = Stdin()
         self.output = output
         self.hang = hang
         self.terminated = False
@@ -140,40 +164,57 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertEqual(source.status()["decodes"], 2)
         self.assertEqual(source.status()["mode"], "compressed_ring")
 
-    def test_session_decodes_live_frames_and_stillest_picks_the_stable_one(self):
-        still_a, still_b = jpeg((100, 100, 100)), jpeg((101, 101, 101))
-        moving = jpeg((200, 50, 50))
-        frames = [moving, still_a, still_b]
-        first_frame_seen = Event()
+    def _session_factory(self, jpegs, packets, done):
+        """A packet copy and a decoder behind it, as the session spawns them."""
+        source_process = FakeProcess(chunks=packets)
+        decoder_process = FakeProcess()
 
-        class SessionStdout:
+        class DecoderStdout:
             def __init__(self):
                 self.index = 0
 
             def read(self, _size):
-                if self.index >= len(frames):
-                    first_frame_seen.wait(1)
+                if self.index >= len(jpegs):
+                    done.wait(1)
                     return b""
-                frame = frames[self.index]
+                frame = jpegs[self.index]
                 self.index += 1
-                self.clock_tick()
                 return frame
 
-            def clock_tick(self):
-                pass
-
-        session_process = FakeProcess()
-        session_process.stdout = SessionStdout()
+        decoder_process.stdout = DecoderStdout()
 
         def factory(command):
-            return session_process if "-t" in command else FakeProcess(output=jpeg())
+            if "copy" in command:
+                return source_process
+            if "pipe:0" in command and "-frames:v" not in command:
+                return decoder_process
+            return FakeProcess(output=jpeg())
+
+        return factory, source_process, decoder_process
+
+    def test_session_decodes_live_frames_and_stillest_picks_the_stable_one(self):
+        still_a, still_b = jpeg((100, 100, 100)), jpeg((101, 101, 101))
+        moving = jpeg((200, 50, 50))
+        done = Event()
+        factory, source_process, decoder_process = self._session_factory(
+            [moving, still_a, still_b], [MID_GOP, STREAM], done,
+        )
 
         source, popen = self.source(factory)
         self.assertTrue(source.start_session())
         self.assertFalse(source.start_session(), "one session at a time")
-        session_cmd = next(c for c, _ in popen.calls if "-t" in c)
-        self.assertEqual(session_cmd[session_cmd.index("-t") + 1], "45")
-        self.assertEqual(session_cmd[session_cmd.index("-vf") + 1], "fps=5,hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2")
+        copy_cmd = next(c for c, _ in popen.calls if "copy" in c)
+        self.assertEqual(copy_cmd[copy_cmd.index("-t") + 1], "45")
+        self.assertNotIn("-vf", copy_cmd, "the session's own source only copies packets")
+        decode_cmd = next(
+            c for c, _ in popen.calls if "pipe:0" in c and "-frames:v" not in c
+        )
+        self.assertEqual(
+            decode_cmd[decode_cmd.index("-vf") + 1],
+            "fps=5,hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2",
+        )
+        self.assertEqual(decode_cmd[decode_cmd.index("-r") + 1], "10",
+                         "an Annex-B pipe carries no timestamps, so fps= needs the source rate")
 
         for _ in range(50):
             if source.status()["session"]["frames"] >= 3:
@@ -189,14 +230,60 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertLess(stillness, 0.02)
 
         source.stop_session("test")
-        first_frame_seen.set()
+        done.set()
         self.assertFalse(source.session_active())
-        self.assertTrue(session_process.terminated or session_process.killed)
+        self.assertTrue(decoder_process.terminated or decoder_process.killed)
+        self.assertTrue(source_process.terminated or source_process.killed)
         # After the session, stillest falls back to a decoded keyframe with no stillness score.
         source.ring.feed(STREAM)
         fallback = source.stillest(after=None)
         self.assertIsNotNone(fallback)
         self.assertIsNone(fallback[2])
+
+    def test_the_session_decoder_is_only_ever_fed_from_a_keyframe(self):
+        """The defect: the decoder used to be handed the middle of a GOP.
+
+        With the codec parameters already known from the SDP it decodes those
+        inter pictures against references it never received, and under
+        hardware decode the substitute is an uninitialised buffer, so the
+        picture comes out flat green with only the coded blocks real.
+        """
+        done = Event()
+        factory, _source_process, decoder = self._session_factory(
+            [jpeg()], [MID_GOP, STREAM], done,
+        )
+        source, _popen = self.source(factory)
+        self.assertTrue(source.start_session())
+        for _ in range(50):
+            if source.status()["session"]["keyframe_start"]:
+                break
+            import time
+            time.sleep(0.02)
+        self.assertTrue(source.status()["session"]["keyframe_start"])
+        self.assertEqual(
+            bytes(decoder.stdin.written), STREAM[:-len(SC)],
+            "parameter sets and everything from the keyframe on, and nothing before it",
+        )
+        done.set()
+        source.stop_session("test")
+        self.assertTrue(decoder.stdin.closed, "the decoder is flushed, not left hanging")
+
+    def test_a_session_that_never_sees_a_keyframe_feeds_the_decoder_nothing(self):
+        done = Event()
+        factory, source_process, decoder = self._session_factory(
+            [jpeg()], [MID_GOP, MID_GOP, MID_GOP + SC], done,
+        )
+        source, _popen = self.source(factory)
+        self.assertTrue(source.start_session())
+        for _ in range(50):
+            if source_process.stdout.chunks == []:
+                break
+            import time
+            time.sleep(0.02)
+        self.assertEqual(bytes(decoder.stdin.written), b"")
+        self.assertFalse(source.status()["session"]["keyframe_start"])
+        done.set()
+        source.stop_session("test")
 
     def test_arguments_are_validated_and_close_stops_everything(self):
         with self.assertRaises(ValueError):
@@ -217,7 +304,7 @@ class ClearStreamSourceTests(unittest.TestCase):
                 return b"" if never.is_set() else b""
 
         def factory(command):
-            if "-t" in command:
+            if "copy" in command or ("pipe:0" in command and "-frames:v" not in command):
                 process = FakeProcess()
                 process.stdout = SilentStdout()
                 return process

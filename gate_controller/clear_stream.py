@@ -90,6 +90,68 @@ class AnnexBSplitter:
         return units
 
 
+class IrapStartGate:
+    """Forward an Annex-B stream only from its first complete IRAP onwards.
+
+    A decoder handed the middle of a GOP has no reference pictures for the
+    inter frames that precede the next keyframe, and RTSP hands it the codec
+    parameters out of band in the SDP, so it has everything it needs to
+    *attempt* them. libavcodec substitutes a generated reference for the ones
+    it never saw; in software that substitute is filled with mid-grey, but on
+    the hardware decode path it is never filled at all, so every skipped
+    block copies the decoder's zeroed buffer. The result is a flat green
+    picture - RGB(0,135,0) is what an all-zero YUV frame renders as - with
+    only the blocks that happened to be coded in that picture carrying real
+    content. It is a valid JPEG, it differs wildly from the scene baseline,
+    and it costs a paid plate lookup.
+
+    Nothing before an IRAP reaches the decoder here, so the first picture it
+    ever sees is one it can decode on its own. The gate holds back the
+    parameter sets it has seen and emits them immediately before that
+    picture, matching the byte layout the on-demand keyframe decode already
+    hands ffmpeg. Only slice and parameter-set units are forwarded, as the
+    ring does: delimiters and SEI carry nothing the decoder needs.
+    """
+
+    def __init__(self, max_nal_bytes: int = MAX_NAL_BYTES):
+        self._splitter = AnnexBSplitter(max_nal_bytes)
+        self._parameter_sets: dict[int, bytes] = {}
+        self._started = False
+
+    @property
+    def started(self) -> bool:
+        """Whether a keyframe has been seen and the stream is flowing."""
+        return self._started
+
+    def feed(self, chunk: bytes) -> bytes:
+        """The part of ``chunk`` the decoder may safely see, possibly empty."""
+        output = bytearray()
+        for unit in self._splitter.feed(chunk):
+            kind = nal_type(unit)
+            if kind is None:
+                continue
+            if kind in (NAL_VPS, NAL_SPS, NAL_PPS):
+                self._parameter_sets[kind] = START_CODE + unit
+                if self._started:
+                    output += START_CODE + unit
+                continue
+            if kind > 31:
+                continue
+            if not self._started:
+                if kind not in IRAP_TYPES or not _first_slice_in_picture(unit):
+                    continue
+                if len(self._parameter_sets) < 3:
+                    # A keyframe whose VPS/SPS/PPS were missed is no more
+                    # decodable on its own than the inter frames before it.
+                    continue
+                self._started = True
+                output += b"".join(
+                    self._parameter_sets[parameter] for parameter in (NAL_VPS, NAL_SPS, NAL_PPS)
+                )
+            output += START_CODE + unit
+        return bytes(output)
+
+
 class HevcPacketRing:
     """The last few seconds of the clear stream, compressed, grouped by GOP."""
 
@@ -211,21 +273,37 @@ class HevcPacketRing:
             }
 
 
-def record_command(source_url: str, ffmpeg: str = "ffmpeg") -> tuple[str, ...]:
-    """ffmpeg command that copies the clear stream's packets to stdout, undecoded."""
+def record_command(source_url: str, ffmpeg: str = "ffmpeg",
+                   duration: float | None = None) -> tuple[str, ...]:
+    """ffmpeg command that copies the clear stream's packets to stdout, undecoded.
+
+    ``duration`` bounds the copy in stream seconds, so a session that feeds a
+    decoder from this stream closes its own RTSP connection when it is done.
+    """
     return (
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-rtsp_transport", "tcp", "-analyzeduration", "0", "-probesize", "32",
-        "-i", source_url, "-map", "0:v:0", "-an", "-c:v", "copy", "-f", "hevc", "pipe:1",
+        "-i", source_url, "-map", "0:v:0", "-an",
+        *(("-t", f"{duration:g}") if duration else ()),
+        "-c:v", "copy", "-f", "hevc", "pipe:1",
     )
 
 
 def decode_command(*, ffmpeg: str = "ffmpeg", decoder_arguments: tuple[str, ...] = (),
-                   filters: tuple[str, ...] = (), frames: int | None = None) -> tuple[str, ...]:
-    """ffmpeg command that decodes an Annex-B HEVC byte stream from stdin to MJPEG on stdout."""
+                   filters: tuple[str, ...] = (), frames: int | None = None,
+                   input_framerate: float | None = None) -> tuple[str, ...]:
+    """ffmpeg command that decodes an Annex-B HEVC byte stream from stdin to MJPEG on stdout.
+
+    An Annex-B byte stream carries no timestamps, so the raw demuxer invents
+    them at its own default of 25 fps. Anything that samples with an ``fps=``
+    filter must pass ``input_framerate``, or the ratio between the filter and
+    the real stream rate is wrong: at the clear stream's 10 fps, ``fps=5`` off
+    a 25 fps assumption samples every fifth picture, that is 2 fps, not 5.
+    """
     return (
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         *decoder_arguments,
+        *(("-r", f"{input_framerate:g}") if input_framerate else ()),
         "-f", "hevc", "-i", "pipe:0", "-map", "0:v:0", "-an",
         *(("-frames:v", str(frames)) if frames else ()),
         *(("-vf", ",".join(filters)) if filters else ()),

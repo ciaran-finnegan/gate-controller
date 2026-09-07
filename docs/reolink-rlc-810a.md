@@ -190,6 +190,23 @@ which waits for the next keyframe) and a live session decoder starts at
 hardware decode, crop and scale: a 5 fps session costs about 60% of one core
 while it runs; 10 fps about 116%, so 5 is the default.
 
+The session decoder is never pointed at RTSP directly. It reads an Annex-B
+pipe fed by a packet copy of the stream (another 5% of a core) that forwards
+nothing until the first keyframe. Decoding straight from RTSP produced flat
+green frames: MediaMTX hands a new reader the middle of a GOP, the SDP
+already carries the codec parameters, so ffmpeg decodes those inter pictures
+against reference frames it never received. In software libavcodec fills the
+substitute reference with mid-grey; on the `drm` hardware path it does not
+fill it at all, so every block the picture did not code copies an
+uninitialised buffer — RGB(0,135,0), what an all-zero YUV frame renders as —
+and only the moving vehicle comes out real. Measured on a synthesised 10 fps
+stream joined mid-GOP, the first three sampled frames are 98%, 95% and 93%
+one flat colour; through the keyframe gate the worst is 15%. The cost is
+that the first session frame waits for the next keyframe, up to a second at
+the camera's 1x interval; the buffered keyframe covers that gap as it always
+did. The status heartbeat carries `session.keyframe_start`, false while a
+session is still waiting for one.
+
 While a session runs, each capture slot takes the *stillest* frame of the
 last second, the one that differs least from its predecessor, rather than
 whatever frame a fixed offset lands on. A stopped car produces a run of
@@ -243,11 +260,31 @@ entered the picture or because it has already left, and is skipped as
 `gate_trigger_capture outcome=skipped_empty_scene scene_difference=…`. Inside
 a presence session an empty frame is the departure signal and ends the
 session with `reason=departed`. Every captured frame journals its
-`scene_difference=` and `clipping=` (the fraction of near-white pixels) so
-both thresholds can be chosen from real captures; set
+`scene_difference=`, `clipping=` (the fraction of near-white pixels) and
+`flat_fraction=` so the thresholds can be chosen from real captures; set
 `GATE_MAX_HIGHLIGHT_CLIPPING` (default `0`, off) to skip headlight- or
 IR-blazed frames as `outcome=skipped_clipped` once the night captures show
 where the line is.
+
+A third gate catches a frame that is not a picture at all. A decode that
+could not finish leaves most of the plate band one flat colour, which reads
+as a *large* scene difference (flat green is nothing like the idle drive)
+and as a normal exposure, so neither of the other two stops it: on
+2026-09-07 one reached OCR, was billed for, and was stored as evidence as a
+green thumbnail. A frame whose plate band is more than
+`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION` (0.6; `0` disables) within a small
+tolerance of one colour is skipped as
+`gate_trigger_capture outcome=skipped_corrupt event_type=… source=…
+flat_fraction=…` and counted in the heartbeat under `skipped.corrupt`. The
+default comes from measuring every frame in the corpus and the incident
+folders — day, dusk and night, empty drive and vehicle at the gate: the
+highest a real capture reaches is 0.22, the green frame measures 0.91 and a
+picture concealed against a substituted grey reference 0.87. Near-black
+pixels are excluded and a band that is mostly near-black scores 0, so an
+IR-off night frame with nothing but a headlit plate is never rejected for
+being dark. A frame blown out to near-white does read as flat and is skipped
+under this name rather than as `skipped_clipped`; it carries no plate
+either.
 
 When a presence session ends by window, budget, or departure without the
 gate opening, the controller journals

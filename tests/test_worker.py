@@ -496,7 +496,14 @@ class WorkerTests(unittest.TestCase):
             event_at=datetime(2026, 9, 6, 22, 15, 59, tzinfo=timezone.utc),
         )
         picture = BytesIO()
-        Image.new("RGB", (64, 32), color="blue").save(picture, format="JPEG")
+        # Textured, not a flat colour: capture rejects a frame whose plate
+        # band is mostly one colour as a picture the decoder never finished.
+        textured = Image.new("RGB", (64, 32))
+        textured.putdata([
+            ((x * 4) % 256, (y * 8) % 256, (x * 3 + y * 5) % 256)
+            for y in range(32) for x in range(64)
+        ])
+        textured.save(picture, format="JPEG")
         frame_bytes = picture.getvalue()
 
         class FrameSource:

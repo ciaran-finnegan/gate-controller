@@ -20,8 +20,37 @@ from gate_controller.trigger_capture import (
 
 
 def jpeg(size=(64, 32)):
+    """A frame with the texture a real scene has.
+
+    Not a flat colour: capture rejects a frame whose plate band is mostly one
+    colour, because that is what a picture the decoder could not finish looks
+    like. ``flat_jpeg`` is the fixture for that case.
+    """
+    width, height = size
+    image = Image.new("RGB", size)
+    image.putdata([
+        ((x * 255) // max(width - 1, 1), (y * 255) // max(height - 1, 1), (x * 4 + y * 8) % 256)
+        for y in range(height) for x in range(width)
+    ])
     output = BytesIO()
-    Image.new("RGB", size, color="blue").save(output, format="JPEG")
+    image.save(output, format="JPEG")
+    return output.getvalue()
+
+
+def flat_jpeg(size=(64, 32), colour=(0, 135, 0), content=0.15):
+    """A partially decoded picture: a strip of content, the rest flat colour.
+
+    RGB(0,135,0) is what an all-zero YUV buffer renders as, which is what the
+    hardware decoder hands back for every block of a picture it could not
+    reconstruct.
+    """
+    width, height = size
+    image = Image.new("RGB", size, color=colour)
+    decoded = jpeg((max(int(width * content), 2), height))
+    with Image.open(BytesIO(decoded)) as strip:
+        image.paste(strip.convert("RGB"), (0, 0))
+    output = BytesIO()
+    image.save(output, format="JPEG")
     return output.getvalue()
 
 
@@ -726,15 +755,57 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertRegex(combined, r"clipping=\d\.\d\d")
         self.assertEqual(capture.status()["skipped"]["empty_scene"], 1)
 
+    def test_a_partially_decoded_frame_is_skipped_before_it_reaches_ocr(self):
+        """The frame that started this: green everywhere the decoder stopped.
+
+        It passes the empty-scene check - flat green differs wildly from the
+        idle drive - and the clipping check, and looks like a plausible
+        exposure. Only its uniformity gives it away.
+        """
+        source = self._SceneSource([flat_jpeg(), jpeg()], [0.355, 0.21])
+        capture = TriggerFrameCapture(self.config, popen=FakePopen([]), frame_source=source)
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            self.assertEqual(capture.capture_once(event(), 100.0), ())
+            self.assertEqual(len(capture.capture_once(event(), 100.0, after=101.0)), 1)
+        combined = "\n".join(logs.output)
+        self.assertRegex(
+            combined,
+            r"outcome=skipped_corrupt event_type=vehicle source=keyframe flat_fraction=0\.\d+",
+        )
+        self.assertEqual(capture.status()["skipped"]["corrupt"], 1)
+        self.assertEqual(capture.status()["skipped"]["max_flat_fraction"], 0.6)
+        self.assertEqual(len(self.injected), 1, "only the good frame was injected")
+        self.assertEqual(
+            sorted(self.config.output_directory.iterdir()), sorted(self.injected[0]),
+            "the broken frame never reached disk",
+        )
+        self.assertRegex(combined, r"outcome=captured .*flat_fraction=0\.\d+")
+
+    def test_the_flat_frame_gate_can_be_turned_off(self):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            max_flat_fraction=0,
+        )
+        capture = TriggerFrameCapture(
+            config, popen=FakePopen([]), frame_source=self._SceneSource([flat_jpeg()], [0.355]),
+        )
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        self.assertEqual(len(capture.capture_once(event(), 100.0)), 1)
+        self.assertEqual(capture.status()["skipped"]["corrupt"], 0)
+
     def test_clipped_frames_are_skipped_only_when_a_threshold_is_set(self):
         from io import BytesIO
         from PIL import Image
         output = BytesIO()
         Image.new("RGB", (64, 32), color="white").save(output, format="JPEG")
         blazed = output.getvalue()
+        # A frame blown out to white is one flat colour by construction, so
+        # the flatness gate would take it first; this test is about the
+        # clipping threshold, so that gate is off on both sides of it.
         strict = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
-            max_highlight_clipping=0.5, empty_scene_threshold=0,
+            max_highlight_clipping=0.5, empty_scene_threshold=0, max_flat_fraction=0,
         )
         capture = TriggerFrameCapture(strict, popen=FakePopen([]), frame_source=self._SceneSource([blazed], [None]))
         capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
@@ -745,7 +816,13 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(list(strict.output_directory.iterdir()), [], "the skipped frame is not left on disk")
         self.assertEqual(capture.status()["skipped"]["clipped"], 1)
 
-        lenient = TriggerFrameCapture(self.config, popen=FakePopen([]), frame_source=self._SceneSource([blazed], [None]))
+        lenient_config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            max_flat_fraction=0,
+        )
+        lenient = TriggerFrameCapture(
+            lenient_config, popen=FakePopen([]), frame_source=self._SceneSource([blazed], [None]),
+        )
         lenient.attach(lambda paths, received_at, trigger: self.injected.append(paths))
         self.assertEqual(len(lenient.capture_once(event(), 100.0)), 1)
 

@@ -181,6 +181,80 @@ class ImageTests(unittest.TestCase):
             with patch("gate_controller.images._content_digest", side_effect=digest):
                 self.assertEqual([stable], rank_images((removed, stable)))
 
+class FlatFractionTests(unittest.TestCase):
+    """A picture the decoder could not finish is uniform, not blank.
+
+    The regions it never wrote keep whatever the buffer held - on the
+    hardware path zeroes, which render as RGB(0,135,0) - while the blocks it
+    did decode carry real content. That reads as a busy scene to the
+    empty-scene check and a normal exposure to the clipping check.
+    """
+
+    @staticmethod
+    def _jpeg(image):
+        import io
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=90)
+        return output.getvalue()
+
+    @classmethod
+    def _scene(cls, size, base, spread, seed=1, shading=70):
+        """Low-frequency texture, the way a real scene varies."""
+        import random
+        rng = random.Random(seed)
+        width, height = size
+        image = Image.new("RGB", size)
+        image.putdata([
+            tuple(
+                min(255, max(0, base[channel] + rng.randint(-spread, spread)
+                             + (x * shading) // (2 * width)
+                             + (y * shading) // (2 * height)))
+                for channel in range(3)
+            )
+            for y in range(height) for x in range(width)
+        ])
+        return image
+
+    def test_a_partially_decoded_picture_is_mostly_one_flat_colour(self):
+        frame = Image.new("RGB", (480, 180), (0, 135, 0))
+        frame.paste(self._scene((150, 90), (110, 110, 110), 40), (0, 0))
+        flat = image_tools.measure_flat_fraction(self._jpeg(frame))
+        self.assertGreater(flat, 0.6)
+
+    def test_a_normal_scene_is_not_flat(self):
+        flat = image_tools.measure_flat_fraction(
+            self._jpeg(self._scene((480, 180), (110, 115, 110), 45)),
+        )
+        self.assertLess(flat, 0.6)
+
+    def test_a_dark_night_frame_with_a_headlit_plate_is_never_called_flat(self):
+        # With the IR illuminator off the drive is near-black by nature. It
+        # is flat, and it can still carry a readable plate, so it is not
+        # scored at all rather than scored and rejected.
+        night = self._scene((480, 180), (5, 5, 6), 4, seed=3, shading=12)
+        night.paste(self._scene((60, 20), (215, 215, 205), 20, seed=4), (200, 120))
+        self.assertEqual(image_tools.measure_flat_fraction(self._jpeg(night)), 0.0)
+        self.assertEqual(
+            image_tools.measure_flat_fraction(
+                self._jpeg(Image.new("RGB", (480, 180), (2, 2, 2))),
+            ),
+            0.0,
+        )
+
+    def test_only_the_plate_band_is_measured_when_one_is_configured(self):
+        from gate_controller.plate_region import PlateRegion
+        # Broken bottom half, real content on top: the band is what matters.
+        frame = Image.new("RGB", (480, 360), (0, 135, 0))
+        frame.paste(self._scene((480, 180), (110, 110, 110), 45), (0, 0))
+        data = self._jpeg(frame)
+        self.assertLess(image_tools.measure_flat_fraction(data), 0.6)
+        band = PlateRegion(0.0, 0.5, 1.0, 0.5)
+        self.assertGreater(image_tools.measure_flat_fraction(data, band), 0.6)
+
+    def test_an_unreadable_frame_is_not_measurable_rather_than_flat(self):
+        self.assertIsNone(image_tools.measure_flat_fraction(b"not a jpeg at all"))
+
+
 class UploadCompletenessTests(unittest.TestCase):
     """A JPEG still being written must never count as readable."""
 
