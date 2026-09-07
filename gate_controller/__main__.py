@@ -126,6 +126,12 @@ def main() -> None:
         corpus=_training_corpus(os.environ),
         local_recognizer=local_recognizer,
         authorised=authorised.get,
+        # The very same provider the GateProcessor below is given. The local
+        # admission gate has to run under the band the processor is about to
+        # apply to the same frame; without it a fuzzy local read would be
+        # admitted under `standard` inside a `strict` band, spending the frame
+        # the cloud would have read exactly.
+        match_policy=match_policy.get,
         # Frames the keyframe decoder already cropped must not be cropped again.
         precropped_directory=(
             trigger_capture_config.output_directory

@@ -23,11 +23,29 @@ Three modes, chosen by ``GATE_LOCAL_OCR_MODE``:
     The local read runs first on the same crop. A read at or above
     ``GATE_LOCAL_OCR_MIN_CONFIDENCE`` is fed, plate and confidence, into the
     controller's own :func:`~gate_controller.matching.decide_access` -- the
-    same function, the same thresholds, exact and fuzzy alike -- and when
-    that authorises, the observation goes to the processor with
-    ``source="local"`` and the cloud request is skipped. Recogniser
-    confidence is the only local-specific gate; everything else falls
-    through to the cloud exactly as before.
+    same function, the same thresholds, exact and fuzzy alike, under the
+    same time-of-day matching policy the processor will apply -- and when
+    that authorises *this frame's own read*, the observation goes to the
+    processor with ``source="local"`` and the cloud request is skipped.
+    Recogniser confidence is the only local-specific gate; everything else
+    falls through to the cloud exactly as before.
+
+**Which statistic the threshold uses.** ``GATE_LOCAL_OCR_MIN_CONFIDENCE`` is
+compared against the **minimum** per-character probability of the read, not
+against their mean. The recogniser emits one softmax maximum per character
+slot; on a seven-character Irish plate, six characters at 1.00 and one at 0.65
+average 0.96 and would clear a 0.95 mean gate, and that one weak character is
+precisely the one deciding whether the read is the authorised plate. The
+measured separation (0.998 on correct reads against 0.772 on wrong ones) means
+a per-character minimum costs very little. The mean is kept beside it as
+``mean_score`` -- journal, corpus sidecar, telemetry -- and gates nothing.
+
+**What the active path may spend.** A frame waits at most
+``LOCAL_DECISION_TIMEOUT_SECONDS``, never more than the decision budget it was
+handed minus ``LOCAL_DECISION_CLOUD_RESERVE_SECONDS`` kept back for the cloud
+request, and never more than ``LOCAL_EVENT_WAIT_BUDGET_SECONDS`` in total
+across one event's frames. A stuck engine therefore costs one bounded wait per
+event, not one per frame.
 
 The models are thermally expensive on a fanless Pi 5 (154 ms mean / 177 ms
 p95 per frame single-threaded, ~0.35 C/s of heating), so inference is
@@ -45,7 +63,9 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
 from threading import Lock, Thread
@@ -87,8 +107,19 @@ MAX_BOXES = 5
 MAX_LATENCY_SAMPLES = 256
 #: How long the active path will wait for a local read before giving the frame
 #: to the cloud. The measured cost is 154 ms mean / 177 ms p95 on one Pi core,
-#: so this is a stuck-engine guard, not a normal outcome.
+#: so this is a stuck-engine guard, not a normal outcome. It is a ceiling, not
+#: an entitlement: the wait is also clamped to the decision budget left and to
+#: the event's own budget below.
 LOCAL_DECISION_TIMEOUT_SECONDS = 2.0
+#: What the local wait must leave behind for the cloud request it may still
+#: need to make. A cold handshake to Plate Recognizer costs 0.4-0.8 s over this
+#: uplink and the read itself another second or so, so a guard that eats into
+#: this would time out the very burst it was meant to accelerate.
+LOCAL_DECISION_CLOUD_RESERVE_SECONDS = 2.0
+#: Total local waiting one event may pay, across all of its frames. Admission
+#: is bounded per frame, but without this a three-frame burst could pay the
+#: stuck-engine guard three times over inside one decision budget.
+LOCAL_EVENT_WAIT_BUDGET_SECONDS = 2.0
 #: How many events' summaries are retained for the telemetry block.
 MAX_ITEM_SUMMARIES = 64
 #: Local observations kept per event, mirroring the telemetry item bound.
@@ -98,6 +129,9 @@ STATUS_RECOGNIZED = "recognized"
 STATUS_NO_PLATE = "no_plate"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_ERROR = "error"
+#: Lifecycle state only, never a frame's status: it is reported by
+#: :meth:`LocalRecognizer.status` and keeps ``available`` false after a close.
+STATUS_CLOSED = "closed"
 
 AGREEMENT_MATCH = "match"
 AGREEMENT_LOCAL_ONLY = "local_only"
@@ -177,12 +211,18 @@ def load_local_recognizer_config(environment=None) -> LocalRecognizerConfig:
 
 @dataclass(frozen=True)
 class EngineRead:
-    """One candidate read: the text, its confidences and its pixel box."""
+    """One candidate read: the text, its confidences and its pixel box.
+
+    ``confidence`` is the weakest character of the read -- the statistic the
+    threshold is applied to. ``mean_confidence`` is the arithmetic mean of the
+    same characters, kept for telemetry only.
+    """
 
     plate: str
     confidence: float
     detection_confidence: float
     box: tuple[int, int, int, int]
+    mean_confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,7 +240,10 @@ class LocalRecognition:
     """The local answer, shaped like the cloud answer the processor consumes."""
 
     plate: str | None = None
+    #: The weakest character of the read: the statistic the threshold gates on.
     score: float = 0.0
+    #: The mean character confidence of the same read: telemetry, never a gate.
+    mean_score: float = 0.0
     box: tuple[float, float, float, float] | None = None
     candidates: tuple[dict, ...] = ()
     status: str = STATUS_NO_PLATE
@@ -225,6 +268,7 @@ class LocalRecognition:
             "status": self.status,
             "plate": self.plate,
             "score": round(float(self.score), 6),
+            "mean_score": round(float(self.mean_score), 6),
             "latency_ms": {
                 "decode": round(float(self.decode_ms), 3),
                 "detect": round(float(self.detect_ms), 3),
@@ -353,20 +397,56 @@ class OnnxPlateReadEngine:
             started = perf_counter()
             prediction = self._recogniser.run_one(prepared, return_confidence=True)
             ocr_ms += (perf_counter() - started) * 1000
-            text = normalise_plate(str(prediction.plate or ""))
-            probabilities = getattr(prediction, "char_probs", None)
-            confidence = (
-                float(numpy.mean(probabilities[: max(len(text), 1)]))
-                if probabilities is not None else 0.0
-            )
+            raw = str(prediction.plate or "")
+            text = normalise_plate(raw)
+            scores = character_scores(raw, getattr(prediction, "char_probs", None))
             reads.append(EngineRead(
-                plate=text, confidence=confidence,
+                plate=text,
+                confidence=min(scores) if scores else 0.0,
+                mean_confidence=sum(scores) / len(scores) if scores else 0.0,
                 detection_confidence=float(detection.confidence), box=coordinates,
             ))
         return EngineResult(
             reads=tuple(reads), width=width, height=height,
             decode_ms=decode_ms, detect_ms=detect_ms, ocr_ms=ocr_ms,
         )
+
+
+def character_scores(raw_text: str, probabilities) -> tuple[float, ...]:
+    """The per-character probabilities of the characters actually read.
+
+    ``char_probs`` carries one softmax maximum per character *slot*, including
+    the recogniser's padding slots. The library removes only *trailing*
+    padding (``rstrip(pad_char)``), so slicing the probabilities by the length
+    of the normalised plate would silently shift by one for a read with an
+    interior pad or separator. Pairing them positionally instead, and keeping
+    only the slots whose character survives :func:`normalise_plate`, cannot
+    misalign whatever the recogniser emits.
+
+    A non-finite probability is reported as 0.0 rather than dropped: a slot
+    the recogniser could not score must fail the confidence gate, not vanish
+    from it.
+    """
+    if probabilities is None:
+        return ()
+    ravel = getattr(probabilities, "ravel", None)
+    if callable(ravel):
+        # One image, one row: flatten so a (1, slots) array pairs with the
+        # text character by character rather than row by row.
+        try:
+            probabilities = ravel()
+        except Exception:
+            pass
+    scores: list[float] = []
+    for character, probability in zip(raw_text, probabilities):
+        if not normalise_plate(character):
+            continue
+        try:
+            value = float(probability)
+        except (TypeError, ValueError):
+            value = 0.0
+        scores.append(value if isfinite(value) else 0.0)
+    return tuple(scores)
 
 
 def _crop_with_pad(frame, box, width: int, height: int):
@@ -432,24 +512,82 @@ def _authorised_set(authorised) -> set[str]:
     return plates
 
 
-def authorise(observations, authorised: set[str]):
+def resolve_policy(policy):
+    """The matching policy in force, from a provider, an object, or nothing.
+
+    Resolved once per frame and then held, so the band the local gate applies
+    is the band in force at the instant the frame was read -- the same instant
+    the processor resolves for the very same frame. This is exactly what
+    :meth:`GateProcessor._current_match_policy` does with the same provider.
+    """
+    if policy is None:
+        return None
+    try:
+        return policy() if callable(policy) else policy
+    except Exception:
+        # A policy that cannot be read must not be silently replaced with a
+        # laxer one. Returning None hands `decide_access` its own fallback,
+        # which is the same one the processor takes when the provider throws,
+        # so the two sides still agree about this frame.
+        return None
+
+
+def authorise(observations, authorised: set[str], *, policy=None, now=None):
     """The controller's own matching, unchanged, over local observations.
 
     Exactly :func:`~gate_controller.matching.decide_access`: same thresholds,
-    same exact-first rule, same two-frame fuzzy rule. Nothing about the local
-    path relaxes it.
+    same exact-first rule, same two-frame fuzzy rule, and the same policy band
+    the processor will apply to this very frame. ``policy`` and ``now`` are
+    passed positionally and by keyword just as the processor passes them, so
+    an overnight ``strict`` band denies a local fuzzy read exactly as it
+    denies a cloud one. Nothing about the local path relaxes it.
     """
     if not authorised:
         return None
     try:
-        return decide_access(observations, authorised)
+        return decide_access(observations, authorised, policy, now=now)
     except Exception:
         return None
 
 
-def _authorises(observations, authorised: set[str]) -> bool:
-    decision = authorise(observations, authorised)
-    return bool(decision is not None and decision.allowed)
+def authorises_plate(observations, authorised: set[str], plate, *,
+                     policy=None, now=None) -> bool:
+    """Does the shared matching authorise, *on the strength of this plate*?
+
+    ``decide_access`` weighs every observation of the event, so asking only
+    whether it allows would let one frame answer on another frame's credit:
+    a frame that read an unrelated plate would "decide", spend the frame, and
+    then be journalled as the local match. Requiring the decision to rest on
+    this frame's own read keeps ``source="local"`` and the shadow journal's
+    ``authorised=`` field -- the evidence the promotion decision rests on --
+    saying what they claim to say.
+    """
+    plate = normalise_plate(str(plate or ""))
+    if not plate:
+        return False
+    decision = authorise(observations, authorised, policy=policy, now=now)
+    if decision is None or not decision.allowed:
+        return False
+    return normalise_plate(str(decision.observed_plate or "")) == plate
+
+
+def is_confident(score, minimum: float) -> bool:
+    """Is ``score`` a real number at or above ``minimum``?
+
+    Written as a positive assertion on purpose. ``nan < 0.95`` is ``False``,
+    so a NaN confidence walks straight through a ``<`` gate; ``nan >= 0.95``
+    is ``False`` too, so this one fails closed. An empty probability slice is
+    enough to produce that NaN, and it would go on to reach the event's
+    ``ocr_confidence`` and the outbox as a bare ``NaN`` literal that no strict
+    JSON reader accepts.
+    """
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return False
+    if not isfinite(value):
+        return False
+    return value >= minimum
 
 
 def classify_agreement(local_plate, cloud_plate) -> str:
@@ -509,11 +647,17 @@ class LocalFrame:
     single ``gate_local_ocr`` line for the frame.
     """
 
-    def __init__(self, recognizer: "LocalRecognizer", trace_id, future, authorised: set[str]):
+    def __init__(self, recognizer: "LocalRecognizer", trace_id, future,
+                 authorised: set[str], policy=None, now=None):
         self._recognizer = recognizer
         self._trace_id = trace_id
         self._future = future
         self._authorised = authorised
+        # Resolved once, at admission, and reused for the decision and for the
+        # journal line, so both are computed under the band that was in force
+        # when the frame was read.
+        self._policy = policy
+        self._now = now
         self._lock = Lock()
         self._accumulated = False
         self._local: LocalRecognition | None = None
@@ -527,11 +671,22 @@ class LocalFrame:
 
     # -- local side -------------------------------------------------------
     def result(self, timeout: float | None = None) -> LocalRecognition:
-        """Block for the local read. Only the active path ever calls this."""
+        """Block for the local read. Only the active path ever calls this.
+
+        A wait that runs out is reported as ``unavailable``, exactly like a
+        frame the reader could not take: there is no local answer for this
+        frame in time, and the cloud has it. It is not an ``error`` -- nothing
+        failed, and the read may still land and be journalled behind us.
+        """
         if self._future is None:
             return unavailable_recognition()
+        if timeout is not None and timeout <= 0:
+            settled = self.settled()
+            return settled if settled is not None else unavailable_recognition()
         try:
             return self._future.result(timeout=timeout)
+        except (FutureTimeoutError, TimeoutError):
+            return unavailable_recognition()
         except Exception:
             return LocalRecognition(status=STATUS_ERROR)
 
@@ -553,8 +708,12 @@ class LocalFrame:
             self._accumulated = True
         return self._recognizer._accumulate(self._trace_id, local, append=append)
 
-    def authorised_locally(self) -> bool:
-        return _authorises(self.local_observations(), self._authorised)
+    def answers_for(self, recognition: LocalRecognition) -> bool:
+        """Does the shared matching authorise *on this frame's own read*?"""
+        return authorises_plate(
+            self.local_observations(), self._authorised, recognition.plate,
+            policy=self._policy, now=self._now,
+        )
 
     def _local_finished(self, future) -> None:
         try:
@@ -611,6 +770,7 @@ class LocalFrame:
             trace_id=self._trace_id, local=local, cloud_plate=cloud_plate,
             cloud_score=cloud_score, decision_source=decision_source,
             authorised=self._authorised, observations=self.local_observations(),
+            policy=self._policy, now=self._now,
         )
 
 
@@ -629,7 +789,7 @@ class _NullFrame(LocalFrame):
     def local_observations(self) -> tuple:
         return ()
 
-    def authorised_locally(self) -> bool:
+    def answers_for(self, recognition: LocalRecognition) -> bool:
         return False
 
     def complete_cloud(self, plate=None, score=0.0, *, decided: bool = True) -> None:
@@ -652,12 +812,14 @@ class LocalRecognizer:
     """Loads the models once, reads frames one at a time, journals agreement."""
 
     def __init__(self, config: LocalRecognizerConfig, *, engine_factory=None,
-                 plate_region=None, logger=None, clock=perf_counter) -> None:
+                 plate_region=None, logger=None, clock=perf_counter,
+                 wall_clock=None) -> None:
         self._config = config
         self._engine_factory = engine_factory or OnnxPlateReadEngine
         self._plate_region = plate_region
         self._logger = logger or LOGGER
         self._clock = clock
+        self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._engine = None
         self._lock = Lock()
         self._state = "loading" if config.enabled else MODE_OFF
@@ -676,6 +838,11 @@ class LocalRecognizer:
         self._summary_order: list[str] = []
         self._observations: dict[str, list] = {}
         self._observation_order: list[str] = []
+        #: Seconds of local waiting each event has already paid, so a burst
+        #: cannot pay the stuck-engine guard once per frame. Bounded exactly
+        #: like the summaries and the observations.
+        self._event_waits: dict[str, float] = {}
+        self._wait_order: list[str] = []
         self._inflight = 0
         self._counts = {
             "frames": 0, "recognised": 0, "errors": 0, "unavailable": 0,
@@ -766,6 +933,10 @@ class LocalRecognizer:
             if self._closed:
                 return
             self._closed = True
+            # The engine is gone, so the state must stop saying `ready`:
+            # `available` is what the active path asks before trusting a read,
+            # and a closed recogniser has nothing to offer.
+            self._state = STATUS_CLOSED
             pool = self._pool
             self._pool = None
             self._engine = None
@@ -773,21 +944,26 @@ class LocalRecognizer:
             pool.shutdown(wait=False, cancel_futures=True)
 
     # -- inference --------------------------------------------------------
-    def begin(self, image: bytes, *, trace_id=None, geometry=None, authorised=None) -> LocalFrame:
+    def begin(self, image: bytes, *, trace_id=None, geometry=None,
+              authorised=None, policy=None) -> LocalFrame:
         """Queue one frame for local reading and return its pairing handle.
 
         Returns immediately. The single worker serialises inferences, so a
-        second frame simply waits its turn behind the first.
+        second frame simply waits its turn behind the first. ``policy`` is
+        resolved here, once, and the frame carries the answer: the decision
+        and the journal line then both speak about the band that was in force
+        when the frame was read.
         """
         if not self._config.enabled or self._closed:
             return NULL_FRAME
         plates = _authorised_set(authorised)
+        resolved, now = resolve_policy(policy), self._wall_clock()
         with self._lock:
             pool, state = self._pool, self._state
         if pool is None:
             return NULL_FRAME
-        if state == STATUS_UNAVAILABLE:
-            return self._declined(trace_id, plates)
+        if state != "ready":
+            return self._declined(trace_id, plates, resolved, now)
         with self._lock:
             # One outstanding read, never a queue. A stalled inference must
             # not make every later frame wait its turn before falling back to
@@ -798,49 +974,105 @@ class LocalRecognizer:
                 busy = False
                 self._inflight += 1
         if busy:
+            # Counted once, as `busy`. A frame refused because another read is
+            # in flight is not evidence that the recogniser is unavailable, and
+            # counting it as both made the two counters uncomparable.
             self._count("busy")
-            return self._declined(trace_id, plates)
+            return self._declined(trace_id, plates, resolved, now, count=None)
         try:
             future = pool.submit(self._read, image, geometry)
         except RuntimeError:
             with self._lock:
                 self._inflight -= 1
             return NULL_FRAME
-        return LocalFrame(self, trace_id, future, plates)
+        return LocalFrame(self, trace_id, future, plates, resolved, now)
 
-    def _declined(self, trace_id, plates) -> LocalFrame:
+    def _declined(self, trace_id, plates, policy=None, now=None, *,
+                  count: str | None = "unavailable") -> LocalFrame:
         """A frame the local reader could not take, answered immediately."""
-        self._count("unavailable")
+        if count is not None:
+            self._count(count)
         future: Future = Future()
         future.set_result(unavailable_recognition())
-        return LocalFrame(self, trace_id, future, plates)
+        return LocalFrame(self, trace_id, future, plates, policy, now)
 
     def recognise(self, image: bytes, *, trace_id=None, geometry=None,
-                  authorised=None, timeout: float | None = None) -> LocalRecognition:
+                  authorised=None, policy=None,
+                  timeout: float | None = None) -> LocalRecognition:
         """Blocking convenience wrapper, used by the active path."""
         return self.begin(
             image, trace_id=trace_id, geometry=geometry, authorised=authorised,
+            policy=policy,
         ).result(timeout)
+
+    def wait_seconds(self, trace_id, remaining: float | None) -> float:
+        """How long this frame may block on its local read.
+
+        The smallest of three bounds: the stuck-engine ceiling, whatever the
+        decision budget can spare once the cloud request's share is set aside,
+        and what is left of this event's own waiting budget. Returns 0.0 when
+        there is nothing to spend, in which case the caller takes the read
+        only if it has already landed.
+        """
+        seconds = LOCAL_DECISION_TIMEOUT_SECONDS
+        if remaining is not None:
+            try:
+                spare = float(remaining) - LOCAL_DECISION_CLOUD_RESERVE_SECONDS
+            except (TypeError, ValueError):
+                spare = 0.0
+            seconds = min(seconds, spare if isfinite(spare) else 0.0)
+        seconds = min(seconds, self.event_wait_remaining(trace_id))
+        return max(0.0, seconds)
+
+    def event_wait_remaining(self, trace_id) -> float:
+        """What is left of one event's total local-waiting budget."""
+        if not trace_id:
+            # No trace id, no event identity: the frame stands alone, exactly
+            # as its observations do.
+            return LOCAL_EVENT_WAIT_BUDGET_SECONDS
+        with self._lock:
+            spent = self._event_waits.get(trace_id, 0.0)
+        return max(0.0, LOCAL_EVENT_WAIT_BUDGET_SECONDS - spent)
+
+    def record_event_wait(self, trace_id, seconds: float) -> None:
+        """Charge ``seconds`` of local waiting to this event."""
+        if not trace_id:
+            return
+        try:
+            spent = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return
+        if not isfinite(spent):
+            return
+        with self._lock:
+            if trace_id not in self._event_waits:
+                self._wait_order.append(trace_id)
+                while len(self._wait_order) > MAX_ITEM_SUMMARIES:
+                    self._event_waits.pop(self._wait_order.pop(0), None)
+            self._event_waits[trace_id] = self._event_waits.get(trace_id, 0.0) + spent
 
     def decides(self, frame: "LocalFrame", recognition: LocalRecognition) -> bool:
         """May this local read answer for the frame instead of the cloud?
 
-        Two conditions, and no third: the recogniser is confident enough
-        (the only local-specific gate), and the controller's own
+        Three conditions, and no fourth: the recogniser is confident enough
+        (the only local-specific gate, applied to the weakest character of the
+        read), the controller's own
         :func:`~gate_controller.matching.decide_access` authorises the local
-        observations of this event -- exact or fuzzy, unchanged thresholds.
+        observations of this event -- exact or fuzzy, unchanged thresholds,
+        under the policy band in force -- and the plate that decision rests on
+        is *this frame's own read*, not a sibling frame's.
         """
         if not self._config.active or not recognition.recognised:
             return False
-        if recognition.score < self._config.min_confidence:
+        if not is_confident(recognition.score, self._config.min_confidence):
             return False
-        return frame.authorised_locally()
+        return frame.answers_for(recognition)
 
     def _accumulate(self, trace_id, recognition, *, append: bool) -> tuple:
         """Confident local reads for one event, bounded and ordered."""
         confident = (
             recognition is not None and recognition.recognised
-            and recognition.score >= self._config.min_confidence
+            and is_confident(recognition.score, self._config.min_confidence)
         )
         if not trace_id:
             # No trace id means no event identity. A shared bucket would let
@@ -885,6 +1117,7 @@ class LocalRecognizer:
             {
                 "plate": read.plate,
                 "score": round(float(read.confidence), 6),
+                "mean_score": round(float(read.mean_confidence), 6),
                 "detection_score": round(float(read.detection_confidence), 6),
             }
             for read in result.reads[:MAX_BOXES]
@@ -899,6 +1132,7 @@ class LocalRecognizer:
         recognition = LocalRecognition(
             plate=best.plate or None if best is not None else None,
             score=float(best.confidence) if best is not None else 0.0,
+            mean_score=float(best.mean_confidence) if best is not None else 0.0,
             box=box, candidates=candidates,
             status=STATUS_RECOGNIZED if (best and best.plate) else STATUS_NO_PLATE,
             decode_ms=result.decode_ms, detect_ms=result.detect_ms,
@@ -910,18 +1144,24 @@ class LocalRecognizer:
     # -- journal and telemetry -------------------------------------------
     def _journal(self, *, trace_id, local: LocalRecognition, cloud_plate,
                  cloud_score, decision_source, authorised: set[str],
-                 observations=()) -> None:
+                 observations=(), policy=None, now=None) -> None:
         local_plate = normalise_plate(local.plate or "")
         cloud_normalised = normalise_plate(str(cloud_plate or ""))
         agreement = classify_agreement(local_plate, cloud_normalised)
+        # Both sides are labelled the way the decision is taken: on this
+        # frame's own read, and under the policy band that was in force when
+        # the frame was read. A label computed any other way is not the
+        # evidence the promotion decision needs.
         local_match = (
-            local.score >= self._config.min_confidence
-            and _authorises(observations, authorised)
+            is_confident(local.score, self._config.min_confidence)
+            and authorises_plate(
+                observations, authorised, local_plate, policy=policy, now=now,
+            )
         )
-        cloud_match = _authorises(
+        cloud_match = authorises_plate(
             [PlateObservation(plate=cloud_normalised, confidence=float(cloud_score or 0.0))]
             if cloud_normalised else (),
-            authorised,
+            authorised, cloud_normalised, policy=policy, now=now,
         )
         authorised_label = classify_authorised(local_match, cloud_match)
         self._count(agreement)
@@ -936,11 +1176,11 @@ class LocalRecognizer:
         )
         self._log(
             "gate_local_ocr stage=%s trace_id=%s local_plate=%s local_score=%.3f "
-            "local_ms=%d cloud_plate=%s cloud_score=%.3f agreement=%s authorised=%s "
-            "decision_source=%s",
+            "local_mean=%.3f local_ms=%d cloud_plate=%s cloud_score=%.3f "
+            "agreement=%s authorised=%s decision_source=%s",
             self._config.mode, trace_id or "-", local_plate or "-", local.score,
-            round(local.total_ms), cloud_normalised or "-", cloud_score,
-            agreement, authorised_label, decision_source,
+            local.mean_score, round(local.total_ms), cloud_normalised or "-",
+            cloud_score, agreement, authorised_label, decision_source,
         )
 
     def _remember(self, trace_id, *, local, agreement, authorised, decision_source) -> None:
@@ -983,6 +1223,11 @@ class LocalRecognizer:
             if self._observations.pop(trace_id, None) is not None:
                 try:
                     self._observation_order.remove(trace_id)
+                except ValueError:
+                    pass
+            if self._event_waits.pop(trace_id, None) is not None:
+                try:
+                    self._wait_order.remove(trace_id)
                 except ValueError:
                     pass
 

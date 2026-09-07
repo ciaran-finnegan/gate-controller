@@ -3466,13 +3466,29 @@ class DependencyLockTests(unittest.TestCase):
             "onnxruntime": "1.29.0",
             "open-image-models": "0.6.0",
             "fast-plate-ocr": "1.1.0",
+            # Their transitive closure, pinned to the same resolution.
+            "numpy": "2.4.6",
+            "opencv-python-headless": "5.0.0.93",
+            "protobuf": "7.36.1",
+            "flatbuffers": "25.12.19",
+            "packaging": "26.3",
+            "PyYAML": "6.0.3",
+            "rich": "15.0.0",
+            "tqdm": "4.70.0",
+            "markdown-it-py": "4.2.0",
+            "mdurl": "0.1.2",
+            "Pygments": "2.21.0",
         }
         pinned_versions = {}
+        options = []
         for line in (REPOSITORY_ROOT / "requirements.txt").read_text(
             encoding="utf-8"
         ).splitlines():
             requirement = line.strip()
             if not requirement or requirement.startswith("#"):
+                continue
+            if requirement.startswith("-"):
+                options.append(requirement)
                 continue
             match = re.fullmatch(
                 r"([A-Za-z0-9_.-]+)==([^;\s]+)(?:\s*;\s*.+)?",
@@ -3482,6 +3498,63 @@ class DependencyLockTests(unittest.TestCase):
             pinned_versions[match.group(1)] = match.group(2)
 
         self.assertEqual(expected_versions, pinned_versions)
+        self.assertEqual(
+            1, len(options), f"one pip option line is expected, got {options}"
+        )
+        only_binary = options[0]
+        self.assertTrue(
+            only_binary.startswith("--only-binary="),
+            f"unexpected pip option in requirements.txt: {only_binary}",
+        )
+        # A missing wheel must fail the install, never start an opencv source
+        # build that would outlast the updater's 900 s timeout.
+        wheel_only = set(only_binary.split("=", 1)[1].split(","))
+        self.assertLessEqual(
+            {
+                "onnxruntime", "open-image-models", "fast-plate-ocr", "numpy",
+                "opencv-python-headless", "protobuf", "flatbuffers", "PyYAML",
+                "rich", "tqdm", "packaging",
+            },
+            wheel_only,
+        )
+        self.assertNotIn(
+            "lgpio", wheel_only,
+            "lgpio has no aarch64 wheel and must keep building from source",
+        )
+        self.assertNotIn(
+            ":all:", wheel_only,
+            "a blanket wheels-only rule would break the lgpio source build",
+        )
+
+    def test_the_recognition_stack_is_marked_arm64_and_python_311(self):
+        # onnxruntime 1.29.0 declares Requires-Python >=3.11. Asserting only
+        # the architecture would fail the whole `pip install -r
+        # requirements.txt` on a 3.10 host, and that install is what
+        # verify_release runs before accepting any release.
+        expected = (
+            '(platform_machine == "aarch64" or platform_machine == "arm64") '
+            'and python_version >= "3.11"'
+        )
+        recognition_stack = {
+            "onnxruntime", "open-image-models", "fast-plate-ocr", "numpy",
+            "opencv-python-headless", "protobuf", "flatbuffers", "packaging",
+            "PyYAML", "rich", "tqdm", "markdown-it-py", "mdurl", "Pygments",
+        }
+        seen = set()
+        for line in (REPOSITORY_ROOT / "requirements.txt").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            requirement = line.strip()
+            if not requirement or requirement.startswith(("#", "-")):
+                continue
+            name, _, marker = requirement.partition(";")
+            name = name.split("==")[0].strip()
+            if name not in recognition_stack:
+                continue
+            seen.add(name)
+            self.assertEqual(expected, marker.strip(), name)
+
+        self.assertEqual(recognition_stack, seen)
 
 
 if __name__ == "__main__":

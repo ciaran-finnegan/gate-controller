@@ -334,8 +334,19 @@ class LocalOcrTelemetry:
         )
 
     def to_wire(self) -> dict[str, object]:
+        mode = self.mode if self.mode in _LOCAL_OCR_MODES else "shadow"
+        decision_source = (
+            self.decision_source if self.decision_source in _LOCAL_OCR_DECISION else "none"
+        )
+        # The Worker enforces this pairing across the two fields and rejects
+        # the whole event when it does not hold, so a block that would be
+        # refused at ingest is repaired here rather than losing the event.
+        # Only the active path can decide locally, so a `local` source under
+        # any other mode is a bug, not a reading worth transmitting.
+        if decision_source == "local" and mode != "active":
+            decision_source = "none"
         return {
-            "mode": self.mode if self.mode in _LOCAL_OCR_MODES else "shadow",
+            "mode": mode,
             "frames": _rounded_int(self.frames, 0, MAX_ITEMS, 0),
             "plate": _optional_string(self.plate),
             "score": None if self.score is None else _ratio(self.score),
@@ -346,9 +357,7 @@ class LocalOcrTelemetry:
             "authorised": (
                 self.authorised if self.authorised in _LOCAL_OCR_AUTHORISED else "none"
             ),
-            "decision_source": (
-                self.decision_source if self.decision_source in _LOCAL_OCR_DECISION else "none"
-            ),
+            "decision_source": decision_source,
             "status": self.status if self.status in _LOCAL_OCR_STATUSES else "no_plate",
         }
 

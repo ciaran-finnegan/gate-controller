@@ -91,17 +91,27 @@ Run this for **weeks, not days**, before considering promotion.
 ### `active`
 
 The local read runs first on the same crop. It may answer for the frame - and
-so open the gate - only when both of these hold:
+so open the gate - only when all three of these hold:
 
 1. The recogniser's confidence is at or above `GATE_LOCAL_OCR_MIN_CONFIDENCE`.
-   This is the **only** local-specific gate.
+   This is the **only** local-specific gate. The statistic compared against it
+   is the **minimum** per-character probability of the read, not the mean -
+   see [The confidence gate](#the-confidence-gate-a-minimum-not-a-mean) below.
 2. The controller's own
    [`decide_access`](../gate_controller/matching.py) authorises the local
    observations of that event. Not a copy of it, not a stricter variant of it:
    the same function, the same `MIN_EXACT_CONFIDENCE`/`MIN_FUZZY_CONFIDENCE`
    thresholds, the same exact-first rule, and the same two-frame
-   `two_frame_ocr_confusion` rule. A local read is subject to exactly the
-   scrutiny a cloud read has always been subject to.
+   `two_frame_ocr_confusion` rule, under the same time-of-day matching policy
+   the processor will apply to the very same frame. A local read is subject to
+   exactly the scrutiny a cloud read has always been subject to.
+3. The plate that decision rests on is **this frame's own read**. `decide_access`
+   weighs every observation of the event, so asking only whether it allows
+   would let a frame that read something unrelated answer on an earlier
+   frame's credit: it would spend the frame, skip its cloud lookup, and be
+   journalled as the local match. The processor would still refuse to open on
+   the wrong plate - it re-runs `decide_access` on what it was handed - but
+   the frame and the evidence would both be wasted.
 
 When both hold, the plate and its confidence are handed to the processor as a
 `PlateObservation` with `source="local"`, and the processor makes the decision
@@ -121,6 +131,83 @@ misread within one event, held by the processor. In practice that is the first
 frame's cloud read agreeing with the second frame's local read, which is the
 same situation the rule was written for.
 
+Say that consequence plainly, because it changes how the shadow numbers should
+be read: **the processor's two-frame rule can now be satisfied by one cloud
+read plus one local read.** The processor accumulates observations per event
+and does not care which reader produced each one. Before this change a fuzzy
+open required two cloud frames to agree; in active mode it can be one of each.
+Shadow-mode agreement counts are per frame and say nothing about that pairing,
+so a week of `agreement=match` does not by itself tell you how often a mixed
+pair would have opened the gate. What does is `authorised=`, which is computed
+over the event's accumulated local observations.
+
+### The confidence gate: a minimum, not a mean
+
+`GATE_LOCAL_OCR_MIN_CONFIDENCE` is compared against the **weakest character**
+of the read. The recogniser returns one softmax maximum per character slot
+(`char_probs`); the gate takes their minimum, and the mean is kept beside it as
+`mean_score` for the journal, the corpus sidecar and the promotion decision.
+
+The reason is arithmetic. On a seven-character Irish plate, six characters at
+1.00 and one at 0.65 average 0.96 - clearing a 0.95 mean gate - and that one
+weak character is precisely the one deciding whether the read is the authorised
+plate or a different vehicle. The measured separation between right and wrong
+reads (0.998 against 0.772) is wide enough that a per-character minimum costs
+very little of the 415-in-458 retention the 0.95 threshold was chosen for.
+
+Two details that follow from the same place:
+
+* The per-character probabilities are paired with the read **positionally**,
+  keeping only the slots whose character survives normalisation. The library
+  strips trailing padding only, so slicing `char_probs` by the length of the
+  normalised plate would shift by one for any read with an interior pad or
+  separator, and score the wrong character.
+* A non-finite probability counts as 0.0, and a non-finite score never clears
+  the gate. `nan < 0.95` is `False`, so a `<` test would have passed a NaN
+  straight through into `GateEvent.ocr_confidence` and out to the outbox as a
+  bare `NaN` literal that no strict JSON reader accepts.
+
+### What the guard may spend
+
+In active mode the local read happens on the OCR worker, holding the OCR slot,
+inside the burst's decision budget - so a stalled inference is not free. The
+wait is the smallest of three bounds:
+
+| bound | value | why |
+| --- | --- | --- |
+| stuck-engine ceiling | `LOCAL_DECISION_TIMEOUT_SECONDS` = 2.0 s | 154 ms mean / 177 ms p95 measured, so this is a guard, not a normal outcome |
+| what the cloud still needs | budget left less `LOCAL_DECISION_CLOUD_RESERVE_SECONDS` = 2.0 s | a cold handshake is 0.4-0.8 s and the read another second; a guard that ate this would time out the burst it was meant to accelerate |
+| what the event has left | `LOCAL_EVENT_WAIT_BUDGET_SECONDS` = 2.0 s per event | admission is bounded per frame, so without this a three-frame burst could pay the guard three times inside one budget |
+
+The processor passes the remaining budget to each call, and the cloud request's
+connect/read split is re-sized **after** the local wait, from what is actually
+left - otherwise the request would be sized for a budget the guard had already
+spent. If nothing is left to spend, the frame takes a local read only if it has
+already landed, and otherwise goes straight to the cloud.
+
+### The time-of-day matching policy
+
+`__main__` hands the one `MatchPolicyCache.get` to
+`PlateRecognizerClient(match_policy=...)` and to `GateProcessor(match_policy=...)`,
+so both consumers read the same schedule and a refresh in the background
+reaches the next frame on both sides. See [plate matching](plate-matching.md)
+for the schedule itself; only `strict` and `standard` ship.
+
+The local path resolves the provider **once per frame**, at admission, and
+applies that answer both to the admission gate and to the frame's journal
+label, so the two speak about the same instant and the same band as the
+processor's own decision on that frame. A provider that raises is not silently
+replaced with a laxer band: the frame falls back to `decide_access`'s own
+default, which is exactly what the processor falls back to for the same frame.
+
+Without it, a fuzzy local read at 02:00 would be admitted under `standard`,
+skip that frame's cloud lookup, and then be refused by the processor applying
+`strict` - fail-closed at the relay, but it burns the frame the cloud would
+have read exactly, making the overnight band *less* likely to open for a
+legitimate car. Under a `strict` band, threading the policy means the local
+path can still answer on an **exact** read (which `strict` allows and the
+processor will honour) and never on a fuzzy one.
+
 ## Environment variables
 
 | variable | default | meaning |
@@ -130,12 +217,20 @@ same situation the rule was written for.
 | `GATE_LOCAL_OCR_DETECTOR` | `yolo-v9-t-384-license-plate-end2end` | Any detector registered in `open-image-models`. |
 | `GATE_LOCAL_OCR_RECOGNISER` | `cct-xs-v2-global-model` | Any OCR model registered in `fast-plate-ocr`. |
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
-| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.95` | The confidence gate. In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision. |
+| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.95` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 
 `GATE_LOCAL_OCR_CLOUD=always` keeps the labelling but gives up the latency win:
 the cloud request runs on the decision path exactly as it does today, and the
 frame is only answered once it returns.
+
+Be blunt about what that combination costs. **`active` with `always` is
+strictly slower than the controller is today** - it pays the local read *and*
+the full cloud request, in series, on the decision thread - and it can never be
+faster. It is a labelling mode: it proves the local decision against a cloud
+answer on the same frame while the corpus keeps growing. The mode that makes
+the gate faster is `fallback`, and `always` is a stage on the way to it, never
+a steady state.
 
 That is deliberate, and it is the one place where the obvious design was the
 wrong one. Moving the label request to a background thread would have it share
@@ -185,12 +280,43 @@ and the CI-gated updater (`deployment/gate_controller_updater.py`, which builds
 each release's `.venv` from that file) install them the same way as everything
 else.
 
-They are marked `platform_machine == "aarch64" or platform_machine == "arm64"`,
-matching the existing `rpi-lgpio` precedent. That covers the Pi and the
-development Mac - the only two platforms these graphs have been measured on -
-and deliberately excludes x86-64 CI, so the unit suite keeps running with no
-onnxruntime present. That is not an accident of convenience: it is a standing
-test that the local recogniser degrades correctly when the wheels are missing.
+They are marked
+`(platform_machine == "aarch64" or platform_machine == "arm64") and
+python_version >= "3.11"`, extending the existing `rpi-lgpio` precedent. The
+architecture half covers the Pi and the development Mac - the only two
+platforms these graphs have been measured on - and deliberately excludes x86-64
+CI, so the unit suite keeps running with no onnxruntime present. That is not an
+accident of convenience: it is a standing test that the local recogniser
+degrades correctly when the wheels are missing.
+
+The Python half is not optional. `onnxruntime` 1.29.0 declares
+`Requires-Python >=3.11`; on an arm64 host still running 3.10 a marker that
+asserted only the architecture would fail the **whole**
+`pip install -r requirements.txt`, and that install is exactly what the
+updater's `verify_release` runs before accepting a release. One old interpreter
+would reject every update rather than merely leave the local recogniser
+uninstalled.
+
+The transitive closure (numpy, opencv-python-headless, protobuf, flatbuffers,
+packaging, PyYAML, rich, tqdm and rich's own three) is pinned beside them, the
+way `requests`' closure already is, and `--only-binary` names that stack so a
+missing wheel fails the install instead of quietly starting an opencv source
+build - which could not finish inside the updater's 900 s timeout.
+
+That option names each package rather than using `--only-binary=:all:`, which
+would apply to the entire resolution. `lgpio`, which `rpi-lgpio` pulls in,
+publishes its aarch64 wheel as `manylinux_2_34`: installable against
+Bookworm's glibc 2.36 and not against an older image, where pip falls back to
+the sdist and builds it in seconds. `:all:` would turn that working fallback
+into a hard install failure and make `verify_release` reject every release -
+the same failure mode the `python_version` marker above exists to prevent.
+
+**Size.** A fresh `.venv` is built per release, so this is paid on every
+update, not once: about **80 MB of wheels downloaded** (86 MB for the whole
+requirements file) and about **264 MB installed**, most of it onnxruntime,
+opencv and numpy. Check the free space on `/opt` before enabling this on a
+controller that keeps several releases. That is separate from - and much larger
+than - the ~8 MB of ONNX weights fetched once into the model directory.
 
 `MemoryMax` in `file-monitor.service` rises from 512M to 1G. Two ONNX sessions
 plus the decoded frame measured 133-237 MB RSS on the Pi, on top of the
@@ -226,17 +352,23 @@ One line per frame, emitted when both answers are in:
 
 ```
 gate_local_ocr stage=shadow trace_id=4af8401d-... local_plate=131D2696 \
-  local_score=0.999 local_ms=163 cloud_plate=131D2696 cloud_score=0.910 \
-  agreement=match authorised=both decision_source=cloud
+  local_score=0.999 local_mean=0.999 local_ms=163 cloud_plate=131D2696 \
+  cloud_score=0.910 agreement=match authorised=both decision_source=cloud
 ```
 
 * `stage` is the mode: `shadow` or `active`.
+* `local_score` is the weakest character of the read - the statistic the
+  threshold gates on - and `local_mean` is the mean of the same characters.
+  A wide gap between them is a read with one bad character.
 * `agreement` is `match`, `mismatch`, `local_only` (only the local reader got a
   plate), `cloud_only`, or `both_none`. Plates are compared normalised -
   uppercased, non-alphanumerics stripped - so `12-D-3456` and `12d3456` agree.
 * `authorised` is `both`, `local_match`, `cloud_match` or `none`: whether each
-  side's read authorises under the shared matching. The local side additionally
-  has to clear `GATE_LOCAL_OCR_MIN_CONFIDENCE`.
+  side's read authorises under the shared matching, **on the strength of that
+  frame's own plate** and under the policy band in force when the frame was
+  read. The local side additionally has to clear
+  `GATE_LOCAL_OCR_MIN_CONFIDENCE`. A frame that read something unrelated is
+  never `local_match`, however its siblings read.
 * `decision_source` is `local`, `cloud` or `none` - which reader's answer went
   to the processor.
 * `local_ms` is the whole local cost for the frame: decode plus detect plus OCR.
@@ -293,10 +425,30 @@ serialised. In shadow mode the block is best-effort by construction: a frame
 whose local read is still running when the cloud has already decided is simply
 not counted.
 
-> The ingest Worker validates the telemetry payload against a key allowlist and
-> rejects the whole event for an unknown key. **Add `local_ocr` to the Worker's
-> allowlist before enabling any mode on a controller that delivers to
-> Cloudflare.** Nothing is emitted while the mode is `off`.
+> **Two app-side prerequisites, not one.** The ingest Worker validates the
+> telemetry payload against a key allowlist and rejects the whole event for an
+> unknown key, so `local_ocr` must be on that allowlist. Active mode
+> additionally sends events with `source="local"`, a value the app has never
+> seen - today's are `ocr`, `remote_command`, `reolink_webhook` and
+> `camera_ftp`. If `source` is validated as an enum, an active-mode open is
+> rejected at ingest: **the gate opens and the event never reaches the app**,
+> which is the worst of the two failure modes because nothing on the gate looks
+> wrong. Both changes are safe to make in advance, and both are inert while the
+> mode is `off`: nothing is emitted and no event carries `source="local"`.
+>
+> Both landed in access-gate-ui **PR #42**, which must be deployed before this
+> controller release. Its accepted shape is exactly the nine keys above -
+> `mode`, `frames` (0-8), `plate` (`[A-Z0-9]{1,32}` or null), `score` (0-1 or
+> null), `latency_ms`, `agreement`, `authorised`, `decision_source`, `status` -
+> with **no `box` on the wire**; the box stays in the corpus sidecar, where it
+> is useful, and never travels with the event.
+
+**One cross-field rule.** PR #42 also rejects the whole event when
+`decision_source` is `"local"` and `mode` is not `"active"`. Nothing in the
+controller can produce that pairing - only the active path calls
+`decided_locally()` - but `LocalOcrTelemetry.to_wire` enforces it as a backstop
+and downgrades such a `decision_source` to `none` rather than emitting an event
+that would be refused whole at ingest.
 
 **Bounded admission.** Only one local read is ever outstanding. A frame that
 arrives while another is still being read is answered immediately as
@@ -321,7 +473,11 @@ load and warm-up timings and the state.
 
 1. Fit the active cooler. Everything below is measured without one and the
    benchmark says that is the binding constraint.
-2. Add `local_ocr` to the ingest Worker's telemetry allowlist.
+2. Prepare the app for both new things, not one: add `local_ocr` to the ingest
+   Worker's telemetry allowlist, **and** accept `"local"` as an event `source`
+   value. The second only matters for active mode, but an event rejected at
+   ingest after the gate has already opened is the failure that looks like
+   nothing at all from the gate's side.
 3. `GATE_LOCAL_OCR_MODE=shadow`. Confirm `stage=ready`, then leave it for
    weeks. Watch `local_ms` p95 and the SoC temperature under real load - the
    benchmark was taken with the controller idle and says nothing about

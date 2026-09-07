@@ -166,7 +166,9 @@ def _geometry_fields(geometry) -> dict | None:
     return fields or None
 
 
-KEEP_LOCAL_KEYS = ("status", "plate", "score", "box", "latency_ms", "candidates")
+KEEP_LOCAL_KEYS = (
+    "status", "plate", "score", "mean_score", "box", "latency_ms", "candidates",
+)
 
 
 def _local_fields(local) -> dict | None:

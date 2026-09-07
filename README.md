@@ -207,10 +207,15 @@ The controller can also read plates on the Pi itself, from the very bytes it
 uploads, using two small MIT-licensed ONNX models. `GATE_LOCAL_OCR_MODE=shadow`
 journals the local read beside the cloud read and can never reach the relay;
 `active` lets a confident local read answer through the controller's own
-matching, with the cloud as the fallback. It is **off unless the variable is
-set**, and with it unset nothing is imported, loaded or started. The models,
-the measured accuracy and latency, the thermal limits of the fanless Pi, the
-journal lines and how to read a week of agreement are in
+matching - on the strength of that frame's own plate, under the same policy
+band the processor will apply - with the cloud as the fallback. Its confidence
+gate is the weakest character of the read, not the mean. It is **off unless the
+variable is set**, and with it unset nothing is imported, loaded or started.
+Enabling it on a controller that delivers to Cloudflare needs two app-side
+changes first: `local_ocr` on the telemetry allowlist, and `"local"` accepted
+as an event `source`. The models, the measured accuracy and latency, the
+thermal limits of the fanless Pi, what the local guard may spend of the
+decision budget, the journal lines and how to read a week of agreement are in
 [on-device plate recognition](docs/local-recognition.md).
 
 The Python entry point and production systemd unit both use a 200 ms

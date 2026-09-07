@@ -99,6 +99,7 @@ class GateProcessor:
         self._closed = False
         self._recognise_call = self._recognizer.recognise
         self._recognizer_accepts_timeout = _accepts_keyword(self._recognise_call, "timeout")
+        self._recognizer_accepts_budget = _accepts_keyword(self._recognise_call, "budget")
         # The on-device recogniser journals per trace; a recogniser that does
         # not take the id (every existing fake) is called exactly as before.
         self._recognizer_accepts_trace_id = _accepts_keyword(
@@ -483,7 +484,15 @@ class GateProcessor:
             {"trace_id": trace_id}
             if self._recognizer_accepts_trace_id and trace_id else {}
         )
-        operation = lambda: self._recognise_call(path, **extra)
+        # The budget is read when the operation actually runs, not now: the
+        # OCR slot may still be held by an abandoned request, and a recogniser
+        # that guards the decision with an on-device read has to bound that
+        # guard by the time the frame really has left.
+        budget = (
+            (lambda: {"budget": max(0.0, deadline - self._decision_clock())})
+            if self._recognizer_accepts_budget else (lambda: {})
+        )
+        operation = lambda: self._recognise_call(path, **budget(), **extra)
         if not self._recognizer_accepts_timeout:
             return self._run_ocr_bounded(operation, deadline, on_start)
         # Give the dial and handshake half of what is left, bounded above:
@@ -498,7 +507,9 @@ class GateProcessor:
             else OCR_READ_TIMEOUT_SECONDS
         )
         read = min(read_cap, max(MIN_OCR_TIMEOUT_SECONDS, remaining - connect))
-        operation = lambda: self._recognise_call(path, timeout=(connect, read), **extra)
+        operation = lambda: self._recognise_call(
+            path, timeout=(connect, read), **budget(), **extra
+        )
         return self._run_ocr_bounded(operation, deadline, on_start)
 
     def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
