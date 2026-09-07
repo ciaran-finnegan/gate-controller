@@ -21,7 +21,10 @@ ExecStopPost=/opt/gate-controller-deploy/current/.venv/bin/python -m gate_contro
 Restart=always
 RestartSec=5s
 TimeoutStopSec=15s
-MemoryMax=512M
+# 512M until 2026-09: the on-device recogniser adds two ONNX sessions and
+# the decoded frame, measured at 133-237 MB RSS on the Pi 5, on top of the
+# controller's own footprint. 1G leaves headroom without hiding a leak.
+MemoryMax=1G
 UMask=0077
 StateDirectory=gate-controller
 StateDirectoryMode=0710

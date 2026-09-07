@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+from math import isfinite
 import os
 from pathlib import Path
 import tempfile
@@ -38,16 +39,19 @@ class TrainingCorpus:
         self._total_bytes: int | None = None
 
     def record(self, image: bytes, *, payload, source: str, geometry=None,
-               extra: dict | None = None) -> Path | None:
+               extra: dict | None = None, local: dict | None = None) -> Path | None:
         """Write one image/sidecar pair. Returns the JPEG path, or None on failure."""
         try:
-            return self._record(image, payload=payload, source=source, geometry=geometry, extra=extra)
+            return self._record(
+                image, payload=payload, source=source, geometry=geometry,
+                extra=extra, local=local,
+            )
         except Exception:
             self._failures += 1
             LOGGER.warning("gate_corpus outcome=failed", exc_info=False)
             return None
 
-    def _record(self, image, *, payload, source, geometry, extra):
+    def _record(self, image, *, payload, source, geometry, extra, local=None):
         if not isinstance(image, (bytes, bytearray)) or not image[:3] == b"\xff\xd8\xff":
             raise ValueError("corpus images must be JPEG bytes")
         directory = self._ensure_directory()
@@ -62,11 +66,18 @@ class TrainingCorpus:
             "geometry": _geometry_fields(geometry),
             "ocr": _ocr_fields(payload),
         }
+        local_fields = _local_fields(local)
+        if local_fields is not None:
+            sidecar["local"] = local_fields
         if isinstance(extra, dict):
             sidecar["extra"] = {k: v for k, v in extra.items() if _json_safe(v)}
         encoded = json.dumps(sidecar, sort_keys=True).encode("utf-8")
         if len(encoded) > MAX_SIDECAR_BYTES:
             sidecar["ocr"] = {"truncated": True, "plate": sidecar["ocr"].get("plate")}
+            if "local" in sidecar:
+                sidecar["local"] = {
+                    "truncated": True, "plate": sidecar["local"].get("plate"),
+                }
             encoded = json.dumps(sidecar, sort_keys=True).encode("utf-8")
         with self._lock:
             image_path = _write_private(directory, stem + ".jpg", bytes(image))
@@ -155,6 +166,24 @@ def _geometry_fields(geometry) -> dict | None:
     return fields or None
 
 
+KEEP_LOCAL_KEYS = (
+    "status", "plate", "score", "mean_score", "box", "latency_ms", "candidates",
+)
+
+
+def _local_fields(local) -> dict | None:
+    """The on-device read, kept beside ``ocr`` and bounded the same way.
+
+    The local answer is a second pseudo-label, not truth, so it is stored
+    next to the cloud one rather than merged into it: a review pass can then
+    see where the two disagreed on the very same frame.
+    """
+    if not isinstance(local, dict):
+        return None
+    return {key: local[key] for key in KEEP_LOCAL_KEYS
+            if key in local and _json_safe(local[key])} or None
+
+
 def _ocr_fields(payload) -> dict:
     if not isinstance(payload, dict):
         return {"results": []}
@@ -177,6 +206,12 @@ def _ocr_fields(payload) -> dict:
 
 def _json_safe(value, depth: int = 0) -> bool:
     if depth > 6:
+        return False
+    if isinstance(value, float) and not isfinite(value):
+        # json.dumps would emit NaN/Infinity, which no strict JSON reader will
+        # parse. A sidecar nothing can read is worse than a missing field, and
+        # a recogniser confidence is exactly the kind of float that can arrive
+        # non-finite.
         return False
     if value is None or isinstance(value, (bool, int, float, str)):
         return True

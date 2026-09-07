@@ -10,3 +10,55 @@ urllib3==2.7.0
 
 # RPi.GPIO-compatible gpiochip provider, including Raspberry Pi 5 support.
 rpi-lgpio==0.6; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
+
+# On-device plate recognition (GATE_LOCAL_OCR_MODE). Both model packages are
+# MIT and both ship pure-ONNX weights; onnxruntime supplies the CPU runtime and
+# pulls in numpy, and open-image-models pulls in opencv-python-headless for the
+# JPEG decode. Pinned to the versions measured on the gate Pi and on the Mac
+# (baseline/report.md, baseline/pi_benchmark.md), where reads were
+# byte-identical across both machines.
+#
+# Wheels only, and only for this stack. A missing wheel would otherwise start
+# a source build - opencv's takes far longer than the updater's 900 s timeout,
+# so a release would fail rather than merely skip a package. aarch64 manylinux
+# wheels exist for every name below today, so nothing is compiled.
+#
+# Named one by one rather than as `--only-binary=:all:`, which would apply to
+# the whole resolution. lgpio, which rpi-lgpio pulls in, publishes its aarch64
+# wheel as manylinux_2_34: installable on Bookworm's glibc 2.36 and not on an
+# older image, where pip falls back to the sdist and builds it in seconds.
+# `:all:` would turn that working fallback into a hard install failure, and
+# verify_release would then reject every release - the very outcome the
+# python_version marker below exists to prevent.
+--only-binary=onnxruntime,open-image-models,fast-plate-ocr,numpy,opencv-python-headless,protobuf,flatbuffers,PyYAML,rich,tqdm,packaging,markdown-it-py,mdurl,Pygments
+#
+# Restricted to arm64 on purpose: the Pi (aarch64) and the development Mac
+# (arm64) are the only platforms these graphs were measured on, and keeping
+# them off x86-64 means CI installs nothing new and the unit suite continues to
+# run with no onnxruntime present - which is exactly how the local recogniser
+# must behave when the wheels are missing.
+#
+# Restricted to Python 3.11 and above as well, because onnxruntime 1.29.0
+# declares Requires-Python >=3.11. A marker asserting only the architecture
+# would fail the whole `pip install -r requirements.txt` on an arm64 host still
+# running 3.10 - and that install is exactly what the updater's verify_release
+# does before every release, so one old interpreter would reject every update
+# instead of merely leaving the local recogniser uninstalled.
+onnxruntime==1.29.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+open-image-models==0.6.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+fast-plate-ocr==1.1.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+
+# Exact transitive dependencies of those three; keep these aligned with their
+# metadata, exactly as the requests block above is kept aligned with its own.
+# Same markers, so a release still installs nothing new on x86-64 CI.
+numpy==2.4.6; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+opencv-python-headless==5.0.0.93; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+protobuf==7.36.1; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+flatbuffers==25.12.19; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+packaging==26.3; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+PyYAML==6.0.3; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+rich==15.0.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+tqdm==4.70.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+markdown-it-py==4.2.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+mdurl==0.1.2; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+Pygments==2.21.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"

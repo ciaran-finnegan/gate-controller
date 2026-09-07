@@ -10,6 +10,7 @@ from time import monotonic, sleep
 
 from PIL import Image
 
+from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME
 from .matching import normalise_plate
 from .plate_region import PlateRegion
 from .models import PlateObservation
@@ -44,6 +45,10 @@ class _UploadGeometry:
 # failure is retried once. The API also closes idle keep-alive connections;
 # posting on one fails instantly, so an idle session is recycled first.
 MIN_REQUEST_INTERVAL_SECONDS = 1.05
+# The floor the processor uses when it splits a remaining decision budget into
+# connect and read timeouts. Re-sizing that split after a local read has to
+# respect the same floor, or a request would be posted with a zero timeout.
+MIN_SOCKET_TIMEOUT_SECONDS = 0.1
 SESSION_IDLE_RECYCLE_SECONDS = 20.0
 MAX_RETRY_AFTER_SECONDS = 2.0
 MAX_TRANSIENT_RETRIES = 1
@@ -265,7 +270,8 @@ class PlateRecognizerClient:
                  max_upload_width: int = 0, *, clock=monotonic, sleep=sleep,
                  plate_region: PlateRegion | None = None,
                  precropped_directory: Path | None = None,
-                 corpus=None):
+                 corpus=None, local_recognizer=None, authorised=None,
+                 match_policy=None):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -288,32 +294,79 @@ class PlateRecognizerClient:
         self._upload_geometry: _UploadGeometry | None = None
         # Optional TrainingCorpus: keeps every uploaded frame and answer.
         self._corpus = corpus
+        # Optional LocalRecognizer: reads the very same upload bytes on the
+        # device. In shadow mode it only journals. In active mode a read that
+        # clears the confidence gate and then satisfies the controller's own
+        # decide_access answers for the frame, and the cloud request is either
+        # skipped or left to label the frame off the decision path.
+        self._local = local_recognizer
+        # Callable returning the authorised plates, so the shared matching can
+        # be applied to a local read exactly as it is applied to a cloud read.
+        self._authorised = authorised
+        # Optional callable returning the time-of-day matching policy. It is
+        # the same provider the processor is given, so a local read is judged
+        # under the band the processor is about to apply to the very same
+        # frame; without it both sides fall back to the shipped `standard`
+        # behaviour, which is what the controller does today.
+        self._match_policy = match_policy
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
             raise ValueError("max_upload_width is outside the safe range")
         self._max_upload_width = max_upload_width
 
-    def recognise(self, path: Path, timeout: tuple[float, float] | None = None) -> PlateObservation:
+    def recognise(self, path: Path, timeout: tuple[float, float] | None = None,
+                  trace_id: str | None = None,
+                  budget: float | None = None) -> PlateObservation:
+        """Read one frame.
+
+        ``budget`` is the seconds of decision time left for this frame when
+        the call starts. It bounds what the local guard may spend and re-sizes
+        the socket timeouts around whatever it did spend; without it the
+        request behaves exactly as it always has.
+        """
+        return self._recognise(path, timeout, trace_id, budget)
+
+    def _recognise(self, path: Path, timeout, trace_id, budget=None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
             if self._closed:
                 raise _closed_client_error()
             generation = self._session_generation
+        # The local read belongs to the frame, not to a network attempt: a
+        # retry reuses the same handle instead of inferring twice.
+        state: dict = {"frame": None, "deadline": self._budget_deadline(budget)}
         retries = 0
-        while True:
-            try:
-                return self._recognise_once(path, timeout, generation)
-            except _RetryableFailure as failure:
-                if retries >= MAX_TRANSIENT_RETRIES:
-                    raise failure.error
-                retries += 1
-                now = self._clock()
-                self._not_before = now + failure.interval
-                _log_retry(failure.cause, failure.interval)
-                if failure.cause in RETRYABLE_TRANSPORT_CAUSES:
-                    self._recycle_session()
+        try:
+            while True:
+                try:
+                    return self._recognise_once(
+                        path, timeout, generation, trace_id, state,
+                    )
+                except _RetryableFailure as failure:
+                    if retries >= MAX_TRANSIENT_RETRIES:
+                        raise failure.error
+                    retries += 1
+                    now = self._clock()
+                    self._not_before = now + failure.interval
+                    _log_retry(failure.cause, failure.interval)
+                    if failure.cause in RETRYABLE_TRANSPORT_CAUSES:
+                        self._recycle_session()
+        except Exception:
+            # In `always` mode the local read has already answered for this
+            # frame; a cloud request that then fails costs a label, not the
+            # decision.
+            decided = state.get("local_observation")
+            if decided is None:
+                raise
+            return decided
+        finally:
+            # Whatever happened to the cloud request, the shadow line is
+            # still owed once the local read lands.
+            frame = state.get("frame")
+            if frame is not None:
+                frame.abandon_cloud()
 
     def prewarm(self) -> bool:
         """Open the TLS connection now, in the background, so the first OCR
@@ -414,7 +467,9 @@ class PlateRecognizerClient:
 
     def _recognise_once(
         self, path: Path, timeout: tuple[float, float] | None, generation: int,
+        trace_id: str | None = None, state: dict | None = None,
     ) -> PlateObservation:
+        state = {} if state is None else state
         self._recycle_if_idle()
         with self._session_lock:
             if self._closed:
@@ -455,17 +510,51 @@ class PlateRecognizerClient:
                     "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                 )
         upload = self._open_upload(path)
-        corpus_image = self._corpus_image(upload) if self._corpus is not None else None
-        # Preparing a downscaled upload can outlast the decision deadline;
-        # never post a request the processor has already abandoned.
+        geometry = self._upload_geometry
+        local_enabled = self._local is not None and self._local.enabled
+        corpus_image = (
+            self._corpus_image(upload)
+            if self._corpus is not None or local_enabled else None
+        )
+        frame = state.get("frame") or NULL_FRAME
+        if local_enabled and corpus_image and state.get("frame") is None:
+            frame = self._local.begin(
+                corpus_image, trace_id=trace_id, geometry=geometry,
+                authorised=self._authorised, policy=self._match_policy,
+            )
+            state["frame"] = frame
+            local_observation = self._local_decision(
+                path, trace_id, frame, corpus_image, geometry, state,
+            )
+            if local_observation is not None:
+                if self._local.config.cloud != CLOUD_ALWAYS:
+                    upload.close()
+                    # The guard may have waited; the burst may have been
+                    # abandoned while it did. The local path owes the same
+                    # invariant the cloud path keeps below - never answer for
+                    # an event the processor has already given up on.
+                    self._raise_if_abandoned(generation)
+                    return local_observation
+                # `always`: the local read is the answer, but the cloud
+                # request still runs here, on this thread, so the frame is
+                # labelled for the corpus. Keeping it on the decision path is
+                # deliberate - a second thread would share this client's
+                # pacing window and upload geometry with a gate-critical
+                # request, and a stray 429 there is worse than the latency
+                # this mode gives up.
+                state["local_observation"] = local_observation
+        # Preparing a downscaled upload, and any local read before it, can
+        # outlast the decision deadline; never post a request the processor
+        # has already abandoned.
         with self._session_lock:
             abandoned = self._closed or generation != self._session_generation
-            closed = self._closed
         if abandoned:
             upload.close()
-            if closed:
-                raise _closed_client_error()
-            raise OcrResponseError("OCR request was abandoned", CAUSE_REQUEST_ABANDONED)
+            self._raise_if_abandoned(generation)
+        # Whatever the local guard spent is gone from the decision budget, so
+        # the request is sized for the budget it actually has rather than the
+        # one the processor split before the guard ran.
+        timeout = self._bounded_timeout(timeout, state.get("deadline"))
         try:
             self._pace(generation)
             try:
@@ -523,9 +612,14 @@ class PlateRecognizerClient:
             raise _response_error(
                 "OCR service response has invalid results", CAUSE_INVALID_RESULTS
             )
-        self._record_corpus(corpus_image, payload, path)
+        self._record_corpus(
+            corpus_image, payload, path, geometry, local=frame.settled(),
+        )
         if not results:
-            return PlateObservation(plate=None, confidence=0.0)
+            frame.complete_cloud(None, 0.0, decided=False)
+            return state.get("local_observation") or PlateObservation(
+                plate=None, confidence=0.0,
+            )
         first_result = results[0]
         if not isinstance(first_result, Mapping):
             raise _response_error(
@@ -533,7 +627,7 @@ class PlateRecognizerClient:
             )
         plate = first_result.get("plate")
         score = first_result.get("score")
-        self._log_plate_box(first_result.get("box"))
+        self._log_plate_box(first_result.get("box"), geometry)
         if not isinstance(plate, str) or not normalise_plate(plate):
             raise _response_error(
                 "OCR service response has no usable plate", CAUSE_NO_USABLE_PLATE
@@ -543,11 +637,111 @@ class PlateRecognizerClient:
             raise _response_error(
                 "OCR service response has invalid confidence", CAUSE_INVALID_CONFIDENCE
             )
-        return PlateObservation(
+        observation = PlateObservation(
             plate=normalise_plate(plate), confidence=float(score),
             make=_optional_string(first_result.get("vehicle", {}), "make"),
             colour=_optional_string(first_result.get("vehicle", {}), "color"),
         )
+        decided = state.get("local_observation")
+        frame.complete_cloud(
+            observation.plate, observation.confidence, decided=decided is None,
+        )
+        return decided or observation
+
+    def _budget_deadline(self, budget) -> float | None:
+        """When the decision this request belongs to gives up, if it said."""
+        if budget is None:
+            return None
+        try:
+            seconds = float(budget)
+        except (TypeError, ValueError):
+            return None
+        if not isfinite(seconds):
+            return None
+        return self._clock() + seconds
+
+    def _raise_if_abandoned(self, generation: int) -> None:
+        with self._session_lock:
+            if self._closed:
+                raise _closed_client_error()
+            if generation != self._session_generation:
+                raise OcrResponseError(
+                    "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
+                )
+
+    def _bounded_timeout(self, timeout, deadline):
+        """Shrink the connect/read split to the budget that is left.
+
+        The processor sizes the request from the budget it had *before* the
+        call; a local read in between spends some of it. Only ever narrower
+        than what the processor asked for, and never below the floor it uses.
+        """
+        if timeout is None or deadline is None:
+            return timeout
+        try:
+            connect, read = (float(value) for value in timeout)
+        except (TypeError, ValueError):
+            return timeout
+        if not (isfinite(connect) and isfinite(read)):
+            return timeout
+        remaining = deadline - self._clock()
+        if not isfinite(remaining) or remaining >= connect + read:
+            return timeout
+        connect = min(connect, max(MIN_SOCKET_TIMEOUT_SECONDS, remaining / 2))
+        read = min(read, max(MIN_SOCKET_TIMEOUT_SECONDS, remaining - connect))
+        return (connect, read)
+
+    def _local_decision(self, path: Path, trace_id, frame, image, geometry, state):
+        """The local read, when it may answer for this frame. Else None.
+
+        Only ``GATE_LOCAL_OCR_MODE=active`` reaches past the first line. The
+        read must clear ``GATE_LOCAL_OCR_MIN_CONFIDENCE`` and then satisfy
+        the controller's own :func:`decide_access` -- exact or fuzzy, the
+        very same function and thresholds the cloud read goes through, and on
+        the strength of this frame's own plate. Anything else falls through
+        to the cloud unchanged.
+
+        The wait is bounded by the recogniser's own budget: the stuck-engine
+        ceiling, the decision budget minus the cloud request's reserve, and
+        what is left of this event's total local waiting. The guard runs on
+        the ``gate-ocr-request`` worker holding the OCR slot, so time spent
+        here is time the burst does not have.
+        """
+        if not self._local.config.active:
+            return None
+        deadline = state.get("deadline")
+        started = self._clock()
+        remaining = None if deadline is None else deadline - started
+        try:
+            recognition = frame.result(self._local.wait_seconds(trace_id, remaining))
+        finally:
+            self._local.record_event_wait(trace_id, self._clock() - started)
+        if not self._local.decides(frame, recognition):
+            return None
+        frame.decided_locally()
+        if self._local.config.cloud != CLOUD_ALWAYS:
+            frame.cloud_skipped()
+            self._record_corpus(
+                image, None, path, geometry, local=recognition, cloud="skipped",
+            )
+        return recognition.observation()
+
+    def local_ocr_summary(self, trace_id: str | None):
+        """The compact per-event local block for the telemetry payload."""
+        if self._local is None:
+            return None
+        try:
+            return self._local.summary(trace_id)
+        except Exception:
+            return None
+
+    def forget_local_ocr(self, trace_id: str | None) -> None:
+        if self._local is None:
+            return
+        try:
+            self._local.forget(trace_id)
+        except Exception:
+            return
 
     @staticmethod
     def _corpus_image(upload) -> bytes | None:
@@ -559,14 +753,21 @@ class PlateRecognizerClient:
         except Exception:
             return None
 
-    def _record_corpus(self, image: bytes | None, payload, path: Path) -> None:
+    def _record_corpus(self, image: bytes | None, payload, path: Path, geometry,
+                       *, local=None, cloud: str = "requested") -> None:
         if self._corpus is None or not image:
             return
+        extra = {
+            "precropped": self._is_precropped(path),
+            "cloud": cloud,
+            "local_ocr": self._local.config.mode if self._local is not None else "off",
+        }
         try:
             self._corpus.record(
-                image, payload=payload, source="plate_recognizer",
-                geometry=self._upload_geometry,
-                extra={"precropped": self._is_precropped(path)},
+                image, payload=payload,
+                source="local_recognizer" if payload is None else "plate_recognizer",
+                geometry=geometry, extra=extra,
+                local=local.to_sidecar() if local is not None else None,
             )
         except Exception:
             pass
@@ -639,13 +840,12 @@ class PlateRecognizerClient:
         )
         return buffer
 
-    def _log_plate_box(self, box) -> None:
+    def _log_plate_box(self, box, geometry) -> None:
         """Journal where the plate sat, as fractions of the whole camera frame.
 
         Boxes accumulate in the journal so GATE_PLATE_REGION can be set, and
         later tightened, from where plates were actually read.
         """
-        geometry = self._upload_geometry
         if geometry is None or not isinstance(box, Mapping):
             return
         try:
@@ -686,6 +886,11 @@ class PlateRecognizerClient:
             session = self._session
             self._session = None
         self._close_session(session)
+        if self._local is not None:
+            try:
+                self._local.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _close_session(session) -> None:

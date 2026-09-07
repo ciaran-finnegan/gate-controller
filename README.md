@@ -203,6 +203,21 @@ actuates; the frame takes the same path as an upload, and the FTP path stays
 as the fallback. `GATE_OCR_MAX_UPLOAD_WIDTH` can downscale frames before the
 OCR upload once the plate is large enough in the 4K image.
 
+The controller can also read plates on the Pi itself, from the very bytes it
+uploads, using two small MIT-licensed ONNX models. `GATE_LOCAL_OCR_MODE=shadow`
+journals the local read beside the cloud read and can never reach the relay;
+`active` lets a confident local read answer through the controller's own
+matching - on the strength of that frame's own plate, under the same policy
+band the processor will apply - with the cloud as the fallback. Its confidence
+gate is the weakest character of the read, not the mean. It is **off unless the
+variable is set**, and with it unset nothing is imported, loaded or started.
+Enabling it on a controller that delivers to Cloudflare needs two app-side
+changes first: `local_ocr` on the telemetry allowlist, and `"local"` accepted
+as an event `source`. The models, the measured accuracy and latency, the
+thermal limits of the fanless Pi, what the local guard may spend of the
+decision budget, the journal lines and how to read a week of agreement are in
+[on-device plate recognition](docs/local-recognition.md).
+
 The Python entry point and production systemd unit both use a 200 ms
 completed-upload quiet window. This is calibrated from the latest ten production
 camera recognition events: each contained one 3840x2160 frame, with no second
