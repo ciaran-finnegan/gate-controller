@@ -140,8 +140,12 @@ a slower shutter.
 
 ## Night Light
 
-A motion-controlled spotlight lights the approach at night. For plates it
-must:
+A PIR-triggered white floodlight lights the approach at night (see
+[Site Lighting](reolink-rlc-810a.md#site-lighting) and the
+[Floodlight subsection](reviews/2026-09-06-camera-night-configuration.md) of
+the night configuration review for what is and is not yet verified about it —
+notably whether it reliably covers the stop position and its trigger delay).
+For plates it must:
 
 - **Be on and at full brightness before the vehicle stops.** Its motion
   sensor must see the approach, not just the gate, so the lamp has come up

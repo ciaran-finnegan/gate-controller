@@ -8,6 +8,23 @@ exposure, capture point, and cutover are covered in
 [RLC-811A gate camera swap](reolink-rlc-811a.md). Everything below applies to
 whichever camera is fitted unless that document says otherwise.
 
+## Site Lighting
+
+There is a PIR-triggered white floodlight at the gate, separate from the
+camera's own IR illuminator and from any spotlight the camera itself may have
+(the RLC-810A has none — see the night configuration review below). Its hold
+timer is short: it stays lit for only a few seconds after triggering, not for
+the whole time a vehicle is stopped at the gate. Extending that hold time
+(most PIR floodlights offer roughly 10 s to several minutes) to 1-2 minutes
+and aiming the fixture at the stop position is the simplest physical fix, and
+is a prerequisite for using the floodlight to force colour night mode (see the
+Floodlight subsection below). Whether the floodlight reliably covers the stop
+position in front of the camera, and its trigger delay relative to an
+arriving vehicle, are unverified as of this writing. See
+[Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
+for the current state of that investigation, including the "Floodlight"
+subsection, and for the exposure settings deployed around it.
+
 ## Network Boundary
 
 Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
@@ -450,9 +467,12 @@ The installed camera was measured and reconfigured against these principles on
 for the settings actually deployed, the API calls, the before/after clipping
 measurements, and the rollback. Two results there change how step 2 below should
 be read on this unit: the `shutter` and `gain` limits are ignored unless
-`exposure` is `Manual`, so lowering the auto caps does nothing; and the site has
-no night illumination at all once the camera's own IR is off, so the white light
-in step 2 is a prerequisite rather than one option among several.
+`exposure` is `Manual`, so lowering the auto caps does nothing; and, on the
+empty test scene measured there (with the site's PIR floodlight untriggered
+and off), the site has no other night illumination once the camera's own IR is
+off — so a reliable white light on the stop position is a prerequisite rather
+than one option among several. Whether the existing PIR floodlight already
+satisfies that (see Site Lighting above) is unverified.
 
 1. Calibrate after dark with representative vehicles, headlight states, wet
    road conditions, and a clean camera cover.
