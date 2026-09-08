@@ -982,6 +982,63 @@ SDP only; it does not carry RTP/RTCP media. Actual media must traverse the exact
 ICE listeners or the configured TURN relay. Do not expose API, metrics, the auth
 sidecar, WHIP, RTSP serving, or camera administration.
 
+## Camera Control Service
+
+Camera *settings* (the IR illuminator and the on-demand 4K still) are owned by a
+separate isolated service, `gate-camera-control`, installed with
+`deployment/install-camera-control.sh --source "$PWD"`. It is the only process
+that holds camera API credentials, in its own root-owned mode-0600
+`/etc/gate-camera-control.env`. Those credentials are deliberately not added to
+`/etc/gate-media-gateway.env`: that file's key set is pinned by
+`validate_gateway_static_environment()` and holds the RTSP secret, so widening it
+would widen who can read that secret. The service runs as its own
+`gate-camera-control` user, binds `127.0.0.1:8767`, and its unit denies all
+network egress except loopback plus the camera's exact `/32`. The controller
+gains no camera credentials and no camera host from it; it only reads the
+nonsecret `/run/gate-camera/state.json` into the `camera_control` heartbeat
+block, exactly as it reads `/run/gate-media/capabilities.json` into `media`.
+
+Deploy it in this order. The ordering matters: the Access application must exist
+before any DNS name resolves to this service, or the window between the two is
+an unauthenticated camera control on the public internet.
+
+1. **Write `/etc/gate-camera-control.env` first**, root:root 0600. One
+   `KEY=value` per line, no whitespace around the `=` or at the end of a line, no
+   quotes around values (they become part of the password), and a trailing
+   newline.
+2. **Validate it before installing anything**:
+   `sudo python3 gate_media_config.py camera-control --env /etc/gate-camera-control.env`.
+   Silence means valid. The installer runs the same check before it publishes,
+   so a rejected file never replaces the running library.
+3. **Run the installer**:
+   `sudo deployment/install-camera-control.sh --source "$PWD"`.
+4. **Verify locally**, with `systemctl status gate-camera-control` and
+   `curl -s http://127.0.0.1:8767/camera/state`, and confirm the egress pin is
+   really in force: `systemctl show gate-camera-control -p IPAddressAllow` must
+   list the camera's `/32`, and the unit's journal must carry no
+   "IP firewalling not supported" or "Failed to install BPF" line. On a kernel
+   without cgroup BPF `IPAddressDeny=` is silently ignored and the service can
+   reach the whole LAN, which voids the isolation the design rests on.
+5. **Create the Cloudflare Access application and a separate service token for
+   it — before any DNS route or ingress rule exists.** Not the `gate-command`
+   token: the blast radius is different.
+6. **Then** add the ingress rule to
+   `deployment/cloudflared/gate-controller-tunnel.yml` ahead of the catch-all,
+   create the DNS route, and reload cloudflared.
+7. **Store the service token in the Worker**, exactly as the `gate-command`
+   token is stored. The token never goes near the Pi.
+
+Re-run the installer on **every** controller release. Activation deliberately
+does not republish `/usr/local/lib/gate-camera-control` — that path sits outside
+the managed release tree so an auto-update cannot silently change the one process
+holding camera credentials — so a release that changes `gate_camera_control/` or
+`gate_media_config.py` does not reach the running service until
+`sudo deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>`
+is run.
+
+The full HTTP contract, environment keys, journal lines, failure modes, and
+rollback are in [Gate camera control](camera-control.md).
+
 Keep rollback-only Supabase credentials outside `/etc/gate-controller.env`, for
 example in root-owned mode-0600 `/etc/gate-controller.rollback.env`. The active
 environment rejects every non-empty `SUPABASE_URL` or

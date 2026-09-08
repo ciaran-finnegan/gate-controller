@@ -67,6 +67,7 @@ OPTIONAL_COMPILE_TARGETS: tuple[str, ...] = (
 OPTIONAL_SHELL_SYNTAX_CHECKS: tuple[tuple[str, str], ...] = (
     ("/bin/sh", "file_monitor.sh"),
     ("/bin/bash", "deployment/install.sh"),
+    ("/bin/bash", "deployment/install-camera-control.sh"),
 )
 
 

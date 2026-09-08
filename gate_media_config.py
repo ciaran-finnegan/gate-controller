@@ -47,6 +47,20 @@ _GATEWAY_KEYS = _GATEWAY_STATIC_KEYS | _RUNTIME_TURN_KEYS
 _LEGACY_GATEWAY_SOURCE_KEY = "MTX_PATHS_GATE_SOURCE"
 _TURN_KEYS = frozenset({"TURN_KEY_ID", "TURN_KEY_API_TOKEN"})
 _BOOLEAN_AUTH_KEYS = _AUTH_KEYS - {"GATE_MEDIA_HMAC_SECRET"}
+_CAMERA_CONTROL_REQUIRED_KEYS = frozenset({
+    "GATE_CAMERA_HOST",
+    "GATE_CAMERA_USERNAME",
+    "GATE_CAMERA_PASSWORD",
+})
+_CAMERA_CONTROL_DEFAULTS = {
+    "GATE_CAMERA_IR_DEFAULT": "Off",
+    "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
+    "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+}
+_CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
+_CAMERA_IR_STATES = frozenset({"Auto", "Off"})
+_CAMERA_CREDENTIAL_KEYS = ("GATE_CAMERA_USERNAME", "GATE_CAMERA_PASSWORD")
+_MAX_CAMERA_LEASE_MINUTES = 60
 
 
 class MediaConfigError(ValueError):
@@ -299,6 +313,99 @@ def validate_turn_environment(values: Mapping[str, str]) -> dict[str, str]:
     return selected
 
 
+def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, str]:
+    """Validate the root-only camera API credential source for gate-camera-control.
+
+    The camera credentials never join the media gateway file: that file's key set
+    is pinned, and widening it would widen who can read the RTSP secret.
+    """
+    selected = dict(values)
+    _validate_effective_values(selected)
+    if not _CAMERA_CONTROL_REQUIRED_KEYS <= set(selected) <= _CAMERA_CONTROL_KEYS:
+        raise MediaConfigError("camera control environment has missing or forbidden keys")
+    for key, default in _CAMERA_CONTROL_DEFAULTS.items():
+        selected.setdefault(key, default)
+    _validate_camera_host(selected["GATE_CAMERA_HOST"])
+    if any(not 1 <= len(selected[key].encode("utf-8")) <= 256
+           for key in _CAMERA_CREDENTIAL_KEYS):
+        raise MediaConfigError("camera credentials must be 1 to 256 bytes")
+    if selected["GATE_CAMERA_IR_DEFAULT"] not in _CAMERA_IR_STATES:
+        raise MediaConfigError("the IR default must be exactly Auto or Off")
+    default_minutes = _bounded_lease_minutes(
+        selected["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"]
+    )
+    max_minutes = _bounded_lease_minutes(selected["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
+    if default_minutes > max_minutes:
+        raise MediaConfigError("the default IR lease must not exceed the maximum")
+    return selected
+
+
+def write_camera_address_dropin(path, values: Mapping[str, str]) -> None:
+    """Render the service's egress pin for the one validated camera address.
+
+    The address is written here rather than printed for the installer to
+    interpolate. Nothing read out of the credential file reaches stdout, a
+    shell variable, a process listing or a `bash -x` trace; and a validator
+    that fails writes nothing at all, instead of leaving a drop-in whose
+    `IPAddressAllow=` has an empty prefix and so pins nothing.
+
+    The address is re-rendered from what `ipaddress` parsed, so the pin is
+    exactly the canonical address the service will dial, and the prefix is the
+    address family's own host length: a hard-coded `/32` on an IPv6 address
+    would pin 2**96 addresses rather than one. `_validate_camera_host` rejects
+    IPv6 outright, so this is the second of the two guards, not the only one.
+    """
+    settings = validate_camera_control_environment(values)
+    address = ipaddress.ip_address(settings["GATE_CAMERA_HOST"])
+    body = (
+        f"[Service]\nIPAddressAllow={address}/{address.max_prefixlen}\n"
+    ).encode("ascii")
+    _atomic_write_trusted_file(path, body, mode=0o644)
+
+
+def relevant_camera_control_environment(
+    environment: Mapping[str, str]
+) -> dict[str, str]:
+    """Select only the exact camera-control keys, never a prefix match."""
+    return {
+        key: value for key, value in environment.items() if key in _CAMERA_CONTROL_KEYS
+    }
+
+
+def _validate_camera_host(value: str) -> None:
+    """The camera host must be one exact reachable private IPv4 address.
+
+    The systemd unit pins the service's egress to loopback plus this address, so
+    a hostname would make that pin unverifiable.
+
+    IPv6 is rejected rather than supported. `http.client` splits a bare IPv6
+    literal at its last colon, so `fd00::54` would be dialled as host `fd00:`
+    port `54` and never reach the camera; the address would still have been
+    written into the egress pin, where an IPv4-shaped `/32` covers 2**96
+    addresses. Refusing the configuration is the honest end of that: the camera
+    is an IPv4 device on the gate LAN, and a bracketed-literal client is the
+    change to make if that ever stops being true.
+    """
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise MediaConfigError("camera host must be one exact IP address") from error
+    if address.version != 4:
+        raise MediaConfigError("camera host must be an IPv4 address")
+    if (str(address) != value or address.is_unspecified or address.is_loopback
+            or address.is_multicast or address.is_link_local or address.is_reserved):
+        raise MediaConfigError("camera host must be one exact reachable IP address")
+
+
+def _bounded_lease_minutes(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", value):
+        raise MediaConfigError("IR lease minutes must be a whole number of minutes")
+    minutes = int(value)
+    if not 1 <= minutes <= _MAX_CAMERA_LEASE_MINUTES:
+        raise MediaConfigError("IR lease minutes must be between 1 and 60")
+    return minutes
+
+
 def relevant_auth_environment(environment: Mapping[str, str]) -> dict[str, str]:
     return {
         key: value for key, value in environment.items()
@@ -399,10 +506,15 @@ def _serialize_environment(values: Mapping[str, str], order) -> bytes:
 
 
 def _atomic_write_environment(path, body: bytes) -> None:
+    """Replace a trusted environment file in one step, owner-readable only."""
+    _atomic_write_trusted_file(path, body, mode=0o600)
+
+
+def _atomic_write_trusted_file(path, body: bytes, *, mode: int) -> None:
     path = os.path.abspath(os.fspath(path))
     parent, name = os.path.split(path)
     if not name or not body or len(body) > _MAX_CONFIG_BYTES:
-        raise MediaConfigError("environment update is invalid")
+        raise MediaConfigError("trusted file update is invalid")
     directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     temporary = f".{name}.new.{os.getpid()}.{secrets.token_hex(8)}"
@@ -421,7 +533,7 @@ def _atomic_write_environment(path, body: bytes) -> None:
             0o600,
             dir_fd=directory_descriptor,
         )
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         view = memoryview(body)
         while view:
             written = os.write(descriptor, view)
@@ -440,7 +552,7 @@ def _atomic_write_environment(path, body: bytes) -> None:
     except MediaConfigError:
         raise
     except OSError as error:
-        raise MediaConfigError("environment could not be atomically updated") from error
+        raise MediaConfigError("trusted file could not be atomically updated") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -529,6 +641,9 @@ def main(argv=None) -> int:
     split_gateway.add_argument("--runtime-turn", required=True)
     turn = subparsers.add_parser("turn")
     turn.add_argument("--env", required=True)
+    camera_control = subparsers.add_parser("camera-control")
+    camera_control.add_argument("--env", required=True)
+    camera_control.add_argument("--write-address-dropin")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "checksum":
@@ -543,6 +658,11 @@ def main(argv=None) -> int:
             )
         elif arguments.command == "turn":
             validate_turn_environment(parse_trusted_environment(arguments.env))
+        elif arguments.command == "camera-control":
+            values = parse_trusted_environment(arguments.env)
+            validate_camera_control_environment(values)
+            if arguments.write_address_dropin is not None:
+                write_camera_address_dropin(arguments.write_address_dropin, values)
         else:
             migrate_gateway_environments(
                 arguments.gateway, arguments.runtime_turn

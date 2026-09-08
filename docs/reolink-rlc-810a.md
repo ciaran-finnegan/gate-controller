@@ -25,6 +25,17 @@ arriving vehicle, are unverified as of this writing. See
 for the current state of that investigation, including the "Floodlight"
 subsection, and for the exposure settings deployed around it.
 
+## Camera API Access
+
+The camera's HTTPS `api.cgi` interface is reached by exactly one process on the
+Pi: the isolated `gate-camera-control` service, documented in
+[Gate camera control](camera-control.md). It holds the only camera API
+credentials, allows only `Login`, `GetIrLights`, `SetIrLights` and `Snap`, caches
+one login token (this firmware answers 502 for about a minute after repeated
+logins), and turns every IR change into a bounded lease that reverts to the
+configured default. `SetIsp` is deliberately not exposed to the app: the deployed
+Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi change.
+
 ## Network Boundary
 
 Connect the RLC-810A and Raspberry Pi to the private LAN or a dedicated camera
