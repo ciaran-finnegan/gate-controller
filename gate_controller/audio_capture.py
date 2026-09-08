@@ -118,11 +118,37 @@ DEFAULT_MIN_AVAILABLE_BYTES = 300 * 1024 * 1024
 # and dropped, rather than mislabelling a clip of some later, unrelated event.
 ACTUATION_CARRY_SECONDS = 5.0
 
-CHILD_ADDRESS_SPACE_BYTES = 128 * 1024 * 1024
+# RLIMIT_AS counts every mapping, including the shared libraries ffmpeg maps
+# before it runs a line of its own code -- and on this board those alone are
+# well past 128 MiB. Measured on the Pi on 2026-09-08: every capture died 55 ms
+# after the session started with `outcome=failed reason=exit_status`, and the
+# child's stderr said `error while loading shared libraries: libcodec2.so.1.0:
+# failed to map segment from shared object`. The same command under
+# `ulimit -v 131072` reproduces it; without the limit it produced 24,393 bytes
+# of valid AAC in 3 s. Resident memory was never the problem: a stream copy
+# decodes nothing, so RSS stays at 2.5-50 MB. 1 GiB clears the mappings with
+# room to spare and is still far below the 3.4 GB runaway ffmpeg that
+# OOM-killed the board on 2026-09-07, which is what this limit exists to stop.
+# The network probe's children are small `ping` processes and keep their own
+# much tighter 64 MiB (net_probe.CHILD_ADDRESS_SPACE_BYTES); this raise applies
+# to the audio child only.
+DEFAULT_CHILD_ADDRESS_SPACE_BYTES = 1024 * 1024 * 1024
+MIN_CHILD_ADDRESS_SPACE_BYTES = 256 * 1024 * 1024
+MAX_CHILD_ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024
+
 # ffmpeg has to connect, read the SDP and start receiving before the -t clock
 # means anything. This is the slack on top of the requested duration.
 CAPTURE_STARTUP_GRACE_SECONDS = 10.0
 MAX_SIDECAR_BYTES = 64 * 1024
+
+# The child's stderr is kept only as a tail, and only to make a failure
+# diagnosable from the journal: `-loglevel error` makes it the one line that
+# says why. Bounded on both sides -- what is held while the child runs, and
+# what is journalled -- so a child looping on errors can neither grow this nor
+# block on a full pipe.
+MAX_STDERR_TAIL_BYTES = 2 * 1024
+STDERR_TAIL_CHARACTERS = 200
+
 SKIPPED_EVENT_TYPES = frozenset({"Heartbeat", "heartbeat"})
 
 # The ADTS frame header every AAC frame in this container starts with: twelve
@@ -144,6 +170,7 @@ class AudioCaptureConfig:
     max_temp_c: float = DEFAULT_MAX_TEMP_C
     max_load: float = DEFAULT_MAX_LOAD
     min_available_bytes: int = DEFAULT_MIN_AVAILABLE_BYTES
+    child_address_space_bytes: int = DEFAULT_CHILD_ADDRESS_SPACE_BYTES
 
 
 def load_audio_capture_config(environment=None, corpus_directory=None) -> AudioCaptureConfig:
@@ -194,6 +221,12 @@ def load_audio_capture_config(environment=None, corpus_directory=None) -> AudioC
         max_load=_float_setting(
             environment, "GATE_AUDIO_CAPTURE_MAX_LOAD", DEFAULT_MAX_LOAD,
             minimum=0.5, maximum=16.0,
+        ),
+        child_address_space_bytes=_integer_setting(
+            environment, "GATE_AUDIO_CAPTURE_MAX_ADDRESS_SPACE_BYTES",
+            DEFAULT_CHILD_ADDRESS_SPACE_BYTES,
+            minimum=MIN_CHILD_ADDRESS_SPACE_BYTES,
+            maximum=MAX_CHILD_ADDRESS_SPACE_BYTES,
         ),
     )
 
@@ -564,7 +597,7 @@ class AudioClipRecorder:
         started_at = self._wall_clock()
         started_monotonic = self._clock()
         try:
-            audio, failure = self._capture()
+            audio, failure, stderr_tail = self._capture()
         finally:
             with self._lock:
                 self._in_flight = None
@@ -572,8 +605,15 @@ class AudioClipRecorder:
         if failure is not None or not audio:
             with self._lock:
                 self._counters["failed"] += 1
-                self._last_capture = {"outcome": "failed", "reason": failure}
-            LOGGER.warning("gate_audio_capture outcome=failed reason=%s", failure)
+                self._last_capture = {
+                    "outcome": "failed", "reason": failure, "stderr": stderr_tail or None,
+                }
+            # The tail is what makes this diagnosable: reason=exit_status on its
+            # own said nothing about the address space limit that caused it.
+            LOGGER.warning(
+                "gate_audio_capture outcome=failed reason=%s stderr=%s",
+                failure, stderr_tail or "-",
+            )
             return False
         sidecar = _build_sidecar(
             request, started_at=started_at, elapsed_seconds=elapsed,
@@ -662,19 +702,27 @@ class AudioClipRecorder:
             "-f", "adts", "pipe:1",
         )
 
-    def _capture(self) -> tuple[bytes, str | None]:
+    def _capture(self) -> tuple[bytes, str | None, str]:
+        """Run one child. Returns its audio, why it failed, and its stderr tail.
+
+        The tail is kept because a failure that says only ``reason=exit_status``
+        is not diagnosable from the journal: that is exactly what the address
+        space limit looked like on 2026-09-08, and the one line that explained
+        it was going to ``DEVNULL``.
+        """
+        errors = bytearray()
         try:
             process = self._popen(
                 self.command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 env={"LANG": "C", "LC_ALL": "C"},
                 close_fds=True,
-                preexec_fn=_limit_child,
+                preexec_fn=_child_limiter(self.config.child_address_space_bytes),
             )
         except (OSError, ValueError):
-            return b"", "spawn"
+            return b"", "spawn", ""
         with self._lock:
             # Publish under the lock so close() either sees this child or has
             # already marked us closed, in which case it dies here.
@@ -685,39 +733,53 @@ class AudioClipRecorder:
                 self._process = process
         if stopping:
             _terminate(process)
-            return b"", "stopping"
+            return b"", "stopping", ""
         try:
-            audio, failure = self._read_bounded(process)
+            audio, failure = self._read_bounded(process, errors)
         finally:
+            # Whatever the child said on its way out, taken without blocking
+            # and before the pipe is closed under us.
+            _drain_errors(_error_descriptor(process), errors)
             _terminate(process)
             with self._lock:
                 if self._process is process:
                     self._process = None
+        tail = _stderr_tail(errors)
         if failure is not None:
-            return audio, failure
+            return audio, failure, tail
         if process.returncode != 0:
-            return audio, "exit_status"
+            return audio, "exit_status", tail
         if not _is_adts_aac(audio):
-            return audio, "not_aac"
-        return audio, None
+            return audio, "not_aac", tail
+        return audio, None, tail
 
-    def _read_bounded(self, process) -> tuple[bytes, str | None]:
+    def _read_bounded(self, process, errors: bytearray | None = None) -> tuple[bytes, str | None]:
         """Read to EOF, never holding more than the cap nor waiting past the
         deadline. ffmpeg's ``-t`` is the first bound; these are the other two,
         because a child that hangs before it ever honours ``-t`` would
         otherwise sit on an RTSP connection forever."""
         deadline = self._clock() + self.config.clip_seconds + CAPTURE_STARTUP_GRACE_SECONDS
         buffer = bytearray()
+        errors = bytearray() if errors is None else errors
         try:
             descriptor = process.stdout.fileno()
         except (AttributeError, OSError, ValueError):
             return b"", "no_stdout"
+        # stderr is read in the same loop, never after it: a child that filled
+        # the stderr pipe while nobody was reading would block on the write and
+        # never reach the -t it was given.
+        error_descriptor = _error_descriptor(process)
+        sources = [descriptor] if error_descriptor is None else [descriptor, error_descriptor]
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return bytes(buffer), "timeout"
-            ready, _, _ = select.select([descriptor], [], [], min(remaining, 1.0))
-            if not ready:
+            ready, _, _ = select.select(sources, [], [], min(remaining, 1.0))
+            if error_descriptor is not None and error_descriptor in ready:
+                if not _read_errors(error_descriptor, errors):
+                    sources.remove(error_descriptor)
+                    error_descriptor = None
+            if descriptor not in ready:
                 continue
             # Never ask for more than the remaining capacity plus one byte, so
             # an oversized clip is detected without ever being held.
@@ -844,21 +906,74 @@ def _is_adts_aac(data) -> bool:
     return header == _ADTS_SYNC and (data[1] >> 1) & 0x03 == 0
 
 
-def _limit_child() -> None:  # pragma: no cover - runs in the child
-    """Cap the child's address space and drop it to the lowest priority.
+def _child_limiter(address_space_bytes: int):
+    """Build the hook that caps one capture child and deprioritises it.
 
-    Copying packets needs almost nothing, so the limit is generous enough
-    never to bite in normal operation and tight enough that a runaway child
-    dies instead of taking the board with it -- which is what happened here on
-    2026-09-07 when a decode test was run on the live device.
+    Copying packets needs almost nothing *resident*, so the limit is tight
+    enough that a runaway child dies instead of taking the board with it --
+    which is what happened here on 2026-09-07 when a decode test was run on the
+    live device. It has to be generous in *address space* all the same, because
+    RLIMIT_AS also counts the shared libraries the loader maps before ffmpeg
+    runs at all; see DEFAULT_CHILD_ADDRESS_SPACE_BYTES for what the old 128 MiB
+    did on 2026-09-08.
     """
-    resource.setrlimit(
-        resource.RLIMIT_AS, (CHILD_ADDRESS_SPACE_BYTES, CHILD_ADDRESS_SPACE_BYTES),
-    )
+
+    def limit_child() -> None:  # pragma: no cover - runs in the child
+        resource.setrlimit(
+            resource.RLIMIT_AS, (address_space_bytes, address_space_bytes),
+        )
+        try:
+            os.nice(19)
+        except OSError:
+            pass
+
+    return limit_child
+
+
+def _error_descriptor(process):
+    """The child's stderr file descriptor, or None when there is not one."""
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return None
     try:
-        os.nice(19)
+        return stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _read_errors(descriptor: int, errors: bytearray) -> bool:
+    """Read what is waiting on stderr, keeping only the tail. False at EOF."""
+    try:
+        chunk = os.read(descriptor, 4096)
     except OSError:
-        pass
+        return False
+    if not chunk:
+        return False
+    errors.extend(chunk)
+    if len(errors) > MAX_STDERR_TAIL_BYTES:
+        del errors[:-MAX_STDERR_TAIL_BYTES]
+    return True
+
+
+def _drain_errors(descriptor, errors: bytearray) -> None:
+    """Take whatever is already buffered on stderr, without ever waiting."""
+    if descriptor is None:
+        return
+    for _ in range(16):
+        try:
+            ready, _unused, _also = select.select([descriptor], [], [], 0)
+        except (OSError, ValueError):
+            return
+        if not ready or not _read_errors(descriptor, errors):
+            return
+
+
+def _stderr_tail(errors: bytearray) -> str:
+    """One journal-safe line: the last few characters the child complained in."""
+    text = bytes(errors).decode("utf-8", "replace")
+    # Collapsed to a single line so one failure stays one journal record, and
+    # trimmed so a chatty child cannot flood it.
+    return " ".join(text.split())[-STDERR_TAIL_CHARACTERS:]
 
 
 def _terminate(process) -> None:
@@ -872,10 +987,12 @@ def _terminate(process) -> None:
                 pass
     except OSError:
         pass
-    stdout = getattr(process, "stdout", None)
-    if stdout is not None:
+    for name in ("stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is None:
+            continue
         try:
-            stdout.close()
+            stream.close()
         except OSError:
             pass
 
