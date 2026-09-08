@@ -39,6 +39,14 @@ OCR_READ_TIMEOUT_SECONDS = 2.0
 # waiting for a slow API. The decision deadline still bounds the whole event.
 OCR_FIRST_ATTEMPT_READ_TIMEOUT_SECONDS = 2.8
 MIN_OCR_TIMEOUT_SECONDS = 0.1
+# A cloud lookup is charged whether or not the answer arrives in time, so a
+# frame whose remaining budget cannot cover one is not sent at all. The floor
+# sits just under the measured p50 of every OCR attempt that completed between
+# 3 and 6 September (1.07 s over 161 attempts, docs/reviews/2026-09-06-
+# decision-timing.md): a request with less budget than the median call takes
+# cannot finish, and it costs the same as one that could.
+# GATE_OCR_MIN_REQUEST_SECONDS re-derives it when the uplink changes.
+DEFAULT_MIN_CLOUD_REQUEST_SECONDS = 1.0
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -50,7 +58,16 @@ class _OcrBusy(TimeoutError):
 
 
 class _OcrDeadlineExceeded(TimeoutError):
-    pass
+    """The frame ran out of decision budget.
+
+    ``attempted`` is False when nothing was ever sent, so the frame must not
+    be journalled as a timed-out request: the app reads ``ocr_timeout`` as a
+    billed lookup, and a request that was never posted was not billed.
+    """
+
+    def __init__(self, message: str, *, attempted: bool = True) -> None:
+        super().__init__(message)
+        self.attempted = attempted
 
 
 class GateProcessor:
@@ -61,7 +78,7 @@ class GateProcessor:
                  activation_guard_seconds: float | None = None,
                  decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
-                 match_policy=None):
+                 match_policy=None, min_cloud_request_seconds: float | None = None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -104,6 +121,26 @@ class GateProcessor:
         # not take the id (every existing fake) is called exactly as before.
         self._recognizer_accepts_trace_id = _accepts_keyword(
             self._recognise_call, "trace_id"
+        )
+        self._recognizer_accepts_attempt = _accepts_keyword(
+            self._recognise_call, "attempt"
+        )
+        # The on-device read, off the serial cloud slot. A recogniser without
+        # it (every existing fake, and any build with local OCR off) keeps the
+        # single-phase path exactly as it was. Both halves are required: a
+        # recogniser that cannot be handed the pass back would infer the frame
+        # a second time inside the slot, which is the cost this split removes.
+        self._local_pass = (
+            _optional_callable(self._recognizer, "local_pass")
+            if self._recognizer_accepts_attempt else None
+        )
+        # This event's local reads, so the processor's own decide_access can
+        # see that both readers produced the same plate.
+        self._local_observations = _optional_callable(
+            self._recognizer, "local_observations"
+        )
+        self._min_cloud_request_seconds = _bounded_min_cloud_request(
+            min_cloud_request_seconds, decision_timeout,
         )
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
@@ -198,8 +235,10 @@ class GateProcessor:
                 ))
                 ocr_failure_reason = "ocr_busy"
                 break
-            except _OcrDeadlineExceeded:
-                if ocr_started:
+            except _OcrDeadlineExceeded as error:
+                # A frame that was never sent is not a timed-out lookup: the
+                # app counts `ocr_timeout` as billed, and nothing was billed.
+                if ocr_started and getattr(error, "attempted", True):
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_timeout",
@@ -230,6 +269,7 @@ class GateProcessor:
             decision = decide_access(
                 observations, authorised, self._current_match_policy(),
                 now=self._clock(),
+                corroborations=self._corroborations(trace.trace_id),
             )
             if self._decision_clock() - started >= self._decision_timeout:
                 timed_out = True
@@ -475,11 +515,74 @@ class GateProcessor:
             payload["_awaiting_telemetry"] = True
         return payload
 
+    def _corroborations(self, trace_id) -> tuple:
+        """This event's on-device reads, or nothing at all.
+
+        Keyed by trace id, and never allowed to disturb the decision: a
+        recogniser without the hook, or one that raises, simply corroborates
+        nothing and the decision is exactly the one the cloud reads alone
+        would have produced.
+        """
+        if self._local_observations is None or not trace_id:
+            return ()
+        try:
+            return tuple(self._local_observations(trace_id))
+        except Exception:
+            return ()
+
+    def _run_local_pass(self, path: Path, deadline: float, trace_id):
+        """The on-device read, taken before queueing for the cloud OCR slot.
+
+        This is the whole of requirement (a): the slot serialises *cloud*
+        requests, and a local read that can answer for the frame must not wait
+        behind one. A failure here is not a failure of the frame -- it falls
+        through to the cloud exactly as it would have without a local reader.
+        """
+        if self._local_pass is None:
+            return None
+        try:
+            return self._local_pass(
+                path, trace_id=trace_id,
+                budget=max(0.0, deadline - self._decision_clock()),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "gate_ocr stage=local_pass_unavailable"
+            )
+            return None
+
     def _recognise(self, path: Path, deadline: float, on_start=None, *,
                    first_attempt: bool = False, trace_id: str | None = None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
+        attempt = None
+        if self._local_pass is not None:
+            if on_start is not None:
+                # Recognition really has started for this frame; the on-device
+                # read is recognition. Marking it here keeps `ocr_ms` honest
+                # and moves the local wait out of `burst_to_ocr_ms`.
+                on_start()
+            attempt = self._run_local_pass(path, deadline, trace_id)
+            if attempt is not None and attempt.decided:
+                return attempt.observation
+        remaining = deadline - self._decision_clock()
+        if remaining < self._min_cloud_request_seconds:
+            # Skipping is what keeps the lookup unbilled; a request posted
+            # into a budget it cannot finish in is charged all the same.
+            if attempt is not None:
+                attempt.abandon()
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skipped reason=insufficient_budget "
+                "remaining_ms=%d required_ms=%d",
+                max(0, round(remaining * 1000)),
+                round(self._min_cloud_request_seconds * 1000),
+            )
+            raise _OcrDeadlineExceeded(
+                "too little decision budget left to bill a cloud request",
+                attempted=False,
+            )
+        attempt_kwargs = {} if attempt is None else {"attempt": attempt}
         extra = (
             {"trace_id": trace_id}
             if self._recognizer_accepts_trace_id and trace_id else {}
@@ -492,9 +595,11 @@ class GateProcessor:
             (lambda: {"budget": max(0.0, deadline - self._decision_clock())})
             if self._recognizer_accepts_budget else (lambda: {})
         )
-        operation = lambda: self._recognise_call(path, **budget(), **extra)
+        operation = lambda: self._recognise_call(
+            path, **budget(), **extra, **attempt_kwargs
+        )
         if not self._recognizer_accepts_timeout:
-            return self._run_ocr_bounded(operation, deadline, on_start)
+            return self._bounded_cloud_call(operation, deadline, on_start, attempt)
         # Give the dial and handshake half of what is left, bounded above:
         # a request that cannot even connect in that time will not finish
         # reading in the rest either.
@@ -508,9 +613,25 @@ class GateProcessor:
         )
         read = min(read_cap, max(MIN_OCR_TIMEOUT_SECONDS, remaining - connect))
         operation = lambda: self._recognise_call(
-            path, timeout=(connect, read), **budget(), **extra
+            path, timeout=(connect, read), **budget(), **extra, **attempt_kwargs
         )
-        return self._run_ocr_bounded(operation, deadline, on_start)
+        return self._bounded_cloud_call(operation, deadline, on_start, attempt)
+
+    def _bounded_cloud_call(self, operation, deadline, on_start, attempt):
+        """Run the cloud request, and never leave a local read unsettled.
+
+        A burst that never gets the slot -- ``ocr_busy``, a closed processor,
+        a deadline that expired while waiting -- raises before the request
+        exists, so nothing else would ever pair the frame's on-device read
+        with a cloud answer and emit its journal line. Settling is idempotent,
+        so doing it here costs nothing when the request did run.
+        """
+        try:
+            return self._run_ocr_bounded(operation, deadline, on_start)
+        except BaseException:
+            if attempt is not None:
+                attempt.abandon()
+            raise
 
     def _run_ocr_bounded(self, operation, deadline: float, on_start=None):
         with self._ocr_slot_lock:
@@ -827,6 +948,40 @@ def _actuation_telemetry(execution) -> tuple[str, bool, str]:
     if execution.reason == "indeterminate_claim":
         return "claimed", True, "indeterminate"
     return "claimed", True, execution.reason
+
+
+def _optional_callable(target, name: str):
+    """A hook the recogniser may or may not have. Never raises."""
+    hook = getattr(target, name, None)
+    return hook if callable(hook) else None
+
+
+def _bounded_min_cloud_request(value, decision_timeout: float) -> float:
+    """How much budget a cloud request must have before it is worth billing.
+
+    Fails closed to sending: an unreadable value, or one that would swallow
+    the whole decision budget and skip every request, falls back to the
+    shipped floor, and a floor that still does not fit is disabled entirely
+    rather than silently turning every frame into a timeout.
+    """
+    try:
+        seconds = (
+            DEFAULT_MIN_CLOUD_REQUEST_SECONDS if value is None else float(value)
+        )
+    except (TypeError, ValueError):
+        seconds = DEFAULT_MIN_CLOUD_REQUEST_SECONDS
+    if not math.isfinite(seconds) or seconds < 0:
+        seconds = DEFAULT_MIN_CLOUD_REQUEST_SECONDS
+    if seconds >= decision_timeout:
+        logging.getLogger(__name__).warning(
+            "gate_ocr min_request_seconds=%.2f status=rejected "
+            "reason=exceeds_decision_timeout", seconds,
+        )
+        seconds = (
+            DEFAULT_MIN_CLOUD_REQUEST_SECONDS
+            if DEFAULT_MIN_CLOUD_REQUEST_SECONDS < decision_timeout else 0.0
+        )
+    return seconds
 
 
 def _accepts_keyword(callable_object, keyword: str) -> bool:

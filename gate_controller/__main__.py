@@ -196,6 +196,7 @@ def main() -> None:
         max_image_age=timedelta(seconds=max_image_age),
         decision_timeout=decision_timeout,
         match_policy=match_policy.get,
+        min_cloud_request_seconds=_min_cloud_request_seconds(os.environ),
     )
 
     def process(paths, received_at=None, decision_started_at=None,
@@ -396,6 +397,25 @@ def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None):
         if config.enabled else ()
     )
     return correlator, workers
+
+
+def _min_cloud_request_seconds(environment):
+    """How much decision budget a cloud lookup must have to be worth billing.
+
+    Unset keeps the shipped floor. An unreadable value is not an error worth
+    refusing to start over: the processor validates it again and falls back to
+    that same floor, which only ever sends more requests, never fewer.
+    """
+    raw = str(environment.get("GATE_OCR_MIN_REQUEST_SECONDS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "gate_ocr key=GATE_OCR_MIN_REQUEST_SECONDS status=rejected"
+        )
+        return None
 
 
 def _ocr_upload_width(environment) -> int:

@@ -263,14 +263,37 @@ one fresh clear-stream keyframe at a time, `GATE_PRESENCE_SPACING_SECONDS`
 (3 s) apart, for up to `GATE_PRESENCE_WINDOW_SECONDS` (20 s) after the alarm
 and at most `GATE_PRESENCE_MAX_FRAMES` (4) extra frames. Only one presence
 frame is ever outstanding, and the bounded burst queue coalesces an FTP
-upload away before a webhook-triggered frame, so a retry does not push a
-sharp frame out. The session ends as soon as the gate opens or a plate is
-read (an unauthorised plate is a final answer, not a reason to keep paying
-for OCR), and also when the window closes, the frame budget is spent, a newer
-camera event is waiting, or the service stops. The journal records
-`gate_trigger_capture outcome=presence_retry frame=N` for each extra frame and
-`outcome=presence_ended reason=opened|plate_read|budget|window|new_event`.
+upload away before a webhook-triggered frame — and a *stale frame of this
+same alarm* before either, because the newest picture answers the same
+question about the same car — so a retry does not push a sharp frame out.
+
+The session ends on a conclusive answer, and reading characters is not one.
+Until 2026-09-08 any decision carrying an observed plate ended it as
+`plate_read`; that stopped the retries with the car still at the gate and the
+gate still shut, including on a frame both readers had read correctly but a
+shade under the confidence bar. Three things end it now:
+
+- **the gate opened** (`reason=opened`);
+- **a confident read of another vehicle** (`reason=plate_denied`): a plate
+  read at or above the band's own exact-match bar with no authorised plate
+  within two edits of it. Another frame of the same car cannot change that,
+  and each one is a paid lookup;
+- **a final pipeline answer** another frame cannot change (`reason=final_…`),
+  such as a revoked authorisation or an ambiguous fuzzy match.
+
+An uncertain read — anything close to an authorised plate, or below the bar —
+keeps the session offering frames. It ends as well when the window closes, the
+frame budget is spent, a newer camera event is waiting, or the service stops.
+The journal records `gate_trigger_capture outcome=presence_retry frame=N` for
+each extra frame and
+`outcome=presence_ended reason=opened|plate_denied|budget|window|new_event`.
 Set `GATE_PRESENCE_MAX_FRAMES=0` to disable the session.
+
+Once a session *has* opened the gate, any of its frames still sitting in the
+burst queue are dropped before they are read
+(`gate_burst stage=skipped reason=event_already_opened`): the relay cooldown
+would refuse a second activation anyway, so the only thing another lookup
+could buy is the bill.
 
 A frame that leaves the pipeline without a decision — coalesced out of a full
 queue, or lost to a processing error — is reported back to the session as

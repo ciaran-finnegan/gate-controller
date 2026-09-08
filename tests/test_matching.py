@@ -2,9 +2,9 @@ import unittest
 from datetime import datetime, timezone
 
 from gate_controller.match_policy import (
-    LEVEL_STANDARD, LEVEL_STRICT, MINUTES_PER_DAY,
-    RECOMMENDED_POLICY,
-    Band, MatchPolicy, safe_policy,
+    LEGACY_MIN_CONFIDENCE, LEVEL_STANDARD, LEVEL_STRICT, LEVELS,
+    MINUTES_PER_DAY, RECOMMENDED_POLICY,
+    Band, MatchPolicy, apply_confidence, safe_policy,
 )
 from gate_controller.matching import decide_access, normalise_plate
 from gate_controller.models import PlateObservation
@@ -240,3 +240,308 @@ class WithdrawnRelaxedLevelTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.reason, "exact_match")
+
+
+def _standard_policy():
+    return MatchPolicy(bands=(Band(0, MINUTES_PER_DAY, LEVEL_STANDARD),))
+
+
+def _strict_policy():
+    return MatchPolicy(bands=(Band(0, MINUTES_PER_DAY, LEVEL_STRICT),))
+
+
+def _cloud(plate, confidence):
+    return PlateObservation(plate, confidence, source="cloud")
+
+
+def _local(plate, confidence):
+    return PlateObservation(plate, confidence, source="local")
+
+
+class LevelledConfidenceTests(unittest.TestCase):
+    """Requirement (e): the confidence bars belong to the level, not the module."""
+
+    def setUp(self):
+        self.addCleanup(apply_confidence, {})
+        apply_confidence({})
+
+    def test_the_daytime_bar_admits_the_cloud_read_that_was_turned_away(self):
+        # 2026-09-08 11:13:48, source=cloud, 10CE1990 at 0.806 against the
+        # hardcoded 0.90. `standard` now asks 0.75 of an exact match.
+        decision = decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _standard_policy(),
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "exact_match")
+
+    def test_the_overnight_bar_is_unchanged_by_this_release(self):
+        strict = _strict_policy()
+        self.assertFalse(
+            decide_access([_cloud("10CE1990", 0.806)], {"10CE1990"}, strict).allowed
+        )
+        self.assertTrue(
+            decide_access([_cloud("10CE1990", 0.90)], {"10CE1990"}, strict).allowed
+        )
+
+    def test_a_fuzzy_match_keeps_a_higher_bar_than_an_exact_one(self):
+        # 11WH2S71 is one known S/5 confusion from 11WH2571: not the
+        # authorised plate, so it is held to more than an exact read is.
+        policy = _standard_policy()
+        near = [_cloud("11WH2S71", 0.80), _cloud("11WH2S71", 0.80)]
+        self.assertFalse(decide_access(near, {"11WH2571"}, policy).allowed)
+        confident = [_cloud("11WH2S71", 0.86), _cloud("11WH2S71", 0.86)]
+        self.assertTrue(decide_access(confident, {"11WH2571"}, policy).allowed)
+
+    def test_each_level_takes_its_bar_from_its_own_environment_key(self):
+        apply_confidence({
+            "GATE_MATCH_MIN_CONFIDENCE_STANDARD": "0.40",
+            "GATE_MATCH_MIN_CONFIDENCE_STRICT": "0.99",
+        })
+
+        self.assertTrue(
+            decide_access([_cloud("12D3456", 0.41)], {"12D3456"},
+                          _standard_policy()).allowed
+        )
+        self.assertFalse(
+            decide_access([_cloud("12D3456", 0.98)], {"12D3456"},
+                          _strict_policy()).allowed
+        )
+
+    def test_an_unusable_value_falls_closed_to_the_bar_that_shipped_before(self):
+        for value in ("nan", "inf", "-0.5", "1.5", "banana", "0x3"):
+            with self.assertLogs("gate_controller.match_policy", level="WARNING") as logs:
+                apply_confidence({"GATE_MATCH_MIN_CONFIDENCE_STANDARD": value})
+            self.assertEqual(
+                LEVELS[LEVEL_STANDARD].min_exact_confidence,
+                LEGACY_MIN_CONFIDENCE,
+                f"{value!r} must not widen the gate",
+            )
+            self.assertIn("status=rejected", "\n".join(logs.output))
+
+    def test_a_rejected_value_is_logged_once_per_load(self):
+        with self.assertLogs("gate_controller.match_policy", level="WARNING") as logs:
+            apply_confidence({"GATE_MATCH_MIN_CONFIDENCE_STANDARD": "nan"})
+
+        rejections = [line for line in logs.output if "status=rejected" in line]
+        self.assertEqual(len(rejections), 1)
+
+    def test_an_environment_that_raises_is_read_as_unset(self):
+        class Hostile:
+            def get(self, key, default=None):
+                raise RuntimeError("no environment here")
+
+        apply_confidence(Hostile())
+
+        self.assertEqual(LEVELS[LEVEL_STANDARD].min_exact_confidence, 0.75)
+
+
+class AgreementRuleTests(unittest.TestCase):
+    """Requirement (b): two readers, the same string, a lower bar on each."""
+
+    def setUp(self):
+        self.addCleanup(apply_confidence, {})
+        apply_confidence({})
+
+    def test_both_readers_below_their_own_bars_still_open_when_they_agree(self):
+        decision = decide_access(
+            [_cloud("10CE1990", 0.71)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.566)],
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "exact_match")
+        self.assertEqual(decision.match_rule, "exact")
+        self.assertEqual(decision.observed_plate, "10CE1990")
+        self.assertEqual(decision.authorised_plate, "10CE1990")
+
+    def test_the_measured_september_reads_are_admitted(self):
+        # The exact pair from the 11:13:48 journal line.
+        decision = decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.566)],
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_it_is_journalled_distinctly(self):
+        with self.assertLogs("gate_controller.matching", level="INFO") as logs:
+            decide_access(
+                [_cloud("10CE1990", 0.71)], {"10CE1990"}, _standard_policy(),
+                corroborations=[_local("10CE1990", 0.566)],
+            )
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_match stage=agreement_grant", combined)
+        self.assertIn("plate=10CE1990", combined)
+        self.assertIn("local_score=0.566", combined)
+        self.assertIn("cloud_score=0.710", combined)
+
+    def test_one_reader_agreeing_with_itself_is_not_agreement(self):
+        decision = decide_access(
+            [_cloud("10CE1990", 0.71), _cloud("10CE1990", 0.72)],
+            {"10CE1990"}, _standard_policy(),
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "no_match")
+
+    def test_two_readers_of_a_plate_that_is_not_authorised_are_denied(self):
+        decision = decide_access(
+            [_cloud("99XX9999", 0.99)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("99XX9999", 0.99)],
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "no_match")
+
+    def test_a_reader_under_its_own_agreement_bar_does_not_corroborate(self):
+        self.assertFalse(decide_access(
+            [_cloud("10CE1990", 0.69)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.99)],
+        ).allowed)
+        self.assertFalse(decide_access(
+            [_cloud("10CE1990", 0.74)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.49)],
+        ).allowed)
+
+    def test_readers_that_disagree_never_corroborate_each_other(self):
+        decision = decide_access(
+            [_cloud("10CE1991", 0.71)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.99)],
+        )
+
+        self.assertFalse(decision.allowed)
+
+    def test_a_non_finite_confidence_is_not_a_confidence(self):
+        for confidence in (float("nan"), float("inf")):
+            self.assertFalse(decide_access(
+                [_cloud("10CE1990", 0.71)], {"10CE1990"}, _standard_policy(),
+                corroborations=[_local("10CE1990", confidence)],
+            ).allowed, f"{confidence!r} corroborated a read")
+
+    def test_agreement_buys_no_extra_edit(self):
+        # Two readers agreeing on a plate two edits away is still two edits.
+        decision = decide_access(
+            [_cloud("11WH2S7I", 0.99)], {"11WH2571"}, _standard_policy(),
+            corroborations=[_local("11WH2S7I", 0.99)],
+        )
+
+        self.assertFalse(decision.allowed)
+
+    def test_agreement_keeps_the_bands_frame_requirement_for_a_fuzzy_match(self):
+        policy = _standard_policy()
+        one_frame = decide_access(
+            [_cloud("11WH2S71", 0.71)], {"11WH2571"}, policy,
+            corroborations=[_local("11WH2S71", 0.99)],
+        )
+        self.assertFalse(
+            one_frame.allowed,
+            "a non-exact match still needs the two frames the band asks for",
+        )
+
+        two_frames = decide_access(
+            [_cloud("11WH2S71", 0.71), _cloud("11WH2S71", 0.72)],
+            {"11WH2571"}, policy,
+            corroborations=[_local("11WH2S71", 0.99)],
+        )
+        self.assertTrue(two_frames.allowed)
+        self.assertEqual(two_frames.reason, "two_frame_ocr_confusion")
+        self.assertEqual(two_frames.match_rule, "ocr_confusion")
+
+    def test_overnight_agreement_defaults_change_nothing(self):
+        decision = decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _strict_policy(),
+            corroborations=[_local("10CE1990", 0.89)],
+        )
+
+        self.assertFalse(
+            decision.allowed,
+            "strict ships with its agreement bars at the historical 0.90",
+        )
+
+    def test_the_agreement_bars_are_tunable_per_level(self):
+        apply_confidence({
+            "GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_STRICT": "0.80",
+            "GATE_MATCH_AGREEMENT_MIN_CLOUD_CONFIDENCE_STRICT": "0.80",
+        })
+
+        decision = decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _strict_policy(),
+            corroborations=[_local("10CE1990", 0.89)],
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "exact_match")
+
+    def test_an_ambiguous_agreed_plate_is_never_resolved_by_favour(self):
+        decision = decide_access(
+            [_cloud("11WH2S71", 0.71), _cloud("11WH2S71", 0.72)],
+            {"11WH2571", "11WH2S7I"}, _standard_policy(),
+            corroborations=[_local("11WH2S71", 0.99)],
+        )
+
+        self.assertFalse(decision.allowed)
+
+    def test_no_corroborations_leaves_every_decision_exactly_as_it_was(self):
+        self.assertFalse(decide_access(
+            [_cloud("10CE1990", 0.71)], {"10CE1990"}, _standard_policy(),
+        ).allowed)
+        self.assertFalse(decide_access(
+            [_cloud("10CE1990", 0.71)], {"10CE1990"}, _standard_policy(),
+            corroborations=(),
+        ).allowed)
+
+
+class LongerMisreadTests(unittest.TestCase):
+    """The 11:07:10 report: a 9-character read beside an 8-character plate.
+
+    The journal line that prompted it pairs both readers on one line --
+    `local_plate=131D26956 local_score=0.389 ... cloud_plate=131D2696
+    cloud_score=0.961`. The grant was the *cloud* read of the authorised
+    plate; the nine-character string was the on-device reader's misread, at a
+    confidence far below its own gate, and it never took part in anything.
+    These tests pin that down so the pairing cannot start to matter later.
+    """
+
+    def setUp(self):
+        self.addCleanup(apply_confidence, {})
+        apply_confidence({})
+
+    def test_a_longer_read_never_exact_matches_a_shorter_authorised_plate(self):
+        decision = decide_access(
+            [_cloud("131D26956", 0.99)], {"131D2696"}, _standard_policy(),
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "no_match")
+        self.assertEqual(decision.observed_plate, "131D26956")
+        # One deletion away, so it is reportable as a near miss -- and a near
+        # miss never widens a match.
+        self.assertEqual(decision.near_miss_plate, "131D2696")
+        self.assertEqual(decision.near_miss_distance, 1)
+
+    def test_a_deletion_is_not_a_known_confusion_at_any_level(self):
+        for policy in (_standard_policy(), _strict_policy()):
+            self.assertFalse(decide_access(
+                [_cloud("131D26956", 0.99), _cloud("131D26956", 0.99)],
+                {"131D2696"}, policy,
+            ).allowed)
+
+    def test_a_longer_agreed_read_is_denied_even_when_both_readers_agree(self):
+        decision = decide_access(
+            [_cloud("131D26956", 0.99)], {"131D2696"}, _standard_policy(),
+            corroborations=[_local("131D26956", 0.99)],
+        )
+
+        self.assertFalse(decision.allowed)
+
+    def test_the_cloud_read_of_the_authorised_plate_is_what_granted(self):
+        # Both readings of the same frame, as they were journalled.
+        decision = decide_access(
+            [_cloud("131D2696", 0.961)], {"131D2696"}, _standard_policy(),
+            corroborations=[_local("131D26956", 0.389)],
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "exact_match")
+        self.assertEqual(decision.observed_plate, "131D2696")

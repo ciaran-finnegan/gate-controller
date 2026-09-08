@@ -522,13 +522,43 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertIn("outcome=presence_ended reason=opened extra_frames=1", combined)
         self.assertEqual(capture.status()["presence"]["retries"], 1)
 
-    def test_presence_session_stops_when_a_plate_was_read_even_if_denied(self):
+    def test_presence_session_keeps_trying_after_a_read_that_did_not_grant(self):
+        # 2026-09-08 11:13:48: both readers read the authorised plate, the
+        # decision was denied for confidence, and `plate_read` ended the
+        # session with the gate shut and the car still there. An uncertain
+        # read is not an answer; the session must keep offering frames.
         clock = [100.0]
-        read = ProcessingResult(False, "no_match", decision=MatchDecision(
-            False, "no_match", observed_plate="99X9999", confidence=0.91,
+        uncertain = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="10CE199O", confidence=0.61,
+            policy_level="standard", policy_band="08:00-22:00",
+            near_miss_plate="10CE1990", near_miss_distance=1,
         ))
         capture, popen = self._presence_capture(
-            5, clock=clock, verdict=lambda n: ProcessingResult(False, "ocr_error") if n < 4 else read,
+            6, clock=clock, max_frames=2,
+            verdict=lambda n: ProcessingResult(False, "ocr_error") if n < 4 else uncertain,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        combined = "\n".join(logs.output)
+        self.assertEqual(extra, 2, "the denied read did not stop the retries")
+        self.assertNotIn("reason=plate_read", combined)
+        self.assertIn("presence_ended reason=budget", combined)
+
+    def test_presence_session_stops_on_a_confident_read_of_another_vehicle(self):
+        # A plate read clearly, at the band's own exact bar, with nothing
+        # authorised within two edits of it. Another frame of the same car
+        # cannot change that, and every one of them is a paid lookup.
+        clock = [100.0]
+        stranger = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="231WH553", confidence=0.91,
+            policy_level="standard", policy_band="08:00-22:00",
+        ))
+        capture, popen = self._presence_capture(
+            5, clock=clock,
+            verdict=lambda n: ProcessingResult(False, "ocr_error") if n < 4 else stranger,
         )
         capture.capture_series(event(), 100.0, self._Stop(clock))
 
@@ -536,7 +566,29 @@ class TriggerFrameCaptureTests(unittest.TestCase):
             extra = capture.presence_session(event(), 100.0, self._Stop(clock))
 
         self.assertEqual(extra, 1)
-        self.assertIn("presence_ended reason=plate_read", "\n".join(logs.output))
+        self.assertIn("presence_ended reason=plate_denied", "\n".join(logs.output))
+
+    def test_presence_session_ends_as_opened_only_when_the_gate_opened(self):
+        # The renamed line: `plate_read` is gone, and the only settle a grant
+        # produces says so.
+        clock = [100.0]
+        granted = ProcessingResult(True, "exact_match", decision=MatchDecision(
+            True, "exact_match", observed_plate="10CE1990",
+            authorised_plate="10CE1990", confidence=0.62,
+            policy_level="standard", policy_band="08:00-22:00",
+        ))
+        capture, popen = self._presence_capture(
+            5, clock=clock,
+            verdict=lambda n: ProcessingResult(False, "ocr_error") if n < 4 else granted,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        combined = "\n".join(logs.output)
+        self.assertIn("presence_ended reason=opened", combined)
+        self.assertNotIn("reason=plate_read", combined)
 
     def test_presence_session_spends_at_most_the_frame_budget_then_the_window(self):
         clock = [100.0]

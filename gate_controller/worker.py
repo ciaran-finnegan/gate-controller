@@ -37,14 +37,44 @@ class BurstIdentity:
     # trigger; the FTP path resolves one from the correlator instead.
     trigger: TriggerTelemetry | None = None
 
+    @property
+    def camera_event(self) -> tuple | None:
+        """Which camera alarm this frame belongs to, or None when unknown.
+
+        The trigger's rule and its event timestamp identify the alarm; the
+        per-frame `delta_ms` deliberately does not take part. Only a
+        correlated webhook trigger has an identity at all -- an FTP burst
+        carries no alarm of its own and is never treated as sharing one.
+        """
+        trigger = self.trigger
+        if trigger is None or getattr(trigger, "correlation", None) != "matched":
+            return None
+        event_at = getattr(trigger, "event_at", None)
+        rule_id = getattr(trigger, "rule_id", None)
+        if event_at is None and rule_id is None:
+            return None
+        return (
+            getattr(trigger, "source", None),
+            getattr(trigger, "event_type", None),
+            rule_id,
+            event_at,
+        )
+
 
 class BoundedBurstQueue:
     """A one-consumer queue that keeps the freshest pending camera work.
 
-    A full queue coalesces the oldest burst away, except that a
-    webhook-triggered frame is given up only when there is nothing else to
-    give up: a presence session holds one frame outstanding at a time, and an
-    FTP upload landing in the same second must not push it out.
+    A full queue coalesces the oldest burst away, in this order:
+
+    1. the oldest queued frame of the *same camera alarm* as the arriving
+       one. Several frames of one passage are the same question asked
+       repeatedly, and the newest picture is the one worth answering: the
+       older one would spend a paid lookup on a staler view of the same car.
+    2. otherwise the oldest untriggered burst, so a webhook-triggered frame is
+       given up only when there is nothing else to give up: a presence session
+       holds one frame outstanding at a time, and an FTP upload landing in the
+       same second must not push it out.
+    3. otherwise the oldest burst of all.
     """
 
     def __init__(self, max_pending: int = 2):
@@ -58,12 +88,12 @@ class BoundedBurstQueue:
         with self._lock:
             if self._stopping:
                 return item
-            dropped = self._coalesce() if self._queue.full() else None
+            dropped = self._coalesce(item) if self._queue.full() else None
             self._queue.put_nowait(item)
             return dropped
 
-    def _coalesce(self):
-        """Remove the oldest untriggered burst, or the oldest burst of all."""
+    def _coalesce(self, arriving=None):
+        """Give up one burst, preferring a stale frame of the arriving alarm."""
         held = []
         while True:
             try:
@@ -76,11 +106,13 @@ class BoundedBurstQueue:
             for candidate in held:
                 self._queue.put_nowait(candidate)
             return None
-        index = next(
-            (position for position, candidate in enumerate(held)
-             if not _is_triggered(candidate)),
-            0,
-        )
+        index = _superseded_index(held, arriving)
+        if index is None:
+            index = next(
+                (position for position, candidate in enumerate(held)
+                 if not _is_triggered(candidate)),
+                0,
+            )
         dropped = held.pop(index)
         for candidate in held:
             self._queue.put_nowait(candidate)
@@ -108,6 +140,36 @@ def _is_triggered(item) -> bool:
     """True for a burst injected by webhook capture: it carries its trigger."""
     identity = item[-1] if item else None
     return isinstance(identity, BurstIdentity) and identity.trigger is not None
+
+
+def _camera_event(item):
+    identity = item[-1] if item else None
+    if not isinstance(identity, BurstIdentity):
+        return None
+    try:
+        return identity.camera_event
+    except Exception:
+        return None
+
+
+def _superseded_index(held, arriving):
+    """The oldest queued frame the arriving one makes redundant, if any.
+
+    Same camera alarm, older frame: the newer picture answers the same
+    question about the same car, so the older one is what to give up. Returns
+    None when the arriving burst belongs to no alarm this queue is holding,
+    which is every FTP burst and every first frame of a passage.
+    """
+    if arriving is None:
+        return None
+    event = _camera_event(arriving)
+    if event is None:
+        return None
+    return next(
+        (position for position, candidate in enumerate(held)
+         if _camera_event(candidate) == event),
+        None,
+    )
 
 
 class BurstCollector:
@@ -491,14 +553,22 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             options["trigger"] = ftp_fallback_trigger()
         on_skipped(paths, reason, received_at, **options)
 
+    def coalesce(item, reason="queue_coalesced"):
+        """Give up one burst without deciding it, and account for it fully."""
+        try:
+            report_dropped(item, reason)
+        finally:
+            report_lost(item[0], reason)
+            _remove_uploads(item[0])
+
     def enqueue(item):
         dropped = bursts.put(item)
         if dropped is not None:
-            try:
-                report_dropped(dropped, "queue_coalesced")
-            finally:
-                report_lost(dropped[0], "queue_coalesced")
-                _remove_uploads(dropped[0])
+            coalesce(dropped)
+
+    superseded = getattr(trigger_capture, "superseded", None)
+    if not callable(superseded):
+        superseded = None
 
     def inject_trigger_burst(paths, received_at, trigger):
         # A webhook-triggered clear frame enters the same bounded queue as an
@@ -543,7 +613,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     processing_args = (
         bursts, emit, on_error,
         lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
-        trigger_resolver, on_result, report_lost,
+        trigger_resolver, on_result, report_lost, superseded, coalesce,
     )
     processing_thread = Thread(
         target=_supervise_worker,
@@ -632,7 +702,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
 def _process_bursts(
     bursts, emit, on_error=None, ranker=None, trigger_resolver=None, on_result=None,
-    on_dropped=None,
+    on_dropped=None, superseded=None, coalesce=None,
 ) -> None:
     ranker = ranker or rank_images
     while True:
@@ -640,6 +710,15 @@ def _process_bursts(
         if item is None:
             return
         paths, received_at, *timing = item
+        # A frame whose own passage has already opened the gate is answered,
+        # not undecided. Reading it would buy a lookup that cannot change
+        # anything; the relay cooldown would refuse the second open anyway.
+        if superseded is not None and coalesce is not None and _is_superseded(
+            superseded, paths
+        ):
+            LOGGER.info("gate_burst stage=skipped reason=event_already_opened")
+            coalesce(item)
+            continue
         trigger_summary = _TRIGGER_UNSET
         try:
             options = {}
@@ -675,6 +754,15 @@ def _process_bursts(
                     LOGGER.exception("gate_burst_result_handler_failed")
         finally:
             _remove_uploads(paths)
+
+
+def _is_superseded(superseded, paths) -> bool:
+    """Ask the capture, and never let the question cost a frame."""
+    try:
+        return bool(superseded(paths))
+    except Exception:
+        LOGGER.exception("gate_burst_superseded_check_failed")
+        return False
 
 
 def _resolve_trigger(trigger_resolver, received_at):

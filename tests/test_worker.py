@@ -1657,3 +1657,168 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreshestFrameFirstTests(unittest.TestCase):
+    """Requirement (d): several frames of one passage, newest answered."""
+
+    @staticmethod
+    def _trigger(event_at="2026-09-08T10:19:54+00:00", delta_ms=10):
+        return TriggerTelemetry(
+            source="reolink_webhook", event_type="vehicle",
+            rule_id="front_gate", correlation="matched",
+            event_at=event_at, delta_ms=delta_ms,
+        )
+
+    def _frame(self, name, trigger):
+        return ((Path(name),), None, BurstIdentity(f"digest-{name}", trigger))
+
+    def test_a_newer_frame_of_the_same_alarm_gives_up_the_older_one(self):
+        # 2026-09-08 11:19:54-11:20:02: three frames of one visitor passage
+        # queued, and every one of them was read. The newest picture answers
+        # the same question about the same car.
+        queue = BoundedBurstQueue(max_pending=2)
+        first = self._frame("first.jpg", self._trigger(delta_ms=10))
+        second = self._frame("second.jpg", self._trigger(delta_ms=3454))
+        third = self._frame("third.jpg", self._trigger(delta_ms=5590))
+
+        queue.put(first)
+        queue.put(second)
+
+        self.assertEqual(queue.put(third), first)
+        self.assertEqual(queue.get(), second)
+        self.assertEqual(queue.get(), third)
+
+    def test_a_frame_of_a_different_alarm_does_not_supersede_this_one(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        passage = self._frame("passage.jpg", self._trigger())
+        other = self._frame(
+            "other.jpg", self._trigger(event_at="2026-09-08T10:33:28+00:00"),
+        )
+        upload = ((Path("upload.jpg"),), None, BurstIdentity("digest-ftp"))
+
+        queue.put(passage)
+        queue.put(upload)
+
+        self.assertEqual(
+            queue.put(other), upload,
+            "a frame of another alarm still gives up the FTP burst first",
+        )
+
+    def test_an_ftp_burst_belongs_to_no_alarm_and_supersedes_nothing(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        triggered = self._frame("clear.jpg", self._trigger())
+        first = ((Path("upload-1.jpg"),), None, BurstIdentity("digest-1"))
+        second = ((Path("upload-2.jpg"),), None, BurstIdentity("digest-2"))
+
+        queue.put(triggered)
+        queue.put(first)
+
+        self.assertEqual(queue.put(second), first)
+        self.assertEqual(queue.get(), triggered)
+
+    def test_an_uncorrelated_trigger_has_no_alarm_identity(self):
+        # A trigger the correlator could not match names no alarm, so two of
+        # them must not be treated as frames of one passage.
+        unverified = TriggerTelemetry(
+            source="camera_ftp", event_type="unverified", correlation="unverified",
+        )
+        self.assertIsNone(BurstIdentity("digest", unverified).camera_event)
+
+    def test_a_burst_whose_passage_already_opened_is_never_read(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        stale = ((Path("stale.jpg"),), None)
+        queue.put(stale)
+        queue.put(None)
+        read = []
+        coalesced = []
+
+        _process_bursts(
+            queue,
+            lambda *args, **kwargs: read.append(args) or ProcessingResult(False, "no_match"),
+            superseded=lambda paths: True,
+            coalesce=lambda item, reason="queue_coalesced": coalesced.append(
+                (item[0], reason)
+            ),
+        )
+
+        self.assertEqual(read, [], "a decided passage must not buy another lookup")
+        self.assertEqual(coalesced, [((Path("stale.jpg"),), "queue_coalesced")])
+
+    def test_a_burst_whose_passage_is_still_open_is_read_as_before(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        queue.put(((Path("live.jpg"),), None))
+        queue.put(None)
+        read = []
+
+        _process_bursts(
+            queue,
+            lambda *args, **kwargs: read.append(args) or ProcessingResult(False, "no_match"),
+            superseded=lambda paths: False,
+            coalesce=lambda item, reason="queue_coalesced": None,
+        )
+
+        self.assertEqual(len(read), 1)
+
+    def test_a_superseded_check_that_raises_never_costs_a_frame(self):
+        queue = BoundedBurstQueue(max_pending=2)
+        queue.put(((Path("live.jpg"),), None))
+        queue.put(None)
+        read = []
+
+        _process_bursts(
+            queue,
+            lambda *args, **kwargs: read.append(args) or ProcessingResult(False, "no_match"),
+            superseded=lambda paths: 1 / 0,
+            coalesce=lambda item, reason="queue_coalesced": None,
+        )
+
+        self.assertEqual(len(read), 1)
+
+
+class SupersededSessionFrameTests(unittest.TestCase):
+    """The capture's own answer to "has this passage already opened?"."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.capture = TriggerFrameCapture(
+            TriggerCaptureConfig(
+                enabled=True,
+                output_directory=Path(self.directory.name) / ".trigger-capture",
+            ),
+        )
+
+    def _inject(self, path):
+        with self.capture._session_lock:
+            self.capture._session_paths.add(path)
+            self.capture._session_pending_paths.add(path)
+            self.capture._session_pending += 1
+
+    def test_a_frame_of_an_opened_session_is_superseded(self):
+        opened, queued = Path("opened.jpg"), Path("queued.jpg")
+        self._inject(opened)
+        self._inject(queued)
+
+        self.capture.note_result((opened,), ProcessingResult(True, "activated"))
+
+        self.assertTrue(self.capture.superseded((queued,)))
+
+    def test_a_frame_of_a_denied_session_is_not_superseded(self):
+        denied, queued = Path("denied.jpg"), Path("queued.jpg")
+        self._inject(denied)
+        self._inject(queued)
+
+        self.capture.note_result((denied,), ProcessingResult(False, "no_match"))
+
+        self.assertFalse(
+            self.capture.superseded((queued,)),
+            "one of the remaining frames may still be the one that opens",
+        )
+
+    def test_a_frame_of_another_session_is_never_superseded(self):
+        mine = Path("mine.jpg")
+        self._inject(mine)
+        self.capture.note_result((mine,), ProcessingResult(True, "activated"))
+
+        self.assertFalse(self.capture.superseded((Path("elsewhere.jpg"),)))

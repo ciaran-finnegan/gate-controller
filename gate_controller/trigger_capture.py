@@ -30,6 +30,7 @@ from .hot_stream import (
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
 from .images import measure_flat_fraction, measure_frame_quality
+from .match_policy import LEVELS, level_rule
 from .plate_region import PlateRegion, parse_plate_region
 from .scene import SceneBaseline
 from .telemetry import TriggerTelemetry
@@ -67,8 +68,6 @@ MAX_PRESENCE_WINDOW_SECONDS = 120.0
 MIN_PRESENCE_SPACING_SECONDS = 1.0
 MAX_PRESENCE_SPACING_SECONDS = 15.0
 MAX_PRESENCE_FRAMES = 10
-# Outcomes that mean the plate was never actually read, so another frame can
-# still change the answer. A plate that was read but not authorised is final.
 # Mean thumbnail difference from the idle scene below which a frame shows an
 # empty drive. Empty-vs-empty drift over 30 s measures around 0.01; a vehicle
 # in the plate band measures well above 0.08.
@@ -93,6 +92,12 @@ MAX_EMPTY_SCENE_THRESHOLD = 0.5
 # above the real frames is what has to be generous, not the margin below the
 # broken ones.
 DEFAULT_MAX_FLAT_FRACTION = 0.8
+# Reasons that leave the plate genuinely unread, so another frame can still
+# change the answer. `no_match` is here because most of them are not a
+# different vehicle at all: they are the authorised plate read a shade under
+# the confidence bar, and the very next frame often reads it cleanly. A read
+# that really is another vehicle is settled by `_is_another_vehicle` instead,
+# which asks the decision rather than the reason string.
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
@@ -540,9 +545,29 @@ class TriggerFrameCapture:
         """Learn how a frame this capture injected was decided.
 
         Called by the worker for every processed burst; frames from other
-        sources are ignored. An open or a read plate settles the session;
-        anything that never read the plate leaves it open to another frame.
-        Returns True when the paths belonged to this session.
+        sources are ignored. Returns True when the paths belonged to this
+        session.
+
+        A session ends on a *conclusive* answer, and reading characters is not
+        one. Until 2026-09-08 any decision carrying an ``observed_plate``
+        settled the session as ``plate_read``, so a read that was denied for
+        being a shade under the confidence bar stopped the retries with the
+        vehicle still at the gate and the gate still shut -- twice on
+        2026-09-08, once on a frame both readers had read correctly. Three
+        outcomes are conclusive now:
+
+        ``opened``
+            The gate opened. Nothing further is owed.
+        ``plate_denied``
+            A confident read of a plate that is not near anything authorised:
+            a different vehicle, not a misread of an authorised one. Retrying
+            only spends paid lookups on a car that is not getting in.
+        ``final_<reason>``
+            The pipeline gave a final answer that another frame cannot change
+            (a revoked authorisation, an ambiguous fuzzy match).
+
+        Everything else -- an uncertain read included -- keeps the session
+        offering frames for the rest of its window.
         """
         with self._session_lock:
             matched = [Path(path) for path in paths if Path(path) in self._session_paths]
@@ -561,14 +586,34 @@ class TriggerFrameCapture:
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
-                else:
-                    decision = getattr(result, "decision", None)
-                    if decision is not None and getattr(decision, "observed_plate", None):
-                        self._session_settled = "plate_read"
-                    elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
-                        self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
+                elif _is_another_vehicle(getattr(result, "decision", None)):
+                    self._session_settled = "plate_denied"
+                elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
+                    self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
             self._session_changed.set()
             return True
+
+    def superseded(self, paths) -> bool:
+        """Has this frame's own session already opened the gate?
+
+        The burst processor asks before it spends a paid lookup on a frame
+        that has been sitting in the queue. A passage that has already opened
+        cannot be improved by reading another of its frames, and the relay
+        cooldown would refuse the second open anyway; the only thing left to
+        decide is whether to pay for it.
+
+        Deliberately narrow: only an *opened* session supersedes, and only for
+        a frame this session actually injected. A denied session keeps reading
+        its frames, because one of them may still be the one that opens.
+        """
+        try:
+            candidates = [Path(path) for path in paths]
+        except (TypeError, ValueError):
+            return False
+        with self._session_lock:
+            if self._session_settled != "opened":
+                return False
+            return any(path in self._session_paths for path in candidates)
 
     def note_dropped(self, paths, reason: str) -> bool:
         """Account for an injected frame that never reached a decision.
@@ -1033,6 +1078,40 @@ class TriggerFrameCapture:
         except subprocess.TimeoutExpired:
             return bytes(buffer), "exit_wait"
         return bytes(buffer), None
+
+
+def _is_another_vehicle(decision) -> bool:
+    """Is this denial about a *different car*, rather than a doubtful read?
+
+    Three things have to hold together, and any one of them missing means the
+    session keeps trying:
+
+    * a plate was read at or above the confidence the band in force demands of
+      an exact match, so the characters are not a guess;
+    * the band is one this controller knows, so the bar is a real number and
+      not a fallback;
+    * no authorised plate sits within :data:`MAX_NEAR_MISS_DISTANCE` of it.
+      ``near_miss_distance`` is already computed on every denial for review;
+      its absence is precisely "nothing authorised looks like this".
+
+    A read that is close to an authorised plate is the case another frame
+    fixes, so it never ends the session. Being wrong here costs paid lookups,
+    never an open, so it is written to keep trying when it cannot be sure.
+    """
+    if decision is None or getattr(decision, "allowed", False):
+        return False
+    if not getattr(decision, "observed_plate", None):
+        return False
+    if getattr(decision, "near_miss_distance", None) is not None:
+        return False
+    level = getattr(decision, "policy_level", None)
+    if level not in LEVELS:
+        return False
+    try:
+        confidence = float(getattr(decision, "confidence", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return confidence >= level_rule(level).min_exact_confidence
 
 
 def _terminate(process) -> None:

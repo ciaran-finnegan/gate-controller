@@ -125,11 +125,17 @@ record where each plate was read so the region can be tuned from data. See the
 RLC-810A document for the decoder settings that keep a fanless Pi 5 cool.
 
 A vehicle at the gate gets more than one chance: after the webhook capture
-series, the controller keeps offering fresh keyframes for OCR while nothing has
-read the plate (`GATE_PRESENCE_WINDOW_SECONDS`, `GATE_PRESENCE_SPACING_SECONDS`,
-`GATE_PRESENCE_MAX_FRAMES`), stops the moment the gate opens or a plate is read,
-waits for a busy OCR slot instead of discarding a frame, and retries a connect
-timeout once. The RLC-810A document describes the session and its journal lines.
+series, the controller keeps offering fresh keyframes for OCR while nothing
+has *decided* the passage (`GATE_PRESENCE_WINDOW_SECONDS`,
+`GATE_PRESENCE_SPACING_SECONDS`, `GATE_PRESENCE_MAX_FRAMES`), stops the moment
+the gate opens — or when a plate is read confidently enough that nothing
+authorised is anywhere near it, which is a different car rather than a
+doubtful read — waits for a busy OCR slot instead of discarding a frame, and
+retries a connect timeout once. A queued frame is dropped unread when a newer
+frame of the same alarm arrives, when its own passage has already opened, or
+when its remaining decision budget could not cover the lookup it would be
+billed for (`GATE_OCR_MIN_REQUEST_SECONDS`). The RLC-810A document describes
+the session and its journal lines.
 `GATE_TRAINING_CORPUS_DIR` keeps every uploaded frame and OCR answer on the Pi
 (bounded by `GATE_TRAINING_CORPUS_MAX_BYTES`) as training data for a local
 recogniser.
@@ -216,7 +222,12 @@ journals the local read beside the cloud read and can never reach the relay;
 `active` lets a confident local read answer through the controller's own
 matching - on the strength of that frame's own plate, under the same policy
 band the processor will apply - with the cloud as the fallback. Its confidence
-gate is the weakest character of the read, not the mean. It is **off unless the
+gate is the weakest character of the read, not the mean. The local read runs
+*off* the single serial cloud OCR slot, so a 170 ms inference never queues
+behind a 2.5 s cloud call for an older frame; and when both readers
+independently read the same plate, the shared matching opens at a lower bar
+than either would clear alone (`GATE_MATCH_AGREEMENT_*`, see
+[plate matching](docs/plate-matching.md)). It is **off unless the
 variable is set**, and with it unset nothing is imported, loaded or started.
 Enabling it on a controller that delivers to Cloudflare needs two app-side
 changes first: `local_ocr` on the telemetry allowlist, and `"local"` accepted

@@ -1205,6 +1205,18 @@ class LocalRecognizer:
                 summary.plate = local.plate
                 summary.score = round(float(local.score), 3)
 
+    def observations(self, trace_id) -> tuple:
+        """This event's confident local reads, for the processor to weigh.
+
+        Read-only: nothing is accumulated here. The processor uses them only
+        as ``corroborations`` for the agreement rule, keyed by trace id so one
+        event's reads can never speak for another's.
+        """
+        if not trace_id:
+            return ()
+        with self._lock:
+            return tuple(self._observations.get(trace_id, ()))
+
     def summary(self, trace_id) -> dict | None:
         """The compact per-event block, or None when nothing local ran."""
         if not trace_id:
