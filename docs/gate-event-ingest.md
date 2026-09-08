@@ -52,6 +52,16 @@ car that had just been let in. The journal had always said
 `outcome=allowed reason=exact_match relay_outcome=not_attempted`; only the
 stored and forwarded event disagreed with it.
 
+A cooldown grant is still a grant, so it has to clear the same bar a pulse
+would have. `ActuationCoordinator` runs `pre_activation_inhibit` — the same
+callable the relay runs under its lock immediately before the GPIO write —
+*before* either cooldown short-circuit. If the frame went stale, the plate was
+withdrawn from the authorised list, the decision deadline passed, or the
+processor closed between the match and the actuation, the event is recorded as
+`opened=false` under that reason (`stale_burst`, `authorisation_revoked`,
+`decision_timeout`, `processor_closed`) rather than as a cooldown grant. Only an
+un-inhibited match in cooldown gets the row above.
+
 The local `events` table carries one extra column the wire does not:
 `actuation_outcome`, `"cooldown"` on exactly these records and NULL everywhere
 else. It is not in `LocalStore._event_payload`, so it never reaches the
@@ -59,6 +69,32 @@ contract. It exists because `LocalStore._was_opened_since` — which decides the
 cooldown itself — must count real relay pulses only. Without it, each coalesced
 frame of a burst would slide the cooldown window forward and could suppress the
 next vehicle's own grant.
+
+### Runbook: rolling back past this release
+
+The `actuation_outcome` column is added by `ALTER TABLE` on open and is left
+in place by a downgrade, but the older code does not read it. Its
+`_was_opened_since` counts any `opened = 1` row with a null `relay_activated_at`
+and a `received_at` inside the window as a relay pulse — which is exactly the
+shape of a cooldown grant this release writes.
+
+So after rolling back to a release before this one, **every cooldown row still
+inside the window reads as a pulse**: for up to one cooldown window (~20 s, the
+`cooldown` given to `GateProcessor` / `ActuationCoordinator`) after the last
+such row's `received_at`, a claim that should have been granted can come back
+`cooldown` instead. In practice that is
+the tail of one burst suppressing the front of the next, so a vehicle arriving
+within those 20 seconds may need a second passage or a remote open. It clears
+itself once the newest cooldown row falls out of the window; nothing needs to be
+deleted. To end it immediately, blank the rows the old code misreads:
+
+```sql
+UPDATE events SET opened = 0 WHERE actuation_outcome = 'cooldown';
+```
+
+That restores the pre-release recording of those rows (`opened = 0`), which is
+the denial this change exists to stop writing — acceptable only as part of a
+rollback, and only for rows already sent.
 
 ## The reason table
 

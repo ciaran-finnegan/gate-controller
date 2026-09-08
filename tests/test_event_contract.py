@@ -28,7 +28,7 @@ from PIL import Image
 from gate_controller.actuation import ActuationCoordinator
 from gate_controller.models import GateEvent, RelayResult
 from gate_controller.processor import GateProcessor
-from gate_controller.store import LocalStore
+from gate_controller.store import LocalStore, _telemetry_payload
 from gate_controller.telemetry import EventTelemetry, StageDurations
 
 # Transcribed from contract.ts. EVENT_TOKEN is the shape of every reason,
@@ -113,7 +113,7 @@ def assert_ingest_accepts_event(payload):
 
 def assert_ingest_accepts_telemetry(wire):
     """The parts of ``validateTelemetry`` this change touches."""
-    _allowed_keys(wire, TELEMETRY_KEYS | {"schema_version"}, "telemetry")
+    _allowed_keys(wire, TELEMETRY_KEYS, "telemetry")
     decision = wire["decision"]
     _allowed_keys(decision, DECISION_KEYS, "telemetry.decision")
     _telemetry_token(decision["outcome"], "telemetry.decision.outcome")
@@ -200,9 +200,8 @@ class CooldownGrantWireTests(unittest.TestCase):
             "the local column names the skipped pulse; the wire has no key for it",
         )
 
-    def test_cooldown_grant_telemetry_names_cooldown_on_the_actuation_block(self):
-        """The contract's own field for "granted, relay not pulsed"."""
-        wire = EventTelemetry(
+    def _cooldown_telemetry(self):
+        return EventTelemetry(
             trace_id="de2781c4-1e19-4a0a-9a3e-6f4a9d2f9b21",
             stage_durations=StageDurations(),
             frames=(),
@@ -214,13 +213,36 @@ class CooldownGrantWireTests(unittest.TestCase):
             relay_outcome="not_attempted",
             outbox_attempt=0,
             delivery_state="pending",
-        ).to_wire()
+        )
+
+    def test_cooldown_grant_telemetry_names_cooldown_on_the_actuation_block(self):
+        """The contract's own field for "granted, relay not pulsed"."""
+        # `_telemetry_payload` is what the outbox stores and posts, so it is
+        # what the contract has to accept. Validating `to_wire()` instead would
+        # judge a shape no Worker ever sees.
+        wire = _telemetry_payload(self._cooldown_telemetry())
 
         assert_ingest_accepts_telemetry(wire)
         self.assertEqual(wire["decision"], {"outcome": "allowed", "reason": "exact_match"})
         self.assertEqual(wire["actuation"], {
             "claim": "cooldown", "attempted": False, "relay_outcome": "not_attempted",
         })
+
+    def test_the_outbox_drops_the_schema_version_the_telemetry_block_may_not_carry(self):
+        """`schema_version` is an event key, not a telemetry key.
+
+        ``EventTelemetry.to_wire`` stamps one so the local store can tell its
+        own records apart; ``assertAllowedKeys`` in contract.ts answers 400 for
+        it inside ``telemetry``. The stripping in ``_telemetry_payload`` is the
+        only thing standing between the two, so pin it here -- without this the
+        transcription above would pass while allowing a key the app rejects.
+        """
+        telemetry = self._cooldown_telemetry()
+
+        self.assertEqual(telemetry.to_wire()["schema_version"], 3)
+        with self.assertRaises(IngestRejected):
+            assert_ingest_accepts_telemetry(telemetry.to_wire())
+        self.assertNotIn("schema_version", _telemetry_payload(telemetry))
 
     def test_cooldown_record_does_not_slide_the_cooldown_window(self):
         """A record of a skipped pulse must never be read back as a pulse.
