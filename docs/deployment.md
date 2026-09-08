@@ -246,6 +246,107 @@ transitions with the returned HTTP status, repeated at most every ten minutes,
 followed by `stage=*_recovered` when the path returns. Check those lines first
 when the app shows the controller as not reporting.
 
+### Vehicle Direction (Shadow)
+
+Every event carries a `telemetry.direction` block saying which way the vehicle
+was going: `{verdict, method, score, slope, frames, span_ms}`, with `verdict`
+one of `entering`, `exiting`, `stationary`, `unknown` and `method` one of
+`box_width`, `none`. The app already accepts it at `schema_version` 3
+(access-gate-ui #49), so nothing about the wire version changes here.
+
+**This is shadow telemetry and nothing acts on it.** It reaches no decision,
+no relay claim, no presence session and no lookup budget. Suppressing an
+opening for a departing vehicle is gate-controller#95 and is a separate
+change.
+
+The signal is the least-squares slope of `log(box width)` against time, over
+the boxes the pipeline already produced for one camera alarm — the on-device
+detector's plate box and the cloud read's vehicle and plate boxes, never
+mixed, because three detectors give three scales. No new model runs and no
+frame is decoded twice. One burst is usually one frame, so the samples are
+pooled by the camera alarm the burst's correlated trigger identifies, which
+is the same identity the burst queue already uses to decide which queued
+frame supersedes which. A burst with no correlated trigger keys on its own
+trace and can only ever fit its own frames.
+
+The verdict is gated at **at least 3 boxed frames spanning at least 2 s**.
+Measured over 42 hand-labelled passages
+(`gate-controller-data/analysis/vehicle-direction-2026-09-08.md`), that gate
+separates entering from exiting completely *among the passages that clear
+it*: 7/7 gated exits caught with **0/15** false exits on a gated entering
+car. Ungated, the same rule called one entering car an exit. The gate may be
+tightened by configuration; the controller refuses to start only with the
+gate loosened (`GATE_DIRECTION_MIN_FRAMES` below 3 or
+`GATE_DIRECTION_MIN_SPAN_SECONDS` below 2.0), and every other malformed
+`GATE_DIRECTION_*` value falls back to its shipped default with one
+`gate_direction key=… status=rejected using=…` line.
+
+**Recall on the whole labelled set is 7 of 12.** Twelve of the 42 passages
+are hand-labelled `exiting`; only seven of them produce three boxed frames
+over two seconds, so the other **five exits fail the gate and ship
+`unknown`** — they are misses, not errors, and they are the price of the
+zero-false-exit result above. Do not read "7/7" as recall.
+
+**What the replay test does and does not prove.** `tests/test_direction.py`
+replays the analysis table, and that table holds each passage's *already
+fitted* slope, frame count and span — the per-frame boxes live in R2 and D1,
+not in this repository. The replay reconstructs a width series
+log-linearly from the recorded slope and checks the fitter recovers it, so it
+exercises the **thresholds and the gate against the 42 recorded slopes**. It
+does **not** validate the fitter against raw box widths, and it cannot catch
+a regression in how a box becomes a width.
+
+Night is unmeasured — exactly one labelled passage is genuinely dark — so a
+passage whose **brightest** frame is darker than
+`GATE_DIRECTION_MIN_BRIGHTNESS` reports `unknown`/`none` rather than a slope
+nobody has validated. A single dark frame does **not** suppress the passage:
+one lit frame is enough for the boxes to have been measurable, and vehicle
+headlights alone will darken individual frames of a passage that was
+otherwise perfectly readable.
+
+What to read in the journal:
+
+```
+gate_direction trace_id=… verdict=exiting method=box_width slope=-0.3345 \
+    frames=7 span_ms=6700 score=0.842 source=vehicle_box
+gate_direction stage=counters estimates=25 entering=12 exiting=7 stationary=2 \
+    unknown=4 night=0 no_boxes=8 no_passage=1 samples=71 disagreements=1 \
+    reused_keys=0 evicted=0 expired=3
+gate_direction stage=source_disagreement vehicle=exiting local=entering \
+    cloud=- using=vehicle_box
+gate_direction stage=passage_restarted camera=reolink_webhook|vehicle|… idle=41.2
+```
+
+One line per event, plus a rollup every 25 estimates. `estimates=` is the
+number of events asked, so it is the denominator for every other counter on
+the line. Per-frame widths are at `DEBUG` (`gate_direction stage=sample`).
+The counters are journal-only on purpose: the app's heartbeat allowlist
+(`PI_STATUS_CAPABILITY_KEYS` in access-gate-ui `worker/routes/controller.ts`)
+has no slot for them, and a key the heartbeat has not been taught is dropped
+rather than stored.
+
+Two lines are worth watching during the shadow week:
+
+- `stage=source_disagreement` — two box series of one passage fitted
+  contradicting verdicts. The verdict shipped is the `using=` one: the
+  vehicle box first (it is the series the analysis measured), then the
+  on-device plate box (densest — that detector runs on every frame), then
+  the cloud plate box (it only exists where a paid lookup returned a
+  result). Counted as `disagreements=` in the rollup.
+- `stage=passage_restarted` — a camera alarm identity arrived again after
+  its passage had gone quiet, so a fresh passage was started rather than the
+  two vehicles' boxes being pooled. This camera has a history of repeating a
+  webhook body verbatim and the alarm key is a hash of `alarmTime`, so this
+  is expected to be non-zero. Counted as `reused_keys=`.
+
+**Promotion rule.** This stays shadow until **zero** false `exiting` verdicts
+on a passage hand-labelled entering, over at least **100** labelled passages
+— against the 42 available today. Exit recall is secondary: a missed exit
+costs lookups, a false exit locks a household member out. Review weekly with
+the same contact-sheet method the analysis used, and re-fit the thresholds
+after the shadow week rather than treating them as calibrated; every one of
+them was chosen on 22 points.
+
 ### Heartbeat Health Blocks
 
 The 15 s heartbeat is the only telemetry that survives a Pi the owner cannot

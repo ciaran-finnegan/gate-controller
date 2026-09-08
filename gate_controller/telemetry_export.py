@@ -14,7 +14,7 @@ from .store import LocalStore
 
 _TOP_LEVEL_KEYS = (
     "trace_id", "taxonomy_version", "stage_durations", "frames", "ocr_attempts",
-    "decision", "actuation", "delivery", "local_ocr",
+    "decision", "actuation", "delivery", "local_ocr", "direction",
 )
 _NESTED_KEYS = {
     "stage_durations": (
@@ -36,6 +36,7 @@ _NESTED_KEYS = {
         "mode", "frames", "plate", "score", "latency_ms", "agreement",
         "authorised", "decision_source", "status",
     ),
+    "direction": ("verdict", "method", "score", "slope", "frames", "span_ms"),
 }
 _CSV_FIELDS = (
     "event_id", "received_at", "source", "reason", "opened", "observed_plate",
@@ -117,6 +118,10 @@ def _safe_telemetry(value: object) -> dict:
     if isinstance(telemetry.get("local_ocr"), dict):
         safe["local_ocr"] = _allowlisted_dict(
             telemetry["local_ocr"], _NESTED_KEYS["local_ocr"]
+        )
+    if isinstance(telemetry.get("direction"), dict):
+        safe["direction"] = _allowlisted_dict(
+            telemetry["direction"], _NESTED_KEYS["direction"]
         )
     for key in ("frames", "ocr_attempts"):
         items = telemetry.get(key)

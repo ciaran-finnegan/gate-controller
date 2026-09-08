@@ -21,6 +21,7 @@ from .cloudflare_client import (
 )
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
+from .direction import DirectionTracker, load_direction_config
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
@@ -95,6 +96,14 @@ def main() -> None:
     if not token:
         parser.error("PLATE_RECOGNIZER_API_TOKEN is required")
 
+    # Read with the rest of the configuration, before a relay is claimed, a
+    # store is recovered or a recogniser thread is started. The one value it
+    # refuses is a *loosened* direction gate, and it used to refuse it far
+    # below here, once the recogniser's threads were running and the store had
+    # already recovered its interrupted actuations -- a shadow signal's typo
+    # taking the controller down half-way up. Everything else it can only
+    # journal and default.
+    direction_config = load_direction_config(os.environ)
     relay = RelayController(PiRelayAdapter())
     store = LocalStore(arguments.database)
     store.recover_interrupted_actuations()
@@ -166,10 +175,15 @@ def main() -> None:
         trigger_capture=trigger_capture,
         corpus=corpus, activity=activity, metrics=metrics,
     )
+    # Shadow only: it reads boxes the pipeline already produced and journals
+    # a verdict. It reaches no decision, spends no lookup and ends no
+    # presence session; gate-controller#95 is where acting on it lives.
+    direction = DirectionTracker(direction_config)
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
         plate_region=plate_region,
         corpus=corpus,
+        direction=direction,
         activity=activity,
         local_recognizer=local_recognizer,
         authorised=authorised.get,

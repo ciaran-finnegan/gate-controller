@@ -12,7 +12,10 @@ from time import monotonic, sleep
 from PIL import Image
 
 from .backpressure import NULL_GATE
-from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME
+from .direction import (
+    SOURCE_LOCAL_PLATE_BOX, SOURCE_PLATE_BOX, SOURCE_VEHICLE_BOX,
+)
+from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME, box_to_frame
 from .matching import normalise_plate
 from .plate_region import PlateRegion
 from .models import PlateObservation
@@ -447,7 +450,7 @@ class PlateRecognizerClient:
                  plate_region: PlateRegion | None = None,
                  precropped_directory: Path | None = None,
                  corpus=None, local_recognizer=None, authorised=None,
-                 match_policy=None, activity=NULL_GATE):
+                 match_policy=None, activity=NULL_GATE, direction=None):
         self._token = token
         self._session = session
         self._session_generation = 0
@@ -487,6 +490,12 @@ class PlateRecognizerClient:
         # The backpressure gate. Reading a frame is the busiest the uplink
         # ever is for the gate itself, and the corpus must never be sharing it.
         self._activity = activity or NULL_GATE
+        # Optional DirectionTracker: the boxes this client already has -- the
+        # on-device detector's and the cloud read's -- pooled by the camera
+        # alarm each trace is bound to, so a passage's box widths can be
+        # fitted for direction. Shadow only, and free: no new model, no extra
+        # decode, one list append per box.
+        self._direction = direction
         if isinstance(max_upload_width, bool) or not isinstance(max_upload_width, int):
             raise ValueError("max_upload_width must be an integer")
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
@@ -886,8 +895,12 @@ class PlateRecognizerClient:
             raise _response_error(
                 "OCR service response has invalid results", CAUSE_INVALID_RESULTS
             )
+        settled = frame.settled()
         self._record_corpus(
-            corpus_image, payload, path, geometry, local=frame.settled(),
+            corpus_image, payload, path, geometry, local=settled,
+        )
+        self.observe_direction(
+            trace_id, payload=payload, local=settled, geometry=geometry,
         )
         if not results:
             frame.complete_cloud(None, 0.0, decided=False)
@@ -1013,6 +1026,10 @@ class PlateRecognizerClient:
             self._record_corpus(
                 image, None, path, geometry, local=recognition, cloud="skipped",
             )
+            # Only on the path that skips the cloud request. In `always` the
+            # request still runs and settles this very read, and observing in
+            # both places would count one frame twice.
+            self.observe_direction(trace_id, local=recognition, geometry=geometry)
         return recognition.observation()
 
     def local_observations(self, trace_id: str | None) -> tuple:
@@ -1028,6 +1045,98 @@ class PlateRecognizerClient:
             return tuple(self._local.observations(trace_id))
         except Exception:
             return ()
+
+    def bind_direction(self, trace_id, passage) -> None:
+        """Bind this trace to its camera alarm for the direction tracker."""
+        tracker = self._direction
+        if tracker is None:
+            return
+        try:
+            tracker.bind(trace_id, passage)
+        except Exception:
+            return
+
+    def observe_direction(self, trace_id, *, payload=None, local=None,
+                          geometry=None) -> None:
+        """Feed this frame's boxes to the direction tracker. Never raises.
+
+        Three sources, all of them already computed for other reasons: the
+        cloud read's vehicle box, the cloud read's plate box, and the
+        on-device detector's plate box. Vehicle widths and plate widths are
+        kept apart -- they are on different scales, and fitting them as one
+        series would manufacture a slope out of a change of source.
+        """
+        tracker = self._direction
+        if tracker is None or not trace_id:
+            return
+        try:
+            first = None
+            if isinstance(payload, Mapping):
+                results = payload.get("results")
+                if isinstance(results, list) and results:
+                    candidate = results[0]
+                    first = candidate if isinstance(candidate, Mapping) else None
+            if first is not None:
+                vehicle = first.get("vehicle")
+                if isinstance(vehicle, Mapping):
+                    tracker.observe(
+                        trace_id, box=self._frame_box(vehicle.get("box"), geometry),
+                        source=SOURCE_VEHICLE_BOX,
+                    )
+                tracker.observe(
+                    trace_id, box=self._frame_box(first.get("box"), geometry),
+                    source=SOURCE_PLATE_BOX,
+                )
+            local_box = getattr(local, "box", None)
+            if local_box is not None:
+                # Already fractions of the whole frame: `LocalRecognition.box`
+                # is mapped through `box_to_frame` when the read is made.
+                tracker.observe(
+                    trace_id, box=local_box, source=SOURCE_LOCAL_PLATE_BOX,
+                )
+        except Exception:
+            return
+
+    def _frame_box(self, box, geometry):
+        """A Plate Recognizer pixel box as fractions of the whole frame."""
+        if not isinstance(box, Mapping):
+            return None
+        try:
+            corners = tuple(
+                float(box[key]) for key in ("xmin", "ymin", "xmax", "ymax")
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        return box_to_frame(corners, geometry, self._plate_region)
+
+    def note_direction_brightness(self, trace_id, brightness) -> None:
+        """How light the frame was, for the estimator's night gate."""
+        tracker = self._direction
+        if tracker is None:
+            return
+        try:
+            tracker.note_brightness(trace_id, brightness)
+        except Exception:
+            return
+
+    def direction_estimate(self, trace_id: str | None):
+        """This event's shadow direction verdict, or None without a tracker."""
+        tracker = self._direction
+        if tracker is None:
+            return None
+        try:
+            return tracker.estimate(trace_id)
+        except Exception:
+            return None
+
+    def forget_direction(self, trace_id: str | None) -> None:
+        tracker = self._direction
+        if tracker is None:
+            return
+        try:
+            tracker.forget(trace_id)
+        except Exception:
+            return
 
     def local_ocr_summary(self, trace_id: str | None):
         """The compact per-event local block for the telemetry payload."""
