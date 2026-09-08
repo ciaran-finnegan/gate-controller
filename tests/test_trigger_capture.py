@@ -100,6 +100,18 @@ class FakePopen:
         return self._processes.pop(0)
 
 
+def never_spawn(command, **_kwargs):
+    """A process factory for a test that only reads the command it built.
+
+    Leaving ``popen`` at its default hands the object the real
+    ``subprocess.Popen`` alongside the live ``rtsp://127.0.0.1:8554/clear``,
+    which is a 4K H.265 decode away from the OOM kill that took the gate down
+    on 2026-09-07. A test that inspects ``.command`` has no business being able
+    to run it.
+    """
+    raise AssertionError(f"this test must not spawn a child: {tuple(command)!r}")
+
+
 def event(event_type="vehicle", rule_id="front_gate"):
     return SanitizedCameraEvent(
         event_id="event-1", event_type=event_type, rule_id=rule_id,
@@ -1067,7 +1079,7 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
         )
-        buffer = ClearKeyframeBuffer(config)
+        buffer = ClearKeyframeBuffer(config, popen=never_spawn)
 
         command = buffer.command
         self.assertIn("-skip_frame", command)
@@ -1088,7 +1100,7 @@ class HotKeyframeCaptureTests(unittest.TestCase):
             hwaccel="drm", frame_width=1920,
         )
 
-        ring = ClearKeyframeBuffer(config).command
+        ring = ClearKeyframeBuffer(config, popen=never_spawn).command
         hw = ring.index("-hwaccel")
         self.assertEqual(ring[hw:hw + 6], (
             "-hwaccel", "drm", "-hwaccel_device", "/dev/dri/renderD128",
@@ -1096,10 +1108,10 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         ))
         self.assertLess(hw, ring.index("-i"), "decoder selection must precede the input")
         self.assertEqual(ring[ring.index("-vf") + 1], "fps=1,hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2")
-        self.assertEqual(ClearKeyframeBuffer(config).status()["decode"],
+        self.assertEqual(ClearKeyframeBuffer(config, popen=never_spawn).status()["decode"],
                          {"hwaccel": "drm", "frame_width": 1920, "plate_region": "full"})
 
-        grab = TriggerFrameCapture(config).command
+        grab = TriggerFrameCapture(config, popen=never_spawn).command
         self.assertIn("-hwaccel", grab)
         self.assertLess(grab.index("-hwaccel"), grab.index("-i"))
         self.assertEqual(grab[grab.index("-vf") + 1], "hwdownload,format=nv12,scale=w='min(iw,1920)':h=-2")
@@ -1107,12 +1119,12 @@ class HotKeyframeCaptureTests(unittest.TestCase):
 
         software_scaled = TriggerFrameCapture(TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture", frame_width=1920,
-        )).command
+        ), popen=never_spawn).command
         self.assertNotIn("-hwaccel", software_scaled)
         self.assertEqual(software_scaled[software_scaled.index("-vf") + 1], "scale=w='min(iw,1920)':h=-2")
         default_grab = TriggerFrameCapture(TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
-        )).command
+        ), popen=never_spawn).command
         self.assertNotIn("-vf", default_grab)
 
     def test_plate_region_crops_at_native_resolution_before_a_shrink_only_scale(self):
@@ -1134,18 +1146,18 @@ class HotKeyframeCaptureTests(unittest.TestCase):
             self.root, webhook_enabled=True,
         )
         self.assertFalse(whole.crop_capture)
-        whole_ring = ClearKeyframeBuffer(whole).command
+        whole_ring = ClearKeyframeBuffer(whole, popen=never_spawn).command
         self.assertNotIn("crop=", whole_ring[whole_ring.index("-vf") + 1])
-        self.assertEqual(ClearKeyframeBuffer(whole).status()["decode"]["plate_region"], "full")
+        self.assertEqual(ClearKeyframeBuffer(whole, popen=never_spawn).status()["decode"]["plate_region"], "full")
 
-        ring = ClearKeyframeBuffer(config).command
+        ring = ClearKeyframeBuffer(config, popen=never_spawn).command
         self.assertEqual(ring[ring.index("-vf") + 1], (
             "fps=1,hwdownload,format=nv12,"
             "crop=trunc(iw*0.9000/2)*2:trunc(ih*0.6000/2)*2:trunc(iw*0.0500/2)*2:trunc(ih*0.4000/2)*2,"
             "scale=w='min(iw,1920)':h=-2"
         ))
-        self.assertEqual(ClearKeyframeBuffer(config).status()["decode"]["plate_region"], "0.05,0.4,0.9,0.6")
-        grab = TriggerFrameCapture(config).command
+        self.assertEqual(ClearKeyframeBuffer(config, popen=never_spawn).status()["decode"]["plate_region"], "0.05,0.4,0.9,0.6")
+        grab = TriggerFrameCapture(config, popen=never_spawn).command
         self.assertIn("crop=trunc(iw*0.9000/2)*2", grab[grab.index("-vf") + 1])
 
         with self.assertRaises(ValueError):
