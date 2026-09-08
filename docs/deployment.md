@@ -657,7 +657,7 @@ Now, immediately after a release is activated and confirmed healthy, the updater
 copies that release's `deployment/gate_controller_updater.py` over the installed
 helper when the two differ, and journals:
 
-```
+```text
 gate-controller-updater: refreshed installed updater from release <sha>
 ```
 
