@@ -62,14 +62,16 @@ next vehicle's own grant.
 
 ## The reason table
 
-What the app calls "Access Denied" is `opened=false`. Not all of it is a
-refusal. Counts are from the 12 hours of 8 September 2026 (131 frames, 8
-grants, 123 `opened=false`), and are illustrative of the mix, not a target.
+Every recorded reason, and whether it is a refusal at all. The app paints
+`opened=false` as "Access Denied", and most of what lands there is not a
+refusal. Counts are the 12 hours of 8 September 2026 (131 frames), illustrative
+of the mix, not a target; the "before" column is how that day's rows were
+recorded, and the nine cooldown rows are the ones this change moves.
 
 | `reason` | Rows | Reader ran? | What it is |
 |---|---|---|---|
 | `exact_match` / `two_frame_ocr_confusion` | 8 | yes | granted; the relay pulsed |
-| `exact_match` **during cooldown** | 9 | yes | **granted**; the gate was already open. Was recorded as `denied / cooldown` before this change |
+| `exact_match` **during cooldown** | 9 | yes | **granted**; the gate was already open, so the relay was not pulsed again. Recorded as `denied / cooldown` before this change |
 | `no_match` | 80 | yes | a genuine no-read, or a correct refusal of a plate that is not authorised |
 | `decision_timeout` | 19 | sometimes | the frame spent its whole decision budget queued behind the Plate Recognizer 1 req/s throttle |
 | `queue_coalesced` | 10 | **no** | the controller declined to spend a cloud call on a car it had just let in. Also what the worker's `gate_burst stage=skipped cause=event_already_opened` records |
