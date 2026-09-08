@@ -628,13 +628,110 @@ symlinked records/releases, missing releases, or any unrelated `current` target
 fail closed and leave the marker present.
 
 The updater systemd sandbox makes the host filesystem read-only except for the
-managed deployment and private runtime-lock directories. It has no device access
-or privilege escalation and retains only the capabilities needed to change
-release ownership and drop candidate commands to `gate-controller-build`.
+managed deployment, the private runtime-lock directory, and
+`/usr/local/libexec/gate-controller`, which holds the fixed helper the unit
+executes and which the updater refreshes for itself (below). It has no device
+access or privilege escalation and retains only the capabilities needed to
+change release ownership and drop candidate commands to
+`gate-controller-build`.
 
 The active release plus two prior releases are retained by default. Pruning only
 runs after successful activation and only removes inactive directories whose
 names are full commit SHAs.
+
+### The Updater Ships Its Own Fixes
+
+`gate-controller-updater.service` does not execute the updater out of the
+release tree; it executes the fixed helper at
+`/usr/local/libexec/gate-controller/gate-controller-updater.py`, so that a bad
+release cannot rewrite the program that would otherwise have to roll it back.
+For a long time only `deployment/install.sh` ever wrote that path, which meant
+every fix to the updater itself shipped to nobody: the Pi kept running whichever
+helper was last installed by hand. On 7 September 2026 that cost an hour and
+three quarters of gate availability — the fix that stopped the updater running
+the full 17-to-40-minute on-device suite had been merged and adopted, but the
+installed helper predated it, so the Pi kept re-running that suite at 84 °C for
+six more hours.
+
+Now, immediately after a release is activated and confirmed healthy, the updater
+copies that release's `deployment/gate_controller_updater.py` over the installed
+helper when the two differ, and journals:
+
+```text
+gate-controller-updater: refreshed installed updater from release <sha>
+```
+
+The rules it works to:
+
+- **Only from a release that already passed both gates.** The copy happens only
+  at the one call site where the release has a completed, successful exact-SHA
+  CI run (`has_successful_ci_run`) *and* has passed on-device `verify_release`
+  *and* is now the live `current` target. An unverified or deferred release
+  never reaches the helper path.
+- **It cannot disturb the run that performs it.** The running process is that
+  very script, but CPython read and compiled the whole file before `main()` was
+  entered and never re-reads it, and `os.replace` swaps a directory entry rather
+  than writing through the old inode. The refreshed helper first runs at the
+  next timer firing, five minutes later.
+- **Atomic, root-owned, `0755`.** The new content is written to a temporary file
+  beside the helper, fsynced, chmodded, and renamed into place, so no reader
+  ever sees a partial file and no staging file is left behind.
+- **`py_compile` before replacing.** A helper this interpreter cannot compile is
+  refused and the installed one is kept.
+- **A failed refresh never fails the activation.** The release is already active
+  and healthy by that point, so a refusal or a write error is logged as
+  `Release activated but the installed updater was not refreshed: ...` and
+  nothing is rolled back. The consequence is only a stale helper until the next
+  release.
+- A symlinked helper, a symlinked source, a missing helper directory, or a
+  release with no `deployment/gate_controller_updater.py` are all refused rather
+  than followed or created.
+
+`deployment/install.sh` still installs the helper itself during bootstrap, and
+still backs it up and restores it on rollback. The two paths agree on content,
+mode, and ownership.
+
+#### One-time manual install, once this change is live
+
+This change cannot install itself: the helper currently on the Pi does not
+contain the refresh, so it will adopt this release without refreshing anything.
+The unit also has to be reinstalled, because the refresh writes into
+`/usr/local/libexec/gate-controller` and the previously installed unit does not
+list that directory in `ReadWritePaths` under `ProtectSystem=strict`.
+
+Once the timer has adopted a release containing this change — confirm with
+`readlink -f /opt/gate-controller-deploy/current` — run this **once**:
+
+```sh
+RELEASE=$(readlink -f /opt/gate-controller-deploy/current)
+sudo install -o root -g root -m 0755 \
+  "$RELEASE/deployment/gate_controller_updater.py" \
+  /usr/local/libexec/gate-controller/gate-controller-updater.py
+sudo install -o root -g root -m 0644 \
+  "$RELEASE/deployment/systemd/gate-controller-updater.service" \
+  /etc/systemd/system/gate-controller-updater.service
+sudo systemctl daemon-reload
+```
+
+Then confirm the helper and the release now agree, and that a poll still runs
+clean:
+
+```sh
+sudo cmp "$RELEASE/deployment/gate_controller_updater.py" \
+  /usr/local/libexec/gate-controller/gate-controller-updater.py
+sudo systemctl start gate-controller-updater.service
+sudo journalctl -u gate-controller-updater.service -n 50 --no-pager
+```
+
+From the next release onwards this is automatic. `cmp` staying silent is the
+check worth repeating after any updater change; if the two ever diverge again,
+the journal line naming the refresh — or the warning explaining why it did not
+happen — is in `journalctl -u gate-controller-updater.service`.
+
+One gap is left deliberately unclosed: the refresh runs on the activation path
+only. If a release is activated and the process dies before the refresh, or an
+interrupted activation is completed by the reconciliation path on the next run,
+that release will not refresh the helper — the following release will.
 
 To stop automatic adoption without stopping the gate controller:
 
