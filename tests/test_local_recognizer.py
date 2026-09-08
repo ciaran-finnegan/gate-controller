@@ -40,7 +40,8 @@ from gate_controller.local_recognizer import (
 )
 from gate_controller.corpus import TrainingCorpus
 from gate_controller.match_policy import (
-    DEFAULT_POLICY, RECOMMENDED_POLICY, STRICT_POLICY, apply_confidence,
+    DEFAULT_POLICY, MIN_CONFIGURABLE_CONFIDENCE, RECOMMENDED_POLICY,
+    STRICT_POLICY, apply_confidence,
 )
 from gate_controller.matching import decide_access
 from gate_controller.models import PlateObservation, RelayResult
@@ -200,6 +201,33 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(environment=environment):
                 with self.assertRaisesRegex(ValueError, message):
                     load_local_recognizer_config(environment)
+
+    def test_a_bar_below_the_configurable_floor_falls_back_to_the_default(self):
+        # `0 < value <= 1` admitted 1e-9, a bar no read can fail: the local
+        # reader would then admit every hallucination it produced, and each
+        # one is a read the agreement rule can act on. This is the same floor
+        # the match bars use, and the fallback is stricter than the floor.
+        for raw in ("1e-9", "0.05", "0.0999"):
+            with self.subTest(raw=raw):
+                with self.assertLogs(
+                    "gate_controller.local_recognizer", level="WARNING",
+                ) as logs:
+                    config = load_local_recognizer_config(
+                        {"GATE_LOCAL_OCR_MIN_CONFIDENCE": raw}
+                    )
+
+                self.assertEqual(config.min_confidence, DEFAULT_MIN_CONFIDENCE)
+                self.assertIn(
+                    "GATE_LOCAL_OCR_MIN_CONFIDENCE status=rejected",
+                    "\n".join(logs.output),
+                )
+
+    def test_the_floor_itself_is_still_a_bar_an_operator_may_ask_for(self):
+        config = load_local_recognizer_config(
+            {"GATE_LOCAL_OCR_MIN_CONFIDENCE": str(MIN_CONFIGURABLE_CONFIDENCE)}
+        )
+
+        self.assertEqual(config.min_confidence, MIN_CONFIGURABLE_CONFIDENCE)
 
 
 class AgreementTests(unittest.TestCase):

@@ -71,6 +71,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from time import perf_counter
 
+from .match_policy import MIN_CONFIGURABLE_CONFIDENCE
 from .matching import decide_access, normalise_plate
 from .models import PlateObservation
 
@@ -215,6 +216,18 @@ def load_local_recognizer_config(environment=None) -> LocalRecognizerConfig:
         raise ValueError("GATE_LOCAL_OCR_MIN_CONFIDENCE must be a number") from error
     if not isfinite(min_confidence) or not 0 < min_confidence <= 1:
         raise ValueError("GATE_LOCAL_OCR_MIN_CONFIDENCE must be above 0 and at most 1")
+    if min_confidence < MIN_CONFIGURABLE_CONFIDENCE:
+        # The same floor the match bars use, for the same reason: a bar of
+        # 1e-9 is a bar no read can fail, which is a typo or a disabled
+        # threshold rather than a posture. Fail closed to the shipped
+        # default, which is stricter than the floor, not to the value asked
+        # for.
+        LOGGER.warning(
+            "gate_local_ocr key=GATE_LOCAL_OCR_MIN_CONFIDENCE status=rejected "
+            "reason=below_floor floor=%.2f using=%.2f",
+            MIN_CONFIGURABLE_CONFIDENCE, DEFAULT_MIN_CONFIDENCE,
+        )
+        min_confidence = DEFAULT_MIN_CONFIDENCE
     directory = (environment.get("GATE_LOCAL_OCR_MODEL_DIR") or DEFAULT_MODEL_DIR).strip()
     model_dir = Path(directory or DEFAULT_MODEL_DIR)
     if not model_dir.is_absolute():
