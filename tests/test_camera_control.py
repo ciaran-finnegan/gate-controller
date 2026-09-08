@@ -17,6 +17,9 @@ from unittest import mock
 
 import gate_camera_control.__main__ as camera_control_main
 from gate_camera_control.__main__ import (
+    IR_BURST,
+    SNAPSHOT_MIN_INTERVAL_SECONDS,
+    STATE_BURST,
     CameraControlHandler,
     CameraControlServer,
     CameraControlService,
@@ -912,6 +915,14 @@ class CameraControlHttpTests(unittest.TestCase):
         self.directory = TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.journal = RecordingJournal()
+        # The service reads time only through this clock, so every budget it
+        # keeps -- the token buckets, the snapshot interval, the lease -- moves
+        # when the test moves it and at no other moment. Requests still travel
+        # over a real socket; only the deadlines are ours. Without this a slow
+        # runner could let a bucket refill between two requests the test
+        # intended to be adjacent, and the assertion would turn on the
+        # machine's speed rather than on the limiter.
+        self.clock = ManualClock()
         self.service = build_service(
             {
                 "GATE_CAMERA_HOST": self.camera.host,
@@ -925,6 +936,7 @@ class CameraControlHttpTests(unittest.TestCase):
             lease_path=Path(self.directory.name) / "lease.json",
             logger=self.journal,
             connection_factory=self.camera.connection_factory,
+            clock=self.clock,
         )
         self.server = CameraControlServer(
             ("127.0.0.1", 0), self.service, logger=self.journal
@@ -1107,7 +1119,7 @@ class CameraControlHttpTests(unittest.TestCase):
             ("GET", "/camera/snapshot"), ("POST", "/camera/snapshot"),
         ):
             with self.subTest(method=method, path=path):
-                self.service._last_snapshot_at = None
+                self.clock.advance(SNAPSHOT_MIN_INTERVAL_SECONDS)
                 status, headers, payload = self.request(method, path)
 
                 self.assertEqual(200, status)
@@ -1157,7 +1169,12 @@ class CameraControlHttpTests(unittest.TestCase):
         self.assertIn(b"Connection: close", answer)
 
     def test_reads_and_lease_changes_are_rate_limited(self):
-        for _ in range(10):
+        # The clock does not move unless this test moves it, so the eleventh
+        # read is refused because ten preceded it and for no other reason. On a
+        # slow runner the wall clock used to refill the bucket mid-loop and the
+        # eleventh read was allowed, which failed the test for a reason that had
+        # nothing to do with the limiter.
+        for _ in range(STATE_BURST):
             self.assertEqual(200, self.json_request("GET", "/camera/state")[0])
 
         status, payload, headers = self.json_request("GET", "/camera/state")
@@ -1166,14 +1183,28 @@ class CameraControlHttpTests(unittest.TestCase):
         self.assertEqual("rate_limited", payload["error"])
         self.assertEqual(str(payload["retry_after"]), headers["Retry-After"])
 
+        # A refused caller that waits exactly as long as it was told is served,
+        # and is not left to guess: the budget refills, it does not latch.
+        self.clock.advance(payload["retry_after"])
+        self.assertEqual(200, self.json_request("GET", "/camera/state")[0])
+
         commands = len(self.camera.commands)
-        for _ in range(6):
-            self.json_request("POST", "/camera/ir", {"state": "Auto"})
+        for _ in range(IR_BURST):
+            self.assertEqual(
+                200, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
+            )
         status, payload, _ = self.json_request("POST", "/camera/ir", {"state": "Auto"})
 
         self.assertEqual(429, status)
         self.assertEqual("rate_limited", payload["error"])
-        self.assertEqual(6, len(self.camera.commands) - commands)
+        # The refused lease change never reached the camera.
+        self.assertEqual(IR_BURST, len(self.camera.commands) - commands)
+
+        self.clock.advance(payload["retry_after"])
+        self.assertEqual(
+            200, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
+        )
+        self.assertEqual(IR_BURST + 1, len(self.camera.commands) - commands)
 
     def test_bad_input_is_rejected_without_reaching_the_camera(self):
         commands = len(self.camera.commands)
@@ -1229,7 +1260,14 @@ class CameraControlHttpTests(unittest.TestCase):
         self.assertEqual(2, payload["retry_after"])
         self.assertEqual("2", headers["Retry-After"])
 
-        self.service._last_snapshot_at = time.time() - 3
+        # Half a second short of the interval is still too soon, and the moment
+        # it has fully elapsed the snapshot is allowed. Both edges are waited
+        # out on the test's own clock, rather than by reaching in and
+        # back-dating the service's private bookkeeping.
+        self.clock.advance(SNAPSHOT_MIN_INTERVAL_SECONDS - 0.5)
+        self.assertEqual(429, self.json_request("GET", "/camera/snap")[0])
+
+        self.clock.advance(0.5)
         status, _headers, body = self.request("GET", "/camera/snapshot")
         self.assertEqual(200, status)
 
