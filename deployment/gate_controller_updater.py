@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import os
+import py_compile
 import re
 import shutil
 import subprocess
@@ -31,6 +32,17 @@ GITHUB_API_ROOT = "https://api.github.com"
 MAX_API_RESPONSE_BYTES = 5 * 1024 * 1024
 LOGGER = logging.getLogger("gate-controller-updater")
 BUILD_USER = "gate-controller-build"
+
+# The fixed helper systemd executes, installed by deployment/install.sh and
+# refreshed from an activated release by refresh_installed_updater below. The
+# unit's ExecStart names this exact path, and it is deliberately not
+# configurable: an environment variable here would let anyone who can write
+# /etc/gate-controller-updater.env redirect a root-owned 0755 write.
+INSTALLED_UPDATER_PATH = Path(
+    "/usr/local/libexec/gate-controller/gate-controller-updater.py"
+)
+RELEASE_UPDATER_RELATIVE_PATH = "deployment/gate_controller_updater.py"
+INSTALLED_UPDATER_MODE = 0o755
 LEGACY_COMMAND_SERVICE = "gate-command-server.service"
 MAX_LOGGED_OUTPUT_CHARACTERS = 8000
 MAX_ERROR_OUTPUT_CHARACTERS = 2000
@@ -968,6 +980,63 @@ def activate_release(release: Path, previous: Path, config: UpdateConfig) -> Non
         raise ActivationError(f"candidate activation failed{detail}") from activation_error
 
 
+def refresh_installed_updater(release: Path) -> bool:
+    """Install this release's updater over the fixed helper systemd executes.
+
+    Only ever call this with a release that ``has_successful_ci_run`` accepted
+    and ``verify_release`` passed and that is now the active release. Both
+    gates matter: CI compiled the file and this board already imported and
+    byte-compiled the tree it belongs to, so an unverified release can never
+    replace the helper.
+
+    The refresh cannot disturb the run that performs it. This process *is* the
+    installed helper, but CPython read and compiled the whole source file
+    before ``main()`` was entered and holds the resulting code objects in
+    memory; it never re-reads the file. ``os.replace`` swaps a directory entry
+    rather than writing through the old inode, so even a concurrent reader of
+    the old path keeps the old file. The new helper first runs at the next
+    timer firing.
+
+    Returns True when the helper was replaced, False when it already matched.
+    """
+    source = release / RELEASE_UPDATER_RELATIVE_PATH
+    if source.is_symlink() or not source.is_file():
+        raise UpdateError(
+            f"release {release.name} does not contain {RELEASE_UPDATER_RELATIVE_PATH}"
+        )
+    installed = INSTALLED_UPDATER_PATH
+    if not installed.parent.is_dir() or installed.parent.is_symlink():
+        raise UpdateError(
+            f"installed updater directory is missing: {installed.parent}"
+        )
+    if installed.is_symlink() or (installed.exists() and not installed.is_file()):
+        raise UpdateError(f"installed updater is not a regular file: {installed}")
+
+    content = source.read_bytes()
+    if installed.is_file() and installed.read_bytes() == content:
+        return False
+
+    _compile_check(source)
+    # Runs as root under the updater unit, so the temporary file _atomic_write
+    # creates and renames into place is root-owned; the mode is set explicitly
+    # because the unit's UMask=0077 would otherwise leave it 0700.
+    _atomic_write(installed, content, INSTALLED_UPDATER_MODE)
+    return True
+
+
+def _compile_check(source: Path) -> None:
+    """Refuse to install a helper this interpreter cannot even compile."""
+    with tempfile.TemporaryDirectory() as scratch:
+        try:
+            py_compile.compile(
+                os.fspath(source),
+                cfile=os.path.join(scratch, "gate-controller-updater.pyc"),
+                doraise=True,
+            )
+        except (py_compile.PyCompileError, OSError, ValueError) as error:
+            raise UpdateError(f"candidate updater failed to compile: {error}") from error
+
+
 def _release_entries(releases_root: Path) -> list[ReleaseEntry]:
     entries: list[ReleaseEntry] = []
     for path in releases_root.iterdir():
@@ -1018,6 +1087,18 @@ def run_once(config: UpdateConfig) -> int:
         candidate = stage_release(candidate_sha, config)
         previous = config.current_link.resolve(strict=True)
         activate_release(candidate, previous, config)
+        try:
+            # The release is already active; a helper that cannot be refreshed
+            # is a stale next run, not a reason to undo a healthy activation.
+            if refresh_installed_updater(candidate):
+                LOGGER.info(
+                    "refreshed installed updater from release %s", candidate_sha
+                )
+        except (UpdateError, OSError) as error:
+            LOGGER.warning(
+                "Release activated but the installed updater was not refreshed: %s",
+                error,
+            )
         try:
             prune_releases(config, candidate_sha)
         except (UpdateError, OSError) as error:

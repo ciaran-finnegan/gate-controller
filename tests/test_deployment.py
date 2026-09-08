@@ -8,7 +8,11 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
+
+from deployment import gate_controller_updater as updater
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -255,6 +259,10 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
             "/usr/local/libexec/gate-controller/gate-controller-updater.py",
             command,
         )
+        # The helper the unit runs and the helper the updater refreshes must
+        # be the same file, or a released fix would be written somewhere the
+        # timer never executes.
+        self.assertIn(str(updater.INSTALLED_UPDATER_PATH), command)
         self.assertFalse(any("/current/" in argument for argument in command))
         self.assertFalse(any("/releases/" in argument for argument in command))
 
@@ -268,12 +276,20 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertEqual("true", service.get("PrivateDevices"))
         self.assertEqual("gate-controller-updater", service.get("RuntimeDirectory"))
         self.assertEqual("yes", service.get("RuntimeDirectoryPreserve"))
+        # The helper directory is writable so that an activated release can
+        # refresh the updater itself; ProtectSystem=strict keeps the rest of
+        # /usr read-only. The leading "-" only means "ignore it if absent".
         self.assertEqual(
             {
                 "/opt/gate-controller-deploy",
                 "/run/gate-controller-updater",
+                "-/usr/local/libexec/gate-controller",
             },
             set(shlex.split(service.get("ReadWritePaths", ""))),
+        )
+        self.assertEqual(
+            str(updater.INSTALLED_UPDATER_PATH.parent),
+            "/usr/local/libexec/gate-controller",
         )
         self.assertEqual(
             {
@@ -3448,6 +3464,231 @@ printf 'changed=%s\n' "$CLOUDFLARED_DROP_IN_CHANGED"
                 ["timeout --signal=TERM --kill-after=5s 30s systemctl daemon-reload"],
                 action_log.read_text(encoding="utf-8").splitlines(),
             )
+
+
+class InstalledUpdaterRefreshTests(unittest.TestCase):
+    """An activated release must be able to replace the installed updater.
+
+    Before this existed, a fix to the updater shipped to nobody: only
+    deployment/install.sh ever wrote
+    /usr/local/libexec/gate-controller/gate-controller-updater.py, so the Pi
+    kept running whatever helper was installed by hand the last time someone
+    logged in. Every test here redirects INSTALLED_UPDATER_PATH into a
+    temporary directory; none of them may reach a real system path.
+    """
+
+    TARGET_SHA = "a" * 40
+    OTHER_SHA = "b" * 40
+    RELEASE_HELPER = "#!/usr/bin/env python3\nprint('release helper')\n"
+
+    def setUp(self):
+        previously_disabled = updater.LOGGER.disabled
+        updater.LOGGER.disabled = True
+        self.addCleanup(setattr, updater.LOGGER, "disabled", previously_disabled)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.installed = (
+            self.root / "libexec/gate-controller/gate-controller-updater.py"
+        )
+        self.installed.parent.mkdir(parents=True)
+        self.redirect_installed_path(self.installed)
+
+    def redirect_installed_path(self, path):
+        patcher = patch.object(updater, "INSTALLED_UPDATER_PATH", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def install_helper(self, body, mode=0o755):
+        self.installed.write_text(body, encoding="utf-8")
+        self.installed.chmod(mode)
+
+    def build_release(self, releases_root, sha, body=RELEASE_HELPER):
+        release = releases_root / sha
+        (release / "deployment").mkdir(parents=True)
+        if body is not None:
+            helper = release / updater.RELEASE_UPDATER_RELATIVE_PATH
+            helper.write_text(body, encoding="utf-8")
+        return release
+
+    def configured_install_root(self):
+        config = replace(
+            updater.UpdateConfig.from_mapping({}),
+            install_root=self.root / "deploy",
+        )
+        previous = config.releases_root / self.OTHER_SHA
+        previous.mkdir(parents=True)
+        config.current_link.symlink_to(previous)
+        return config
+
+    def test_stale_installed_helper_is_replaced_and_left_executable(self):
+        self.install_helper("print('stale helper')\n", mode=0o700)
+        release = self.build_release(self.root / "releases", self.TARGET_SHA)
+
+        replaced = updater.refresh_installed_updater(release)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            self.RELEASE_HELPER, self.installed.read_text(encoding="utf-8")
+        )
+        self.assertEqual(0o755, self.installed.stat().st_mode & 0o777)
+        self.assertFalse(self.installed.is_symlink())
+        # os.replace leaves no staging file behind for the next run to trip on.
+        self.assertEqual(
+            [self.installed.name],
+            sorted(entry.name for entry in self.installed.parent.iterdir()),
+        )
+
+    def test_matching_installed_helper_is_not_rewritten(self):
+        self.install_helper(self.RELEASE_HELPER)
+        release = self.build_release(self.root / "releases", self.TARGET_SHA)
+        before = self.installed.stat()
+
+        replaced = updater.refresh_installed_updater(release)
+
+        after = self.installed.stat()
+        self.assertFalse(replaced)
+        self.assertEqual(before.st_ino, after.st_ino)
+        self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+
+    def test_a_release_helper_that_does_not_compile_is_refused(self):
+        self.install_helper(self.RELEASE_HELPER + "# installed\n")
+        release = self.build_release(
+            self.root / "releases", self.TARGET_SHA, body="def broken(:\n"
+        )
+        before = self.installed.read_text(encoding="utf-8")
+
+        with self.assertRaises(updater.UpdateError) as raised:
+            updater.refresh_installed_updater(release)
+
+        self.assertIn("failed to compile", str(raised.exception))
+        self.assertEqual(before, self.installed.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [self.installed.name],
+            sorted(entry.name for entry in self.installed.parent.iterdir()),
+        )
+
+    def test_a_release_without_an_updater_is_refused(self):
+        self.install_helper(self.RELEASE_HELPER + "# installed\n")
+        release = self.build_release(
+            self.root / "releases", self.TARGET_SHA, body=None
+        )
+        before = self.installed.read_text(encoding="utf-8")
+
+        with self.assertRaises(updater.UpdateError):
+            updater.refresh_installed_updater(release)
+
+        self.assertEqual(before, self.installed.read_text(encoding="utf-8"))
+
+    def test_a_symlinked_installed_helper_is_refused_rather_than_followed(self):
+        outside = self.root / "outside-helper.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        self.installed.symlink_to(outside)
+        release = self.build_release(self.root / "releases", self.TARGET_SHA)
+
+        with self.assertRaises(updater.UpdateError):
+            updater.refresh_installed_updater(release)
+
+        self.assertTrue(self.installed.is_symlink())
+        self.assertEqual("print('outside')\n", outside.read_text(encoding="utf-8"))
+
+    def test_a_symlinked_release_helper_is_refused_rather_than_followed(self):
+        self.install_helper(self.RELEASE_HELPER + "# installed\n")
+        outside = self.root / "outside-helper.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        release = self.build_release(
+            self.root / "releases", self.TARGET_SHA, body=None
+        )
+        (release / updater.RELEASE_UPDATER_RELATIVE_PATH).symlink_to(outside)
+        before = self.installed.read_text(encoding="utf-8")
+
+        with self.assertRaises(updater.UpdateError):
+            updater.refresh_installed_updater(release)
+
+        self.assertEqual(before, self.installed.read_text(encoding="utf-8"))
+
+    def activated_release(self, config, body=RELEASE_HELPER):
+        """Patch run_once down to a CI-approved, verified activation."""
+        candidate = self.build_release(config.releases_root, self.TARGET_SHA, body)
+        workflow_runs = {
+            "workflow_runs": [
+                {
+                    "head_sha": self.TARGET_SHA,
+                    "head_branch": "master",
+                    "event": "push",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "path": ".github/workflows/ci.yml",
+                }
+            ]
+        }
+
+        def legacy_service_absent(_arguments, **_options):
+            return subprocess.CompletedProcess([], 4, stdout="not-found\n")
+
+        # stage_release is the seam that fetches and runs verify_release; the
+        # candidate here stands for a release that has already passed both it
+        # and the exact-SHA CI check above.
+        return candidate, [
+            patch.object(
+                updater, "_main_commit_payload", lambda _config: {"sha": self.TARGET_SHA}
+            ),
+            patch.object(
+                updater,
+                "_workflow_runs_payload",
+                lambda _config, _sha: workflow_runs,
+            ),
+            patch.object(updater, "stage_release", lambda _sha, _config: candidate),
+            patch.object(updater, "_restart_and_confirm", lambda _config: None),
+            patch.object(updater.subprocess, "run", legacy_service_absent),
+        ]
+
+    def run_once_with(self, config, patches, level):
+        updater.LOGGER.disabled = False
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with self.assertLogs(updater.LOGGER, level=level) as logs:
+            result = updater.run_once(config)
+        return result, logs.output
+
+    def test_run_once_refreshes_the_helper_from_the_release_it_activated(self):
+        self.install_helper("print('stale helper')\n")
+        config = self.configured_install_root()
+        candidate, patches = self.activated_release(config)
+
+        result, messages = self.run_once_with(config, patches, "INFO")
+
+        self.assertEqual(0, result)
+        self.assertEqual(candidate.resolve(), config.current_link.resolve())
+        self.assertEqual(
+            self.RELEASE_HELPER, self.installed.read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            any(
+                message.endswith(
+                    f"refreshed installed updater from release {self.TARGET_SHA}"
+                )
+                for message in messages
+            ),
+            messages,
+        )
+
+    def test_a_failed_refresh_warns_without_undoing_a_healthy_activation(self):
+        # The helper directory is absent, so the refresh cannot write anywhere.
+        self.redirect_installed_path(self.root / "absent/gate-controller-updater.py")
+        config = self.configured_install_root()
+        candidate, patches = self.activated_release(config)
+
+        result, messages = self.run_once_with(config, patches, "WARNING")
+
+        self.assertEqual(0, result)
+        self.assertEqual(candidate.resolve(), config.current_link.resolve())
+        self.assertFalse(config.pending_activation_path.exists())
+        self.assertFalse((self.root / "absent").exists())
+        self.assertTrue(
+            any("was not refreshed" in message for message in messages), messages
+        )
 
 
 class DependencyLockTests(unittest.TestCase):
