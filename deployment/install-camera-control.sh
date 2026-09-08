@@ -74,9 +74,10 @@ camera_environment_configured() {
   python3 "$SOURCE/gate_media_config.py" camera-control --env "$CAMERA_ENV" >/dev/null
 }
 
-camera_host() {
+render_camera_address_dropin() {
+  local destination=$1
   python3 "$SOURCE/gate_media_config.py" camera-control --env "$CAMERA_ENV" \
-    --print-host
+    --write-address-dropin "$destination"
 }
 
 disable_camera_service() {
@@ -169,17 +170,15 @@ EOF
 }
 
 publish_camera_address_dropin() {
-  local host=$1
-  [[ -n $host ]] || fail "the camera address drop-in needs a host"
   install -d -o root -g root -m 0755 "$CAMERA_DROPIN_DIR"
   # Written aside and moved into place, so an interrupted install never leaves a
   # truncated IPAddressAllow= and a service whose egress pin is wider than the
-  # camera's own address.
+  # camera's own address. The validator renders the address straight into the
+  # staged file: it is never carried through a shell variable, where a `bash -x`
+  # trace or a failed substitution would either expose it or pin nothing.
   STAGED_CAMERA_DROPIN=$CAMERA_DROPIN.new.$$
-  install -o root -g root -m 0644 /dev/stdin "$STAGED_CAMERA_DROPIN" <<EOF
-[Service]
-IPAddressAllow=$host/32
-EOF
+  render_camera_address_dropin "$STAGED_CAMERA_DROPIN" \
+    || fail "the camera address drop-in could not be written"
   mv -f -- "$STAGED_CAMERA_DROPIN" "$CAMERA_DROPIN"
   STAGED_CAMERA_DROPIN=
 }
@@ -247,16 +246,10 @@ main() {
     return 0
   fi
 
-  # Assigned on its own line, so a validator that fails here aborts under
-  # `set -e`. As an argument the substitution's exit status is discarded, and
-  # the drop-in would be written with an empty IPAddressAllow= prefix.
-  local host
-  host=$(camera_host) || fail "the camera address could not be read"
-
   publish_library
   CAMERA_LIBRARY_PUBLISHED=1
   publish_unit
-  publish_camera_address_dropin "$host"
+  publish_camera_address_dropin
   activate || fail "the camera control service could not be activated"
   printf 'gate-camera-control is active on 127.0.0.1:8767.\n'
   trap - ERR INT TERM

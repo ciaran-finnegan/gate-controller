@@ -2,6 +2,7 @@ import json
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import threading
 import time
@@ -29,7 +30,11 @@ from gate_camera_control.reolink import (
     TokenCache,
 )
 from gate_camera_control.state import StatePublisher, state_document
-from gate_media_config import MediaConfigError, validate_camera_control_environment
+from gate_media_config import (
+    MediaConfigError,
+    validate_camera_control_environment,
+    write_camera_address_dropin,
+)
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
@@ -70,6 +75,11 @@ class FakeCamera:
         self._server.daemon_threads = True
         if certificate is not None:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # `PROTOCOL_TLS_SERVER` alone leaves TLS 1.0 and 1.1 reachable on
+            # some builds, and the fake camera must not accept a handshake the
+            # client is pinned against -- the same floor `net_probe.tls_context`
+            # sets, for the same reason.
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(certificate)
             self._server.socket = context.wrap_socket(
                 self._server.socket, server_side=True
@@ -273,6 +283,47 @@ class CameraControlEnvironmentTests(unittest.TestCase):
 
         self.assertNotIn("GATE_CAMERA_STALE_SECONDS", selected)
         self.assertNotIn("PLATE_RECOGNIZER_API_TOKEN", selected)
+
+    def test_the_egress_pin_is_written_rather_than_printed(self):
+        """No value out of the credential file is ever echoed to stdout.
+
+        The installer used to read the address back from a `--print-host`, which
+        put it into a shell variable. The pin is rendered here instead, from the
+        address `ipaddress` parsed, so the file holds the canonical address the
+        service will dial and nothing crosses a pipe.
+        """
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        target = Path(directory.name) / "10-camera-address.conf"
+
+        write_camera_address_dropin(target, {
+            "GATE_CAMERA_HOST": "192.168.0.54",
+            "GATE_CAMERA_USERNAME": "gate",
+            "GATE_CAMERA_PASSWORD": "s3cret",
+        })
+
+        self.assertEqual(
+            "[Service]\nIPAddressAllow=192.168.0.54/32\n",
+            target.read_text(encoding="ascii"),
+        )
+        self.assertEqual(0o644, stat.S_IMODE(target.stat().st_mode))
+        self.assertNotIn("s3cret", target.read_text(encoding="ascii"))
+
+    def test_an_invalid_environment_writes_no_pin_at_all(self):
+        """A drop-in with an empty prefix would pin nothing; write none instead."""
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        target = Path(directory.name) / "10-camera-address.conf"
+
+        with self.assertRaises(MediaConfigError):
+            write_camera_address_dropin(target, {
+                "GATE_CAMERA_HOST": "camera.local",
+                "GATE_CAMERA_USERNAME": "gate",
+                "GATE_CAMERA_PASSWORD": "s3cret",
+            })
+
+        self.assertFalse(target.exists())
+        self.assertEqual([], sorted(Path(directory.name).iterdir()))
 
 
 class ReolinkClientTests(unittest.TestCase):
@@ -853,8 +904,11 @@ class CameraControlHttpTests(unittest.TestCase):
         self.addCleanup(raw.close)
 
         raw.sendall(b"NOT-A-REQUEST-LINE\r\n\r\n")
+        # Read to the close, not to the header terminator: the frame this
+        # response announces ends at the close, and stopping at the first blank
+        # line asserts against whatever happened to arrive in one segment.
         answer = b""
-        while b"\r\n\r\n" not in answer:
+        while True:
             chunk = raw.recv(4096)
             if not chunk:
                 break

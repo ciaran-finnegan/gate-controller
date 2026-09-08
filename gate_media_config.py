@@ -340,6 +340,24 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
     return selected
 
 
+def write_camera_address_dropin(path, values: Mapping[str, str]) -> None:
+    """Render the service's egress pin for the one validated camera address.
+
+    The address is written here rather than printed for the installer to
+    interpolate. Nothing read out of the credential file reaches stdout, a
+    shell variable, a process listing or a `bash -x` trace; and a validator
+    that fails writes nothing at all, instead of leaving a drop-in whose
+    `IPAddressAllow=` has an empty prefix and so pins nothing.
+
+    The address is re-rendered from what `ipaddress` parsed, so the pin is
+    exactly the canonical address the service will dial.
+    """
+    settings = validate_camera_control_environment(values)
+    address = ipaddress.ip_address(settings["GATE_CAMERA_HOST"])
+    body = f"[Service]\nIPAddressAllow={address}/32\n".encode("ascii")
+    _atomic_write_trusted_file(path, body, mode=0o644)
+
+
 def relevant_camera_control_environment(
     environment: Mapping[str, str]
 ) -> dict[str, str]:
@@ -473,10 +491,15 @@ def _serialize_environment(values: Mapping[str, str], order) -> bytes:
 
 
 def _atomic_write_environment(path, body: bytes) -> None:
+    """Replace a trusted environment file in one step, owner-readable only."""
+    _atomic_write_trusted_file(path, body, mode=0o600)
+
+
+def _atomic_write_trusted_file(path, body: bytes, *, mode: int) -> None:
     path = os.path.abspath(os.fspath(path))
     parent, name = os.path.split(path)
     if not name or not body or len(body) > _MAX_CONFIG_BYTES:
-        raise MediaConfigError("environment update is invalid")
+        raise MediaConfigError("trusted file update is invalid")
     directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     temporary = f".{name}.new.{os.getpid()}.{secrets.token_hex(8)}"
@@ -495,7 +518,7 @@ def _atomic_write_environment(path, body: bytes) -> None:
             0o600,
             dir_fd=directory_descriptor,
         )
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         view = memoryview(body)
         while view:
             written = os.write(descriptor, view)
@@ -514,7 +537,7 @@ def _atomic_write_environment(path, body: bytes) -> None:
     except MediaConfigError:
         raise
     except OSError as error:
-        raise MediaConfigError("environment could not be atomically updated") from error
+        raise MediaConfigError("trusted file could not be atomically updated") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -605,7 +628,7 @@ def main(argv=None) -> int:
     turn.add_argument("--env", required=True)
     camera_control = subparsers.add_parser("camera-control")
     camera_control.add_argument("--env", required=True)
-    camera_control.add_argument("--print-host", action="store_true")
+    camera_control.add_argument("--write-address-dropin")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "checksum":
@@ -621,11 +644,10 @@ def main(argv=None) -> int:
         elif arguments.command == "turn":
             validate_turn_environment(parse_trusted_environment(arguments.env))
         elif arguments.command == "camera-control":
-            settings = validate_camera_control_environment(
-                parse_trusted_environment(arguments.env)
-            )
-            if arguments.print_host:
-                print(settings["GATE_CAMERA_HOST"])
+            values = parse_trusted_environment(arguments.env)
+            validate_camera_control_environment(values)
+            if arguments.write_address_dropin is not None:
+                write_camera_address_dropin(arguments.write_address_dropin, values)
         else:
             migrate_gateway_environments(
                 arguments.gateway, arguments.runtime_turn

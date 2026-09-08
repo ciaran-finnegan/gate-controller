@@ -277,8 +277,23 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertNotIn("gate-media-gateway.env", installer)
         self.assertIn("/etc/gate-camera-control.env", installer)
         self.assertIn("d $CAMERA_RUNTIME_ROOT 0755", installer)
-        self.assertIn("IPAddressAllow=$host/32", installer)
+        self.assertIn("--write-address-dropin", installer)
         self.assertIn("reject_gpio_membership", installer)
+
+    def test_the_installer_never_carries_the_camera_address_through_the_shell(self):
+        """The validator writes the pin; the installer only moves the file.
+
+        A `host=$(...)` step puts the camera's address into a shell variable,
+        where `bash -x` prints it and a failed substitution silently yields
+        `IPAddressAllow=/32` -- a pin that matches nothing.
+        """
+        installer = (
+            REPOSITORY_ROOT / "deployment/install-camera-control.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("--print-host", installer)
+        self.assertNotIn("IPAddressAllow=$", installer)
+        self.assertNotIn("GATE_CAMERA_HOST=", installer)
 
     def test_the_release_verifier_syntax_checks_the_camera_installer(self):
         """The check must be presence-guarded, like every other file check.

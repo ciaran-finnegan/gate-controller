@@ -37,7 +37,7 @@ no request body can widen it.
 | The controller never gains camera credentials | `file-monitor.service` reads no camera env; it learns the IR state only from the nonsecret `/run/gate-camera/state.json` |
 | The media gateway secret is not widened | The camera env is a **separate** file. `validate_gateway_static_environment()` pins the gateway key set, so camera-API keys cannot be bolted onto it, and the service is not in group `gate-media` |
 | Its own identity | System user and group `gate-camera-control`; the installer refuses to run if that account shares a group with the media or controller services, or with `gpio` |
-| Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the installer-rendered drop-in `gate-camera-control.service.d/10-camera-address.conf`. `GATE_CAMERA_HOST` must be one exact reachable IP so that pin is verifiable |
+| Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the drop-in `gate-camera-control.service.d/10-camera-address.conf`, which the validator writes itself (`camera-control --write-address-dropin`) so the address never passes through the installer's shell. `GATE_CAMERA_HOST` must be one exact reachable IP so that pin is verifiable |
 | Its own remote door | A separate Cloudflare Tunnel hostname (`gate-camera.*`) with its own Access application and its own service token — deliberately not the `gate-command` token |
 | No camera payloads leak | Every response is a bounded JSON status (or JPEG bytes); no camera payload, URL, token, or credential appears in a response or in the journal |
 | Loopback only | Binds `127.0.0.1:8767`; `--host` refuses anything else |
