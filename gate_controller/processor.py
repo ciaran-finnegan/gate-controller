@@ -14,6 +14,7 @@ from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
 from .actuation import ActuationCoordinator
+from .direction import passage_key
 from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
 from .matching import decide_access, normalise_plate
@@ -181,6 +182,7 @@ class GateProcessor:
             return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
         trace = self._new_trace()
         trace.set_trigger(trigger)
+        self._bind_direction(trace, trigger)
         if (
             received_at is not None
             or decision_started_at is not None
@@ -228,6 +230,9 @@ class GateProcessor:
                 trace.disable()
             else:
                 trace.add_frame(frame_quality)
+                self._note_scene_brightness(
+                    trace.trace_id, frame_quality.brightness,
+                )
             remaining = self._decision_timeout - (self._decision_clock() - started)
             if remaining <= 0:
                 timed_out = True
@@ -476,6 +481,7 @@ class GateProcessor:
             if decision_started_at is None:
                 trace.mark_burst()
             trace.set_trigger(trigger or ftp_fallback_trigger())
+            self._bind_direction(trace, trigger)
         else:
             trace = _BestEffortTrace.wrap(trace)
         trace.mark_decision("denied", reason)
@@ -492,6 +498,7 @@ class GateProcessor:
         self, trace: _BestEffortTrace, result: ProcessingResult
     ) -> ProcessingResult:
         self._attach_local_ocr(trace)
+        self._attach_direction(trace)
         telemetry = trace.finish()
         if telemetry is None:
             self._release_outbox_without_telemetry(result.event_id)
@@ -533,6 +540,77 @@ class GateProcessor:
                 forget(trace_id)
             except Exception:
                 return
+
+    def _attach_direction(self, trace: _BestEffortTrace) -> None:
+        """Attach this event's shadow direction verdict and journal it.
+
+        Shadow only: nothing here has reached ``decide_access``, the relay or
+        the presence session, and by the time it runs the decision is already
+        made. The block is attached even when nothing was measured -- the
+        answer is then ``unknown``/``none`` -- so a week of review has a
+        denominator rather than a pile of absent keys.
+
+        The trace's binding to its camera alarm is dropped here, so the
+        tracker holds nothing for an event that is over, and the samples of
+        one alarm can never be read by a trace bound to another.
+        """
+        estimate_of = getattr(self._recognizer, "direction_estimate", None)
+        if not callable(estimate_of):
+            return
+        trace_id = trace.trace_id
+        if not trace_id:
+            return
+        try:
+            estimate = estimate_of(trace_id)
+        except Exception:
+            return
+        if estimate is None:
+            return
+        try:
+            block = estimate.to_wire()
+            logging.getLogger(__name__).info(
+                "gate_direction trace_id=%s %s", trace_id, estimate.journal(),
+            )
+        except Exception:
+            return
+        trace.set_direction(block)
+        forget = getattr(self._recognizer, "forget_direction", None)
+        if callable(forget):
+            try:
+                forget(trace_id)
+            except Exception:
+                return
+
+    def _bind_direction(self, trace, trigger) -> None:
+        """Tell the direction tracker which camera alarm this trace belongs to.
+
+        One burst is usually one frame; the slope needs the frames of the
+        whole alarm. The identity is the correlated trigger's own, so two
+        alarms can never pool their boxes, and a burst with no correlated
+        trigger stays alone with its own frames.
+        """
+        bind = getattr(self._recognizer, "bind_direction", None)
+        if not callable(bind):
+            return
+        try:
+            bind(trace.trace_id, passage_key(trigger))
+        except Exception:
+            return
+
+    def _note_scene_brightness(self, trace_id, brightness) -> None:
+        """Tell the direction tracker how light this frame was.
+
+        The night operating point is unmeasured (one dark passage in the
+        labelled set), so a dark event has to be able to say ``unknown``
+        instead of reporting a slope nobody has validated.
+        """
+        note = getattr(self._recognizer, "note_direction_brightness", None)
+        if not callable(note):
+            return
+        try:
+            note(trace_id, brightness)
+        except Exception:
+            return
 
     def _release_outbox_without_telemetry(self, event_id: int | None) -> None:
         if not self._outbox_enabled or event_id is None:
@@ -935,6 +1013,13 @@ class _BestEffortTrace:
         operation = getattr(self._trace, "set_local_ocr", None)
         if callable(operation):
             self._call("set_local_ocr", local_ocr)
+
+    def set_direction(self, direction) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "set_direction", None)
+        if callable(operation):
+            self._call("set_direction", direction)
 
     def seed_upstream(
         self, received_at: datetime | None, decision_started_at: float | None,

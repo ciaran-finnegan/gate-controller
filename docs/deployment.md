@@ -246,6 +246,64 @@ transitions with the returned HTTP status, repeated at most every ten minutes,
 followed by `stage=*_recovered` when the path returns. Check those lines first
 when the app shows the controller as not reporting.
 
+### Vehicle Direction (Shadow)
+
+Every event carries a `telemetry.direction` block saying which way the vehicle
+was going: `{verdict, method, score, slope, frames, span_ms}`, with `verdict`
+one of `entering`, `exiting`, `stationary`, `unknown` and `method` one of
+`box_width`, `none`. The app already accepts it at `schema_version` 3
+(access-gate-ui #49), so nothing about the wire version changes here.
+
+**This is shadow telemetry and nothing acts on it.** It reaches no decision,
+no relay claim, no presence session and no lookup budget. Suppressing an
+opening for a departing vehicle is gate-controller#95 and is a separate
+change.
+
+The signal is the least-squares slope of `log(box width)` against time, over
+the boxes the pipeline already produced for one camera alarm — the on-device
+detector's plate box and the cloud read's vehicle and plate boxes, never
+mixed, because three detectors give three scales. No new model runs and no
+frame is decoded twice. One burst is usually one frame, so the samples are
+pooled by the camera alarm the burst's correlated trigger identifies, which
+is the same identity the burst queue already uses to decide which queued
+frame supersedes which. A burst with no correlated trigger keys on its own
+trace and can only ever fit its own frames.
+
+The verdict is gated at **at least 3 boxed frames spanning at least 2 s**.
+Measured over 42 hand-labelled passages
+(`gate-controller-data/analysis/vehicle-direction-2026-09-08.md`), that gate
+separates entering from exiting completely: 7/7 exits caught with **0/15**
+false exits on an entering car. Ungated, the same rule called one entering
+car an exit. The gate may be tightened by configuration and the controller
+refuses to start with it loosened.
+
+Night is unmeasured — exactly one labelled passage is genuinely dark — so a
+frame darker than `GATE_DIRECTION_MIN_BRIGHTNESS` makes the whole passage
+report `unknown`/`none` rather than a slope nobody has validated.
+
+What to read in the journal:
+
+```
+gate_direction trace_id=… verdict=exiting method=box_width slope=-0.3345 \
+    frames=7 span_ms=6700 score=0.842 source=vehicle_box
+gate_direction stage=counters estimates=25 entering=12 exiting=7 stationary=2 \
+    unknown=4 night=0 no_boxes=8 samples=71 evicted=0 expired=3
+```
+
+One line per event, plus a rollup every 25 estimates. Per-frame widths are at
+`DEBUG` (`gate_direction stage=sample`). The counters are journal-only on
+purpose: the app's heartbeat allowlist (`PI_STATUS_CAPABILITY_KEYS` in
+access-gate-ui `worker/routes/controller.ts`) has no slot for them, and a key
+the heartbeat has not been taught is dropped rather than stored.
+
+**Promotion rule.** This stays shadow until **zero** false `exiting` verdicts
+on a passage hand-labelled entering, over at least **100** labelled passages
+— against the 42 available today. Exit recall is secondary: a missed exit
+costs lookups, a false exit locks a household member out. Review weekly with
+the same contact-sheet method the analysis used, and re-fit the thresholds
+after the shadow week rather than treating them as calibrated; every one of
+them was chosen on 22 points.
+
 ### Heartbeat Health Blocks
 
 The 15 s heartbeat is the only telemetry that survives a Pi the owner cannot

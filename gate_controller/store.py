@@ -1300,6 +1300,8 @@ def _telemetry_payload(telemetry: EventTelemetry) -> dict:
         payload["match_policy"] = dict(raw["match_policy"])
     if "local_ocr" in raw:
         payload["local_ocr"] = dict(raw["local_ocr"])
+    if "direction" in raw:
+        payload["direction"] = dict(raw["direction"])
     return payload
 
 
@@ -1411,6 +1413,9 @@ def _decode_telemetry_payload(encoded: object) -> dict:
     local_ocr = telemetry.get("local_ocr")
     if local_ocr is not None and not isinstance(local_ocr, dict):
         raise _MalformedTelemetry("telemetry local_ocr block is invalid")
+    direction = telemetry.get("direction")
+    if direction is not None and not isinstance(direction, dict):
+        raise _MalformedTelemetry("telemetry direction block is invalid")
     return telemetry
 
 

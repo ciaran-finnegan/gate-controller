@@ -21,6 +21,7 @@ from .cloudflare_client import (
 )
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
+from .direction import DirectionTracker, load_direction_config
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
@@ -166,10 +167,15 @@ def main() -> None:
         trigger_capture=trigger_capture,
         corpus=corpus, activity=activity, metrics=metrics,
     )
+    # Shadow only: it reads boxes the pipeline already produced and journals
+    # a verdict. It reaches no decision, spends no lookup and ends no
+    # presence session; gate-controller#95 is where acting on it lives.
+    direction = DirectionTracker(load_direction_config(os.environ))
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
         plate_region=plate_region,
         corpus=corpus,
+        direction=direction,
         activity=activity,
         local_recognizer=local_recognizer,
         authorised=authorised.get,

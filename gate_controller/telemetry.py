@@ -376,6 +376,78 @@ class LocalOcrTelemetry:
         }
 
 
+_DIRECTION_VERDICTS = frozenset({"entering", "exiting", "stationary", "unknown"})
+_DIRECTION_METHODS = frozenset({"box_width", "none"})
+#: d(log box width)/dt per second. The measured range is -0.66..+0.10; the
+#: bound is a bound on nonsense, not a calibration, and it mirrors
+#: `MAX_DIRECTION_SLOPE` in the app's ingest contract exactly.
+MAX_DIRECTION_SLOPE = 10.0
+MAX_DIRECTION_FRAMES = 64
+MAX_DIRECTION_SPAN_MS = 600_000
+
+
+@dataclass(frozen=True)
+class DirectionTelemetry:
+    """Which way the vehicle was going, in one small shadow block.
+
+    Narrowed twice on purpose. The estimator in ``direction.py`` already
+    clamps what it produces; this is the boundary the wire payload is built
+    at, and ingest rejects the **whole event** for a key or a value it does
+    not recognise -- read the comment on ``OcrAttemptTelemetry.to_wire()``
+    first. A repaired block loses one shadow reading; a refused event is
+    retried by the outbox forever.
+    """
+
+    verdict: str = "unknown"
+    method: str = "none"
+    score: float | None = None
+    slope: float | None = None
+    frames: int = 0
+    span_ms: int = 0
+
+    @classmethod
+    def from_block(cls, block: object) -> "DirectionTelemetry | None":
+        if not isinstance(block, dict):
+            return None
+        return cls(
+            verdict=str(block.get("verdict", "unknown")),
+            method=str(block.get("method", "none")),
+            score=block.get("score"),
+            slope=block.get("slope"),
+            frames=block.get("frames", 0),
+            span_ms=block.get("span_ms", 0),
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        method = self.method if self.method in _DIRECTION_METHODS else "none"
+        verdict = self.verdict if self.verdict in _DIRECTION_VERDICTS else "unknown"
+        # The Worker enforces this pairing across the two fields and rejects
+        # the whole event when it does not hold: a verdict is a claim about a
+        # measurement, and `none` says no estimator ran.
+        if method == "none":
+            verdict = "unknown"
+        return {
+            "verdict": verdict,
+            "method": method,
+            "score": None if self.score is None else _ratio(self.score),
+            "slope": _optional_slope(self.slope),
+            "frames": _rounded_int(self.frames, 0, MAX_DIRECTION_FRAMES, 0),
+            "span_ms": _rounded_int(self.span_ms, 0, MAX_DIRECTION_SPAN_MS, 0),
+        }
+
+
+def _optional_slope(value: object | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(min(max(number, -MAX_DIRECTION_SLOPE), MAX_DIRECTION_SLOPE), 6)
+
+
 @dataclass(frozen=True)
 class StageTimestamps:
     filesystem_ingress_at: datetime | None = None
@@ -456,6 +528,7 @@ class EventTelemetry:
     trigger: TriggerTelemetry | None = None
     match_policy: MatchPolicyTelemetry | None = None
     local_ocr: LocalOcrTelemetry | None = None
+    direction: DirectionTelemetry | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trace_id", _trace_id(self.trace_id))
@@ -510,6 +583,8 @@ class EventTelemetry:
             payload["match_policy"] = self.match_policy.to_wire()
         if self.local_ocr is not None:
             payload["local_ocr"] = self.local_ocr.to_wire()
+        if self.direction is not None:
+            payload["direction"] = self.direction.to_wire()
         return payload
 
 
@@ -554,6 +629,7 @@ class ProcessingTrace:
         self._trigger: TriggerTelemetry | None = None
         self._match_policy: MatchPolicyTelemetry | None = None
         self._local_ocr: LocalOcrTelemetry | None = None
+        self._direction: DirectionTelemetry | None = None
         self._finished_telemetry: EventTelemetry | None = None
 
     def seed_upstream(
@@ -603,6 +679,19 @@ class ProcessingTrace:
         if not isinstance(local_ocr, LocalOcrTelemetry):
             local_ocr = LocalOcrTelemetry.from_block(local_ocr)
         self._local_ocr = local_ocr
+
+    def set_direction(self, direction) -> None:
+        """Attach the shadow direction block; a plain dict is accepted.
+
+        Unlike the blocks above, this one is attached to *every* event: the
+        honest answer when nothing was measured is `unknown`/`none`, not an
+        absent block, so a week of shadow data has a denominator.
+        """
+        if direction is None:
+            return
+        if not isinstance(direction, DirectionTelemetry):
+            direction = DirectionTelemetry.from_block(direction)
+        self._direction = direction
 
     def add_frame(self, frame: FrameTelemetry) -> None:
         if len(self._frames) < MAX_ITEMS:
@@ -748,6 +837,7 @@ class ProcessingTrace:
             trigger=self._trigger,
             match_policy=self._match_policy,
             local_ocr=self._local_ocr,
+            direction=self._direction,
         )
         return self._finished_telemetry
 
