@@ -349,7 +349,6 @@ class PlateRecognizerClient:
         self._precropped_directory = (
             Path(precropped_directory).resolve() if precropped_directory is not None else None
         )
-        self._upload_geometry: _UploadGeometry | None = None
         # Optional TrainingCorpus: keeps every uploaded frame and answer.
         self._corpus = corpus
         # Optional LocalRecognizer: reads the very same upload bytes on the
@@ -406,8 +405,7 @@ class PlateRecognizerClient:
             return empty
 
     def _local_pass(self, path: Path, trace_id, budget) -> LocalPass:
-        upload = self._open_upload(path)
-        geometry = self._upload_geometry
+        upload, geometry = self._open_upload(path)
         try:
             image = self._corpus_image(upload)
         finally:
@@ -787,10 +785,8 @@ class PlateRecognizerClient:
         """
         prepared = state.get("upload_bytes")
         if prepared:
-            self._upload_geometry = state.get("geometry")
             return BytesIO(prepared), state.get("geometry"), prepared
-        upload = self._open_upload(path)
-        geometry = self._upload_geometry
+        upload, geometry = self._open_upload(path)
         image = self._corpus_image(upload) if want_bytes else None
         return upload, geometry, image
 
@@ -969,17 +965,24 @@ class PlateRecognizerClient:
             return False
 
     def _open_upload(self, path: Path):
-        """Return the bytes to upload: the file itself, or a cropped, bounded copy.
+        """Return ``(bytes to upload, geometry)``: the file itself, or a cropped, bounded copy.
 
         The plate region is cut out first at native resolution (unless the
         decoder already produced a region-only frame), then the result is
         downscaled only if it is still wider than the limit. The original
         file is never modified. Any decode problem falls back to uploading
-        the file unchanged so OCR still runs.
+        the file unchanged so OCR still runs, with a ``None`` geometry.
+
+        The geometry is *returned*, never stashed on the client. Two threads
+        prepare uploads for the same client now -- the local pass runs on the
+        decision thread while a cloud request for an older frame is still in
+        flight on the request thread -- and an instance attribute would let
+        one frame's crop be read back as another's, putting the plate box in
+        the wrong place in the journal and the corpus sidecar.
         """
         precropped = self._is_precropped(path)
         region = None if precropped else self._plate_region
-        self._upload_geometry = None
+        geometry = None
         try:
             with Image.open(path) as image:
                 frame_width, frame_height = image.size
@@ -994,12 +997,12 @@ class PlateRecognizerClient:
                     else crop_width
                 )
                 target_height = max(1, round(crop_height * target_width / crop_width))
-                self._upload_geometry = _UploadGeometry(
+                geometry = _UploadGeometry(
                     frame_width, frame_height, left, top, crop_width, crop_height,
                     target_width, target_height, precropped, region is not None,
                 )
                 if region is None and target_width == frame_width:
-                    return path.open("rb")
+                    return path.open("rb"), geometry
                 # draft() lets the JPEG decoder skip detail the resize would
                 # discard. It scales the whole frame by a power of two, so the
                 # crop box is rescaled to whatever size the decoder chose.
@@ -1017,15 +1020,14 @@ class PlateRecognizerClient:
                 decoded.save(buffer, format="JPEG", quality=UPLOAD_JPEG_QUALITY)
         except (OSError, ValueError, Image.DecompressionBombError):
             _LOGGER.warning("gate_ocr upload_downscale=failed")
-            self._upload_geometry = None
-            return path.open("rb")
+            return path.open("rb"), None
         buffer.seek(0)
         _LOGGER.info(
             "gate_ocr upload_downscale=applied source_width=%d upload_width=%d upload_bytes=%d crop=%s",
             frame_width, decoded.width, buffer.getbuffer().nbytes,
             f"{left},{top},{right},{bottom}" if region is not None else "none",
         )
-        return buffer
+        return buffer, geometry
 
     def _log_plate_box(self, box, geometry) -> None:
         """Journal where the plate sat, as fractions of the whole camera frame.

@@ -2855,6 +2855,98 @@ class FastLocalDecisionTests(unittest.TestCase):
             self.assertEqual(processor._min_cloud_request_seconds, 0.0)
             self.assertTrue(processor.process((frame,)).opened)
 
+    def test_the_slot_queue_wait_stays_in_burst_to_ocr_ms(self):
+        """`burst_to_ocr_ms` means "burst until the cloud request starts".
+
+        Every measurement taken to date reads it that way -- the PR's own
+        evidence is a `burst_to_ocr_ms=3654` slot wait. Marking recognition at
+        the local pass instead moved that wait into `ocr_ms` and made this
+        release's numbers incomparable with every earlier one.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=0.3, cloud_delay=0.05,
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            durations = result.telemetry.stage_durations
+            self.assertLess(
+                durations.ocr_ms, 200,
+                "ocr_ms must be the cloud request, not the local pass",
+            )
+            self.assertGreaterEqual(
+                durations.burst_to_ocr_ms, 300,
+                "the wait before the cloud request belongs to burst_to_ocr_ms",
+            )
+
+    def test_a_locally_decided_frame_is_still_timed_from_when_it_was_read(self):
+        # No cloud request is ever made for this frame, so nothing else would
+        # mark recognition for it: `ocr_ms` keeps carrying the local read,
+        # exactly where it sat before the pass was split off the slot.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=0.3, local_plate="12D3456", local_confidence=0.99,
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(recognizer.cloud_calls, [])
+            self.assertEqual(len(result.telemetry.ocr_attempts), 1)
+            self.assertGreaterEqual(result.telemetry.stage_durations.ocr_ms, 250)
+
+    def test_a_local_pass_that_overruns_cannot_overrun_the_decision(self):
+        # `local_pass` decodes, crops and re-encodes the JPEG before inference
+        # starts, and that prep answers to no budget of its own. On the
+        # decision thread a 3 s pass carried a 1.5 s decision to 3.01 s.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "slow.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=3.0, local_plate="12D3456", local_confidence=0.99,
+            )
+            processor = self._processor(
+                directory, recognizer, decision_timeout=1.5,
+            )
+
+            started = monotonic()
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,))
+            elapsed = monotonic() - started
+
+            self.assertLess(
+                elapsed, 2.5,
+                f"the deadline no longer bounds the event: {elapsed:.2f}s",
+            )
+            self.assertFalse(result.opened)
+            self.assertIn(
+                "gate_ocr stage=local_pass_overran", "\n".join(logs.output),
+            )
+
+    def test_a_skipped_lookup_leaves_no_half_started_ocr_attempt(self):
+        # The budget guard skips the request before anything is billed. It
+        # must not stamp `ocr_started_at` on an event with no attempts, nor
+        # leave the trace's pending mark set for the next frame to inherit.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "late.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                min_cloud_request_seconds=1.0,
+            )
+            clock.value = 6.5
+
+            result = processor.process((frame,), decision_started_at=0.0)
+
+            self.assertEqual(result.telemetry.ocr_attempts, ())
+            self.assertIsNone(result.telemetry.stage_timestamps.ocr_started_at)
+            self.assertIsNone(result.telemetry.stage_durations.burst_to_ocr_ms)
+
     def test_an_unreadable_min_request_floor_falls_back_to_the_default(self):
         for value in (float("nan"), float("inf"), "not a number", -1.0):
             self.assertEqual(

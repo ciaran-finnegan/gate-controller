@@ -66,6 +66,17 @@ MATCH_RULE_EDIT_DISTANCE = "edit_distance"
 #: knob must not silently choose the laxer new default.
 LEGACY_MIN_CONFIDENCE = 0.90
 
+#: The lowest bar an operator may configure. Below this a "bar" is not a bar:
+#: ``GATE_MATCH_MIN_CONFIDENCE_STANDARD=0`` admits a 0.0-confidence exact read,
+#: and ``1e-9`` is the same thing with a decimal point in it. Both readers
+#: score far above 0.10 even on garbage -- the measured separation on this site
+#: is 0.998 on correct reads against 0.772 on wrong ones, and the lowest bar
+#: anything here ships with is the 0.50 local agreement bar -- so 0.10 is
+#: already five times laxer than the laxest shipped value while still being a
+#: number the reader can fail. A value below it is a typo or a disabled bar,
+#: not a posture, and is refused like any other unusable value.
+MIN_CONFIGURABLE_CONFIDENCE = 0.10
+
 #: The confidence bars, per level. ``field`` is the :class:`LevelRule`
 #: attribute, ``prefix`` the environment key stem (``<prefix>_STANDARD`` /
 #: ``<prefix>_STRICT``), and the mapping the shipped default for each level.
@@ -161,9 +172,11 @@ def _confidence_value(raw: object, key: str, default: float,
     """Read one confidence knob, failing closed to the historical 0.90.
 
     A value that is not a number, is not finite (``nan`` and ``inf`` both),
-    or falls outside 0-1 is refused. It does **not** fall back to this
-    release's laxer default: a knob the operator meant to set and mistyped
-    must leave the gate no wider than it was before the knob existed.
+    or falls outside :data:`MIN_CONFIGURABLE_CONFIDENCE`-1 is refused --
+    ``0`` and ``1e-9`` included, because a bar no read can fail is not a bar.
+    It does **not** fall back to this release's laxer default: a knob the
+    operator meant to set and mistyped must leave the gate no wider than it
+    was before the knob existed.
     """
     if raw is None:
         return default
@@ -174,7 +187,8 @@ def _confidence_value(raw: object, key: str, default: float,
         value = float(text)
     except (TypeError, ValueError):
         value = None
-    if value is None or not isfinite(value) or not 0.0 <= value <= 1.0:
+    if (value is None or not isfinite(value)
+            or not MIN_CONFIGURABLE_CONFIDENCE <= value <= 1.0):
         if key not in warned:
             warned.add(key)
             LOGGER.warning(

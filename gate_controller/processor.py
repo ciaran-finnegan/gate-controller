@@ -218,9 +218,9 @@ class GateProcessor:
                 break
             ocr_started = False
 
-            def mark_ocr_start():
+            def mark_ocr_start(at=None):
                 nonlocal ocr_started
-                trace.mark_ocr_start()
+                trace.mark_ocr_start(at)
                 ocr_started = True
 
             try:
@@ -229,6 +229,11 @@ class GateProcessor:
                     trace_id=trace.trace_id,
                 )
             except _OcrBusy:
+                # The slot was taken, or the processor closed under the frame.
+                # Either way no request was made, so a mark taken between the
+                # two must not be left pending on the trace.
+                if ocr_started:
+                    trace.discard_ocr_start()
                 trace.add_ocr_rejection(OcrAttemptTelemetry(
                     frame_sequence=sequence,
                     status="ocr_busy",
@@ -243,6 +248,11 @@ class GateProcessor:
                         frame_sequence=sequence,
                         status="ocr_timeout",
                     ))
+                elif ocr_started:
+                    # Marked, then refused before anything was billed: take
+                    # the mark back rather than stamping `ocr_started_at` on
+                    # an event whose `ocr_attempts` is empty.
+                    trace.discard_ocr_start()
                 timed_out = True
                 break
             except Exception as error:
@@ -537,19 +547,52 @@ class GateProcessor:
         requests, and a local read that can answer for the frame must not wait
         behind one. A failure here is not a failure of the frame -- it falls
         through to the cloud exactly as it would have without a local reader.
+
+        It runs on its own thread, bounded by the decision deadline. The
+        recogniser bounds its own *inference* wait, but the pass also decodes,
+        crops and re-encodes the JPEG before inference starts, and that prep
+        answers to no budget at all: on the decision thread a slow frame could
+        carry a 1.5 s decision past 3 s. Bounded here, the deadline bounds the
+        whole event again, and a pass that finishes too late is settled off
+        the decision thread rather than left hanging.
         """
         if self._local_pass is None:
             return None
+        if deadline - self._decision_clock() <= 0:
+            return None
+        result: Queue = Queue(maxsize=1)
+
+        def invoke():
+            try:
+                outcome = (True, self._local_pass(
+                    path, trace_id=trace_id,
+                    budget=max(0.0, deadline - self._decision_clock()),
+                ))
+            except Exception:
+                outcome = (False, None)
+            result.put(outcome)
+
+        worker = Thread(target=invoke, name="gate-local-pass", daemon=True)
+        worker.start()
         try:
-            return self._local_pass(
-                path, trace_id=trace_id,
-                budget=max(0.0, deadline - self._decision_clock()),
+            succeeded, attempt = result.get(
+                timeout=max(0.0, deadline - self._decision_clock())
             )
-        except Exception:
+        except Empty:
+            logging.getLogger(__name__).warning(
+                "gate_ocr stage=local_pass_overran"
+            )
+            Thread(
+                target=_abandon_late_local_pass, args=(result,),
+                name="gate-local-pass-abandon", daemon=True,
+            ).start()
+            return None
+        if not succeeded:
             logging.getLogger(__name__).warning(
                 "gate_ocr stage=local_pass_unavailable"
             )
             return None
+        return attempt
 
     def _recognise(self, path: Path, deadline: float, on_start=None, *,
                    first_attempt: bool = False, trace_id: str | None = None):
@@ -558,13 +601,33 @@ class GateProcessor:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         attempt = None
         if self._local_pass is not None:
-            if on_start is not None:
-                # Recognition really has started for this frame; the on-device
-                # read is recognition. Marking it here keeps `ocr_ms` honest
-                # and moves the local wait out of `burst_to_ocr_ms`.
-                on_start()
+            # `on_start` is deliberately NOT fired here. `burst_to_ocr_ms` has
+            # meant "burst to the cloud request starting" in every measurement
+            # taken to date, and it is what the OCR-slot queue wait shows up
+            # in; firing it before the slot is acquired would move that wait
+            # into `ocr_ms` and make this release's numbers incomparable with
+            # every earlier one. The local pass is timed separately below.
+            started = self._decision_clock()
             attempt = self._run_local_pass(path, deadline, trace_id)
-            if attempt is not None and attempt.decided:
+            elapsed_ms = max(0.0, self._decision_clock() - started) * 1000.0
+            decided = attempt is not None and attempt.decided
+            # Journal only: `stage_durations` is an allow-list on the app's
+            # side (worker/contracts/gate-event-ingest/contract.ts rejects the
+            # whole event for an unknown key), so this duration cannot go on
+            # the wire until the app learns the field.
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=local_pass local_pass_ms=%d decided=%s",
+                round(elapsed_ms), "true" if decided else "false",
+            )
+            if decided:
+                # This frame never queues for the slot and never reaches the
+                # cloud, so nothing else will mark recognition for it. Marking
+                # it from `started` keeps `burst_to_ocr_ms` meaning "time
+                # until this frame's recognition began" on both paths, and
+                # puts the local read in `ocr_ms` exactly where it sat before
+                # the pass was split off the slot.
+                if on_start is not None:
+                    on_start(started)
                 return attempt.observation
         remaining = deadline - self._decision_clock()
         if remaining < self._min_cloud_request_seconds:
@@ -814,8 +877,20 @@ class _BestEffortTrace:
     def add_frame(self, frame) -> None:
         self._call("add_frame", frame)
 
-    def mark_ocr_start(self) -> None:
-        self._call("mark_ocr_start")
+    def mark_ocr_start(self, at: float | None = None) -> None:
+        # Back-dating is optional so a trace that predates it (every existing
+        # fake) is still called exactly as it always was.
+        if at is None:
+            self._call("mark_ocr_start")
+        else:
+            self._call("mark_ocr_start", at)
+
+    def discard_ocr_start(self) -> None:
+        if self._trace is None:
+            return
+        operation = getattr(self._trace, "discard_ocr_start", None)
+        if callable(operation):
+            self._call("discard_ocr_start")
 
     def add_ocr_attempt(self, attempt) -> None:
         self._call("add_ocr_attempt", attempt)
@@ -954,6 +1029,29 @@ def _optional_callable(target, name: str):
     """A hook the recogniser may or may not have. Never raises."""
     hook = getattr(target, name, None)
     return hook if callable(hook) else None
+
+
+def _abandon_late_local_pass(result) -> None:
+    """Settle a local pass that finished after its frame gave up waiting.
+
+    The pass owns an on-device read handle; leaving it unsettled would leave
+    the event's local journal line unpaired. Runs off the decision thread, so
+    an engine that never returns costs one parked daemon thread and nothing
+    the gate is waiting on.
+    """
+    try:
+        succeeded, attempt = result.get()
+    except Exception:
+        return
+    if not succeeded or attempt is None:
+        return
+    abandon = getattr(attempt, "abandon", None)
+    if not callable(abandon):
+        return
+    try:
+        abandon()
+    except Exception:
+        return
 
 
 def _bounded_min_cloud_request(value, decision_timeout: float) -> float:

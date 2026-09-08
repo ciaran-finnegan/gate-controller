@@ -91,8 +91,24 @@ CLOUD_MODES = (CLOUD_FALLBACK, CLOUD_ALWAYS)
 #: observed on the Pi's own frames.
 DEFAULT_DETECTOR = "yolo-v9-t-384-license-plate-end2end"
 DEFAULT_RECOGNISER = "cct-xs-v2-global-model"
-#: 0.95 keeps 415 of 458 labelled baseline frames at 98.1% exact.
-DEFAULT_MIN_CONFIDENCE = 0.95
+#: The admission gate for a local read, and the *floor under every other
+#: local bar*: a read below this never reaches :func:`decide_access` at all,
+#: as an observation or as a corroboration.
+#:
+#: 0.95 was chosen for the shadow-mode measurement (it keeps 415 of 458
+#: labelled baseline frames at 98.1% exact) and it is far too high to be the
+#: admission gate. ``agreement_min_local_confidence`` ships at 0.50 for
+#: ``standard``, and with a 0.95 gate in front of it the agreement rule could
+#: never run: the 11:13:48 case on 2026-09-08 -- local ``10CE1990`` at 0.566,
+#: cloud the same plate at 0.806 -- was excluded from the corroboration pool
+#: before any bar it was written for could see it.
+#:
+#: 0.5 is what the live Pi has run since 2026-09-08 (owner decision). The
+#: authorised-plate match is the real gate, not the recogniser's own score;
+#: the 0.75-snapped baseline measured zero wrong-plate accepts. A site that
+#: wants the stricter shadow-mode gate sets
+#: ``GATE_LOCAL_OCR_MIN_CONFIDENCE`` back to 0.95.
+DEFAULT_MIN_CONFIDENCE = 0.5
 DEFAULT_THREADS = 1
 MAX_THREADS = 4
 #: ``ProtectHome=true`` hides ``~/.cache`` from the service, and the state

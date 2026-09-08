@@ -40,7 +40,7 @@ from gate_controller.local_recognizer import (
 )
 from gate_controller.corpus import TrainingCorpus
 from gate_controller.match_policy import (
-    DEFAULT_POLICY, RECOMMENDED_POLICY, STRICT_POLICY,
+    DEFAULT_POLICY, RECOMMENDED_POLICY, STRICT_POLICY, apply_confidence,
 )
 from gate_controller.matching import decide_access
 from gate_controller.models import PlateObservation, RelayResult
@@ -179,7 +179,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config.detector, DEFAULT_DETECTOR)
         self.assertEqual(config.recogniser, DEFAULT_RECOGNISER)
         self.assertEqual(config.threads, 1, "the board is thermally limited")
-        self.assertEqual(config.min_confidence, 0.95)
+        self.assertEqual(
+            config.min_confidence, 0.5,
+            "0.95 was the shadow-mode measurement threshold; as the admission "
+            "gate it is the floor under agreement_min_local and would keep the "
+            "agreement rule from ever running on shipped defaults",
+        )
         self.assertEqual(str(config.model_dir), DEFAULT_MODEL_DIR)
         self.assertEqual(config.cloud, "fallback")
 
@@ -226,7 +231,7 @@ class AgreementTests(unittest.TestCase):
 
     def test_a_read_below_the_threshold_is_not_an_authorised_local_match(self):
         logger = RecordingLogger()
-        local = recognizer([read("12D3456", 0.80)], logger=logger)
+        local = recognizer([read("12D3456", 0.40)], logger=logger)
         frame = local.begin(b"frame", trace_id="trace-2", authorised={"12D3456"})
         frame.result(5)
         frame.complete_cloud("12D3456", 0.99)
@@ -983,7 +988,7 @@ class OcrClientIntegrationTests(unittest.TestCase):
         local.close()
 
     def test_a_read_below_the_threshold_falls_through_to_the_cloud(self):
-        local = recognizer([read("12D3456", 0.90)], mode="active")
+        local = recognizer([read("12D3456", 0.40)], mode="active")
         session = FakeSession([FakeResponse(cloud_payload("12D3456"))])
         client = self._client(local, session)
 
@@ -1610,6 +1615,120 @@ class LocalObservationTests(unittest.TestCase):
         client.forget_local_ocr("trace-1")
 
         self.assertEqual(client.local_observations("trace-1"), ())
+
+
+class ShippedDefaultAgreementTests(unittest.TestCase):
+    """The agreement rule has to be reachable on what the controller ships.
+
+    Every other test of the rule sets ``min_confidence=0.5`` by hand. With the
+    admission gate at its old 0.95 default nothing under 0.95 ever reached the
+    corroboration pool, so the shipped 0.50 agreement bar was unreachable and
+    the rule could not run at all on a stock configuration.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(apply_confidence, {})
+        apply_confidence({})
+
+    def _jpeg(self, name="event.jpg", colour=120):
+        path = self.root / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _recognizer(self, script, *, environment=None):
+        config = load_local_recognizer_config(
+            environment or {"GATE_LOCAL_OCR_MODE": "active"}
+        )
+        local = LocalRecognizer(
+            config, engine_factory=engine_factory(script),
+            logger=RecordingLogger(),
+        )
+        local.start()
+        local.wait_ready(5)
+        self.addCleanup(local.close)
+        return local
+
+    def _open(self, local, cloud_score=0.806):
+        """Run the 11:13:48 event end to end and return the result."""
+        session = FakeSession([FakeResponse(cloud_payload("10CE1990", cloud_score))])
+        client = PlateRecognizerClient(
+            "token", session=session, local_recognizer=local,
+            authorised=lambda: {"10CE1990"},
+        )
+        processor = GateProcessor(
+            recognizer=client,
+            store=LocalStore(self.root / "gate.db"),
+            relay=RecordingRelay(),
+            authorised={"10CE1990"},
+            cooldown=timedelta(seconds=20),
+            clock=lambda: datetime(2026, 9, 8, 10, 13, 48, tzinfo=timezone.utc),
+        )
+        return processor.process((self._jpeg(),))
+
+    def test_the_shipped_default_admits_the_11_13_48_event(self):
+        # local 10CE1990 at 0.566, cloud the same plate at 0.806.
+        result = self._open(self._recognizer([read("10CE1990", 0.566)]))
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.decision.reason, "exact_match")
+
+    def test_agreement_opens_the_gate_when_neither_reader_could_alone(self):
+        """The same event with the cloud read below the 0.75 exact bar.
+
+        Nothing but the agreement rule can open this, so it fails outright
+        with the admission gate above the agreement bar.
+        """
+        result = self._open(
+            self._recognizer([read("10CE1990", 0.566)]), cloud_score=0.71,
+        )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.decision.reason, "exact_match")
+
+    def test_the_shipped_default_lets_the_agreement_rule_run(self):
+        """The local read reaches the pool, which is what 0.95 prevented."""
+        local = self._recognizer([read("10CE1990", 0.566)])
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse({"results": []})]),
+            local_recognizer=local, authorised=lambda: {"10CE1990"},
+        )
+
+        client.local_pass(self._jpeg(), trace_id="trace-1")
+
+        observations = client.local_observations("trace-1")
+        self.assertEqual(
+            [(item.plate, item.source) for item in observations],
+            [("10CE1990", "local")],
+        )
+        # And the pair opens under the shipped bars even when the cloud read
+        # alone is below the 0.75 exact bar: only agreement can carry this.
+        self.assertTrue(decide_access(
+            [PlateObservation("10CE1990", 0.71, source="cloud")],
+            {"10CE1990"}, DEFAULT_POLICY, corroborations=observations,
+        ).allowed)
+
+    def test_the_old_default_would_have_kept_the_rule_unreachable(self):
+        local = self._recognizer(
+            [read("10CE1990", 0.566)],
+            environment={
+                "GATE_LOCAL_OCR_MODE": "active",
+                "GATE_LOCAL_OCR_MIN_CONFIDENCE": "0.95",
+            },
+        )
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse({"results": []})]),
+            local_recognizer=local, authorised=lambda: {"10CE1990"},
+        )
+
+        client.local_pass(self._jpeg(), trace_id="trace-1")
+
+        self.assertEqual(
+            client.local_observations("trace-1"), (),
+            "a 0.95 admission gate is a 0.95 floor under every agreement bar",
+        )
 
 
 if __name__ == "__main__":

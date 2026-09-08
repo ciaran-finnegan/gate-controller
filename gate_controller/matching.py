@@ -73,7 +73,11 @@ def decide_access(
     ]
 
     for observed_plate, observation in normalised_observations:
+        # A non-finite confidence is not a confidence: `inf >= bar` is true for
+        # every bar, so it is refused here exactly as the agreement rule
+        # refuses it, rather than walking through the comparison.
         if (observed_plate and observed_plate in authorised_plates
+                and isfinite(observation.confidence)
                 and observation.confidence >= rule.min_exact_confidence):
             return MatchDecision(
                 allowed=True,
@@ -198,10 +202,11 @@ def _decide_agreement(
       no on-device reader can never reach this branch at all.
     * the agreed plate must still authorise under *this band's* rule -- exact
       membership, or the band's own one-confusion rule against a single
-      authorised candidate *on the number of frames that band requires*.
-      Agreement lowers what a read has to carry; it never buys an extra edit,
-      never buys a frame, and under ``strict`` it never buys anything but an
-      exact match.
+      authorised candidate *on the number of frames that band requires of
+      each reader separately*. Agreement lowers what a read has to carry; it
+      never buys an extra edit, it never lets one reader's second frame stand
+      in for the other's missing one, and under ``strict`` it never buys
+      anything but an exact match.
     * a non-finite confidence (``nan``, ``inf``) is not a confidence. It is
       dropped before any comparison, so it cannot walk through a ``>=``.
 
@@ -246,7 +251,7 @@ def _decide_agreement(
         if local is None or cloud is None:
             continue
         match_rule, distance, authorised_plate = _agreement_match(
-            plate, authorised_plates, rule, max(local[1], cloud[1]),
+            plate, authorised_plates, rule, min(local[1], cloud[1]),
         )
         if match_rule is None:
             continue
@@ -273,9 +278,13 @@ def _agreement_match(
 ) -> tuple[str | None, int | None, str | None]:
     """How an agreed plate authorises under ``rule``, if it does at all.
 
-    ``frames`` is how many frames of this event carried the plate, so the
-    band's own two-frame requirement still stands for a non-exact match. An
-    exact match has never needed a second frame and does not gain one here.
+    ``frames`` is how many frames of this event *each* reader carried the
+    plate on -- the smaller of the two counts -- so the band's own two-frame
+    requirement still stands for a non-exact match. Taking the larger would
+    let one reader's second frame stand in for the other's missing one, which
+    is the one-reader case the two-frame fuzzy rule already covers at a much
+    higher bar. An exact match has never needed a second frame and does not
+    gain one here.
     """
     if plate in authorised_plates:
         return MATCH_RULE_EXACT, 0, plate

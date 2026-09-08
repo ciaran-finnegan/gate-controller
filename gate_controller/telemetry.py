@@ -520,6 +520,9 @@ class ProcessingTrace:
         self._burst_processing_started_at: datetime | None = None
         self._first_ocr_start: float | None = None
         self._pending_ocr_start: float | None = None
+        # True while the pending mark is also what `_first_ocr_start` holds,
+        # so discarding an attempt that never happened can take both back.
+        self._first_ocr_start_pending = False
         self._last_ocr_end: float | None = None
         self._ocr_work_ms = 0.0
         self._decision: float | None = None
@@ -591,13 +594,38 @@ class ProcessingTrace:
         if len(self._frames) < MAX_ITEMS:
             self._frames.append(frame)
 
-    def mark_ocr_start(self) -> None:
-        """Mark the start of the next OCR attempt before invoking OCR."""
+    def mark_ocr_start(self, at: float | None = None) -> None:
+        """Mark the start of the next OCR attempt before invoking OCR.
+
+        ``at`` back-dates the mark to a monotonic instant already taken. The
+        on-device pass runs before the caller knows whether it will answer for
+        the frame, so a frame it did answer is marked from when that read
+        actually began rather than from when it finished.
+        """
         if len(self._ocr_attempts) >= MAX_ITEMS or self._pending_ocr_start is not None:
             return
-        self._pending_ocr_start = self._monotonic_clock()
+        now = self._monotonic_clock()
+        self._pending_ocr_start = now if at is None or at > now else at
         if self._first_ocr_start is None:
             self._first_ocr_start = self._pending_ocr_start
+            self._first_ocr_start_pending = True
+
+    def discard_ocr_start(self) -> None:
+        """Take back a mark for an attempt that never ran.
+
+        A frame can be marked as starting and then be refused before any work
+        happens -- the OCR slot is taken, the processor closed underneath it,
+        or the remaining budget is too small to bill a lookup. Without this
+        the mark stays pending forever: the next attempt's `mark_ocr_start`
+        is ignored, so its duration is charged from the wrong instant, and
+        `ocr_started_at` is stamped on an event with no attempts at all.
+        """
+        if self._pending_ocr_start is None:
+            return
+        self._pending_ocr_start = None
+        if self._first_ocr_start_pending:
+            self._first_ocr_start = None
+            self._first_ocr_start_pending = False
 
     def add_ocr_attempt(self, attempt: OcrAttemptTelemetry) -> None:
         if len(self._ocr_attempts) >= MAX_ITEMS:
@@ -608,6 +636,7 @@ class ProcessingTrace:
         duration_ms = _elapsed(self._pending_ocr_start, ended_at) or 0.0
         self._last_ocr_end = ended_at
         self._pending_ocr_start = None
+        self._first_ocr_start_pending = False
         self._ocr_work_ms += duration_ms
         self._ocr_attempts.append(replace(attempt, duration_ms=duration_ms))
 

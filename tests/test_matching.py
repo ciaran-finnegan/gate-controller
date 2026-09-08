@@ -308,6 +308,32 @@ class LevelledConfidenceTests(unittest.TestCase):
                           _strict_policy()).allowed
         )
 
+    def test_a_bar_no_read_can_fail_is_refused_like_any_other_bad_value(self):
+        # `0` opened the gate on a 0.0-confidence exact read, and `1e-9` is
+        # the same thing with a decimal point in it.
+        for value in ("0", "0.0", "1e-9", "0.09"):
+            with self.subTest(value=value):
+                with self.assertLogs(
+                    "gate_controller.match_policy", level="WARNING",
+                ) as logs:
+                    apply_confidence({"GATE_MATCH_MIN_CONFIDENCE_STANDARD": value})
+                self.assertEqual(
+                    LEVELS[LEVEL_STANDARD].min_exact_confidence,
+                    LEGACY_MIN_CONFIDENCE,
+                    f"{value!r} is a disabled bar, not a posture",
+                )
+                self.assertIn("status=rejected", "\n".join(logs.output))
+                self.assertFalse(
+                    decide_access([_cloud("12D3456", 0.0)], {"12D3456"},
+                                  _standard_policy()).allowed,
+                    "a 0.0-confidence exact read must never open the gate",
+                )
+
+    def test_the_floor_itself_is_still_a_usable_bar(self):
+        apply_confidence({"GATE_MATCH_MIN_CONFIDENCE_STANDARD": "0.10"})
+
+        self.assertEqual(LEVELS[LEVEL_STANDARD].min_exact_confidence, 0.10)
+
     def test_an_unusable_value_falls_closed_to_the_bar_that_shipped_before(self):
         for value in ("nan", "inf", "-0.5", "1.5", "banana", "0x3"):
             with self.assertLogs("gate_controller.match_policy", level="WARNING") as logs:
@@ -419,6 +445,15 @@ class AgreementRuleTests(unittest.TestCase):
                 corroborations=[_local("10CE1990", confidence)],
             ).allowed, f"{confidence!r} corroborated a read")
 
+    def test_the_exact_rule_refuses_a_non_finite_confidence_too(self):
+        """`inf >= bar` is true for every bar, including strict's 0.90."""
+        for policy in (_standard_policy(), _strict_policy()):
+            for confidence in (float("inf"), float("nan")):
+                with self.subTest(level=policy.bands[0].level, value=confidence):
+                    self.assertFalse(decide_access(
+                        [_cloud("10CE1990", confidence)], {"10CE1990"}, policy,
+                    ).allowed)
+
     def test_agreement_buys_no_extra_edit(self):
         # Two readers agreeing on a plate two edits away is still two edits.
         decision = decide_access(
@@ -442,11 +477,70 @@ class AgreementRuleTests(unittest.TestCase):
         two_frames = decide_access(
             [_cloud("11WH2S71", 0.71), _cloud("11WH2S71", 0.72)],
             {"11WH2571"}, policy,
-            corroborations=[_local("11WH2S71", 0.99)],
+            corroborations=[_local("11WH2S71", 0.99), _local("11WH2S71", 0.98)],
         )
         self.assertTrue(two_frames.allowed)
         self.assertEqual(two_frames.reason, "two_frame_ocr_confusion")
         self.assertEqual(two_frames.match_rule, "ocr_confusion")
+
+    def test_the_frame_count_is_the_weaker_readers_own_count(self):
+        """The band's two frames are asked of each reader, not of the pair.
+
+        Counting the frames as the maximum over the two readers let a reader
+        that saw the plate twice cover for one that saw it once, which is a
+        one-reader fuzzy match taken at the agreement bars instead of the much
+        higher fuzzy bar. Authorised ``10CE1990``; the reader sees the
+        one-confusion string ``1OCE1990``.
+        """
+        policy = _standard_policy()
+
+        # Frame 0: local only. Frame 1: both. The cloud saw it once, below
+        # every bar the fuzzy rule asks for.
+        cloud_saw_it_once = decide_access(
+            [_cloud("1OCE1990", 0.71)], {"10CE1990"}, policy,
+            corroborations=[_local("1OCE1990", 0.55), _local("1OCE1990", 0.55)],
+        )
+        self.assertFalse(
+            cloud_saw_it_once.allowed,
+            "one cloud frame is not the two frames standard asks for",
+        )
+
+        local_saw_it_once = decide_access(
+            [_cloud("1OCE1990", 0.71), _cloud("1OCE1990", 0.72)],
+            {"10CE1990"}, policy,
+            corroborations=[_local("1OCE1990", 0.55)],
+        )
+        self.assertFalse(
+            local_saw_it_once.allowed,
+            "one local frame is not the two frames standard asks for",
+        )
+
+        both_saw_it_twice = decide_access(
+            [_cloud("1OCE1990", 0.71), _cloud("1OCE1990", 0.72)],
+            {"10CE1990"}, policy,
+            corroborations=[_local("1OCE1990", 0.55), _local("1OCE1990", 0.56)],
+        )
+        self.assertTrue(
+            both_saw_it_twice.allowed,
+            "a genuine two-and-two agreement is what the rule is for",
+        )
+        self.assertEqual(both_saw_it_twice.reason, "two_frame_ocr_confusion")
+
+    def test_the_must_open_cases_are_untouched_by_the_frame_count(self):
+        """Every case the release was written to open still opens."""
+        # 2026-09-08 11:13:48: exact agreement, one frame each.
+        self.assertTrue(decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _standard_policy(),
+            corroborations=[_local("10CE1990", 0.566)],
+        ).allowed)
+        # The cloud alone, at the daytime exact bar.
+        self.assertTrue(decide_access(
+            [_cloud("10CE1990", 0.806)], {"10CE1990"}, _standard_policy(),
+        ).allowed)
+        # The on-device reader alone, deciding its own frame.
+        self.assertTrue(decide_access(
+            [_local("10CE1990", 1.0)], {"10CE1990"}, _standard_policy(),
+        ).allowed)
 
     def test_overnight_agreement_defaults_change_nothing(self):
         decision = decide_access(

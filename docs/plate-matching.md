@@ -47,11 +47,26 @@ band. These are a site's own risk posture for the hardware it has.
 | `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_STRICT` | `0.90` | As above, overnight — the historical bar, so agreement adds nothing |
 | `GATE_MATCH_AGREEMENT_MIN_CLOUD_CONFIDENCE_STRICT` | `0.90` | As above, overnight |
 
-A value must be a finite number in 0-1. Anything else — `nan`, `inf`, out of
-range, unparseable — is refused and that one bar falls back to **0.90**, the
-value the controller required before these knobs existed, logged once at
+A value must be a finite number in **0.10-1**. Anything else — `nan`, `inf`,
+out of range, unparseable — is refused and that one bar falls back to **0.90**,
+the value the controller required before these knobs existed, logged once at
 start-up as `match_confidence key=… status=rejected using=0.90`. A mistyped
 knob therefore never widens the gate, not even to this release's own default.
+
+The floor is 0.10 rather than 0 because a bar no read can fail is not a bar:
+`GATE_MATCH_MIN_CONFIDENCE_STANDARD=0` would open the gate on a 0.0-confidence
+exact read, and `1e-9` is the same thing with a decimal point in it. Both
+readers score far above 0.10 even when they are wrong (0.772 on wrong reads
+against 0.998 on correct ones, measured here), and the laxest bar anything
+ships with is the 0.50 local agreement bar, so 0.10 leaves every real posture
+reachable while refusing a disabled one.
+
+`GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` has a second floor under it that
+does not live here: `GATE_LOCAL_OCR_MIN_CONFIDENCE` (default `0.5`) is the
+on-device recogniser's own admission gate, and a read below it never reaches
+the matcher to corroborate anything. The effective local agreement bar is the
+larger of the two. See
+[local recognition](local-recognition.md#environment-variables).
 
 ### Why the daytime exact bar is 0.75
 
@@ -83,8 +98,13 @@ It is narrow by construction:
   without `GATE_LOCAL_OCR_MODE=active` can never reach it at all;
 - the agreed plate must still authorise **under the band's own rule**: exact
   membership, or that band's one-confusion rule against a single authorised
-  candidate, on the number of frames that band requires. Agreement lowers what
-  a read has to carry. It never buys an extra edit and never buys a frame;
+  candidate, on the number of frames that band requires **of each reader
+  separately**. The frame count the rule is tested against is the *smaller* of
+  the two readers' counts, so a reader that saw the plate twice cannot cover
+  for one that saw it once: that is the one-reader case, and the two-frame
+  fuzzy rule already covers it at a much higher bar. Agreement lowers what a
+  read has to carry. It never buys an extra edit, and it never buys a frame
+  from the other reader's count;
 - reads of one event never corroborate another: the on-device reads are keyed
   by trace id;
 - a non-finite confidence is not a confidence and is dropped before any

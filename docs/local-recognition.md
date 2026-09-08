@@ -156,6 +156,8 @@ weak character is precisely the one deciding whether the read is the authorised
 plate or a different vehicle. The measured separation between right and wrong
 reads (0.998 against 0.772) is wide enough that a per-character minimum costs
 very little of the 415-in-458 retention the 0.95 threshold was chosen for.
+(That 0.95 was the *measurement* threshold; what ships as the admission gate is
+0.5 -- see the environment table below.)
 
 Two details that follow from the same place:
 
@@ -232,6 +234,15 @@ readers produced the same string and lower each one's bar. A read below
 `GATE_LOCAL_OCR_MIN_CONFIDENCE` never enters the pool, so it corroborates
 nothing.
 
+That makes `GATE_LOCAL_OCR_MIN_CONFIDENCE` a **floor under**
+`GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*`, not an independent knob: the
+effective local agreement bar is the larger of the two. This is why the
+shipped default is 0.5 rather than the 0.95 the shadow-mode measurement used.
+At 0.95 the 2026-09-08 11:13:48 event -- local `10CE1990` at 0.566, cloud the
+same plate at 0.806 -- was dropped before the 0.50 agreement bar written for
+it could see it, and the agreement rule could not run at all on shipped
+defaults.
+
 ### The time-of-day matching policy
 
 `__main__` hands the one `MatchPolicyCache.get` to
@@ -264,7 +275,7 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_DETECTOR` | `yolo-v9-t-384-license-plate-end2end` | Any detector registered in `open-image-models`. |
 | `GATE_LOCAL_OCR_RECOGNISER` | `cct-xs-v2-global-model` | Any OCR model registered in `fast-plate-ocr`. |
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
-| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.95` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision. |
+| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.5` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision *and* admission to the corroboration pool, so it is the floor under `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` too. 0.95 is the shadow-mode measurement threshold and is too high to be the admission gate: it would keep the agreement rule from ever running on the shipped 0.50 agreement bar. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
 
