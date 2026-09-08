@@ -328,12 +328,12 @@ five-minute buckets, at most twelve buckets -- 60 minutes -- per POST, so a
 | Key | What it counts, per minute |
 | --- | --- |
 | `heartbeats` | Heartbeat POSTs that were acknowledged in that minute |
-| `ocr_attempts` | Every OCR attempt the burst pipeline made |
+| `ocr_attempts` | Every OCR attempt the burst pipeline made. A burst is counted when it finishes but credited to the minute it *started* in, so one that runs past a boundary lands where it happened rather than a minute late; a start the ring cannot trust -- in the future, more than one bucket old, or inside a bucket already delivered -- falls back to the minute in progress |
 | `billed_lookups` | The attempts Plate Recognizer charges for -- see below |
 | `recognized` | Attempts that returned a plate |
 | `unread_frames` | Attempts that returned no plate. **Never `no_plate`:** the contract refuses any key matching `/plate/` and rejects the whole body for it |
 | `ocr_error`, `ocr_timeout`, `ocr_busy` | Failed, abandoned at the decision deadline, and never sent because the OCR slot was taken |
-| `http_429` | Requests the 1 req/s throttle refused, counted in the minute the throttle happened in rather than the minute the burst finished. The client retries and usually succeeds, so without this counter a throttled request leaves no trace outside the journal. A 429 in a minute the ring never opened is counted in the drain minute instead -- late rather than lost |
+| `http_429` | Requests the 1 req/s throttle refused, counted in the minute the throttle happened in rather than the minute the burst finished. The client retries and usually succeeds, so without this counter a throttled request leaves no trace outside the journal. A 429 in a minute the ring never opened is counted in the drain minute instead -- late rather than lost. The rollup cycle drains the client's counter as well as a finished burst, so a 429 on the last burst before a quiet spell is attributed before its own bucket closes |
 | `ocr_ms_p50`, `ocr_ms_p90` | Attempt durations, from a bounded per-minute sample |
 | `local_attempts`, `local_recognized` | Frames the on-device reader completed, and events it answered |
 | `recognition_lookups_month_to_date`, `recognition_lookup_quota` | The burn-down against the 2,500/month allowance |
@@ -364,16 +364,22 @@ Given a request did go out:
   `tls_error`, `connection_error` and `request_error` (never arrived), and
   every `http_*` cause including `http_429` -- a throttled request is refused
   before it is processed.
-- **`ocr_timeout` is billed, like `read_timeout`.** They are usually the same
-  physical event -- the request went out and the reply did not come back in
-  time -- seen from the decision's clock rather than the socket's. The
-  processor records an `ocr_timeout` attempt only past `ocr_started`, which is
-  to say only once the request had been launched, so classifying it as "never
-  sent" made the burn-down disagree with itself depending on which timer
-  fired first. The residual error runs the other way and is bounded: in local
-  `active` mode an `ocr_timeout` may be the on-device guard having consumed
-  the decision budget before a request was posted, and the processor cannot
-  tell the two apart from where it stands.
+- **`ocr_timeout` is billed when the request went out, and only then.** An
+  abandoned request that was posted is the same physical event as a
+  `read_timeout` -- the reply did not come back in time -- seen from the
+  decision's clock rather than the socket's, so classifying the two
+  differently made the burn-down disagree with itself depending on which
+  timer fired first. But "the request went out" is not what `ocr_started`
+  means: it fires when the request *thread* starts, and between that and
+  `session.post` sit the client's 1.05 s pacing window (the service allows
+  one request a second), the downscaled upload and the on-device guard. The
+  second frame of a burst waiting out that window and being abandoned there
+  is the ordinary case, not a corner, and billing it billed the throttle. So
+  the dispatch site says whether a request was posted, the processor carries
+  that on the attempt as `cloud_lookup`, and the burn-down counts it. The
+  residual error is a recogniser that cannot report its dispatches, which
+  keeps the old assumption that a cloud read posts; every recogniser this
+  controller ships reports.
 
 **Where the month-to-date figure comes from: the controller itself.** It is
 its own count, persisted in `metrics-quota.json` beside the database and reset
@@ -433,14 +439,18 @@ before a bucket closes.
 below the gate:
 
 - it stands down entirely while a gate decision is in flight, on the same
-  `ActivityGate` the corpus uploader uses;
+  `ActivityGate` the corpus uploader uses -- before the ledger write as well
+  as before the POST, since the `fsync` and `os.replace` are the half of a
+  cycle that touches the card the decision is on;
 - it holds no lock across the POST, so a stalled endpoint cannot block the
   pipeline that fills the ring;
 - a failure backs off from 5 s to 5 minutes rather than retrying in a tight
   loop -- the behaviour that made the 2026-09-05 D1 outage worse -- and the
   minutes stay pending until a 2xx. The backoff is a schedule the worker
-  keeps: a pending retry pulls the next wake earlier than the boundary would,
-  bounded below at 5 s so it can never become a loop;
+  keeps: a pending retry pulls the next wake earlier than the boundary would.
+  No wait is ever below 5 s, on either path: a cycle that runs just before a
+  boundary would otherwise compute a wait of a millisecond and come straight
+  back, flushing the ledger each time, for a bucket that has already closed;
 - the ring is memory only and fixed at 180 minutes; the oldest minute is
   dropped when it is full, and nothing but the small month-to-date counter is
   written to the SD card;

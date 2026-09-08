@@ -8,7 +8,7 @@ from gate_controller.metrics import (
     BUCKET_MINUTES, BUCKET_SECONDS, MAX_BUCKETS_PER_POST, MAX_MINUTES_PER_POST,
     MetricsRing, MetricsRollupWorker, ROLLUP_BACKOFF_BASE_SECONDS,
     ROLLUP_BACKOFF_MAX_SECONDS, ROLLUP_BOUNDARY_DELAY_SECONDS,
-    ROLLUP_MIN_WAIT_SECONDS, SCHEMA_VERSION,
+    ROLLUP_MIN_WAIT_SECONDS, SCHEMA_VERSION, minute_key,
 )
 
 
@@ -188,6 +188,66 @@ class MetricsRollupWorkerTests(unittest.TestCase):
 
         self.assertEqual(worker.run_once(), 1)
 
+    def test_standing_down_defers_the_sd_card_write_as_well_as_the_post(self):
+        """A decision in flight must not be sharing the card with an fsync.
+
+        The flush ran before the deferral check, so the cycle stood down from
+        the POST -- the cheap, off-card half -- and went ahead with the
+        `fsync` and `os.replace` anyway, which is the half the module docstring
+        says ranks below the gate.
+        """
+        writes = []
+
+        class RecordingRing(MetricsRing):
+            def flush_quota(inner) -> bool:
+                writes.append(True)
+                return False
+
+        ring = RecordingRing(clock=self.clock, retry_counts=lambda: {})
+        ring.record_heartbeat()
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        activity = ActivityGate(quiet_seconds=5.0)
+        worker = MetricsRollupWorker(
+            ring, self.sent, clock=self.clock, jitter=lambda: 1.0,
+            activity=activity,
+        )
+
+        with activity.activity("burst"):
+            self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(writes, [], "nothing was written while the gate decided")
+
+        self.assertEqual(worker.run_once(), 1)
+        self.assertEqual(writes, [True], "and the next cycle writes as usual")
+
+    def test_a_quiet_spell_does_not_strand_the_last_bursts_throttling(self):
+        """The rollup drains the 429 counter too, not only a finished burst.
+
+        A drain needs a burst, and the last vehicle before a quiet spell is
+        exactly the one whose 429s would then sit in the client until the next
+        vehicle -- long after the bucket they belong to had closed and gone.
+        """
+        pending = [{minute_key(START): {"http_429": 2}}]
+        ring = MetricsRing(
+            clock=self.clock,
+            retry_counts=lambda: pending.pop() if pending else {},
+        )
+        # One burst opens the minute the throttling happened in, and then the
+        # gate goes quiet: nothing else will ever call the drain.
+        ring.record_heartbeat()
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        worker = MetricsRollupWorker(
+            ring, self.sent, clock=self.clock, jitter=lambda: 1.0,
+        )
+
+        self.assertEqual(worker.run_once(), 1)
+
+        minute = self.sent.payloads[0]["minutes"][0]
+        self.assertEqual(minute["minute_start"], minute_key(START))
+        self.assertEqual(
+            minute["recognition"]["http_429"], 2,
+            "attributed before its own bucket was delivered",
+        )
+
     def test_a_stalled_endpoint_does_not_hold_the_ring_against_the_pipeline(self):
         """A 60 s metrics POST must not block the burst that is deciding."""
         posting = Event()
@@ -219,6 +279,10 @@ class MetricsRollupWorkerTests(unittest.TestCase):
             @staticmethod
             def flush_quota():
                 return False
+
+            @staticmethod
+            def absorb_retry_counts():
+                return None
 
             @staticmethod
             def unsent_minutes(**kwargs):
@@ -287,6 +351,22 @@ class MetricsRollupWorkerTests(unittest.TestCase):
         late = self.clock() + timedelta(minutes=1)
 
         self.assertGreaterEqual(worker.next_wait_seconds(late), ROLLUP_MIN_WAIT_SECONDS)
+
+    def test_no_wait_anywhere_in_a_bucket_is_below_the_floor(self):
+        # The floor used to be on the retry path only, so a healthy cycle
+        # running a moment before a boundary computed waits of 0.0999 s,
+        # 0.00999 s, 0.000999 s and came straight back -- each of those cycles
+        # flushing the ledger to the SD card. The bucket is already closed;
+        # waiting past the boundary costs it nothing.
+        worker = self.worker()
+        boundary = START.replace(minute=20, second=0, microsecond=0)
+
+        for second in range(BUCKET_SECONDS):
+            for micro in (0, 1, 100_000, 900_000, 999_000, 999_900):
+                now = boundary + timedelta(seconds=second, microseconds=micro)
+                wait = worker.next_wait_seconds(now)
+                if wait < ROLLUP_MIN_WAIT_SECONDS:
+                    self.fail(f"{wait} s wait at {now.isoformat()}")
 
     def test_a_healthy_cycle_waits_for_the_boundary_not_for_the_backoff(self):
         worker = self.worker()

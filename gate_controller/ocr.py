@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from io import BytesIO
 from math import isfinite
 from pathlib import Path
@@ -308,6 +308,34 @@ def _spent(observation, state: dict):
     return replace(observation, cloud_lookup=spent)
 
 
+def _mark_post_started(state: dict) -> None:
+    """Tell the caller that a request is about to go out on this attempt.
+
+    A caller that abandons the read gets no return value and so no
+    ``cloud_lookup``: from where it stands, a read that died in the throttle
+    window, in the downscaled upload or in the on-device guard looks exactly
+    like one whose reply was lost. This is the difference, announced from the
+    only place that knows.
+
+    It is the last thing before ``session.post`` deliberately: everything that
+    can still stop a request from being sent -- the 1.05 s pacing window, the
+    upload, the local guard, the abandonment checks -- is already behind us,
+    and after this point the allowance may have been charged whatever the
+    caller decides to do with its clock.
+
+    Annotation only, and it never raises: the frame is not the metric's
+    business.
+    """
+    callback = state.get("on_post_started")
+    if callback is None or state.get("post_started"):
+        return
+    state["post_started"] = True
+    try:
+        callback()
+    except Exception:
+        _LOGGER.debug("ocr_post_start_callback_failed", exc_info=True)
+
+
 def _retryable_transport_cause(error: BaseException) -> str | None:
     """Return the cause when the failure is worth one fresh-connection retry.
     A failing classifier must never mask the original error, so it is
@@ -523,7 +551,8 @@ class PlateRecognizerClient:
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None,
                   trace_id: str | None = None,
                   budget: float | None = None,
-                  attempt: LocalPass | None = None) -> PlateObservation:
+                  attempt: LocalPass | None = None,
+                  on_post_started: Callable[[], None] | None = None) -> PlateObservation:
         """Read one frame.
 
         ``budget`` is the seconds of decision time left for this frame when
@@ -536,16 +565,24 @@ class PlateRecognizerClient:
         redone, so the frame is decoded and inferred once per frame however
         the caller splits the work.
 
+        ``on_post_started`` is called once, immediately before the request
+        goes out, so a caller that later abandons this read can tell an
+        attempt that may have been billed from one that never left the Pi.
+        It changes nothing about the read itself.
+
         The whole read is held open on the activity gate, so a corpus upload
         defers before it starts and abandons if it is already running. The
         gate is a counter and a timestamp behind one lock; it adds nothing
         measurable to the frame.
         """
         with self._activity.activity("ocr"):
-            return self._recognise(path, timeout, trace_id, budget, attempt)
+            return self._recognise(
+                path, timeout, trace_id, budget, attempt, on_post_started,
+            )
 
     def _recognise(self, path: Path, timeout, trace_id, budget=None,
-                   attempt: LocalPass | None = None) -> PlateObservation:
+                   attempt: LocalPass | None = None,
+                   on_post_started=None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
@@ -557,6 +594,10 @@ class PlateRecognizerClient:
         state: dict = (attempt.state if attempt is not None and attempt.state else None) or {
             "frame": None, "deadline": self._budget_deadline(budget),
         }
+        # The dispatch callback belongs to this call rather than to the pass
+        # prepared off the slot, so it is set on whichever state we ended up
+        # with: a reused pass must still be able to report that it posted.
+        state["on_post_started"] = on_post_started
         retries = 0
         try:
             while True:
@@ -778,6 +819,9 @@ class PlateRecognizerClient:
         timeout = self._bounded_timeout(timeout, state.get("deadline"))
         try:
             self._pace(generation)
+            # Past the throttle window, the upload and every abandonment
+            # check: from here on the request really is going out.
+            _mark_post_started(state)
             try:
                 response = session.post(
                     self._endpoint,

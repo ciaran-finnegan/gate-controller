@@ -110,11 +110,17 @@ METRICS_PATH = "/api/controller/metrics"
 #           arrived; ocr.py already refuses to retry it for exactly this
 #           reason ("the request may already have been accepted and billed").
 #           `ocr_timeout` -- the processor abandoning a request whose decision
-#           budget ran out. It is recorded only past `ocr_started`, which is to
-#           say only once the request had been launched, so it is the same
-#           physical event as a `read_timeout` seen from the decision's side of
-#           the clock rather than the socket's, and classifying the two
-#           differently made the burn-down disagree with itself.
+#           budget ran out, *when a request had actually gone out*. Then it is
+#           the same physical event as a `read_timeout` seen from the
+#           decision's side of the clock rather than the socket's, and
+#           classifying the two differently made the burn-down disagree with
+#           itself. `cloud_lookup` is what separates the two cases, and it
+#           carries the dispatch site's answer here as everywhere else:
+#           `ocr_started` only says the request *thread* was launched, and
+#           between that and `session.post` sit the 1.05 s pacing window, the
+#           downscaled upload and the on-device guard, any of which can eat
+#           the last of the budget with nothing sent. The second frame of a
+#           burst waiting out the throttle is the ordinary case, not a corner.
 #           The response-shape causes below, which can only arise *after* a
 #           2xx body was received and therefore after the lookup was spent.
 # Not billed: `ocr_busy` (never left the Pi), `connect_timeout`, `tls_error`,
@@ -122,10 +128,11 @@ METRICS_PATH = "/api/controller/metrics"
 #           `http_*` cause including `http_429` -- a throttled request is
 #           refused before it is processed.
 #
-# Known overcount, bounded and documented: in local `active` mode an
-# `ocr_timeout` may be the on-device guard having eaten the decision budget
-# before any request was posted. The processor cannot tell the two apart from
-# where it stands, and `ocr_timeout` is rare beside `read_timeout`.
+# Residual error, bounded and in the safe direction: a recogniser that cannot
+# report its dispatches -- one whose `recognise` has no `on_post_started`
+# parameter -- keeps this counter's original assumption that a cloud read
+# posts, so an `ocr_timeout` from it is billed. Every recogniser the
+# controller ships does report.
 BILLED_STATUSES = frozenset({"recognized", "no_plate", "ocr_timeout"})
 BILLED_FAILURE_CAUSES = frozenset({
     "read_timeout",
@@ -547,7 +554,7 @@ class MetricsRing:
         local = getattr(telemetry, "local_ocr", None)
         billed = 0
         with self._lock:
-            minute = self._minute_locked()
+            minute = self._minute_locked(self._burst_minute_key_locked(telemetry))
             for attempt in attempts:
                 status = getattr(attempt, "status", "unknown")
                 cause = getattr(attempt, "failure_cause", None)
@@ -599,7 +606,9 @@ class MetricsRing:
             return True
         return status == "ocr_error" and cause in BILLED_FAILURE_CAUSES
 
-    def _absorb_retry_counts_locked(self, current: _MinuteCounters) -> None:
+    def _absorb_retry_counts_locked(
+        self, current: _MinuteCounters | None = None,
+    ) -> None:
         """Fold the OCR client's throttle counter into the minutes it happened in.
 
         A 429 is retried inside the client and the retry usually succeeds, so
@@ -613,6 +622,12 @@ class MetricsRing:
         into the next minute, and four times in five into the next bucket. A
         minute the ring never opened, or one already delivered, falls back to
         the minute in progress -- it is better counted late than not at all.
+
+        ``current`` is the minute a finished burst was counted into. The
+        rollup thread has no such minute and passes none: the fallback minute
+        is then opened only if something actually has to go in it, because a
+        cycle that opened one every five minutes would keep the ring
+        permanently non-empty and post a bucket of nothing forever.
         """
         try:
             counts = self._retry_counts()
@@ -630,7 +645,11 @@ class MetricsRing:
             target = None
             if isinstance(key, str) and key not in self._sent:
                 target = self._minutes.get(key)
-            (target or current).http_429 += throttled
+            if target is None:
+                if current is None:
+                    current = self._minute_locked()
+                target = current
+            target.http_429 += throttled
 
     def _stamp_quota(self) -> None:
         """Record the burn-down against the current minute as a gauge.
@@ -656,8 +675,55 @@ class MetricsRing:
         except Exception:
             return
 
-    def _minute_locked(self) -> _MinuteCounters:
-        key = minute_key(self._clock())
+    def _burst_minute_key_locked(self, telemetry: object) -> str | None:
+        """The minute a burst *started*, when the ring can still safely use it.
+
+        A burst is counted when it finishes, and the burst that straddles a
+        boundary is the slow one -- the one whose counters are most worth
+        having in the right minute. This is the same correction the 429
+        counter makes, and it is made under the same conditions.
+
+        Three of them, all refusals that fall back to the minute in progress:
+
+        * The start has to be a real timestamp in the recent past. Nothing in
+          the future, and nothing older than one bucket -- a longer reach
+          buys nothing (a burst has a decision budget of seconds) and would
+          let a stepped clock stamp an arbitrary minute.
+        * The minute must not already have been delivered.
+        * Nor may any minute of its **bucket**, delivered or not present. The
+          app replaces a bucket row rather than merging into it, so opening a
+          new minute inside a bucket already posted would re-post that bucket
+          as just this one minute and throw the rest of it away -- the very
+          failure this rollup was rewritten to avoid.
+
+        A refusal is never an error: anything unexpected about the timestamp
+        answers ``None``, and the burst is counted in the minute in progress
+        exactly as it was before. Losing a burst's counters over its clock
+        would be a far worse trade than crediting them a minute late.
+        """
+        started = getattr(
+            getattr(telemetry, "stage_timestamps", None),
+            "burst_processing_started_at", None,
+        )
+        if not isinstance(started, datetime):
+            return None
+        try:
+            now = self._clock()
+            age = (now - started).total_seconds()
+            if not 0 <= age < BUCKET_SECONDS:
+                return None
+            key = minute_key(started)
+            if key >= minute_key(now) or key in self._sent:
+                return None
+            bucket = _bucket_of(key)
+            if any(_bucket_of(sent) == bucket for sent in self._sent):
+                return None
+        except Exception:
+            return None
+        return key
+
+    def _minute_locked(self, key: str | None = None) -> _MinuteCounters:
+        key = minute_key(self._clock()) if key is None else key
         counters = self._minutes.get(key)
         if counters is None:
             counters = _MinuteCounters()
@@ -757,6 +823,26 @@ class MetricsRing:
         except Exception:
             return {}
 
+    def absorb_retry_counts(self) -> None:
+        """Fold in the client's pending 429s without a burst to hang them on.
+
+        The burst path drains the counter too, but a drain needs a burst: the
+        429s of the last vehicle before a quiet spell would sit in the client
+        until the next one, and be credited after their own bucket had closed
+        and been delivered. The rollup cycle drains as well, just before it
+        reads the ring, so a bucket is only ever posted once everything known
+        about it is in.
+
+        Never raises: it is called from the rollup thread, which is the ring's
+        only reader. It opens no minute of its own -- a cycle that did would
+        leave the ring permanently non-empty and post empty buckets forever.
+        """
+        try:
+            with self._lock:
+                self._absorb_retry_counts_locked()
+        except Exception:
+            LOGGER.warning("gate_metrics stage=record_failed detail=retry_counts")
+
     def flush_quota(self) -> bool:
         """Persist the ledger, from a thread that is not the burst thread."""
         if self._quota is None:
@@ -845,14 +931,26 @@ class MetricsRollupWorker:
 
     def _run_once(self) -> int:
         now = self._clock()
+        # Standing down means standing down: the fsync and `os.replace` a
+        # ledger flush costs are exactly the kind of SD-card work a gate
+        # decision must not be sharing the card with, so the deferral is
+        # checked before anything is written and not only before the POST.
+        # Nothing is lost by waiting -- the count is in memory, the next cycle
+        # is seconds away, and `run_forever` flushes on the way out.
+        if self._deferred_by_gate():
+            return 0
         # The ledger's only writer thread. `record_billed` on the burst path
         # sets a flag; the fsync happens here, where a slow SD card delays a
         # metric instead of a gate.
         self._ring.flush_quota()
-        if self._deferred_by_gate():
-            return 0
         if self._retry_at is not None and now < self._retry_at:
             return 0
+        # Fold in any 429s the client has counted since the last burst. The
+        # burst path drains too, but a throttled burst followed by a quiet
+        # spell would otherwise leave its 429s in the client's counter until
+        # the next vehicle -- long after the bucket they belong to had closed
+        # and gone.
+        self._ring.absorb_retry_counts()
         minutes = self._ring.unsent_minutes(now=now)
         if not minutes:
             return 0
@@ -919,13 +1017,18 @@ class MetricsRollupWorker:
         * **A pending backoff can pull the wake earlier**, so the documented
           "5 s, then 10, then 20 ... up to 5 minutes" is a schedule the worker
           actually keeps rather than a number it computes and sleeps through.
-          Never below :data:`ROLLUP_MIN_WAIT_SECONDS`, so a failing endpoint
-          can never become a tight loop.
+
+        Never below :data:`ROLLUP_MIN_WAIT_SECONDS`, on either path. The floor
+        is not only about a failing endpoint: the wake lands a few seconds
+        *after* a boundary, so a cycle that runs a moment before one computes
+        a wait of a millisecond and comes straight back -- and every one of
+        those cycles flushes the ledger to the SD card. Waiting past the
+        boundary instead costs a bucket nothing; it is already closed.
         """
         now = now or self._clock()
         boundary = self._seconds_to_next_boundary(now)
         if self._retry_at is None:
-            return boundary
+            return max(ROLLUP_MIN_WAIT_SECONDS, boundary)
         retry = (self._retry_at - now).total_seconds()
         return max(ROLLUP_MIN_WAIT_SECONDS, min(boundary, retry))
 

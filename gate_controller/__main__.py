@@ -234,6 +234,12 @@ def main() -> None:
         # Counted after the burst has answered and released the gate, from the
         # telemetry the processor already built. The decision path is not
         # touched, and a metric can never delay a relay pulse.
+        #
+        # Counted here, but credited to the minute the burst *started*, which
+        # the telemetry carries: recording is what happens late, and a burst
+        # that runs past a minute boundary is the slow one whose counters most
+        # want to be in the right minute. Same rule, and the same refusals, as
+        # the 429 counter in `MetricsRing._absorb_retry_counts_locked`.
         if metrics is not None:
             metrics.record_processing_result(result)
         return result

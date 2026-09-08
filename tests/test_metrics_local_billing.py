@@ -25,6 +25,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import sleep
 
 from PIL import Image
 
@@ -168,6 +169,126 @@ class LocalReadBillingTests(unittest.TestCase):
         self.assertEqual(attempt.source, "cloud")
         self.assertTrue(attempt.cloud_lookup)
         self.assertEqual(self._recognition()["billed_lookups"], 1)
+
+
+class AbandonedRequestBillingTests(unittest.TestCase):
+    """An attempt abandoned before its POST is not a lookup either.
+
+    ``ocr_timeout`` is billed because the processor records it only past
+    ``ocr_started`` -- but ``ocr_started`` fires when the request *thread*
+    starts, and between that and ``session.post`` sit the client's 1.05 s
+    pacing window (Plate Recognizer allows one request a second), the
+    downscaled upload and the on-device guard. The second frame of a burst is
+    the ordinary case: the first frame's reply sets ``_not_before``, the
+    second waits it out, and a decision budget shorter than that window is
+    abandoned inside ``_pace`` with nothing sent. Billing it billed the
+    throttle.
+
+    So the flag comes from the dispatch site, which is the only place that
+    knows -- and an attempt that *was* posted and then abandoned is still
+    billed, because from the caller's side that is a lost reply.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        # Distinct content: the processor drops duplicate frames by digest.
+        self.frames = []
+        for index, shade in enumerate((128, 64)):
+            frame = self.root / f"frame-{index}.jpg"
+            Image.new("L", (64, 32), color=shade).save(frame, format="JPEG")
+            self.frames.append(frame)
+        self.clock = FrozenClock()
+        self.ledger = QuotaLedger(None, clock=self.clock)
+        self.ring = MetricsRing(
+            quota=self.ledger, clock=self.clock, retry_counts=lambda: {},
+        )
+
+    def _drive(self, session, frames):
+        client = PlateRecognizerClient("token", session=session)
+        processor = GateProcessor(
+            recognizer=client,
+            store=LocalStore(self.root / "gate.db"),
+            relay=RecordingRelay([]),
+            authorised={PLATE},
+            clock=self.clock,
+            # Shorter than the 1.05 s the client must wait between requests.
+            decision_timeout=0.6,
+        )
+        self.addCleanup(processor.close)
+        result = processor.process(tuple(frames))
+        self.ring.record_processing_result(result)
+        return result
+
+    def _recognition(self) -> dict:
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        return self.ring.unsent_minutes()[0]["recognition"]
+
+    def test_a_frame_abandoned_in_the_pacing_window_costs_nothing(self):
+        # An unauthorised plate, so the burst goes on to the second frame.
+        session = FakeSession([FakeResponse(cloud_payload("99ZZ9999"))])
+        result = self._drive(session, self.frames)
+
+        attempts = list(result.telemetry.ocr_attempts)
+        self.assertEqual(
+            [attempt.status for attempt in attempts],
+            ["recognized", "ocr_timeout"],
+        )
+        self.assertEqual(
+            len(session.calls), 1,
+            "the second frame never reached session.post",
+        )
+        posted, abandoned = attempts
+        self.assertTrue(posted.cloud_lookup)
+        self.assertFalse(
+            abandoned.cloud_lookup,
+            "the request died waiting out the throttle window; nothing was "
+            "sent, so nothing was charged",
+        )
+
+        self.assertEqual(
+            self.ring.quota_status()["recognition_lookups_month_to_date"], 1,
+        )
+        recognition = self._recognition()
+        self.assertEqual(recognition["billed_lookups"], 1)
+        self.assertEqual(
+            recognition["ocr_timeout"], 1,
+            "the abandonment is still counted; only the billing changed",
+        )
+
+    def test_a_request_that_went_out_and_timed_out_is_still_billed(self):
+        # One frame, so there is no pacing window: the POST starts, and the
+        # decision budget runs out waiting for the reply. That is a
+        # `read_timeout` seen from the decision's clock, and it is charged.
+        session = StallingSession(1.0)
+        result = self._drive(session, self.frames[:1])
+
+        attempts = list(result.telemetry.ocr_attempts)
+        self.assertEqual([attempt.status for attempt in attempts], ["ocr_timeout"])
+        self.assertEqual(len(session.calls), 1, "the request did go out")
+        self.assertTrue(attempts[0].cloud_lookup)
+
+        self.assertEqual(
+            self.ring.quota_status()["recognition_lookups_month_to_date"], 1,
+        )
+        self.assertEqual(self._recognition()["billed_lookups"], 1)
+
+
+class StallingSession:
+    """A session whose POST outlives the decision budget."""
+
+    def __init__(self, seconds: float):
+        self._seconds = seconds
+        self.calls = []
+
+    def post(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        sleep(self._seconds)
+        return FakeResponse({"results": []})
+
+    def close(self):
+        return None
 
 
 class WireContractTests(unittest.TestCase):

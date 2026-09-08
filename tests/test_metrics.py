@@ -15,13 +15,15 @@ from gate_controller.metrics import (
 )
 from gate_controller.telemetry import (
     EventTelemetry, LocalOcrTelemetry, OcrAttemptTelemetry, StageDurations,
+    StageTimestamps,
 )
 
 
-def telemetry(attempts=(), local=None) -> EventTelemetry:
+def telemetry(attempts=(), local=None, started_at=None) -> EventTelemetry:
     return EventTelemetry(
         trace_id="0123456789abcdef",
         stage_durations=StageDurations(),
+        stage_timestamps=StageTimestamps(burst_processing_started_at=started_at),
         frames=(),
         ocr_attempts=tuple(attempts),
         decision_outcome="denied",
@@ -210,6 +212,60 @@ class MetricsRingTests(unittest.TestCase):
         }
         self.assertEqual(minutes[throttled], 1)
         self.assertEqual(minutes[minute_key(START + timedelta(minutes=1))], 0)
+
+    def test_a_burst_is_counted_in_the_minute_it_started_in(self):
+        # Same correction as the throttle counter, for the same reason: a
+        # burst is counted when it finishes, and the burst that runs past a
+        # boundary is the slow one whose counters most want the right minute.
+        self.clock.advance(seconds=32)  # 10:21:02: the burst is over
+        self.ring.record_event_telemetry(telemetry(
+            (attempt("recognized"),), started_at=START.replace(second=59),
+        ))
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        minutes = {
+            entry["minute_start"]: entry["recognition"]
+            for entry in self.ring.unsent_minutes()
+        }
+        self.assertEqual(minutes[minute_key(START)]["recognized"], 1)
+        self.assertNotIn(
+            minute_key(START + timedelta(minutes=1)), minutes,
+            "the minute it was recorded in never opened",
+        )
+
+    def test_a_burst_from_a_bucket_already_delivered_is_counted_now(self):
+        # The app replaces a bucket row rather than merging into it, so
+        # opening a new minute inside a bucket it already holds would make the
+        # next post replace that bucket with this one minute and throw the
+        # rest away. Counted late instead, exactly as a stranded throttle is.
+        self.ring.record_heartbeat()
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        self.ring.mark_sent(self.ring.unsent_minutes())
+
+        self.ring.record_event_telemetry(telemetry(
+            (attempt("recognized"),), started_at=START.replace(second=59),
+        ))
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        minutes = {
+            entry["minute_start"]: entry["recognition"]
+            for entry in self.ring.unsent_minutes()
+        }
+        recorded = minute_key(START + timedelta(minutes=BUCKET_MINUTES))
+        self.assertEqual(list(minutes), [recorded])
+        self.assertEqual(minutes[recorded]["recognized"], 1)
+
+    def test_a_burst_start_older_than_a_bucket_is_not_trusted(self):
+        # A stepped clock, or a telemetry object off a queue: never reach
+        # further back than the correction is for.
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        self.ring.record_event_telemetry(telemetry(
+            (attempt("recognized"),), started_at=START,
+        ))
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        minutes = [entry["minute_start"] for entry in self.ring.unsent_minutes()]
+        self.assertEqual(minutes, [minute_key(START + timedelta(minutes=BUCKET_MINUTES))])
 
     def test_a_throttle_from_a_minute_the_ring_never_opened_is_not_lost(self):
         ring = MetricsRing(

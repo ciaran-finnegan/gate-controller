@@ -69,11 +69,21 @@ def bucket_start_for(timestamp: str) -> str:
     ).isoformat()
 
 
+def _is_number(value: object) -> bool:
+    """`typeof value === 'number'`, which a boolean is not.
+
+    Python's ``isinstance(True, int)`` is, so a plain ``isinstance`` check
+    would have this transcription add a boolean where the app replaces with
+    it -- and quietly forgive a controller that sent one.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _merge(into: dict, other: dict) -> None:
     """`mergeMetrics`: counters add, gauges keep the worst reading."""
     for key, value in other.items():
         previous = into.get(key)
-        if not isinstance(value, (int, float)) or not isinstance(previous, (int, float)):
+        if not _is_number(value) or not _is_number(previous):
             into[key] = value
         elif key in SUMMED_COUNTERS:
             into[key] = previous + value
@@ -308,6 +318,30 @@ class BucketDeliveryTests(unittest.TestCase):
                     "overwrote with a fragment of itself",
                 )
                 self.assertEqual(len(delivered), TRAFFIC_MINUTES // BUCKET_MINUTES)
+
+
+class TranscriptionFidelityTests(unittest.TestCase):
+    """Where Python and the app disagree, this copy must follow the app.
+
+    A transcription that is more forgiving than the original is worse than no
+    transcription: it passes bodies the app would treat differently, and the
+    difference never shows up here.
+    """
+
+    def test_a_boolean_replaces_a_counter_rather_than_adding_to_it(self):
+        # `typeof true !== 'number'`, so `mergeMetrics` overwrites. Python's
+        # `isinstance(True, int)` is True, so a plain numeric check summed it
+        # to 6 and quietly forgave a controller that posted a boolean.
+        merged = {"billed_lookups": 5}
+        _merge(merged, {"billed_lookups": True})
+
+        self.assertIs(merged["billed_lookups"], True)
+
+    def test_a_number_still_adds(self):
+        merged = {"billed_lookups": 5}
+        _merge(merged, {"billed_lookups": 2})
+
+        self.assertEqual(merged["billed_lookups"], 7)
 
 
 if __name__ == "__main__":
