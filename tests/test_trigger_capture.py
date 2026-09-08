@@ -568,6 +568,109 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(extra, 1)
         self.assertIn("presence_ended reason=plate_denied", "\n".join(logs.output))
 
+    def test_a_night_visitor_is_conclusive_at_the_conclusive_read_bar(self):
+        """Overnight, `strict` asks 0.90 of a read before it may open a gate.
+
+        Asking that same bar of "is this a different vehicle?" meant a
+        perfectly legible 0.806 read of a stranger's plate could never be
+        conclusive, so every denied night passage ran to the frame budget:
+        6 paid lookups over 11.5 s against 3 over 2.5 s by day. The bar for
+        stopping the spend is not the bar for opening the gate.
+        """
+        clock = [100.0]
+        stranger = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="231WH553", confidence=0.806,
+            policy_level="strict", policy_band="22:00-08:00",
+        ))
+        capture, _popen = self._presence_capture(
+            5, clock=clock, verdict=lambda n: stranger,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        combined = "\n".join(logs.output)
+        self.assertEqual(extra, 0, "the session spent nothing it did not have to")
+        self.assertIn("presence_ended reason=plate_denied", combined)
+        self.assertNotIn("stage=unresolved", combined)
+
+    def test_a_read_below_the_conclusive_bar_still_keeps_trying(self):
+        # The other half: the bar is lower than the band's, not absent.
+        clock = [100.0]
+        guess = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="8AB12", confidence=0.42,
+            policy_level="standard", policy_band="08:00-22:00",
+        ))
+        capture, _popen = self._presence_capture(
+            8, clock=clock, max_frames=2, verdict=lambda n: guess,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        self.assertEqual(extra, 2)
+        self.assertIn("presence_ended reason=budget", "\n".join(logs.output))
+
+    def test_the_conclusive_bar_is_tunable_and_never_stops_capture(self):
+        loaded = load_trigger_capture_config(
+            {"GATE_PRESENCE_CONCLUSIVE_CONFIDENCE": "0.6"},
+            self.root, webhook_enabled=True,
+        )
+        self.assertEqual(loaded.conclusive_read_confidence, 0.6)
+
+        for value in ("banana", "nan", "-1", "9"):
+            with self.subTest(value=value):
+                fallback = load_trigger_capture_config(
+                    {"GATE_PRESENCE_CONCLUSIVE_CONFIDENCE": value},
+                    self.root, webhook_enabled=True,
+                )
+                self.assertGreaterEqual(fallback.conclusive_read_confidence, 0.10)
+                self.assertLessEqual(fallback.conclusive_read_confidence, 1.0)
+
+    def test_a_plate_that_was_read_and_refused_is_not_unresolved(self):
+        """`stage=unresolved` means nothing read the plate, and only that.
+
+        A read that merely failed its bar - the 11:13:48 case - is a matching
+        question, and warning `unresolved` for it hides the sessions where the
+        camera genuinely produced nothing readable.
+        """
+        clock = [100.0]
+        uncertain = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="10CE199O", confidence=0.61,
+            policy_level="standard", policy_band="08:00-22:00",
+            near_miss_plate="10CE1990", near_miss_distance=1,
+        ))
+        capture, _popen = self._presence_capture(
+            8, clock=clock, max_frames=2, verdict=lambda n: uncertain,
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_presence stage=plate_read_below_bar reason=budget", combined)
+        self.assertNotIn("stage=unresolved", combined)
+        self.assertEqual(capture.status()["presence"]["unresolved"], 0)
+        self.assertEqual(capture.status()["presence"]["plate_read_below_bar"], 1)
+
+    def test_a_passage_nothing_could_read_is_still_unresolved(self):
+        clock = [100.0]
+        capture, _popen = self._presence_capture(
+            8, clock=clock, max_frames=2,
+            verdict=lambda n: ProcessingResult(False, "no_match"),
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.presence_session(event(), 100.0, self._Stop(clock))
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_presence stage=unresolved reason=budget", combined)
+        self.assertEqual(capture.status()["presence"]["unresolved"], 1)
+
     def test_presence_session_ends_as_opened_only_when_the_gate_opened(self):
         # The renamed line: `plate_read` is gone, and the only settle a grant
         # produces says so.

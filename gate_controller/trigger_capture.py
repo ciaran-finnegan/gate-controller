@@ -18,6 +18,7 @@ import select
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock
@@ -30,7 +31,6 @@ from .hot_stream import (
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
 from .images import measure_flat_fraction, measure_frame_quality
-from .match_policy import LEVELS, level_rule
 from .plate_region import PlateRegion, parse_plate_region
 from .scene import SceneBaseline
 from .telemetry import TriggerTelemetry
@@ -113,6 +113,19 @@ PRESENCE_RETRY_REASONS = frozenset({
 # may take the whole decision timeout, and an open then holds the relay for
 # its pulse. Anything past that means the verdict is not coming.
 VERDICT_QUEUE_DEPTH = 3
+# The bar a read must clear before "this is a different vehicle" is a
+# conclusion rather than a guess. Deliberately *not* the band's own exact bar:
+# that one decides whether to open the gate, and overnight it is 0.90, so a
+# 0.806 read of a visitor's plate could never be conclusive and every denied
+# night passage ran to the frame budget - 6 lookups and 11.5 s against 3 and
+# 2.5 s by day, and a `stage=unresolved` warning although a plate had been
+# read. This decision only ever *stops spending*; it can never open the gate,
+# so it takes the standard exact bar around the clock. The distance test
+# beside it is what keeps a misread of an authorised plate out.
+DEFAULT_CONCLUSIVE_READ_CONFIDENCE = 0.75
+# Below this a "conclusive read" is not conclusive, so the session would stop
+# retrying on noise. The same reasoning as the matching bars' own floor.
+MIN_CONCLUSIVE_READ_CONFIDENCE = 0.10
 RELAY_PULSE_ALLOWANCE_SECONDS = 5.0
 MIN_DECISION_TIMEOUT_SECONDS = 0.5
 MAX_DECISION_TIMEOUT_SECONDS = 30.0
@@ -183,6 +196,10 @@ class TriggerCaptureConfig:
     # Skip frames whose plate band is mostly one flat colour: a picture the
     # decoder could not finish, not a scene. 0 disables.
     max_flat_fraction: float = DEFAULT_MAX_FLAT_FRACTION
+    # What a read must carry before the presence session concludes it is
+    # looking at a different vehicle and stops offering frames. It gates no
+    # actuation: see DEFAULT_CONCLUSIVE_READ_CONFIDENCE.
+    conclusive_read_confidence: float = DEFAULT_CONCLUSIVE_READ_CONFIDENCE
 
 
 def load_trigger_capture_config(
@@ -275,6 +292,15 @@ def load_trigger_capture_config(
     source_fps = _number(
         environment.get("GATE_CLEAR_STREAM_SOURCE_FPS", "10"), MIN_SOURCE_FPS, MAX_SOURCE_FPS,
     )
+    # Clamped, not validated: a bad value here must not stop capture from
+    # starting, and the fallback is the shipped bar.
+    conclusive_confidence = _clamped(
+        environment.get(
+            "GATE_PRESENCE_CONCLUSIVE_CONFIDENCE",
+            str(DEFAULT_CONCLUSIVE_READ_CONFIDENCE),
+        ),
+        MIN_CONCLUSIVE_READ_CONFIDENCE, 1.0, DEFAULT_CONCLUSIVE_READ_CONFIDENCE,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -301,6 +327,7 @@ def load_trigger_capture_config(
         session_fps=session_fps,
         session_seconds=session_seconds,
         source_fps=source_fps,
+        conclusive_read_confidence=conclusive_confidence,
     )
 
 
@@ -457,6 +484,7 @@ class TriggerFrameCapture:
         self._skipped_clipped = 0
         self._skipped_corrupt = 0
         self._unresolved_sessions = 0
+        self._below_bar_sessions = 0
         self._last_skip: str | None = None
         self._live_session = False
         self._last_stillness: float | None = None
@@ -469,6 +497,8 @@ class TriggerFrameCapture:
         self._session_pending = 0
         self._session_pending_since: float | None = None
         self._session_settled: str | None = None
+        # Whether any frame of this session put characters on the vehicle.
+        self._session_read_a_plate = False
         self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
         # (the default probe alone costs about two seconds at 4K), and the
@@ -583,10 +613,16 @@ class TriggerFrameCapture:
                 self._session_pending = max(0, self._session_pending - 1)
                 if self._session_pending == 0:
                     self._session_pending_since = None
+            decision = getattr(result, "decision", None)
+            if _read_a_plate(decision):
+                # Read and refused is not "nothing could read the plate".
+                self._session_read_a_plate = True
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
-                elif _is_another_vehicle(getattr(result, "decision", None)):
+                elif _is_another_vehicle(
+                    decision, self.config.conclusive_read_confidence,
+                ):
                     self._session_settled = "plate_denied"
                 elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
                     self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
@@ -701,13 +737,30 @@ class TriggerFrameCapture:
         )
         self._stop_live_session(reason)
         if reason in ("window", "budget", "departed"):
-            # A vehicle was here and nothing read its plate: the one line an
-            # operator should be looking for when the gate did not open.
-            self._unresolved_sessions += 1
-            LOGGER.warning(
-                "gate_presence stage=unresolved reason=%s event_type=%s extra_frames=%d",
-                reason, getattr(event, "event_type", "unknown"), extra,
-            )
+            with self._session_lock:
+                read_a_plate = self._session_read_a_plate
+            if read_a_plate:
+                # A plate *was* read; it simply did not clear its bar, or it
+                # sat too close to an authorised one to be conclusive. That is
+                # a matching question, not a camera one, so it is journalled
+                # apart from the sessions where nothing could be read at all -
+                # `stage=unresolved` is the line an operator greps for when
+                # the gate did not open and nobody knows why.
+                self._below_bar_sessions += 1
+                LOGGER.warning(
+                    "gate_presence stage=plate_read_below_bar reason=%s "
+                    "event_type=%s extra_frames=%d",
+                    reason, getattr(event, "event_type", "unknown"), extra,
+                )
+            else:
+                # A vehicle was here and nothing read its plate: the one line
+                # an operator should be looking for when the gate did not
+                # open.
+                self._unresolved_sessions += 1
+                LOGGER.warning(
+                    "gate_presence stage=unresolved reason=%s event_type=%s extra_frames=%d",
+                    reason, getattr(event, "event_type", "unknown"), extra,
+                )
         return extra
 
     def _verdict_deadline_seconds(self) -> float:
@@ -757,6 +810,7 @@ class TriggerFrameCapture:
             self._session_pending = 0
             self._session_pending_since = None
             self._session_settled = None
+            self._session_read_a_plate = False
             self._session_changed.clear()
         self._start_live_session()
         if self._frame_source is not None:
@@ -985,6 +1039,8 @@ class TriggerFrameCapture:
                 "max_frames": self.config.presence_max_frames,
                 "retries": self._presence_retries,
                 "unresolved": self._unresolved_sessions,
+                "plate_read_below_bar": self._below_bar_sessions,
+                "conclusive_confidence": self.config.conclusive_read_confidence,
                 "dropped_frames": self._dropped_frames,
                 "lost_verdicts": self._lost_verdicts,
             },
@@ -1080,38 +1136,52 @@ class TriggerFrameCapture:
         return bytes(buffer), None
 
 
-def _is_another_vehicle(decision) -> bool:
+def _is_another_vehicle(decision, bar: float = DEFAULT_CONCLUSIVE_READ_CONFIDENCE) -> bool:
     """Is this denial about a *different car*, rather than a doubtful read?
 
-    Three things have to hold together, and any one of them missing means the
-    session keeps trying:
+    Two things have to hold together, and either one missing means the session
+    keeps trying:
 
-    * a plate was read at or above the confidence the band in force demands of
-      an exact match, so the characters are not a guess;
-    * the band is one this controller knows, so the bar is a real number and
-      not a fallback;
+    * a plate was read at or above ``bar``, so the characters are not a guess;
     * no authorised plate sits within :data:`MAX_NEAR_MISS_DISTANCE` of it.
       ``near_miss_distance`` is already computed on every denial for review;
       its absence is precisely "nothing authorised looks like this".
+
+    ``bar`` is a *conclusive-read* bar, not the band's own exact bar. The two
+    answer different questions: the band's bar decides whether to open the
+    gate, and overnight it is 0.90. Asking it here meant a perfectly legible
+    0.806 read of a visitor's plate could never be conclusive, so every denied
+    night passage ran to the frame budget - 6 paid lookups over 11.5 s against
+    3 over 2.5 s by day - and then warned `stage=unresolved` although the
+    plate had been read. Nothing decided here can open the gate; it can only
+    stop the session spending, so it is not the bar that guards the relay.
 
     A read that is close to an authorised plate is the case another frame
     fixes, so it never ends the session. Being wrong here costs paid lookups,
     never an open, so it is written to keep trying when it cannot be sure.
     """
-    if decision is None or getattr(decision, "allowed", False):
-        return False
-    if not getattr(decision, "observed_plate", None):
+    if not _read_a_plate(decision):
         return False
     if getattr(decision, "near_miss_distance", None) is not None:
-        return False
-    level = getattr(decision, "policy_level", None)
-    if level not in LEVELS:
         return False
     try:
         confidence = float(getattr(decision, "confidence", 0.0))
     except (TypeError, ValueError):
         return False
-    return confidence >= level_rule(level).min_exact_confidence
+    return isfinite(confidence) and confidence >= bar
+
+
+def _read_a_plate(decision) -> bool:
+    """Did this denial actually put characters on the vehicle?
+
+    A denial carrying an ``observed_plate`` read the plate and refused it -
+    under its bar, ambiguous, close to something authorised. That is a
+    different thing from a passage nothing could read at all, and only the
+    second one is what `stage=unresolved` was written to find.
+    """
+    if decision is None or getattr(decision, "allowed", False):
+        return False
+    return bool(getattr(decision, "observed_plate", None))
 
 
 def _terminate(process) -> None:

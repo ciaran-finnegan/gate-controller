@@ -483,9 +483,11 @@ Two more lines changed rather than appeared:
   A read no longer ends a presence session; only a grant (`reason=opened`), a
   confident read of a plate nothing authorised is near (`reason=plate_denied`),
   or a final pipeline answer does.
-* `gate_burst stage=skipped reason=event_already_opened` marks a queued frame
-  whose own passage had already opened the gate, dropped before it could buy a
-  lookup that could not change anything.
+* `gate_burst stage=skipped cause=event_already_opened
+  recorded_reason=queue_coalesced` marks a queued frame whose own passage had
+  already opened the gate, dropped before it could buy a lookup that could not
+  change anything. The persisted event says `queue_coalesced`, which is what
+  the line's second field names: nothing new goes on the wire.
 
 ## Reading a week of agreement
 

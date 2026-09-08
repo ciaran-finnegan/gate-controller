@@ -64,17 +64,28 @@ class BurstIdentity:
 class BoundedBurstQueue:
     """A one-consumer queue that keeps the freshest pending camera work.
 
-    A full queue coalesces the oldest burst away, in this order:
+    A full queue gives up exactly one burst. Two rules each propose a
+    candidate, and both are about giving up the *stale* picture:
 
     1. the oldest queued frame of the *same camera alarm* as the arriving
        one. Several frames of one passage are the same question asked
        repeatedly, and the newest picture is the one worth answering: the
        older one would spend a paid lookup on a staler view of the same car.
-    2. otherwise the oldest untriggered burst, so a webhook-triggered frame is
-       given up only when there is nothing else to give up: a presence session
-       holds one frame outstanding at a time, and an FTP upload landing in the
-       same second must not push it out.
-    3. otherwise the oldest burst of all.
+    2. the oldest untriggered burst, so a webhook-triggered frame is given up
+       only when there is nothing else to give up: a presence session holds
+       one frame outstanding at a time, and an FTP upload landing in the same
+       second must not push it out.
+
+    When both propose one, the **older** of the two is what goes. Consulting
+    rule 1 first inverted both of them in production: the FTP still lands
+    about 1.6 s before the webhook, so the queue is [ftp-still, session-1]
+    when session-2 arrives, and dropping session-1 kept the oldest picture in
+    the queue and threw away the presence session's own frame. Neither rule
+    ever asks to keep a staler frame than the other, so taking the older
+    candidate satisfies both at once.
+
+    Failing that -- nothing untriggered, and no queued frame of the arriving
+    alarm -- the oldest burst of all goes.
     """
 
     def __init__(self, max_pending: int = 2):
@@ -106,13 +117,18 @@ class BoundedBurstQueue:
             for candidate in held:
                 self._queue.put_nowait(candidate)
             return None
-        index = _superseded_index(held, arriving)
-        if index is None:
-            index = next(
-                (position for position, candidate in enumerate(held)
-                 if not _is_triggered(candidate)),
-                0,
-            )
+        # `held` is drained in queue order, so a smaller position is older.
+        superseded = _superseded_index(held, arriving)
+        untriggered = next(
+            (position for position, candidate in enumerate(held)
+             if not _is_triggered(candidate)),
+            None,
+        )
+        candidates = [
+            position for position in (superseded, untriggered)
+            if position is not None
+        ]
+        index = min(candidates) if candidates else 0
         dropped = held.pop(index)
         for candidate in held:
             self._queue.put_nowait(candidate)
@@ -716,7 +732,15 @@ def _process_bursts(
         if superseded is not None and coalesce is not None and _is_superseded(
             superseded, paths
         ):
-            LOGGER.info("gate_burst stage=skipped reason=event_already_opened")
+            # The wire value stays `queue_coalesced`: the app's reason
+            # allowlist has no string for this, and the frame really was given
+            # up without being decided. The journal says which of the two
+            # reasons a burst is given up for, because they are different
+            # things to look at afterwards.
+            LOGGER.info(
+                "gate_burst stage=skipped cause=event_already_opened "
+                "recorded_reason=queue_coalesced"
+            )
             coalesce(item)
             continue
         trigger_summary = _TRIGGER_UNSET

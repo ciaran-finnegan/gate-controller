@@ -1689,6 +1689,31 @@ class FreshestFrameFirstTests(unittest.TestCase):
         self.assertEqual(queue.get(), second)
         self.assertEqual(queue.get(), third)
 
+    def test_the_ftp_still_goes_before_the_sessions_own_first_frame(self):
+        """The production ordering, which inverted both coalescing rules.
+
+        The FTP still lands about 1.6 s before the webhook, so when the
+        session's second frame arrives the queue is [ftp-still, session-1].
+        Consulting the same-alarm rule first dropped session-1 and kept the
+        oldest picture of all -- against the #88 invariant that a triggered
+        frame is given up last, and against this release's own reason for
+        preferring the freshest frame.
+        """
+        queue = BoundedBurstQueue(max_pending=2)
+        still = ((Path("ftp-still.jpg"),), None, BurstIdentity("digest-ftp"))
+        first = self._frame("session-1.jpg", self._trigger(delta_ms=10))
+        second = self._frame("session-2.jpg", self._trigger(delta_ms=3454))
+
+        queue.put(still)
+        queue.put(first)
+
+        self.assertEqual(
+            queue.put(second), still,
+            "the oldest picture in the queue is what goes",
+        )
+        self.assertEqual(queue.get(), first)
+        self.assertEqual(queue.get(), second)
+
     def test_a_frame_of_a_different_alarm_does_not_supersede_this_one(self):
         queue = BoundedBurstQueue(max_pending=2)
         passage = self._frame("passage.jpg", self._trigger())
@@ -1716,6 +1741,33 @@ class FreshestFrameFirstTests(unittest.TestCase):
 
         self.assertEqual(queue.put(second), first)
         self.assertEqual(queue.get(), triggered)
+
+    def test_the_skip_line_names_the_reason_the_event_is_actually_given(self):
+        # The journal said `reason=event_already_opened` while the persisted
+        # event said `queue_coalesced`, so the two could not be joined up.
+        queue = BoundedBurstQueue(max_pending=2)
+        queue.put(((Path("stale.jpg"),), None))
+        queue.put(None)
+        coalesced = []
+
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            _process_bursts(
+                queue,
+                lambda *args, **kwargs: ProcessingResult(False, "no_match"),
+                superseded=lambda paths: True,
+                coalesce=lambda item, reason="queue_coalesced": coalesced.append(
+                    (item[0], reason)
+                ),
+            )
+
+        combined = "\n".join(logs.output)
+        self.assertIn("cause=event_already_opened", combined)
+        self.assertIn("recorded_reason=queue_coalesced", combined)
+        self.assertNotIn(
+            "reason=event_already_opened", combined,
+            "no such reason is ever recorded against the event",
+        )
+        self.assertEqual(coalesced, [((Path("stale.jpg"),), "queue_coalesced")])
 
     def test_an_uncorrelated_trigger_has_no_alarm_identity(self):
         # A trigger the correlator could not match names no alarm, so two of

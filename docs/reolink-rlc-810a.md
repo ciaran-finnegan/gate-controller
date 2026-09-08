@@ -275,9 +275,17 @@ shade under the confidence bar. Three things end it now:
 
 - **the gate opened** (`reason=opened`);
 - **a confident read of another vehicle** (`reason=plate_denied`): a plate
-  read at or above the band's own exact-match bar with no authorised plate
-  within two edits of it. Another frame of the same car cannot change that,
-  and each one is a paid lookup;
+  read at or above `GATE_PRESENCE_CONCLUSIVE_CONFIDENCE` (0.75) with no
+  authorised plate within two edits of it. Another frame of the same car
+  cannot change that, and each one is a paid lookup.
+
+  That bar is deliberately *not* the band's own exact-match bar. The two
+  answer different questions: the band's bar decides whether to open the gate
+  and is 0.90 overnight, so asking it here meant a perfectly legible 0.806
+  read of a stranger's plate could never be conclusive and every denied night
+  passage ran to the frame budget — 6 paid lookups over 11.5 s against 3 over
+  2.5 s by day. Nothing decided here can open the gate; it can only stop the
+  session spending;
 - **a final pipeline answer** another frame cannot change (`reason=final_…`),
   such as a revoked authorisation or an ambiguous fuzzy match.
 
@@ -289,11 +297,24 @@ each extra frame and
 `outcome=presence_ended reason=opened|plate_denied|budget|window|new_event`.
 Set `GATE_PRESENCE_MAX_FRAMES=0` to disable the session.
 
+A session that ends on `budget`, `window` or `departed` warns once, and which
+warning it is says where to look:
+
+- `gate_presence stage=unresolved` — a vehicle was here and **nothing read its
+  plate**. A camera, lighting or capture question. This is the line to grep
+  for when the gate did not open and nobody knows why.
+- `gate_presence stage=plate_read_below_bar` — a plate *was* read and refused:
+  under its confidence bar, ambiguous, or close enough to an authorised plate
+  that another frame might still have fixed it. A matching question, answered
+  from `docs/plate-matching.md`, not from the camera.
+
 Once a session *has* opened the gate, any of its frames still sitting in the
 burst queue are dropped before they are read
-(`gate_burst stage=skipped reason=event_already_opened`): the relay cooldown
-would refuse a second activation anyway, so the only thing another lookup
-could buy is the bill.
+(`gate_burst stage=skipped cause=event_already_opened
+recorded_reason=queue_coalesced`): the relay cooldown would refuse a second
+activation anyway, so the only thing another lookup could buy is the bill. The
+frame is recorded as `queue_coalesced`, the same reason as any other burst
+given up without being decided.
 
 A frame that leaves the pipeline without a decision — coalesced out of a full
 queue, or lost to a processing error — is reported back to the session as
