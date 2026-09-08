@@ -80,7 +80,9 @@ release virtual environment, installing dependencies for this architecture,
 importing the modules the service loads at startup, compiling sources, and
 checking the
 candidate's shell scripts. Set `GATE_UPDATE_RUN_TESTS=1` to run the full suite on
-the Pi as well. Network, GitHub, rate-limit,
+the Pi as well; the suite refuses to run any command against a live stream, so
+doing that can no longer starve the board the way it did on 2026-09-07.
+Network, GitHub, rate-limit,
 dependency, staging, or verification failures leave the running release
 untouched; activation failures restore the previous managed symlink. The root
 updater helper and all systemd units are fixed copies installed only by explicit
@@ -257,3 +259,15 @@ initialization and actuation outcomes.
 Run the unit suite with `python3 -m unittest discover -s tests -v`, compile with
 `python3 -m compileall gate_controller deployment tests`, and validate shell
 entry points with `bash -n deployment/install.sh` and `sh -n file_monitor.sh`.
+
+The suite may not run a command against a live video stream. Every class on the
+capture path takes a process factory (`popen=`) whose default is the real
+`subprocess.Popen`, and every default source URL is the camera's 4K main stream,
+so a test that forgets to inject a fake gets the live camera: nothing happens on
+a laptop, and on the Pi it is an out-of-memory kill that stops the gate
+answering webhooks. `tests/stream_guard.py` therefore fails any test whose
+command mentions `rtsp://` or the loopback media server, and is installed for
+the whole suite under every way of invoking it. An integration test that
+genuinely needs a real stream marks itself with
+`tests.stream_guard.allow_live_stream("why")` and bounds its children in time,
+frames and address space, as `tests/test_clear_stream_ffmpeg.py` does.

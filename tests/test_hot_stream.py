@@ -17,6 +17,11 @@ def jpeg(colour, size=(64, 32)):
     return output.getvalue()
 
 
+def never_spawn(command, **_kwargs):
+    """A process factory for a test that only reads the command it built."""
+    raise AssertionError(f"this test must not spawn a child: {tuple(command)!r}")
+
+
 class JpegStreamParserTests(unittest.TestCase):
     def test_extracts_complete_jpegs_across_arbitrary_chunks(self):
         first = jpeg("red")
@@ -95,7 +100,10 @@ class HotStreamConfigurationTests(unittest.TestCase):
             {"GATE_HOT_STREAM_ENABLED": "true", "UNRELATED_SECRET": "do-not-inherit"},
             Path("/var/lib/gate-controller/uploads"),
         )
-        buffer = HotStreamBuffer(config)
+        # The command is all this test reads, so the buffer must not be able
+        # to run it: the default `popen` is the real subprocess.Popen and the
+        # default source is the live camera.
+        buffer = HotStreamBuffer(config, popen=never_spawn)
 
         self.assertEqual("/usr/bin/ffmpeg", buffer.command[0])
         self.assertIn("rtsp://127.0.0.1:8554/camera", buffer.command)

@@ -27,6 +27,17 @@ from gate_controller.telemetry import TriggerTelemetry
 from gate_controller.trigger_capture import TriggerCaptureConfig, TriggerFrameCapture
 
 
+def never_spawn(command, **_kwargs):
+    """A process factory for a test that must never start a child.
+
+    Every capture object takes one. The default is the real
+    ``subprocess.Popen``, and the default source URL is the live 4K camera
+    stream, so a capture built without this is one missed frame away from
+    decoding it.
+    """
+    raise AssertionError(f"this test must not spawn a child: {tuple(command)!r}")
+
+
 class MutableClock:
     def __init__(self):
         self.value = 0.0
@@ -535,7 +546,15 @@ class WorkerTests(unittest.TestCase):
                 presence_spacing_seconds=0, presence_max_frames=1,
                 presence_window_seconds=60.0, empty_scene_threshold=0,
             )
-            capture = RecordingCapture(config, frame_source=FrameSource())
+            # `popen` is not decoration: without it this capture holds the
+            # real subprocess.Popen and the default rtsp://127.0.0.1:8554/clear,
+            # so any path that misses the frame source -- a `latest()` that
+            # returns None, an exception inside it -- falls through to
+            # `_grab()` and decodes the camera's 4K stream for real. That is
+            # nothing on a laptop and an OOM kill on the Pi.
+            capture = RecordingCapture(
+                config, frame_source=FrameSource(), popen=never_spawn,
+            )
             injected = []
             session = {}
 
