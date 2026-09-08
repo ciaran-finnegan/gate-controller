@@ -304,14 +304,15 @@ stores five-minute buckets, and a day of production traffic writes about 288
 rows against a free-plan allowance of 100,000 a day.
 
 `GATE_METRICS_ENABLED` (default `true`) adds **one** thread on a
-`GATE_METRICS_ROLLUP_SECONDS` poll (default `300`, accepted range 60-3600)
+`GATE_METRICS_ROLLUP_SECONDS` poll (default `300`, accepted range 60-3600,
+quantised down to a whole number of five-minute buckets and never below one)
 inside the existing controller process -- no new systemd unit, no new
 credential. The POST goes through the same `CloudflareServiceClient` and
 Access service token as event ingest and the heartbeat.
 
-**What it carries.** One entry per whole minute, oldest first, at most 60
-minutes per POST (the contract's ceiling), so a 25-minute outage replays
-completely on reconnect instead of leaving a hole:
+**What it carries.** One entry per whole minute, oldest first, in whole
+five-minute buckets, at most twelve buckets -- 60 minutes -- per POST, so a
+25-minute outage replays completely on reconnect instead of leaving a hole:
 
 ```json
 {"controller_id": "primary", "schema_version": 1,
@@ -332,30 +333,47 @@ completely on reconnect instead of leaving a hole:
 | `recognized` | Attempts that returned a plate |
 | `unread_frames` | Attempts that returned no plate. **Never `no_plate`:** the contract refuses any key matching `/plate/` and rejects the whole body for it |
 | `ocr_error`, `ocr_timeout`, `ocr_busy` | Failed, abandoned at the decision deadline, and never sent because the OCR slot was taken |
-| `http_429` | Requests the 1 req/s throttle refused. The client retries and usually succeeds, so without this counter a throttled request leaves no trace outside the journal |
+| `http_429` | Requests the 1 req/s throttle refused, counted in the minute the throttle happened in rather than the minute the burst finished. The client retries and usually succeeds, so without this counter a throttled request leaves no trace outside the journal. A 429 in a minute the ring never opened is counted in the drain minute instead -- late rather than lost |
 | `ocr_ms_p50`, `ocr_ms_p90` | Attempt durations, from a bounded per-minute sample |
 | `local_attempts`, `local_recognized` | Frames the on-device reader completed, and events it answered |
 | `recognition_lookups_month_to_date`, `recognition_lookup_quota` | The burn-down against the 2,500/month allowance |
 
 **The billing rule.** The allowance is charged for a request the service
-actually processed, so `billed_lookups` counts an attempt that demonstrably
-reached the API:
+actually processed, so the first question is not what an attempt read but
+whether a request went out at all.
+
+**A read the on-device recogniser answered is not billed**, because in
+`GATE_LOCAL_OCR_MODE=active` with `GATE_LOCAL_OCR_CLOUD=fallback` it returns
+before any request is posted -- that saving is the entire point of on-device
+recognition, and billing it would erase the saving from the burn-down it is
+supposed to show. `GATE_LOCAL_OCR_CLOUD=always` is the opposite case: the
+local read decides *and* the request goes out to label the frame for the
+corpus, so the lookup is spent and is billed. What decides is whether a
+request was made, never which reader answered.
+
+Given a request did go out:
 
 - **Billed:** `recognized` and `unread_frames` (a 2xx with or without a plate);
   `read_timeout` -- the request was sent in full and the reply never arrived,
-  which is exactly why `ocr.py` refuses to retry it; and the response-shape
-  failures (`invalid_json`, `invalid_payload`, `invalid_results`,
-  `invalid_result_entry`, `invalid_confidence`, `invalid_response`,
-  `no_usable_plate`), which can only arise after a response body was received.
+  which is exactly why `ocr.py` refuses to retry it; `ocr_timeout` -- see
+  below; and the response-shape failures (`invalid_json`, `invalid_payload`,
+  `invalid_results`, `invalid_result_entry`, `invalid_confidence`,
+  `invalid_response`, `no_usable_plate`), which can only arise after a
+  response body was received.
 - **Not billed:** `ocr_busy` (never left the Pi), `connect_timeout`,
   `tls_error`, `connection_error` and `request_error` (never arrived), and
   every `http_*` cause including `http_429` -- a throttled request is refused
   before it is processed.
-- **Known undercount:** `ocr_timeout`, where the processor abandoned a request
-  whose decision budget ran out. It may or may not have been processed. It is
-  counted in `ocr_attempts` and `ocr_timeout` and deliberately not in
-  `billed_lookups`, because overstating the burn-down that decides whether the
-  gate still opens at the end of the month is the worse error.
+- **`ocr_timeout` is billed, like `read_timeout`.** They are usually the same
+  physical event -- the request went out and the reply did not come back in
+  time -- seen from the decision's clock rather than the socket's. The
+  processor records an `ocr_timeout` attempt only past `ocr_started`, which is
+  to say only once the request had been launched, so classifying it as "never
+  sent" made the burn-down disagree with itself depending on which timer
+  fired first. The residual error runs the other way and is bounded: in local
+  `active` mode an `ocr_timeout` may be the on-device guard having consumed
+  the decision budget before a request was posted, and the processor cannot
+  tell the two apart from where it stands.
 
 **Where the month-to-date figure comes from: the controller itself.** It is
 its own count, persisted in `metrics-quota.json` beside the database and reset
@@ -372,6 +390,45 @@ Recognizer account dashboard rather than against anything the controller says.
 The allowance itself is configuration (`GATE_RECOGNITION_LOOKUP_QUOTA`,
 default `2500`), not a measurement -- if the plan changes, change the variable.
 
+The counter is written by the rollup thread, never by the burst that counted
+it: `record_billed` takes a lock around one integer and sets a flag, and the
+`fsync` and `os.replace` happen on the next rollup cycle. An SD-card write on
+the path that has just opened the gate is not worth the at most one rollup
+period of counting a power cut could cost.
+
+**If the counter cannot be vouched for, it is not reported at all.** When the
+stored ledger comes back unreadable, or the last write failed, the two quota
+keys are simply left out of the heartbeat and the rollup, so the tile reads
+"not reported". A stamped `0` would read as a full allowance still to spend on
+the day the card stopped taking writes, which is the reading that lets the
+gate quietly stop opening. There is no status token to send instead: the app
+narrows the heartbeat's `cloud` block with `boundedNumbers(value,
+CLOUD_CEILINGS)`, which accepts numbers only, so the absence *is* the signal
+and the transition is journalled (`gate_metrics stage=quota_unreported`). A
+failed read clears when the month rolls over, because a new month's zero is a
+number the controller is sure of again; a failed write clears on the first
+one that succeeds.
+
+**Whole buckets, once each.** The app stores one row per five-minute bucket
+and `upsertControllerHealth` **replaces** that row with whatever arrives for
+it (`do update set metrics = excluded.metrics`), then advances the quota
+ledger by *(incoming minus stored)* for the same buckets. A post landing three
+minutes into a bucket therefore does not fill the row in later -- the next
+post throws those three minutes away and walks the ledger back to match. So:
+
+- a minute is offered only once the whole **bucket** it belongs to has closed,
+  not merely once the minute has; and
+- a POST carries a whole number of buckets, at most twelve, because
+  `storedBucketMetrics` reads back at most twelve to compute that delta and a
+  thirteenth would be counted again on every re-send.
+
+The cadence is aligned to the wall clock rather than to when the thread came
+up: the worker wakes a few seconds after each five-minute boundary, so the
+bucket it posts is the one that has just closed.
+`GATE_METRICS_ROLLUP_SECONDS` is quantised down to a whole number of buckets
+and never below one, so `60` behaves as `300` -- there is nothing new to send
+before a bucket closes.
+
 **What it will not do.** The rollup ranks below event delivery, which ranks
 below the gate:
 
@@ -381,12 +438,14 @@ below the gate:
   pipeline that fills the ring;
 - a failure backs off from 5 s to 5 minutes rather than retrying in a tight
   loop -- the behaviour that made the 2026-09-05 D1 outage worse -- and the
-  minutes stay pending until a 2xx;
+  minutes stay pending until a 2xx. The backoff is a schedule the worker
+  keeps: a pending retry pulls the next wake earlier than the boundary would,
+  bounded below at 5 s so it can never become a loop;
 - the ring is memory only and fixed at 180 minutes; the oldest minute is
   dropped when it is full, and nothing but the small month-to-date counter is
   written to the SD card;
-- a minute is posted once and only after it has closed, so a bucket is never
-  half-counted and never counted twice.
+- no bucket is ever delivered in pieces, so none is half-counted, and each
+  `bucket_start` goes out once.
 
 **In the journal**, one line per state change, never one per cycle:
 
@@ -397,6 +456,7 @@ below the gate:
 | `gate_metrics stage=deferred reason=<activity>` / `stage=resumed` | Stood down for a gate decision, and back |
 | `gate_metrics stage=ring_full dropped=<n> capacity=<n>` | Minutes are ageing out undelivered -- the cloud path has been down for hours |
 | `gate_metrics stage=quota_write_failed detail=<error class>` / `stage=quota_read_failed` | The month-to-date counter could not be persisted or read; counting continues in memory |
+| `gate_metrics stage=quota_unreported detail=<load or write>` / `stage=quota_reported` | The burn-down is being withheld because the ledger cannot vouch for it, and the moment it can again. The tile reads "not reported" in between, never `0` |
 | `gate_metrics stage=record_failed` / `stage=cycle_failed` | A metric was dropped rather than allowed to raise into the pipeline |
 
 Setting `GATE_METRICS_ENABLED=false` constructs nothing: no ring, no ledger,

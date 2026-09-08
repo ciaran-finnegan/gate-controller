@@ -154,11 +154,25 @@ class OcrAttemptTelemetry:
     #: rejects the whole event for any unknown key, so this is deliberately
     #: absent from :meth:`to_wire`.
     failure_cause: str | None = None
+    #: Which reader produced this attempt's read -- ``cloud`` or ``local`` --
+    #: straight off :attr:`gate_controller.models.PlateObservation.source`.
+    #: Journal-only, for the same reason as ``failure_cause``.
+    source: str = "cloud"
+    #: Whether a cloud lookup was actually spent on this attempt. Not the same
+    #: question as ``source``: under ``GATE_LOCAL_OCR_CLOUD=always`` the local
+    #: reader answers and the cloud request goes out anyway, so a ``local``
+    #: attempt can still have been charged. The quota burn-down in
+    #: ``metrics.py`` bills on this, never on ``source``. Journal-only.
+    cloud_lookup: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "failure_cause", _optional_failure_cause(self.failure_cause)
         )
+        object.__setattr__(
+            self, "source", "local" if self.source == "local" else "cloud"
+        )
+        object.__setattr__(self, "cloud_lookup", bool(self.cloud_lookup))
 
     def to_wire(self) -> dict[str, object]:
         # Wire keys are frozen by the ingest contract. Do not add fields here

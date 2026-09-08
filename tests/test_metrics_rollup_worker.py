@@ -5,8 +5,10 @@ from threading import Event, Thread
 from gate_controller.backpressure import ActivityGate
 from gate_controller.cloudflare_client import CloudflareMetricsReporter
 from gate_controller.metrics import (
-    MAX_MINUTES_PER_POST, MetricsRing, MetricsRollupWorker,
-    ROLLUP_BACKOFF_MAX_SECONDS, SCHEMA_VERSION,
+    BUCKET_MINUTES, BUCKET_SECONDS, MAX_BUCKETS_PER_POST, MAX_MINUTES_PER_POST,
+    MetricsRing, MetricsRollupWorker, ROLLUP_BACKOFF_BASE_SECONDS,
+    ROLLUP_BACKOFF_MAX_SECONDS, ROLLUP_BOUNDARY_DELAY_SECONDS,
+    ROLLUP_MIN_WAIT_SECONDS, SCHEMA_VERSION,
 )
 
 
@@ -56,9 +58,16 @@ class MetricsRollupWorkerTests(unittest.TestCase):
         )
 
     def fill(self, minutes: int = 1) -> None:
+        """Record `minutes` busy minutes and leave the clock past their bucket.
+
+        The extra five minutes are the point: the ring holds a minute back
+        until the whole five-minute bucket it belongs to has closed, because
+        the app replaces a bucket row rather than merging into it.
+        """
         for _ in range(minutes):
             self.ring.record_heartbeat()
             self.clock.advance(minutes=1)
+        self.clock.advance(minutes=BUCKET_MINUTES)
 
     def test_one_post_carries_the_closed_minutes_and_the_schema(self):
         self.fill(3)
@@ -208,6 +217,10 @@ class MetricsRollupWorkerTests(unittest.TestCase):
     def test_a_cycle_that_throws_is_contained(self):
         class Exploding:
             @staticmethod
+            def flush_quota():
+                return False
+
+            @staticmethod
             def unsent_minutes(**kwargs):
                 raise RuntimeError("ring is broken")
 
@@ -217,6 +230,86 @@ class MetricsRollupWorkerTests(unittest.TestCase):
             self.assertEqual(worker.run_once(), 0)
 
         self.assertIn("gate_metrics stage=cycle_failed", logs.output[0])
+
+    def test_the_wake_is_aligned_to_the_wall_clock_not_to_thread_start(self):
+        # Whenever the thread starts, the next cycle lands just after a
+        # five-minute boundary. Waking every 300 s from thread start instead
+        # put the post in the middle of a bucket, which is the whole reason a
+        # bucket used to reach the app in pieces.
+        worker = self.worker()
+        for phase in (0, 10, 100, 190, 250, 299):
+            with self.subTest(phase=phase):
+                now = START.replace(minute=20, second=0) + timedelta(seconds=phase)
+                woken = now + timedelta(seconds=worker.next_wait_seconds(now))
+
+                self.assertEqual(woken.minute % BUCKET_MINUTES, 0)
+                self.assertEqual(woken.second, int(ROLLUP_BOUNDARY_DELAY_SECONDS))
+                self.assertLessEqual(
+                    (woken - now).total_seconds(), BUCKET_SECONDS,
+                    "never more than one bucket away",
+                )
+
+    def test_a_slower_cadence_still_lands_on_a_bucket_boundary(self):
+        worker = self.worker(poll_interval=600.0)
+
+        for phase in range(0, 600, 37):
+            with self.subTest(phase=phase):
+                now = START.replace(minute=20, second=0) + timedelta(seconds=phase)
+                wait = worker.next_wait_seconds(now)
+                woken = now + timedelta(seconds=wait)
+
+                self.assertEqual(woken.minute % BUCKET_MINUTES, 0)
+                self.assertEqual(woken.second, int(ROLLUP_BOUNDARY_DELAY_SECONDS))
+                self.assertGreater(wait, 0)
+                self.assertLessEqual(wait, 600)
+
+    def test_the_documented_backoff_is_a_schedule_the_worker_keeps(self):
+        # The docs promise "5 s, doubling to 5 minutes". Sleeping the full poll
+        # interval regardless made that a number the worker computed and then
+        # ignored: the first retry was five minutes away, not five seconds.
+        failing = Recorder(TimeoutError("offline"))
+        worker = self.worker(send=failing)
+        self.fill(1)
+
+        worker.run_once()
+
+        self.assertEqual(
+            worker.next_wait_seconds(self.clock()), ROLLUP_BACKOFF_BASE_SECONDS,
+        )
+
+    def test_a_backoff_wait_is_never_a_tight_loop(self):
+        failing = Recorder(TimeoutError("offline"))
+        worker = self.worker(send=failing)
+        self.fill(1)
+        worker.run_once()
+
+        # Well past the retry deadline: the wait floors rather than spinning.
+        late = self.clock() + timedelta(minutes=1)
+
+        self.assertGreaterEqual(worker.next_wait_seconds(late), ROLLUP_MIN_WAIT_SECONDS)
+
+    def test_a_healthy_cycle_waits_for_the_boundary_not_for_the_backoff(self):
+        worker = self.worker()
+        self.fill(1)
+        worker.run_once()
+
+        self.assertGreater(
+            worker.next_wait_seconds(self.clock()), ROLLUP_MIN_WAIT_SECONDS,
+        )
+
+    def test_a_post_never_spans_more_buckets_than_the_app_reads_back(self):
+        # The app reads back at most twelve stored buckets to work out the
+        # quota delta. A thirteenth would have its counters applied again
+        # every time a lost response made the controller re-send.
+        self.fill(MAX_MINUTES_PER_POST + BUCKET_MINUTES)
+
+        self.worker().run_once()
+
+        buckets = {
+            entry["minute_start"][:15] + ("0" if entry["minute_start"][15] < "5" else "5")
+            for entry in self.sent.payloads[0]["minutes"]
+        }
+        self.assertLessEqual(len(buckets), MAX_BUCKETS_PER_POST)
 
     def test_run_forever_stops_on_the_stop_event(self):
         stop = Event()

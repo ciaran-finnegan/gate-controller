@@ -274,8 +274,13 @@ class LocalRecognition:
         return bool(self.plate)
 
     def observation(self) -> PlateObservation:
+        # `cloud_lookup=False` is the read as the recogniser produced it: no
+        # request left the Pi for this plate. The OCR client overwrites it when
+        # the frame's cloud request went out anyway, which is what `always`
+        # mode does.
         return PlateObservation(
             plate=self.plate, confidence=self.score, source="local",
+            cloud_lookup=False,
         )
 
     def to_sidecar(self) -> dict:

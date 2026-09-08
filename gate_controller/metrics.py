@@ -43,8 +43,18 @@ LOGGER = logging.getLogger(__name__)
 
 #: The schema the app's contract accepts; it rejects anything else outright.
 SCHEMA_VERSION = 1
-#: `MAX_MINUTES_PER_POST` in the app contract. More than this is a 400.
-MAX_MINUTES_PER_POST = 60
+#: The app folds minutes into five-minute buckets and stores one row each.
+BUCKET_MINUTES = 5
+BUCKET_SECONDS = BUCKET_MINUTES * 60
+#: `MAX_BUCKETS_PER_POST` in the app's `controllerHealth.ts`: the read-back of
+#: already-stored buckets, which is what stops a replayed post from being
+#: counted twice, is capped at twelve. A post that spanned a thirteenth bucket
+#: would have that bucket's quota delta applied again on every re-send.
+MAX_BUCKETS_PER_POST = 12
+#: `MAX_MINUTES_PER_POST` in the app contract. More than this is a 400 -- and
+#: it is exactly twelve whole buckets, which is why minutes are only ever
+#: offered a whole bucket at a time.
+MAX_MINUTES_PER_POST = MAX_BUCKETS_PER_POST * BUCKET_MINUTES
 #: The contract's ceiling for a minute's heartbeat count.
 MAX_HEARTBEATS_PER_MINUTE = 60
 #: The contract's ceiling for every recognition counter (1e7).
@@ -66,6 +76,14 @@ DEFAULT_LOOKUP_QUOTA = 2500
 
 ROLLUP_BACKOFF_BASE_SECONDS = 5.0
 ROLLUP_BACKOFF_MAX_SECONDS = 300.0
+#: How long after a bucket boundary the post is made. The ring is fed after a
+#: burst finishes, so a burst that ended on the boundary is still being counted
+#: when the boundary passes; a few seconds costs nothing and squares the race.
+ROLLUP_BOUNDARY_DELAY_SECONDS = 5.0
+#: The floor on any wait in :meth:`MetricsRollupWorker.run_forever`. A backoff
+#: deadline may pull a wake earlier than the next boundary, but never into a
+#: tight loop.
+ROLLUP_MIN_WAIT_SECONDS = 5.0
 
 METRICS_PATH = "/api/controller/metrics"
 
@@ -74,10 +92,29 @@ METRICS_PATH = "/api/controller/metrics"
 # The allowance is charged for a request the service actually processed. An
 # attempt that never left the Pi, or that never got a reply, is not a lookup.
 #
+# The first question is therefore not "what did this attempt read" but "did a
+# request go out at all". `OcrAttemptTelemetry.cloud_lookup` answers it, set at
+# the one place that knows -- the dispatch site in `ocr.py` -- because the two
+# are not the same question. With `GATE_LOCAL_OCR_MODE=active` and
+# `GATE_LOCAL_OCR_CLOUD=fallback`, a confident on-device read returns before
+# any `session.post`: the attempt's status is `recognized`, and billing it
+# would count precisely the lookups on-device recognition stopped spending.
+# With `GATE_LOCAL_OCR_CLOUD=always` the same local read answers and the cloud
+# request goes out regardless, so that one *is* billed. Hence `cloud_lookup`
+# rather than `source`, which only says which reader the gate believed.
+#
+# Given a request did go out:
+#
 # Billed:   `recognized` and `no_plate` -- a 2xx with, or without, a plate.
 #           `read_timeout` -- the request was sent in full and the reply never
 #           arrived; ocr.py already refuses to retry it for exactly this
 #           reason ("the request may already have been accepted and billed").
+#           `ocr_timeout` -- the processor abandoning a request whose decision
+#           budget ran out. It is recorded only past `ocr_started`, which is to
+#           say only once the request had been launched, so it is the same
+#           physical event as a `read_timeout` seen from the decision's side of
+#           the clock rather than the socket's, and classifying the two
+#           differently made the burn-down disagree with itself.
 #           The response-shape causes below, which can only arise *after* a
 #           2xx body was received and therefore after the lookup was spent.
 # Not billed: `ocr_busy` (never left the Pi), `connect_timeout`, `tls_error`,
@@ -85,12 +122,11 @@ METRICS_PATH = "/api/controller/metrics"
 #           `http_*` cause including `http_429` -- a throttled request is
 #           refused before it is processed.
 #
-# Known undercount: `ocr_timeout` -- the processor abandoning a request whose
-# decision budget ran out -- may or may not have been processed by the service
-# by then. It is counted in `ocr_attempts` and `ocr_timeout` and deliberately
-# not in `billed_lookups`, because guessing high would overstate the burn-down
-# that decides whether the gate still opens at the end of the month.
-BILLED_STATUSES = frozenset({"recognized", "no_plate"})
+# Known overcount, bounded and documented: in local `active` mode an
+# `ocr_timeout` may be the on-device guard having eaten the decision budget
+# before any request was posted. The processor cannot tell the two apart from
+# where it stands, and `ocr_timeout` is rare beside `read_timeout`.
+BILLED_STATUSES = frozenset({"recognized", "no_plate", "ocr_timeout"})
 BILLED_FAILURE_CAUSES = frozenset({
     "read_timeout",
     "invalid_json", "invalid_payload", "invalid_results", "invalid_result_entry",
@@ -107,6 +143,36 @@ def minute_key(moment: datetime) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:00Z")
+
+
+def bucket_key(moment: datetime) -> str:
+    """The five-minute bucket this moment belongs to, in the minute format.
+
+    The app rounds `minute_start` down to a five-minute boundary and stores one
+    row per bucket, so this is the same arithmetic the other side does. Minute
+    keys sort lexicographically, so `key < bucket_key(now)` is exactly "this
+    minute's bucket closed before now".
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    return moment.replace(
+        minute=(moment.minute // BUCKET_MINUTES) * BUCKET_MINUTES,
+    ).strftime("%Y-%m-%dT%H:%M:00Z")
+
+
+def _bucket_of(minute: str) -> str:
+    """The bucket a ring minute key belongs to. Runs on the rollup thread."""
+    parsed = datetime.strptime(minute, "%Y-%m-%dT%H:%M:00Z")
+    return bucket_key(parsed.replace(tzinfo=timezone.utc))
+
+
+def _grouped_by_bucket(minutes: list[str]):
+    """Sorted minute keys, grouped into the buckets they belong to."""
+    grouped: "OrderedDict[str, list[str]]" = OrderedDict()
+    for key in minutes:
+        grouped.setdefault(_bucket_of(key), []).append(key)
+    return grouped.items()
 
 
 def _bounded_counter(value: int) -> int:
@@ -248,11 +314,21 @@ class QuotaLedger:
     event in D1.
 
     So this is the only state that outlives the process: a few dozen bytes
-    rewritten atomically after each burst, which is nothing beside the SQLite
-    writes the same burst already makes.
+    rewritten atomically, which is nothing beside the SQLite writes a burst
+    already makes.
+
+    **The write never happens on the burst thread.** :meth:`record_billed` runs
+    from the pipeline wrapper, immediately after a gate decision; an SD-card
+    ``fsync`` there is a stall on the path that opens the gate. So it takes a
+    lock around one integer and sets a flag, and the rollup worker thread calls
+    :meth:`flush` on its own cycle. The cost of a power cut between the two is
+    at most one rollup period of billed lookups; the cost of the alternative is
+    measured in milliseconds on every burst.
 
     Every failure here is swallowed. A month-to-date counter that cannot be
-    written must cost a metric, never a gate opening.
+    written must cost a metric, never a gate opening -- but it must not be
+    allowed to report a confident zero either, which is what
+    :meth:`reportable` is for.
     """
 
     def __init__(self, path: Path | None, *, quota: int = DEFAULT_LOOKUP_QUOTA,
@@ -263,6 +339,10 @@ class QuotaLedger:
         self._lock = Lock()
         self._month = ""
         self._billed = 0
+        self._dirty = False
+        self._write_failed = False
+        self._load_failed = False
+        self._reported = True
         self._writes = _StageLogger("quota_write")
         self._load()
 
@@ -275,14 +355,54 @@ class QuotaLedger:
             self._roll_over_locked()
             return self._billed
 
+    def reportable(self) -> bool:
+        """Whether the count is worth putting in front of the owner.
+
+        False once a write has failed, or once the stored counter came back
+        unreadable, because then the number in memory is not the month's total
+        and a burn-down tile reading "0 of 2500" is worse than one reading "not
+        reported". A failed load latches until the month rolls over, at which
+        point zero is the right answer again; a failed write clears as soon as
+        one succeeds.
+        """
+        with self._lock:
+            self._roll_over_locked()
+            return not (self._write_failed or self._load_failed)
+
     def record_billed(self, count: int) -> int:
+        """Count billed lookups. Runs on the burst thread: no file I/O here."""
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             return self.month_to_date()
         with self._lock:
             self._roll_over_locked()
             self._billed = _bounded_counter(self._billed + count)
-            self._persist_locked()
+            self._dirty = True
             return self._billed
+
+    def flush(self) -> bool:
+        """Persist the counter if it has moved. Called from the rollup thread.
+
+        The lock is taken twice and held across neither the ``fsync`` nor the
+        ``os.replace``: a burst counting a lookup while the card is busy waits
+        on an integer, not on the filesystem.
+        """
+        with self._lock:
+            self._roll_over_locked()
+            if not self._dirty or self._path is None:
+                self._dirty = False
+                return False
+            payload = json.dumps(
+                {"month": self._month, "billed_lookups": self._billed}
+            )
+            self._dirty = False
+        written = self._write(payload)
+        with self._lock:
+            if not written:
+                # Try again next cycle rather than losing the count silently.
+                self._dirty = True
+            self._write_failed = not written
+            self._announce_locked()
+        return written
 
     def _current_month(self) -> str:
         try:
@@ -295,7 +415,25 @@ class QuotaLedger:
         if month and month != self._month:
             self._month = month
             self._billed = 0
-            self._persist_locked()
+            self._dirty = True
+            # A new month starts from a zero this controller is sure of, so a
+            # counter that could not be read last month stops poisoning it.
+            self._load_failed = False
+            self._announce_locked()
+
+    def _announce_locked(self) -> None:
+        """One journal line per change of reporting state, never per cycle."""
+        reportable = not (self._write_failed or self._load_failed)
+        if reportable == self._reported:
+            return
+        self._reported = reportable
+        if reportable:
+            LOGGER.info("gate_metrics stage=quota_reported")
+        else:
+            LOGGER.warning(
+                "gate_metrics stage=quota_unreported detail=%s",
+                "load" if self._load_failed else "write",
+            )
 
     def _load(self) -> None:
         month = self._current_month()
@@ -309,8 +447,15 @@ class QuotaLedger:
             return
         except Exception:
             LOGGER.warning("gate_metrics stage=quota_read_failed detail=unreadable")
+            # There was a counter and it cannot be read, so this month's total
+            # is unknown: withhold it rather than restart the burn-down at zero
+            # and tell the owner they have their whole allowance left.
+            self._load_failed = True
+            self._announce_locked()
             return
         if not isinstance(stored, dict):
+            self._load_failed = True
+            self._announce_locked()
             return
         if stored.get("month") != month:
             # A counter from a previous month is history, not this month's
@@ -319,11 +464,14 @@ class QuotaLedger:
         billed = stored.get("billed_lookups")
         if isinstance(billed, int) and not isinstance(billed, bool) and billed >= 0:
             self._billed = _bounded_counter(billed)
+        else:
+            self._load_failed = True
+            self._announce_locked()
 
-    def _persist_locked(self) -> None:
+    def _write(self, payload: str) -> bool:
+        """The atomic rewrite. No lock is held; nothing here raises."""
         if self._path is None:
-            return
-        payload = json.dumps({"month": self._month, "billed_lookups": self._billed})
+            return False
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(
@@ -344,8 +492,9 @@ class QuotaLedger:
                 temporary.unlink(missing_ok=True)
         except Exception as error:
             self._writes.failure(type(error).__name__)
-            return
+            return False
         self._writes.success()
+        return True
 
 
 class MetricsRing:
@@ -402,6 +551,10 @@ class MetricsRing:
             for attempt in attempts:
                 status = getattr(attempt, "status", "unknown")
                 cause = getattr(attempt, "failure_cause", None)
+                # Absent on anything but a read the on-device recogniser
+                # answered without a request going out, so the default is the
+                # cloud attempt this counter has always assumed.
+                spent = bool(getattr(attempt, "cloud_lookup", True))
                 minute.ocr_attempts += 1
                 minute.add_duration(getattr(attempt, "duration_ms", None))
                 if status == "recognized":
@@ -414,7 +567,7 @@ class MetricsRing:
                     minute.ocr_busy += 1
                 elif status == "ocr_error":
                     minute.ocr_error += 1
-                if self._is_billed(status, cause):
+                if self._is_billed(status, cause, spent):
                     billed += 1
             minute.billed_lookups += billed
             if local is not None:
@@ -433,18 +586,33 @@ class MetricsRing:
         self._stamp_quota()
 
     @staticmethod
-    def _is_billed(status: object, cause: object) -> bool:
+    def _is_billed(status: object, cause: object, cloud_lookup: bool = True) -> bool:
+        """Whether this attempt spent one of the month's cloud lookups.
+
+        A request that never went out cannot have been billed, whatever it
+        read: that is the whole of the local-recognition saving, and counting
+        it would erase the saving from the burn-down.
+        """
+        if not cloud_lookup:
+            return False
         if status in BILLED_STATUSES:
             return True
         return status == "ocr_error" and cause in BILLED_FAILURE_CAUSES
 
-    def _absorb_retry_counts_locked(self, minute: _MinuteCounters) -> None:
-        """Fold the OCR client's throttle counter into the current minute.
+    def _absorb_retry_counts_locked(self, current: _MinuteCounters) -> None:
+        """Fold the OCR client's throttle counter into the minutes it happened in.
 
         A 429 is retried inside the client and the retry usually succeeds, so
         without this counter a throttled request leaves no trace anywhere but
         the journal -- and throttling is the failure mode that costs a whole
         burst its second frame.
+
+        The counter stamps its own minute, because the drain happens when a
+        burst finishes and a throttled burst is exactly the one that ran long:
+        crediting the drain minute pushed a boundary-straddling burst's 429s
+        into the next minute, and four times in five into the next bucket. A
+        minute the ring never opened, or one already delivered, falls back to
+        the minute in progress -- it is better counted late than not at all.
         """
         try:
             counts = self._retry_counts()
@@ -452,15 +620,30 @@ class MetricsRing:
             return
         if not isinstance(counts, dict):
             return
-        throttled = counts.get("http_429", 0)
-        if isinstance(throttled, int) and not isinstance(throttled, bool) and throttled > 0:
-            minute.http_429 += throttled
+        for key, causes in counts.items():
+            if not isinstance(causes, dict):
+                continue
+            throttled = causes.get("http_429", 0)
+            if (not isinstance(throttled, int) or isinstance(throttled, bool)
+                    or throttled <= 0):
+                continue
+            target = None
+            if isinstance(key, str) and key not in self._sent:
+                target = self._minutes.get(key)
+            (target or current).http_429 += throttled
 
     def _stamp_quota(self) -> None:
-        """Record the burn-down against the current minute as a gauge."""
+        """Record the burn-down against the current minute as a gauge.
+
+        Nothing is stamped when the ledger cannot vouch for its own count: an
+        absent key renders as "not reported", where a stamped zero would read
+        as a full allowance still to spend.
+        """
         if self._quota is None:
             return
         try:
+            if not self._quota.reportable():
+                return
             month_to_date = self._quota.month_to_date()
             quota = self._quota.quota
         except Exception:
@@ -485,7 +668,11 @@ class MetricsRing:
 
     def _evict_locked(self) -> None:
         while len(self._minutes) > self._max_minutes:
-            oldest, _counters = self._minutes.popitem(last=False)
+            # By key, not by insertion order, which a clock stepped backwards
+            # by NTP would otherwise make the wrong thing to trust -- the same
+            # reason `unsent_minutes` sorts rather than iterating.
+            oldest = min(self._minutes)
+            self._minutes.pop(oldest, None)
             self._sent.discard(oldest)
             self._dropped_minutes += 1
             if self._dropped_minutes == 1 or self._dropped_minutes % 60 == 0:
@@ -497,22 +684,43 @@ class MetricsRing:
     # -- reading -----------------------------------------------------------
     def unsent_minutes(self, *, limit: int = MAX_MINUTES_PER_POST,
                        now: datetime | None = None) -> list[dict]:
-        """Closed, undelivered minutes, oldest first.
+        """Undelivered minutes from *closed five-minute buckets*, oldest first.
 
-        The minute in progress is never returned: a minute is posted once, and
-        the app folds whole minutes into five-minute buckets. Half a minute
-        now and the rest later would either double-count or be lost.
+        Whole buckets, or nothing. The app does not merge a post into a bucket
+        it already holds -- ``upsertControllerHealth`` is
+        ``do update set metrics = excluded.metrics``, which **replaces** the
+        row -- and it advances the quota ledger by (incoming minus stored) for
+        that bucket. So delivering minutes ``:00`` and ``:01`` now and ``:02``
+        to ``:04`` later does not fill the bucket in: the second post throws
+        the first two minutes away and the ledger is walked back to match.
+
+        A minute closing is therefore not enough; its *bucket* has to have
+        closed, which is what ``key < bucket_key(now)`` tests. Then every
+        bucket_start is delivered exactly once, complete.
+
+        The batch is a whole number of buckets for the second half of the same
+        reason. The app reads back at most ``MAX_BUCKETS_PER_POST`` (12) stored
+        buckets to compute that delta, so a post spanning a thirteenth bucket
+        has that bucket's counters applied again every time a lost response
+        makes the controller re-send.
         """
-        limit = max(1, min(MAX_MINUTES_PER_POST, int(limit)))
-        current = minute_key(now or self._clock())
+        limit = max(BUCKET_MINUTES, min(MAX_MINUTES_PER_POST, int(limit)))
+        horizon = bucket_key(now or self._clock())
         with self._lock:
             # Sorted rather than trusted to insertion order: a clock stepped
             # backwards by NTP would otherwise replay minutes out of order.
             pending = sorted(
                 key for key in self._minutes
-                if key < current and key not in self._sent
+                if key < horizon and key not in self._sent
             )
-            return [self._minutes[key].to_wire(key) for key in pending[:limit]]
+            chosen: list[str] = []
+            buckets = 0
+            for bucket, minutes in _grouped_by_bucket(pending):
+                if buckets >= MAX_BUCKETS_PER_POST or len(chosen) + len(minutes) > limit:
+                    break
+                chosen.extend(minutes)
+                buckets += 1
+            return [self._minutes[key].to_wire(key) for key in chosen]
 
     def mark_sent(self, minutes) -> None:
         keys = {
@@ -527,16 +735,37 @@ class MetricsRing:
             self._sent &= set(self._minutes)
 
     def quota_status(self) -> dict:
-        """The two quota keys the heartbeat's `cloud` block already accepts."""
+        """The two quota keys the heartbeat's `cloud` block already accepts.
+
+        Empty when the ledger cannot vouch for its count, so the tile reads
+        "not reported" instead of a confident "0 of 2500" -- a number that
+        would say the owner has their whole month left on the day the card
+        stopped taking writes. The app's heartbeat narrows `cloud` with
+        `boundedNumbers(value, CLOUD_CEILINGS)`, which accepts numbers only, so
+        there is no key to carry a status token: the transition is journalled
+        (`gate_metrics stage=quota_unreported`) and the absence is the signal.
+        """
         if self._quota is None:
             return {}
         try:
+            if not self._quota.reportable():
+                return {}
             return {
                 "recognition_lookups_month_to_date": self._quota.month_to_date(),
                 "recognition_lookup_quota": self._quota.quota,
             }
         except Exception:
             return {}
+
+    def flush_quota(self) -> bool:
+        """Persist the ledger, from a thread that is not the burst thread."""
+        if self._quota is None:
+            return False
+        try:
+            return self._quota.flush()
+        except Exception:
+            LOGGER.warning("gate_metrics stage=quota_flush_failed detail=unexpected")
+            return False
 
     def status(self) -> dict:
         with self._lock:
@@ -575,6 +804,14 @@ class MetricsRollupWorker:
         self._send = send
         self._controller_id = controller_id
         self._poll_interval = poll_interval
+        # The cadence, quantised down to a whole number of five-minute buckets
+        # and never below one. A bucket is the unit the app stores, so posting
+        # oftener than one closes cannot deliver anything new -- and posting on
+        # a period that is not a multiple of a bucket would drift the wake off
+        # the boundary again, one cycle at a time.
+        self._post_period = BUCKET_SECONDS * max(
+            1, int(float(poll_interval) // BUCKET_SECONDS)
+        )
         self._activity = activity
         self._clock = clock or _utc_now
         self._backoff_base = float(backoff_base)
@@ -608,6 +845,10 @@ class MetricsRollupWorker:
 
     def _run_once(self) -> int:
         now = self._clock()
+        # The ledger's only writer thread. `record_billed` on the burst path
+        # sets a flag; the fsync happens here, where a slow SD card delays a
+        # metric instead of a gate.
+        self._ring.flush_quota()
         if self._deferred_by_gate():
             return 0
         if self._retry_at is not None and now < self._retry_at:
@@ -663,10 +904,49 @@ class MetricsRollupWorker:
         )
         self._health.failure(_error_detail(error))
 
+    def next_wait_seconds(self, now: datetime | None = None) -> float:
+        """How long to sleep before the next cycle.
+
+        Two rules, in this order:
+
+        * **The wake is aligned to the wall clock**, not to when this thread
+          happened to start. A five-minute bucket closes at :00, :05, :10 and
+          so on, and this posts a few seconds after that, so what goes out is
+          the bucket that just closed. Waking every 300 s from thread start
+          instead put the post in the middle of a bucket -- which, before
+          minutes were held back until their bucket closed, is what fed the app
+          half a bucket and let it replace the row with that half.
+        * **A pending backoff can pull the wake earlier**, so the documented
+          "5 s, then 10, then 20 ... up to 5 minutes" is a schedule the worker
+          actually keeps rather than a number it computes and sleeps through.
+          Never below :data:`ROLLUP_MIN_WAIT_SECONDS`, so a failing endpoint
+          can never become a tight loop.
+        """
+        now = now or self._clock()
+        boundary = self._seconds_to_next_boundary(now)
+        if self._retry_at is None:
+            return boundary
+        retry = (self._retry_at - now).total_seconds()
+        return max(ROLLUP_MIN_WAIT_SECONDS, min(boundary, retry))
+
+    def _seconds_to_next_boundary(self, now: datetime) -> float:
+        """Seconds until the next bucket boundary this worker posts on."""
+        try:
+            epoch = now.timestamp()
+        except Exception:
+            return self._poll_interval
+        elapsed = (epoch - ROLLUP_BOUNDARY_DELAY_SECONDS) % self._post_period
+        return self._post_period - elapsed
+
     def run_forever(self, stop_event: Event) -> None:
         while not stop_event.is_set():
             self.run_once()
-            stop_event.wait(self._poll_interval)
+            if stop_event.is_set():
+                break
+            stop_event.wait(self.next_wait_seconds())
+        # Whatever the burst thread counted since the last cycle is worth the
+        # one write it takes to keep across a restart.
+        self._ring.flush_quota()
 
 
 def _error_detail(error: BaseException) -> str:

@@ -1,14 +1,17 @@
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, Thread
 
 from gate_controller import ocr
 from gate_controller.metrics import (
-    DEFAULT_LOOKUP_QUOTA, MAX_MINUTES_PER_POST, MetricsRing, QuotaLedger,
-    build_metrics_ring, metrics_enabled, metrics_rollup_seconds,
-    recognition_lookup_quota,
+    BUCKET_MINUTES, DEFAULT_LOOKUP_QUOTA, MAX_MINUTES_PER_POST, MetricsRing,
+    QuotaLedger, build_metrics_ring, metrics_enabled, metrics_rollup_seconds,
+    minute_key, recognition_lookup_quota,
 )
 from gate_controller.telemetry import (
     EventTelemetry, LocalOcrTelemetry, OcrAttemptTelemetry, StageDurations,
@@ -32,9 +35,11 @@ def telemetry(attempts=(), local=None) -> EventTelemetry:
     )
 
 
-def attempt(status, *, cause=None, duration_ms=0.0) -> OcrAttemptTelemetry:
+def attempt(status, *, cause=None, duration_ms=0.0, source="cloud",
+            cloud_lookup=True) -> OcrAttemptTelemetry:
     return OcrAttemptTelemetry(
         frame_sequence=0, status=status, failure_cause=cause, duration_ms=duration_ms,
+        source=source, cloud_lookup=cloud_lookup,
     )
 
 
@@ -59,7 +64,11 @@ class MetricsRingTests(unittest.TestCase):
         self.ring = MetricsRing(clock=self.clock, retry_counts=lambda: {})
 
     def minute(self, index=0):
-        self.clock.advance(minutes=1)
+        # Past the end of the bucket, not merely past the end of the minute:
+        # the ring holds a minute back until the whole five-minute bucket it
+        # belongs to has closed, because the app replaces a bucket row rather
+        # than merging into it.
+        self.clock.advance(minutes=BUCKET_MINUTES)
         return self.ring.unsent_minutes()[index]
 
     def test_recognition_outcomes_are_counted_under_the_contract_key_names(self):
@@ -95,7 +104,6 @@ class MetricsRingTests(unittest.TestCase):
     def test_attempts_that_never_reached_the_service_are_not_billed(self):
         self.ring.record_event_telemetry(telemetry((
             attempt("ocr_busy"),
-            attempt("ocr_timeout"),
             attempt("ocr_error", cause="connect_timeout"),
             attempt("ocr_error", cause="tls_error"),
             attempt("ocr_error", cause="connection_error"),
@@ -106,7 +114,47 @@ class MetricsRingTests(unittest.TestCase):
         recognition = self.minute()["recognition"]
 
         self.assertEqual(recognition["billed_lookups"], 0)
-        self.assertEqual(recognition["ocr_attempts"], 7)
+        self.assertEqual(recognition["ocr_attempts"], 6)
+
+    def test_an_ocr_timeout_is_billed_the_same_as_a_read_timeout(self):
+        # Both are one physical event -- the request went out and the reply did
+        # not come back in time -- seen from the decision's clock and from the
+        # socket's. The processor records an `ocr_timeout` attempt only past
+        # `ocr_started`, so by then the request had been launched.
+        self.ring.record_event_telemetry(telemetry((
+            attempt("ocr_timeout"),
+            attempt("ocr_error", cause="read_timeout"),
+        )))
+
+        recognition = self.minute()["recognition"]
+
+        self.assertEqual(recognition["billed_lookups"], 2)
+        self.assertEqual(recognition["ocr_timeout"], 1)
+
+    def test_a_read_that_never_left_the_pi_is_not_billed(self):
+        # The on-device reader answering in `fallback` mode: status
+        # `recognized`, and no request was posted. Billing it would count
+        # exactly the lookups on-device recognition stopped spending.
+        self.ring.record_event_telemetry(telemetry(
+            (attempt("recognized", source="local", cloud_lookup=False),),
+            local=LocalOcrTelemetry(mode="active", frames=1, status="recognized"),
+        ))
+
+        recognition = self.minute()["recognition"]
+
+        self.assertEqual(recognition["billed_lookups"], 0)
+        self.assertEqual(recognition["recognized"], 1)
+        self.assertEqual(recognition["local_recognized"], 1)
+
+    def test_a_local_read_in_always_mode_is_billed_because_the_request_went_out(self):
+        # `GATE_LOCAL_OCR_CLOUD=always`: the local read decided, the cloud
+        # request was posted anyway to label the frame, and the allowance was
+        # charged for it. Billing follows the request, not the reader.
+        self.ring.record_event_telemetry(telemetry(
+            (attempt("recognized", source="local", cloud_lookup=True),),
+        ))
+
+        self.assertEqual(self.minute()["recognition"]["billed_lookups"], 1)
 
     def test_local_reads_are_counted_beside_the_cloud_ones(self):
         self.ring.record_event_telemetry(telemetry(
@@ -130,20 +178,63 @@ class MetricsRingTests(unittest.TestCase):
         self.assertEqual(recognition["ocr_ms_p90"], 900)
 
     def test_throttled_requests_are_drained_from_the_ocr_client(self):
-        drained = [{"http_429": 2, "connection_error": 1}, {}]
+        current = minute_key(START)
+        drained = [{current: {"http_429": 2, "connection_error": 1}}, {}]
         ring = MetricsRing(clock=self.clock, retry_counts=lambda: drained.pop(0))
 
         ring.record_event_telemetry(telemetry((attempt("recognized"),)))
         ring.record_event_telemetry(telemetry((attempt("recognized"),)))
-        self.clock.advance(minutes=1)
+        self.clock.advance(minutes=BUCKET_MINUTES)
 
         self.assertEqual(ring.unsent_minutes()[0]["recognition"]["http_429"], 2)
+
+    def test_a_throttle_is_counted_in_the_minute_it_happened_in(self):
+        # A throttled burst is by definition the one that ran long, so it is
+        # the one most likely to finish -- and be drained -- in the minute
+        # after the 429. Crediting the drain minute pushed it into the next
+        # five-minute bucket four times in five.
+        throttled = minute_key(START)
+        drained = [{throttled: {"http_429": 1}}]
+        ring = MetricsRing(
+            clock=self.clock, retry_counts=lambda: drained.pop(0) if drained else {},
+        )
+        ring.record_heartbeat()
+
+        self.clock.advance(minutes=1)
+        ring.record_event_telemetry(telemetry((attempt("recognized"),)))
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        minutes = {
+            entry["minute_start"]: entry["recognition"]["http_429"]
+            for entry in ring.unsent_minutes()
+        }
+        self.assertEqual(minutes[throttled], 1)
+        self.assertEqual(minutes[minute_key(START + timedelta(minutes=1))], 0)
+
+    def test_a_throttle_from_a_minute_the_ring_never_opened_is_not_lost(self):
+        ring = MetricsRing(
+            clock=self.clock,
+            retry_counts=lambda: {"2026-09-08T09:00:00Z": {"http_429": 3}},
+        )
+
+        ring.record_event_telemetry(telemetry((attempt("recognized"),)))
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        self.assertEqual(
+            ring.unsent_minutes()[0]["recognition"]["http_429"], 3,
+            "counted late in the drain minute rather than dropped",
+        )
 
     def test_the_ocr_client_counts_a_throttled_request_for_the_ring_to_drain(self):
         ocr.count_retryable_failure("http_429")
         ocr.count_retryable_failure("http_429")
 
-        self.assertEqual(ocr.drain_retry_counts()["http_429"], 2)
+        drained = ocr.drain_retry_counts()
+
+        self.assertEqual(len(drained), 1, "one minute")
+        minute, causes = next(iter(drained.items()))
+        self.assertRegex(minute, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$")
+        self.assertEqual(causes["http_429"], 2)
         self.assertEqual(ocr.drain_retry_counts(), {})
 
     def test_heartbeats_are_counted_into_the_minute_they_landed_in(self):
@@ -152,18 +243,42 @@ class MetricsRingTests(unittest.TestCase):
 
         self.assertEqual(self.minute()["heartbeats"], 4)
 
-    def test_the_minute_in_progress_is_never_offered_for_sending(self):
+    def test_a_minute_from_the_bucket_in_progress_is_never_offered(self):
+        # A closed minute is not enough. The app replaces a five-minute bucket
+        # row with whatever arrives for it and walks its quota ledger to match,
+        # so offering :20 while :21 to :24 are still being counted would put
+        # one minute of a five-minute bucket on the wire and throw the other
+        # four away when they followed.
         self.ring.record_heartbeat()
-
         self.assertEqual(self.ring.unsent_minutes(), [])
 
         self.clock.advance(minutes=1)
+        self.assertEqual(
+            self.ring.unsent_minutes(), [], "the minute closed; its bucket did not",
+        )
+
+        self.clock.advance(minutes=BUCKET_MINUTES)
         self.assertEqual(len(self.ring.unsent_minutes()), 1)
+
+    def test_a_bucket_is_offered_whole_or_not_at_all(self):
+        for _ in range(7):
+            self.ring.record_heartbeat()
+            self.clock.advance(minutes=1)
+
+        # 10:20 to 10:26 recorded, the clock now at 10:27: the 10:20 bucket has
+        # closed and the 10:25 one has not.
+        minutes = [entry["minute_start"] for entry in self.ring.unsent_minutes()]
+
+        self.assertEqual(minutes, [
+            "2026-09-08T10:20:00Z", "2026-09-08T10:21:00Z", "2026-09-08T10:22:00Z",
+            "2026-09-08T10:23:00Z", "2026-09-08T10:24:00Z",
+        ])
 
     def test_a_minute_is_offered_once_and_never_again(self):
         self.ring.record_heartbeat()
-        self.clock.advance(minutes=1)
+        self.clock.advance(minutes=BUCKET_MINUTES)
         minutes = self.ring.unsent_minutes()
+        self.assertEqual(len(minutes), 1)
 
         self.ring.mark_sent(minutes)
 
@@ -232,19 +347,85 @@ class QuotaLedgerTests(unittest.TestCase):
         ledger.record_billed(2)
 
         self.assertEqual(ledger.month_to_date(), 5)
+        # The write is the rollup thread's job, not the burst thread's.
+        self.assertTrue(ledger.flush())
         self.assertEqual(self.ledger().month_to_date(), 5)
         self.assertEqual(
             json.loads(self.path.read_text()),
             {"month": "2026-09", "billed_lookups": 5},
         )
 
+    def test_the_burst_thread_never_touches_the_sd_card(self):
+        # `record_billed` runs from the pipeline wrapper, microseconds after a
+        # gate decision. An fsync there is a stall on the path that opens the
+        # gate; the rollup thread does the write on its own cycle instead.
+        ledger = self.ledger()
+        touched = []
+        for module, name in (("os", "fsync"), ("os", "replace")):
+            original = getattr(__import__(module), name)
+
+            def spy(*args, _name=name, _original=original, **kwargs):
+                touched.append(_name)
+                return _original(*args, **kwargs)
+
+            patch = unittest.mock.patch(f"{module}.{name}", spy)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+        ledger.record_billed(4)
+        self.assertEqual(touched, [], "no filesystem write on the burst path")
+
+        self.assertTrue(ledger.flush())
+        self.assertEqual(touched, ["fsync", "replace"])
+
+    def test_a_slow_card_does_not_block_the_heartbeat_or_the_next_burst(self):
+        # The heartbeat thread reads `quota_status` every 15 s and the burst
+        # thread counts into the same ledger. Neither may wait on an fsync,
+        # which means the lock must not span the write.
+        ledger = self.ledger()
+        ledger.record_billed(1)
+        writing = Event()
+        release = Event()
+        original = os.fsync
+
+        def slow_fsync(descriptor):
+            writing.set()
+            release.wait(5)
+            return original(descriptor)
+
+        patch = unittest.mock.patch("os.fsync", slow_fsync)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(release.set)
+
+        writer = Thread(target=ledger.flush, daemon=True)
+        writer.start()
+        self.assertTrue(writing.wait(5))
+
+        try:
+            self.assertEqual(ledger.month_to_date(), 1)
+            self.assertEqual(ledger.record_billed(1), 2)
+        finally:
+            release.set()
+            writer.join(5)
+        self.assertFalse(writer.is_alive())
+
+    def test_a_flush_with_nothing_new_writes_nothing(self):
+        ledger = self.ledger()
+        ledger.record_billed(1)
+
+        self.assertTrue(ledger.flush())
+        self.assertFalse(ledger.flush())
+
     def test_the_counter_starts_again_when_the_month_does(self):
         ledger = self.ledger()
         ledger.record_billed(7)
+        ledger.flush()
 
         self.clock.advance(days=30)
 
         self.assertEqual(ledger.month_to_date(), 0)
+        ledger.flush()
         self.assertEqual(json.loads(self.path.read_text())["month"], "2026-10")
 
     def test_a_counter_written_in_a_previous_month_is_not_carried_forward(self):
@@ -261,6 +442,39 @@ class QuotaLedgerTests(unittest.TestCase):
         self.assertIn("gate_metrics stage=quota_read_failed", logs.output[0])
         self.assertEqual(ledger.month_to_date(), 0)
 
+    def test_a_count_that_cannot_be_vouched_for_is_withheld_not_reported_as_zero(self):
+        # The tile has to read "not reported", never "0 of 2500" -- which says
+        # the owner has their whole month left on the day the card stopped
+        # taking writes, and is the reading that lets the gate stop opening.
+        self.path.write_text("{not json")
+        with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
+            ledger = self.ledger()
+
+        self.assertFalse(ledger.reportable())
+        self.assertIn(
+            "gate_metrics stage=quota_unreported detail=load",
+            "\n".join(logs.output),
+        )
+
+        ring = MetricsRing(quota=ledger, clock=self.clock, retry_counts=lambda: {})
+        ring.record_event_telemetry(telemetry((attempt("recognized"),)))
+
+        self.assertEqual(ring.quota_status(), {})
+        self.clock.advance(minutes=BUCKET_MINUTES)
+        self.assertNotIn("cloud", ring.unsent_minutes()[0])
+
+    def test_a_new_month_is_a_zero_the_controller_can_vouch_for_again(self):
+        self.path.write_text("{not json")
+        with self.assertLogs("gate_controller.metrics", level="WARNING"):
+            ledger = self.ledger()
+        self.assertFalse(ledger.reportable())
+
+        self.clock.advance(days=30)
+
+        with self.assertLogs("gate_controller.metrics", level="INFO") as logs:
+            self.assertTrue(ledger.reportable())
+        self.assertIn("gate_metrics stage=quota_reported", "\n".join(logs.output))
+
     def test_an_unwritable_ledger_is_journalled_once_and_keeps_counting(self):
         ledger = QuotaLedger(
             Path("/proc/gate-metrics-does-not-exist/quota.json"), clock=self.clock,
@@ -268,11 +482,19 @@ class QuotaLedgerTests(unittest.TestCase):
 
         with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
             ledger.record_billed(1)
+            ledger.flush()
             ledger.record_billed(1)
+            ledger.flush()
 
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("gate_metrics stage=quota_write_failed", logs.output[0])
+        journal = "\n".join(logs.output)
+        self.assertEqual(
+            journal.count("stage=quota_write_failed"), 1, "once, not per cycle",
+        )
+        self.assertIn("gate_metrics stage=quota_unreported detail=write", journal)
         self.assertEqual(ledger.month_to_date(), 2)
+        self.assertFalse(
+            ledger.reportable(), "counting continues; reporting does not",
+        )
 
     def test_the_ring_reports_the_burn_down_the_heartbeat_block_accepts(self):
         ring = MetricsRing(quota=self.ledger(), clock=self.clock, retry_counts=lambda: {})
@@ -285,7 +507,7 @@ class QuotaLedgerTests(unittest.TestCase):
             "recognition_lookups_month_to_date": 2,
             "recognition_lookup_quota": DEFAULT_LOOKUP_QUOTA,
         })
-        self.clock.advance(minutes=1)
+        self.clock.advance(minutes=BUCKET_MINUTES)
         cloud = ring.unsent_minutes()[0]["cloud"]
         self.assertEqual(cloud["recognition_lookups_month_to_date"], 2)
         self.assertEqual(cloud["recognition_lookup_quota"], DEFAULT_LOOKUP_QUOTA)
@@ -325,6 +547,7 @@ class MetricsSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ring = build_metrics_ring({}, state_directory=Path(directory))
             ring.record_event_telemetry(telemetry((attempt("recognized"),)))
+            ring.flush_quota()
 
             self.assertTrue((Path(directory) / "metrics-quota.json").is_file())
 

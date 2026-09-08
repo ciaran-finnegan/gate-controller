@@ -18,6 +18,12 @@ class PlateObservation:
     #: on-device recogniser. Matching never looks at it; it only tells the
     #: event and the app which reader opened the gate.
     source: str = "cloud"
+    #: Whether a cloud lookup was actually spent producing this read. Not the
+    #: same question as ``source``: under ``GATE_LOCAL_OCR_CLOUD=always`` the
+    #: on-device reader answers *and* the cloud request still goes out, so the
+    #: gate was opened locally and the allowance was charged anyway. The quota
+    #: burn-down counts this, never ``source``.
+    cloud_lookup: bool = True
 
 
 @dataclass(frozen=True)

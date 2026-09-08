@@ -18,7 +18,9 @@ import re
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from gate_controller.metrics import MetricsRing, MetricsRollupWorker, QuotaLedger
+from gate_controller.metrics import (
+    BUCKET_MINUTES, MetricsRing, MetricsRollupWorker, QuotaLedger, minute_key,
+)
 from gate_controller.telemetry import (
     EventTelemetry, LocalOcrTelemetry, OcrAttemptTelemetry, StageDurations,
 )
@@ -239,13 +241,18 @@ def a_busy_minute(ring):
 
 class ControllerMetricsContractTests(unittest.TestCase):
     def setUp(self):
-        # Recent, but safely inside the app's 5-minute future-skew bound.
-        self.clock = FrozenClock(
-            datetime.now(timezone.utc).replace(second=30, microsecond=0) - timedelta(minutes=10)
-        )
+        # Recent, but safely inside the app's 5-minute future-skew bound, and
+        # started on a five-minute boundary because that is where the worker
+        # posts from: whole buckets, never a fraction of one.
+        recent = datetime.now(timezone.utc) - timedelta(minutes=10)
+        self.clock = FrozenClock(recent.replace(
+            minute=recent.minute // BUCKET_MINUTES * BUCKET_MINUTES,
+            second=30, microsecond=0,
+        ))
         self.ring = MetricsRing(
             quota=QuotaLedger(None, quota=2500, clock=self.clock),
-            clock=self.clock, retry_counts=lambda: {"http_429": 1},
+            clock=self.clock,
+            retry_counts=lambda: {minute_key(self.clock()): {"http_429": 1}},
         )
         self.sent = Recorder()
         self.worker = MetricsRollupWorker(self.ring, self.sent, clock=self.clock)
@@ -254,6 +261,9 @@ class ControllerMetricsContractTests(unittest.TestCase):
         for _ in range(minutes):
             a_busy_minute(self.ring)
             self.clock.advance(minutes=1)
+        # Past the last bucket's boundary: a minute is only offered once the
+        # whole five-minute bucket it belongs to has closed.
+        self.clock.advance(minutes=BUCKET_MINUTES)
         self.assertEqual(self.worker.run_once(), minutes)
         return self.sent.payloads[0]
 
@@ -273,7 +283,7 @@ class ControllerMetricsContractTests(unittest.TestCase):
 
     def test_an_empty_minute_passes_the_contract(self):
         self.ring.record_heartbeat()
-        self.clock.advance(minutes=1)
+        self.clock.advance(minutes=BUCKET_MINUTES)
         self.worker.run_once()
 
         self.validate(self.sent.payloads[0])

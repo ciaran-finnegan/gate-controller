@@ -1,5 +1,6 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import re
 from collections.abc import Mapping
 from io import BytesIO
@@ -276,6 +277,37 @@ def _retry_after_seconds(response) -> float:
     return min(max(seconds, MIN_REQUEST_INTERVAL_SECONDS), MAX_RETRY_AFTER_SECONDS)
 
 
+def _read_timed_out(error: BaseException) -> bool:
+    """Whether the request was sent in full and only the reply was lost.
+
+    A failing classifier must never mask the original error, so it is simply
+    treated as not billable -- the same bias the burn-down keeps everywhere:
+    an undercount is recoverable, an overcount closes the gate early.
+    """
+    try:
+        return classify_failure_cause(error) == CAUSE_READ_TIMEOUT
+    except Exception:
+        return False
+
+
+def _spent(observation, state: dict):
+    """Stamp a read with whether a cloud lookup was actually spent on it.
+
+    One place decides it, and it is the dispatch site rather than the reader
+    that answered: under ``GATE_LOCAL_OCR_CLOUD=always`` the on-device read is
+    the answer and the request goes out regardless, so the gate opens locally
+    and the allowance is charged anyway. Under ``fallback`` a confident local
+    read returns before any ``session.post`` and nothing is charged. The quota
+    burn-down counts this flag, never ``source``.
+    """
+    if not isinstance(observation, PlateObservation):
+        return observation
+    spent = bool(state.get("cloud_lookup"))
+    if observation.cloud_lookup == spent:
+        return observation
+    return replace(observation, cloud_lookup=spent)
+
+
 def _retryable_transport_cause(error: BaseException) -> str | None:
     """Return the cause when the failure is worth one fresh-connection retry.
     A failing classifier must never mask the original error, so it is
@@ -312,34 +344,60 @@ def _corpus_local_plate(local) -> str | None:
     return plate if isinstance(plate, str) and plate.strip() else None
 
 
-# Retryable failures, counted by bounded cause since the last drain.
+# Retryable failures, counted by the minute they happened in and by bounded
+# cause, since the last drain.
 #
 # `http_429` is the one that has nowhere else to go: the retry at the call
 # site usually succeeds, so a throttled request currently leaves no trace in
 # `event_telemetry` at all and only a `gate_ocr stage=retry` line in the
 # journal. The metrics ring drains this after each burst; nothing else reads
 # it, and a drain that never comes cannot grow past the ceiling below.
+#
+# The minute is stamped here rather than at drain time. A drain happens when a
+# burst *finishes*, and a burst that was throttled is precisely the one that
+# ran long, so attributing its 429s to the drain minute pushed them into the
+# following minute -- and, four times in five, into the following five-minute
+# bucket -- whenever a burst straddled the boundary. Stamping costs one
+# `strftime` on a path that has just decided to sleep for a second.
 _MAX_RETRY_COUNT = 10_000_000
-_retry_counts: dict[str, int] = {}
+#: Enough minutes to hold anything a drain could reasonably be behind by. The
+#: ring drains after every burst; a map this size means a drain that never
+#: comes still cannot grow without bound.
+_MAX_RETRY_MINUTES = 180
+_retry_counts: dict[str, dict[str, int]] = {}
 _retry_counts_lock = Lock()
+
+
+def _retry_minute() -> str:
+    """The minute a retryable failure happened in, in the ring's own format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:00Z")
 
 
 def count_retryable_failure(cause: object) -> None:
     """Count one retryable OCR failure. Never raises: it is on the OCR path."""
     try:
         token = bounded_failure_cause(cause)
+        minute = _retry_minute()
         with _retry_counts_lock:
-            current = _retry_counts.get(token, 0)
+            causes = _retry_counts.get(minute)
+            if causes is None:
+                if len(_retry_counts) >= _MAX_RETRY_MINUTES:
+                    _retry_counts.pop(min(_retry_counts), None)
+                causes = _retry_counts[minute] = {}
+            current = causes.get(token, 0)
             if current < _MAX_RETRY_COUNT:
-                _retry_counts[token] = current + 1
+                causes[token] = current + 1
     except Exception:
         return
 
 
-def drain_retry_counts() -> dict[str, int]:
-    """Take and reset the counts accumulated since the previous drain."""
+def drain_retry_counts() -> dict[str, dict[str, int]]:
+    """Take and reset the counts accumulated since the previous drain.
+
+    Keyed by minute, then by cause: ``{"2026-09-08T10:24:00Z": {"http_429": 2}}``.
+    """
     with _retry_counts_lock:
-        drained = dict(_retry_counts)
+        drained = {minute: dict(causes) for minute, causes in _retry_counts.items()}
         _retry_counts.clear()
     return drained
 
@@ -503,9 +561,9 @@ class PlateRecognizerClient:
         try:
             while True:
                 try:
-                    return self._recognise_once(
+                    return _spent(self._recognise_once(
                         path, timeout, generation, trace_id, state,
-                    )
+                    ), state)
                 except _RetryableFailure as failure:
                     # Counted before the retry budget is consulted: a second
                     # 429 in one event is still a throttled request, and
@@ -526,7 +584,7 @@ class PlateRecognizerClient:
             decided = state.get("local_observation")
             if decided is None:
                 raise
-            return decided
+            return _spent(decided, state)
         finally:
             # Whatever happened to the cloud request, the shadow line is
             # still owed once the local read lands.
@@ -732,6 +790,11 @@ class PlateRecognizerClient:
                 # Classify and journal the transport failure, then let the
                 # original exception propagate unchanged, after one retry on
                 # a fresh connection when it never produced a response.
+                if _read_timed_out(error):
+                    # The body went out in full and the reply never came: the
+                    # service may already have accepted and charged for it,
+                    # which is the same reason this one is never retried.
+                    state["cloud_lookup"] = True
                 _log_transport_failure(error)
                 if _retryable_transport_cause(error) is not None:
                     cause = _retryable_transport_cause(error)
@@ -742,6 +805,10 @@ class PlateRecognizerClient:
         finally:
             upload.close()
 
+        # A response came back, so the allowance was charged -- whatever the
+        # status code says about what it was charged for, and whichever reader
+        # ends up answering for this frame.
+        state["cloud_lookup"] = True
         responded_at = self._clock()
         self._not_before = responded_at + MIN_REQUEST_INTERVAL_SECONDS
         with self._session_lock:

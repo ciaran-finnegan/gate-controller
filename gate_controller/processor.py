@@ -244,6 +244,11 @@ class GateProcessor:
                 # A frame that was never sent is not a timed-out lookup: the
                 # app counts `ocr_timeout` as billed, and nothing was billed.
                 if ocr_started and getattr(error, "attempted", True):
+                    # Recorded only past `ocr_started` and only for a frame
+                    # the dispatch site actually attempted. That is the same
+                    # physical event as a `read_timeout` -- the reply never
+                    # came back inside the budget -- and the quota burn-down
+                    # bills it the same way.
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_timeout",
@@ -274,6 +279,15 @@ class GateProcessor:
                 confidence=observation.confidence,
                 make=observation.make,
                 colour=observation.colour,
+                # Journal-only, and the reason the quota burn-down counts what
+                # the gate spent rather than what it read: in local `active` /
+                # cloud `fallback` a confident on-device read returns before
+                # any request is posted, and billing it would count exactly
+                # the lookups on-device recognition stopped spending. Both
+                # fields are absent from `to_wire`, so the event ingest
+                # contract is untouched.
+                source=getattr(observation, "source", "cloud"),
+                cloud_lookup=bool(getattr(observation, "cloud_lookup", True)),
             ))
             observations.append(observation)
             decision = decide_access(
@@ -1111,12 +1125,28 @@ def _recorded_failure_causes(telemetry) -> tuple:
         return ()
 
 
+def _recorded_readers(telemetry) -> tuple:
+    """`(source, cloud_lookup)` per attempt, for the journal line only."""
+    try:
+        return tuple(
+            (
+                getattr(attempt, "source", "cloud"),
+                bool(getattr(attempt, "cloud_lookup", True)),
+            )
+            for attempt in telemetry.ocr_attempts
+        )
+    except Exception:
+        return ()
+
+
 def _log_completed_trace(telemetry) -> None:
     try:
         wire = telemetry.to_wire()
-        # failure_cause is journal-only: it is absent from the wire payload
-        # because the ingest contract rejects unknown ocr_attempts keys.
+        # failure_cause, source and cloud_lookup are journal-only: they are
+        # absent from the wire payload because the ingest contract rejects
+        # unknown ocr_attempts keys.
         causes = _recorded_failure_causes(telemetry)
+        readers = _recorded_readers(telemetry)
         attempts = []
         for index, attempt in enumerate(wire.get("ocr_attempts", ())):
             entry = {
@@ -1127,6 +1157,16 @@ def _log_completed_trace(telemetry) -> None:
             cause = causes[index] if index < len(causes) else None
             if cause is not None:
                 entry["failure_cause"] = cause
+            # Only when they are not the ordinary cloud attempt, so the line
+            # stays short and the interesting case stands out: a read the
+            # on-device recogniser answered, and whether it cost a lookup.
+            source, cloud_lookup = (
+                readers[index] if index < len(readers) else ("cloud", True)
+            )
+            if source != "cloud":
+                entry["source"] = source
+            if not cloud_lookup:
+                entry["cloud_lookup"] = False
             attempts.append(entry)
         logging.getLogger(__name__).info(
             "gate_pipeline stage=processing_finished trace_id=%s outcome=%s reason=%s "
