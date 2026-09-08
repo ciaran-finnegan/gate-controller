@@ -603,6 +603,15 @@ load and warm-up timings and the state.
    the local reader answers - and only those.
 6. The kill switch is `GATE_LOCAL_OCR_MODE=off` and a restart.
 
+The saving is visible in the burn-down, not only in the latency. The
+five-minute rollup counts `billed_lookups` on whether a request was actually
+posted, so a frame the local reader answered under `fallback` is counted in
+`recognized` and `local_recognized` and costs nothing, while the same read
+under `always` is billed because the labelling request went out regardless.
+The journal says which for every attempt: `ocr_attempts=[{... "source":
+"local", "cloud_lookup": false}]`, both keys present only when they are not
+the ordinary cloud attempt. See "The billing rule" in `docs/deployment.md`.
+
 ## What is deliberately not here
 
 * **A local-only mode.** The cloud remains the fallback for everything the

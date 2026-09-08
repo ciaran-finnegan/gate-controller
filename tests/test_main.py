@@ -19,6 +19,7 @@ from gate_controller.__main__ import (
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
+from gate_controller.metrics import MetricsRing, MetricsRollupWorker, QuotaLedger
 from gate_controller.net_probe import NetProbeWorker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.relay import RelayController
@@ -646,6 +647,40 @@ class MainConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(workers[0]._telemetry_retention_days, 14)
         self.assertEqual(0, status()["queue_depth"])
+
+    def test_a_metrics_ring_adds_the_rollup_worker_and_counts_heartbeats(self):
+        """The producer the app's `/api/controller/metrics` never had."""
+        store = self.create_store()
+        ring = MetricsRing(quota=QuotaLedger(None))
+
+        workers, _, status = build_background_workers(store, relay=object(), environment={
+            "GATE_CLOUDFLARE_API_URL": "https://gate.example.com",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+            "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            "GATE_METRICS_ROLLUP_SECONDS": "600",
+        }, metrics=ring)
+
+        rollup = next(w for w in workers if isinstance(w, MetricsRollupWorker))
+        self.assertEqual(rollup.poll_interval, 600.0)
+        heartbeat = next(w for w in workers if isinstance(w, HeartbeatWorker))
+        self.assertIs(heartbeat._metrics, ring)
+        # The heartbeat's cloud block carries the burn-down as well, because
+        # the app's heartbeat allow-list already accepts both keys.
+        cloud = status()["cloud"]
+        self.assertEqual(cloud["recognition_lookups_month_to_date"], 0)
+        self.assertEqual(cloud["recognition_lookup_quota"], 2500)
+
+    def test_without_a_metrics_ring_no_rollup_worker_is_registered(self):
+        workers, _, status = build_background_workers(
+            self.create_store(), relay=object(), environment={
+                "GATE_CLOUDFLARE_API_URL": "https://gate.example.com",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_ID": "client-id",
+                "GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET": "client-secret",
+            },
+        )
+
+        self.assertFalse(any(isinstance(w, MetricsRollupWorker) for w in workers))
+        self.assertNotIn("recognition_lookup_quota", status()["cloud"])
 
     def test_telemetry_retention_days_must_be_a_positive_integer(self):
         for configured in ("0", "not-a-number"):

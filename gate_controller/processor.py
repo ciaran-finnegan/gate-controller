@@ -122,6 +122,15 @@ class GateProcessor:
         self._recognizer_accepts_trace_id = _accepts_keyword(
             self._recognise_call, "trace_id"
         )
+        # A recogniser that says when a request actually goes out lets an
+        # abandoned read be billed for what it spent rather than for how far
+        # it got; one that cannot keeps the assumption this counter has always
+        # made, that a cloud recogniser posts. `**kwargs` is not an answer
+        # here -- the callback has to be invoked, not merely accepted -- so
+        # this asks for the parameter by name.
+        self._recognizer_reports_post_start = _accepts_keyword(
+            self._recognise_call, "on_post_started", variadic=False,
+        )
         self._recognizer_accepts_attempt = _accepts_keyword(
             self._recognise_call, "attempt"
         )
@@ -217,16 +226,24 @@ class GateProcessor:
                 timed_out = True
                 break
             ocr_started = False
+            # "A request was posted for this frame." Only the dispatch site
+            # knows, so a recogniser that cannot say keeps the historic
+            # assumption that it posted; see `_recognizer_reports_post_start`.
+            cloud_request_posted = not self._recognizer_reports_post_start
 
             def mark_ocr_start(at=None):
                 nonlocal ocr_started
                 trace.mark_ocr_start(at)
                 ocr_started = True
 
+            def mark_post_started():
+                nonlocal cloud_request_posted
+                cloud_request_posted = True
+
             try:
                 observation = self._recognise(
                     path, deadline, mark_ocr_start, first_attempt=sequence == 0,
-                    trace_id=trace.trace_id,
+                    trace_id=trace.trace_id, on_post_started=mark_post_started,
                 )
             except _OcrBusy:
                 # The slot was taken, or the processor closed under the frame.
@@ -244,9 +261,21 @@ class GateProcessor:
                 # A frame that was never sent is not a timed-out lookup: the
                 # app counts `ocr_timeout` as billed, and nothing was billed.
                 if ocr_started and getattr(error, "attempted", True):
+                    # Recorded only past `ocr_started`, which is to say only
+                    # once the request thread had been launched -- which is
+                    # not the same as a request having gone out. Between the
+                    # two sit the 1.05 s pacing window, the downscaled upload
+                    # and the on-device guard, any of which can eat the last
+                    # of the budget with nothing sent. So `cloud_lookup` is
+                    # what the dispatch site reported, not what the launch
+                    # implied: an abandoned request that was posted is the
+                    # same physical event as a `read_timeout` and is billed
+                    # the same way, and one that never got that far is not
+                    # billed at all. Journal-only, like every `cloud_lookup`.
                     trace.add_ocr_attempt(OcrAttemptTelemetry(
                         frame_sequence=sequence,
                         status="ocr_timeout",
+                        cloud_lookup=cloud_request_posted,
                     ))
                 elif ocr_started:
                     # Marked, then refused before anything was billed: take
@@ -274,6 +303,15 @@ class GateProcessor:
                 confidence=observation.confidence,
                 make=observation.make,
                 colour=observation.colour,
+                # Journal-only, and the reason the quota burn-down counts what
+                # the gate spent rather than what it read: in local `active` /
+                # cloud `fallback` a confident on-device read returns before
+                # any request is posted, and billing it would count exactly
+                # the lookups on-device recognition stopped spending. Both
+                # fields are absent from `to_wire`, so the event ingest
+                # contract is untouched.
+                source=getattr(observation, "source", "cloud"),
+                cloud_lookup=bool(getattr(observation, "cloud_lookup", True)),
             ))
             observations.append(observation)
             decision = decide_access(
@@ -595,7 +633,8 @@ class GateProcessor:
         return attempt
 
     def _recognise(self, path: Path, deadline: float, on_start=None, *,
-                   first_attempt: bool = False, trace_id: str | None = None):
+                   first_attempt: bool = False, trace_id: str | None = None,
+                   on_post_started=None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
@@ -650,6 +689,8 @@ class GateProcessor:
             {"trace_id": trace_id}
             if self._recognizer_accepts_trace_id and trace_id else {}
         )
+        if self._recognizer_reports_post_start and on_post_started is not None:
+            extra["on_post_started"] = on_post_started
         # The budget is read when the operation actually runs, not now: the
         # OCR slot may still be held by an abandoned request, and a recogniser
         # that guards the decision with an on-device read has to bound that
@@ -1082,13 +1123,21 @@ def _bounded_min_cloud_request(value, decision_timeout: float) -> float:
     return seconds
 
 
-def _accepts_keyword(callable_object, keyword: str) -> bool:
+def _accepts_keyword(callable_object, keyword: str, *, variadic: bool = True) -> bool:
+    """Whether *callable_object* takes this keyword.
+
+    ``variadic=False`` asks for the parameter by name only. A ``**kwargs``
+    signature accepts anything and does nothing with it, which is the right
+    answer for a value being passed *in* and the wrong one for a callback the
+    callee is expected to invoke.
+    """
     try:
         parameters = inspect.signature(callable_object).parameters.values()
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        parameter.name == keyword
+        or (variadic and parameter.kind == inspect.Parameter.VAR_KEYWORD)
         for parameter in parameters
     )
 
@@ -1111,12 +1160,28 @@ def _recorded_failure_causes(telemetry) -> tuple:
         return ()
 
 
+def _recorded_readers(telemetry) -> tuple:
+    """`(source, cloud_lookup)` per attempt, for the journal line only."""
+    try:
+        return tuple(
+            (
+                getattr(attempt, "source", "cloud"),
+                bool(getattr(attempt, "cloud_lookup", True)),
+            )
+            for attempt in telemetry.ocr_attempts
+        )
+    except Exception:
+        return ()
+
+
 def _log_completed_trace(telemetry) -> None:
     try:
         wire = telemetry.to_wire()
-        # failure_cause is journal-only: it is absent from the wire payload
-        # because the ingest contract rejects unknown ocr_attempts keys.
+        # failure_cause, source and cloud_lookup are journal-only: they are
+        # absent from the wire payload because the ingest contract rejects
+        # unknown ocr_attempts keys.
         causes = _recorded_failure_causes(telemetry)
+        readers = _recorded_readers(telemetry)
         attempts = []
         for index, attempt in enumerate(wire.get("ocr_attempts", ())):
             entry = {
@@ -1127,6 +1192,16 @@ def _log_completed_trace(telemetry) -> None:
             cause = causes[index] if index < len(causes) else None
             if cause is not None:
                 entry["failure_cause"] = cause
+            # Only when they are not the ordinary cloud attempt, so the line
+            # stays short and the interesting case stands out: a read the
+            # on-device recogniser answered, and whether it cost a lookup.
+            source, cloud_lookup = (
+                readers[index] if index < len(readers) else ("cloud", True)
+            )
+            if source != "cloud":
+                entry["source"] = source
+            if not cloud_lookup:
+                entry["cloud_lookup"] = False
             attempts.append(entry)
         logging.getLogger(__name__).info(
             "gate_pipeline stage=processing_finished trace_id=%s outcome=%s reason=%s "
