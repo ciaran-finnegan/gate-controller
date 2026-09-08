@@ -312,6 +312,38 @@ def _corpus_local_plate(local) -> str | None:
     return plate if isinstance(plate, str) and plate.strip() else None
 
 
+# Retryable failures, counted by bounded cause since the last drain.
+#
+# `http_429` is the one that has nowhere else to go: the retry at the call
+# site usually succeeds, so a throttled request currently leaves no trace in
+# `event_telemetry` at all and only a `gate_ocr stage=retry` line in the
+# journal. The metrics ring drains this after each burst; nothing else reads
+# it, and a drain that never comes cannot grow past the ceiling below.
+_MAX_RETRY_COUNT = 10_000_000
+_retry_counts: dict[str, int] = {}
+_retry_counts_lock = Lock()
+
+
+def count_retryable_failure(cause: object) -> None:
+    """Count one retryable OCR failure. Never raises: it is on the OCR path."""
+    try:
+        token = bounded_failure_cause(cause)
+        with _retry_counts_lock:
+            current = _retry_counts.get(token, 0)
+            if current < _MAX_RETRY_COUNT:
+                _retry_counts[token] = current + 1
+    except Exception:
+        return
+
+
+def drain_retry_counts() -> dict[str, int]:
+    """Take and reset the counts accumulated since the previous drain."""
+    with _retry_counts_lock:
+        drained = dict(_retry_counts)
+        _retry_counts.clear()
+    return drained
+
+
 def _log_retry(cause: str, wait_seconds: float) -> None:
     try:
         _LOGGER.info(
@@ -475,6 +507,10 @@ class PlateRecognizerClient:
                         path, timeout, generation, trace_id, state,
                     )
                 except _RetryableFailure as failure:
+                    # Counted before the retry budget is consulted: a second
+                    # 429 in one event is still a throttled request, and
+                    # counting only the retried ones would understate it.
+                    count_retryable_failure(failure.cause)
                     if retries >= MAX_TRANSIENT_RETRIES:
                         raise failure.error
                     retries += 1

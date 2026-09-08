@@ -16,7 +16,9 @@ from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_sec
 from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
 )
-from .cloudflare_client import CloudflareServiceClient, CloudflareStatusReporter
+from .cloudflare_client import (
+    CloudflareMetricsReporter, CloudflareServiceClient, CloudflareStatusReporter,
+)
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .host_metrics import read_host_metrics
@@ -32,6 +34,9 @@ from .camera_control_state import (
     CAMERA_CONTROL_STATE_PATH, read_camera_control_state,
 )
 from .media_capabilities import read_media_capabilities
+from .metrics import (
+    MetricsRollupWorker, build_metrics_ring, metrics_rollup_seconds,
+)
 from .ocr import PlateRecognizerClient
 from .outbox import (
     CloudflareOutboxSender, HttpOutboxSender, OutboxWorker,
@@ -146,13 +151,20 @@ def main() -> None:
         if trigger_capture_config.enabled else None
     )
     corpus = _training_corpus(os.environ)
+    # The metrics ring is built here, before the workers, because two things
+    # need the same instance: the rollup worker that posts it, and the burst
+    # pipeline below that fills it. `None` when GATE_METRICS_ENABLED is false,
+    # and then nothing is constructed and no thread runs.
+    metrics = build_metrics_ring(
+        os.environ, state_directory=Path(arguments.database).resolve().parent,
+    )
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture,
-        corpus=corpus, activity=activity,
+        corpus=corpus, activity=activity, metrics=metrics,
     )
     recognizer = PlateRecognizerClient(
         token, max_upload_width=_ocr_upload_width(os.environ),
@@ -211,7 +223,7 @@ def main() -> None:
         # pulse. A frame from the FTP path never reaches trigger_capture's
         # span, so this is where that path claims the link.
         with activity.activity("burst"):
-                return processor.process(
+            result = processor.process(
                 paths,
                 received_at=received_at,
                 decision_started_at=decision_started_at,
@@ -219,6 +231,12 @@ def main() -> None:
                 trigger=trigger,
                 idempotency_key=idempotency_key,
             )
+        # Counted after the burst has answered and released the gate, from the
+        # telemetry the processor already built. The decision path is not
+        # touched, and a metric can never delay a relay pulse.
+        if metrics is not None:
+            metrics.record_processing_result(result)
+        return result
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
                        processing_started_at=None, *, trigger=None):
@@ -545,7 +563,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
-                             corpus=None, activity=None):
+                             corpus=None, activity=None, metrics=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -608,11 +626,24 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             trigger_capture=trigger_capture,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
+            metrics=metrics,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
+            metrics=metrics,
         )
         workers.append(heartbeat_worker)
+        # Only when a ring was handed in: the ring is fed by the burst
+        # pipeline in `main`, and a rollup worker posting an empty ring
+        # nobody feeds would be a POST that says nothing.
+        if metrics is not None:
+            workers.append(MetricsRollupWorker(
+                metrics,
+                CloudflareMetricsReporter(cloudflare_client, controller_id).send,
+                controller_id=controller_id,
+                poll_interval=metrics_rollup_seconds(environment),
+                activity=activity,
+            ))
         if net_probe is not None:
             workers.append(net_probe)
         if corpus_upload is not None:
@@ -696,7 +727,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        hot_stream=None, match_policy=None, local_recognizer=None,
                        trigger_capture=None, net_probe=None,
                        heartbeat=None, plates=None,
-                       corpus=None, corpus_upload=None, activity=None,
+                       corpus=None, corpus_upload=None, activity=None, metrics=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -742,7 +773,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     network = _network_status(net_probe)
     if network is not None:
         status["network"] = network
-    status["cloud"] = _cloud_status(store, heartbeat, plates, now)
+    status["cloud"] = _cloud_status(store, heartbeat, plates, now, metrics=metrics)
     corpus_status = _corpus_status(corpus, corpus_upload, activity)
     if corpus_status is not None:
         status["corpus"] = corpus_status
@@ -857,7 +888,7 @@ def _network_status(net_probe) -> dict | None:
     return measured if isinstance(measured, dict) else None
 
 
-def _cloud_status(store, heartbeat, plates, now: datetime) -> dict:
+def _cloud_status(store, heartbeat, plates, now: datetime, *, metrics=None) -> dict:
     cloud: dict = {
         "heartbeat_rtt_ms": None,
         "heartbeat_consecutive_failures": None,
@@ -882,6 +913,21 @@ def _cloud_status(store, heartbeat, plates, now: datetime) -> dict:
         cloud["oldest_pending_outbox_age_s"] = store.oldest_pending_outbox_age_seconds(now=now)
     except Exception:
         cloud["oldest_pending_outbox_age_s"] = None
+    # The quota pair rides the 15 s heartbeat as well as the five-minute
+    # rollup: the heartbeat's `cloud` block already allow-lists both keys, so
+    # the burn-down is live rather than up to five minutes stale. Nothing new
+    # is invented here -- an unknown heartbeat key is dropped silently, which
+    # is exactly the failure this phase exists to end.
+    quota = getattr(metrics, "quota_status", None)
+    if callable(quota):
+        try:
+            measured = quota()
+        except Exception:
+            measured = None
+        if isinstance(measured, dict):
+            for key, value in measured.items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    cloud[key] = value
     return cloud
 
 

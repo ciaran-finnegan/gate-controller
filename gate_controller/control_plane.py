@@ -9,12 +9,17 @@ LOGGER = logging.getLogger(__name__)
 
 class HeartbeatWorker:
     def __init__(self, control_plane, status, poll_interval: float = 15.0, *,
-                 health: TransitionLogger | None = None, clock=time.perf_counter):
+                 health: TransitionLogger | None = None, clock=time.perf_counter,
+                 metrics=None):
         self._control_plane = control_plane
         self._status = status
         self._poll_interval = poll_interval
         self._health = health or TransitionLogger(LOGGER, "heartbeat")
         self._clock = clock
+        # The metrics ring counts delivered heartbeats per minute, because the
+        # rollup contract requires the count and the app reads it as "was this
+        # controller reporting during that bucket".
+        self._metrics = metrics
         self._lock = Lock()
         self._last_rtt_ms: float | None = None
 
@@ -46,7 +51,17 @@ class HeartbeatWorker:
             return False
         self._record_round_trip(started)
         self._health.success()
+        self._count_heartbeat()
         return True
+
+    def _count_heartbeat(self) -> None:
+        record = getattr(self._metrics, "record_heartbeat", None)
+        if not callable(record):
+            return
+        try:
+            record()
+        except Exception:
+            return
 
     def _record_round_trip(self, started: float | None) -> None:
         if started is None:

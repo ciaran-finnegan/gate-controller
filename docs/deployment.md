@@ -259,8 +259,15 @@ the instrument this work exists to provide, which is why the ordering matters
 even though nothing breaks.
 
 `POST /api/controller/metrics` is the stricter one: an unrecognised key there
-rejects the whole body with `400`. Nothing in this phase posts to it yet, but
-the same rule applies when the phase-2 rollup does.
+rejects the whole body with `400`. The five-minute rollup described below is
+what posts to it, and that rule is why its wire format is an allow-list
+checked against a copy of the app's own contract in
+`tests/test_metrics_contract.py`.
+
+The heartbeat's `cloud` block also carries `recognition_lookups_month_to_date`
+and `recognition_lookup_quota`, so the quota burn-down is live at 15 s rather
+than up to five minutes stale. Both keys are in the app's heartbeat allow-list
+already; nothing here invents one.
 
 | Block | What it carries |
 | --- | --- |
@@ -287,6 +294,113 @@ used to be sent as `latest_camera_image`; it is now reported as
 `latest_camera_image_available` plus `latest_camera_image_age_seconds`. The
 default gateway is read from `/proc/net/route` and used only as a ping target,
 never reported.
+
+### Five-Minute Metrics Rollup
+
+The heartbeat says what is true now; it keeps no history at all, because
+`controller_status` is one row upserted every 15 s. The rollup is the history,
+and it is deliberately the cheapest possible one: the Pi aggregates, the cloud
+stores five-minute buckets, and a day of production traffic writes about 288
+rows against a free-plan allowance of 100,000 a day.
+
+`GATE_METRICS_ENABLED` (default `true`) adds **one** thread on a
+`GATE_METRICS_ROLLUP_SECONDS` poll (default `300`, accepted range 60-3600)
+inside the existing controller process -- no new systemd unit, no new
+credential. The POST goes through the same `CloudflareServiceClient` and
+Access service token as event ingest and the heartbeat.
+
+**What it carries.** One entry per whole minute, oldest first, at most 60
+minutes per POST (the contract's ceiling), so a 25-minute outage replays
+completely on reconnect instead of leaving a hole:
+
+```json
+{"controller_id": "primary", "schema_version": 1,
+ "minutes": [{"minute_start": "2026-09-08T10:20:00Z", "heartbeats": 4,
+   "recognition": {"ocr_attempts": 3, "billed_lookups": 2, "recognized": 1,
+     "unread_frames": 1, "ocr_error": 1, "ocr_timeout": 0, "ocr_busy": 0,
+     "http_429": 1, "ocr_ms_p50": 940, "ocr_ms_p90": 2000,
+     "local_attempts": 3, "local_recognized": 1},
+   "cloud": {"recognition_lookups_month_to_date": 412,
+     "recognition_lookup_quota": 2500}}]}
+```
+
+| Key | What it counts, per minute |
+| --- | --- |
+| `heartbeats` | Heartbeat POSTs that were acknowledged in that minute |
+| `ocr_attempts` | Every OCR attempt the burst pipeline made |
+| `billed_lookups` | The attempts Plate Recognizer charges for -- see below |
+| `recognized` | Attempts that returned a plate |
+| `unread_frames` | Attempts that returned no plate. **Never `no_plate`:** the contract refuses any key matching `/plate/` and rejects the whole body for it |
+| `ocr_error`, `ocr_timeout`, `ocr_busy` | Failed, abandoned at the decision deadline, and never sent because the OCR slot was taken |
+| `http_429` | Requests the 1 req/s throttle refused. The client retries and usually succeeds, so without this counter a throttled request leaves no trace outside the journal |
+| `ocr_ms_p50`, `ocr_ms_p90` | Attempt durations, from a bounded per-minute sample |
+| `local_attempts`, `local_recognized` | Frames the on-device reader completed, and events it answered |
+| `recognition_lookups_month_to_date`, `recognition_lookup_quota` | The burn-down against the 2,500/month allowance |
+
+**The billing rule.** The allowance is charged for a request the service
+actually processed, so `billed_lookups` counts an attempt that demonstrably
+reached the API:
+
+- **Billed:** `recognized` and `unread_frames` (a 2xx with or without a plate);
+  `read_timeout` -- the request was sent in full and the reply never arrived,
+  which is exactly why `ocr.py` refuses to retry it; and the response-shape
+  failures (`invalid_json`, `invalid_payload`, `invalid_results`,
+  `invalid_result_entry`, `invalid_confidence`, `invalid_response`,
+  `no_usable_plate`), which can only arise after a response body was received.
+- **Not billed:** `ocr_busy` (never left the Pi), `connect_timeout`,
+  `tls_error`, `connection_error` and `request_error` (never arrived), and
+  every `http_*` cause including `http_429` -- a throttled request is refused
+  before it is processed.
+- **Known undercount:** `ocr_timeout`, where the processor abandoned a request
+  whose decision budget ran out. It may or may not have been processed. It is
+  counted in `ocr_attempts` and `ocr_timeout` and deliberately not in
+  `billed_lookups`, because overstating the burn-down that decides whether the
+  gate still opens at the end of the month is the worse error.
+
+**Where the month-to-date figure comes from: the controller itself.** It is
+its own count, persisted in `metrics-quota.json` beside the database and reset
+when the UTC month changes, not a figure read back from the service. The
+Snapshot API reference documents no usage endpoint for the **cloud** API --
+`total_calls` and `usage.calls` are returned by the on-premise `/info/`
+endpoint, which this deployment does not run; it posts to
+`https://api.platerecognizer.com/v1/plate-reader/`. Even if a cloud usage
+endpoint were available it would put a second dependency on the token the
+decision path holds, and the app's contract asks for "the controller's own
+count" precisely because it cannot reconstruct one: most attempts return no
+plate and never become an event in D1. Cross-check it against the Plate
+Recognizer account dashboard rather than against anything the controller says.
+The allowance itself is configuration (`GATE_RECOGNITION_LOOKUP_QUOTA`,
+default `2500`), not a measurement -- if the plan changes, change the variable.
+
+**What it will not do.** The rollup ranks below event delivery, which ranks
+below the gate:
+
+- it stands down entirely while a gate decision is in flight, on the same
+  `ActivityGate` the corpus uploader uses;
+- it holds no lock across the POST, so a stalled endpoint cannot block the
+  pipeline that fills the ring;
+- a failure backs off from 5 s to 5 minutes rather than retrying in a tight
+  loop -- the behaviour that made the 2026-09-05 D1 outage worse -- and the
+  minutes stay pending until a 2xx;
+- the ring is memory only and fixed at 180 minutes; the oldest minute is
+  dropped when it is full, and nothing but the small month-to-date counter is
+  written to the SD card;
+- a minute is posted once and only after it has closed, so a bucket is never
+  half-counted and never counted twice.
+
+**In the journal**, one line per state change, never one per cycle:
+
+| Line | Meaning |
+| --- | --- |
+| `gate_metrics stage=rollup_failed detail=<http_status or error class> consecutive=<n>` | The POST failed; repeated at most every ten minutes |
+| `gate_metrics stage=rollup_recovered failures=<n>` | It is delivering again |
+| `gate_metrics stage=deferred reason=<activity>` / `stage=resumed` | Stood down for a gate decision, and back |
+| `gate_metrics stage=ring_full dropped=<n> capacity=<n>` | Minutes are ageing out undelivered -- the cloud path has been down for hours |
+| `gate_metrics stage=quota_write_failed detail=<error class>` / `stage=quota_read_failed` | The month-to-date counter could not be persisted or read; counting continues in memory |
+| `gate_metrics stage=record_failed` / `stage=cycle_failed` | A metric was dropped rather than allowed to raise into the pipeline |
+
+Setting `GATE_METRICS_ENABLED=false` constructs nothing: no ring, no ledger,
+no worker, no thread.
 
 ### Network Probe
 

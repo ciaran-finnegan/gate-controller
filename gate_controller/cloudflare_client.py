@@ -185,3 +185,26 @@ class CloudflareStatusReporter:
         self.client.post_json(
             "/api/controller/status", {**status, "controller_id": self._controller_id}
         )
+
+
+class CloudflareMetricsReporter:
+    """The five-minute rollup, on the same client and Access service token.
+
+    The body is posted exactly as the worker built it, including its own
+    ``controller_id``: unlike the heartbeat, the metrics contract rejects the
+    whole body for a single unexpected key, so the payload that a test
+    validates has to be the payload that goes on the wire.
+    """
+
+    def __init__(self, client, controller_id):
+        self.client = client
+        self._controller_id = controller_id
+
+    @property
+    def controller_id(self):
+        return self._controller_id
+
+    def send(self, payload) -> None:
+        self.client.post_json("/api/controller/metrics", payload)
+
+    __call__ = send
