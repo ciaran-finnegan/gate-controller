@@ -59,12 +59,7 @@ class ActuationCoordinator:
                 return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
                                           "actuation_inhibit_error")
             if claim.status == "cooldown":
-                cooldown_event = GateEvent(
-                    source=event.source, reason="cooldown", opened=False, idempotency_key=key,
-                    received_at=event.received_at, decision_at=claim_time,
-                    authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
-                    ocr_confidence=event.ocr_confidence,
-                )
+                cooldown_event = _cooldown_event(event, key, claim_time)
                 event_id = self._store.record_terminal_outcome(
                     cooldown_event, status="failed", detail="cooldown",
                     outbox_payload=outbox_payload, command_ack=command_ack,
@@ -75,13 +70,7 @@ class ActuationCoordinator:
             if (self._last_attempt_monotonic is not None
                     and monotonic_now - self._last_attempt_monotonic
                     < self._cooldown.total_seconds()):
-                cooldown_event = GateEvent(
-                    source=event.source, reason="cooldown", opened=False,
-                    idempotency_key=key, received_at=event.received_at,
-                    decision_at=claim_time, authorised_plate=event.authorised_plate,
-                    observed_plate=event.observed_plate,
-                    ocr_confidence=event.ocr_confidence,
-                )
+                cooldown_event = _cooldown_event(event, key, claim_time)
                 try:
                     event_id = self._store.finalize_actuation(
                         claim, cooldown_event, terminal_status="failed",
@@ -207,6 +196,29 @@ class ActuationCoordinator:
     def _reconcile_outbox(self, event_id: int | None, payload: dict | None) -> None:
         if event_id is not None and payload is not None:
             self._store.ensure_outbox(event_id, payload)
+
+
+def _cooldown_event(event: GateEvent, key: str, claim_time: datetime) -> GateEvent:
+    """The record of a decision that was granted while the gate was already open.
+
+    The relay is not pulsed a second time, but nothing about the *decision*
+    changed: the plate was authorised, at the confidence the reader gave it.
+    Recording it as a denial with ``reason="cooldown"`` was a lie the app
+    faithfully repeated -- on 8 September 2026 nine such rows read
+    "10-CE-1990 / Access Denied / 99.9%" for a car that had just been let in.
+
+    So the decision travels intact -- ``opened`` true, the match reason, the
+    plates and the confidence -- and the fact that this event did not work the
+    relay is carried by ``actuation_outcome`` locally, by the null
+    ``relay_activated_at`` on the wire, and by ``telemetry.actuation``
+    (``claim="cooldown"``, ``attempted=false``) for anyone reading the detail.
+    """
+    return GateEvent(
+        source=event.source, reason=event.reason, opened=True, idempotency_key=key,
+        received_at=event.received_at, decision_at=claim_time,
+        authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
+        ocr_confidence=event.ocr_confidence, actuation_outcome="cooldown",
+    )
 
 
 def _linux_boot_id() -> str | None:

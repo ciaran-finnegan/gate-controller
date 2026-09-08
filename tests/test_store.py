@@ -655,6 +655,66 @@ class LocalStoreTests(unittest.TestCase):
                     store.was_opened_since(datetime(2026, 8, 13, 9, 59, tzinfo=timezone.utc))
                 )
 
+    def test_adds_the_actuation_outcome_column_to_an_existing_database(self):
+        """The live Pi database predates the column; opening it must add it.
+
+        Every row already there is left NULL, which is what those rows meant:
+        none of them was a granted decision that skipped the relay.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("""
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY, received_at TEXT NOT NULL,
+                        decision_at TEXT, relay_activated_at TEXT,
+                        source TEXT NOT NULL, reason TEXT NOT NULL,
+                        opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE,
+                        authorised_plate TEXT, observed_plate TEXT,
+                        ocr_confidence REAL NOT NULL DEFAULT 0
+                    )
+                """)
+                connection.execute(
+                    """
+                    INSERT INTO events (received_at, source, reason, opened)
+                    VALUES ('2026-08-13T10:00:00+00:00', 'ocr', 'exact_match', 1)
+                    """
+                )
+                connection.commit()
+
+            store = LocalStore(database)
+
+            with closing(sqlite3.connect(database)) as connection:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(events)")
+                }
+                existing = connection.execute(
+                    "SELECT actuation_outcome FROM events"
+                ).fetchall()
+            still_counted = store.was_opened_since(
+                datetime(2026, 8, 13, 9, 59, tzinfo=timezone.utc)
+            )
+
+        self.assertIn("actuation_outcome", columns)
+        self.assertEqual(existing, [(None,)])
+        self.assertTrue(still_counted, "an existing opened row still holds the window")
+
+    def test_a_cooldown_record_is_not_evidence_that_the_relay_pulsed(self):
+        """`opened` says the gate was open; only a pulse holds the window."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            store.record_event(GateEvent(
+                source="ocr", reason="exact_match", opened=True,
+                idempotency_key="coalesced",
+                received_at=datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc),
+                authorised_plate="10CE1990", observed_plate="10CE1990",
+                ocr_confidence=0.999, actuation_outcome="cooldown",
+            ))
+
+            self.assertFalse(store.was_opened_since(
+                datetime(2026, 8, 13, 9, 59, tzinfo=timezone.utc)
+            ))
+
     def test_records_timed_event_and_queues_an_outbox_item(self):
         with tempfile.TemporaryDirectory() as directory:
             store = LocalStore(Path(directory) / "gate.db")

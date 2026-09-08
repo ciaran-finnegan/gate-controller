@@ -916,11 +916,20 @@ class LocalStore:
                     and monotonic_cutoff < 0):
                 return True
         cutoff_text = _timestamp(cutoff)
+        # The second clause is the fallback for an opened event that carries no
+        # relay timestamp -- legacy imports, and relays that report activation
+        # without an instant. A cooldown record looks exactly like that on the
+        # first two columns, because the decision was granted, so it has to be
+        # excluded explicitly: it is evidence that the gate was open, never
+        # evidence that this controller pulsed the relay. Counting one would let
+        # each coalesced frame of a burst slide the cooldown window forward and
+        # suppress the next vehicle's own grant.
         event = connection.execute(
             """
             SELECT 1 FROM events WHERE (
                 relay_activated_at >= ? OR
-                (opened = 1 AND relay_activated_at IS NULL AND received_at >= ?)
+                (opened = 1 AND relay_activated_at IS NULL AND received_at >= ?
+                 AND actuation_outcome IS NULL)
             ) LIMIT 1
             """, (cutoff_text, cutoff_text),
         ).fetchone()
@@ -963,13 +972,14 @@ class LocalStore:
             """
             INSERT INTO events (
                 received_at, decision_at, relay_activated_at, source, reason, opened,
-                idempotency_key, authorised_plate, observed_plate, ocr_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                idempotency_key, authorised_plate, observed_plate, ocr_confidence,
+                actuation_outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (_timestamp(event.received_at), _optional_timestamp(event.decision_at),
              _optional_timestamp(event.relay_activated_at), event.source, event.reason,
              int(event.opened), event.idempotency_key, event.authorised_plate,
-             event.observed_plate, event.ocr_confidence),
+             event.observed_plate, event.ocr_confidence, event.actuation_outcome),
         )
         return cursor.lastrowid
 
@@ -983,7 +993,8 @@ class LocalStore:
                     id INTEGER PRIMARY KEY, received_at TEXT NOT NULL, decision_at TEXT,
                     relay_activated_at TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
                     opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE, authorised_plate TEXT,
-                    observed_plate TEXT, ocr_confidence REAL NOT NULL DEFAULT 0
+                    observed_plate TEXT, ocr_confidence REAL NOT NULL DEFAULT 0,
+                    actuation_outcome TEXT
                 );
                 CREATE TABLE IF NOT EXISTS actuation_claims (
                     id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
@@ -1017,6 +1028,14 @@ class LocalStore:
                 CREATE INDEX IF NOT EXISTS event_telemetry_created_at
                     ON event_telemetry (created_at);
             """)
+            event_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(events)")
+            }
+            if "actuation_outcome" not in event_columns:
+                # NULL on every row written before this column existed, which is
+                # what those rows meant: none of them was a granted decision that
+                # skipped the relay.
+                connection.execute("ALTER TABLE events ADD COLUMN actuation_outcome TEXT")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(actuation_claims)")}
             for name in (
                 "terminal_status", "terminal_detail", "activation_attempt_at",

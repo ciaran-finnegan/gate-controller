@@ -246,6 +246,13 @@ and ranks completed frames inside 200 ms. Future camera settings that emit frame
 farther apart require fresh telemetry and calibration. CLI overrides must be
 finite and between 100 ms and 2 seconds.
 
+Every frame becomes one event in the app's log, and the decision it took is not
+the same question as whether it worked the relay: a plate matched while the
+gate was already open is a **grant** whose actuation was skipped, not a denial.
+The wire fields, the reason table, and the one app-side change still needed
+(frames no reader saw cannot yet report a null confidence) are in
+[gate event ingest](docs/gate-event-ingest.md).
+
 ## Camera Deployment
 
 The installed camera is an RLC-810A. See
