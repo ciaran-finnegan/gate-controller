@@ -39,9 +39,19 @@ same identity ``worker.BurstIdentity.camera_event`` already uses to decide
 which queued frame supersedes which, and the same one every frame of a
 presence session carries -- and each processing trace is *bound* to that key
 by the processor. A burst with no correlated alarm (a bare FTP burst) keys on
-its own trace id and can therefore only ever fit its own frames. Two alarms
-have different ``event_at`` values, so one passage's boxes can never be
-fitted into another's.
+its own trace id and can therefore only ever fit its own frames.
+
+That camera identity is **not unique over time**. This camera has a measured
+history of repeating a webhook body verbatim, and ``event_id`` in
+``reolink_events`` is a hash of the alarm time, so a repeated ``alarmTime``
+is the same key again -- two different vehicles pooled into one series, which
+produced a measured ``entering`` verdict built from another passage's boxes.
+Each camera key therefore carries a **generation**: the passage the tracker
+appends to is ``"<camera key>#<generation>"``, and
+:meth:`DirectionTracker.bind` starts a new generation whenever the passage
+that key last pointed at has been idle for longer than
+``PASSAGE_SESSION_GAP_SECONDS``. The old passage's samples are dropped there
+and then, so a finished passage is never appended to and never read again.
 
 Bounds
 ------
@@ -104,6 +114,16 @@ MAX_TRACKED_EVENTS = 64
 #: A passage untouched for this long is over. Well past the longest presence
 #: window the capture config allows (``MAX_PRESENCE_WINDOW_SECONDS``, 120 s).
 PASSAGE_TTL_SECONDS = 300.0
+#: How long one camera alarm may go without a frame and still be the same
+#: passage. A presence session runs for ``GATE_PRESENCE_WINDOW_SECONDS`` (20 s
+#: as shipped) and spaces its frames at ``GATE_PRESENCE_SPACING_SECONDS`` (3 s)
+#: plus one decision, so every frame of a real alarm lands well inside this.
+#: Past it the alarm identity has been *reused* -- a repeated ``alarmTime`` is
+#: the same key -- and the arriving frame belongs to a different vehicle, so
+#: :meth:`DirectionTracker.bind` starts a fresh generation rather than pooling
+#: two passages. Erring short costs a verdict (fewer frames, so ``unknown``);
+#: erring long costs a *wrong* verdict, which is the expensive mistake.
+PASSAGE_SESSION_GAP_SECONDS = 30.0
 
 #: d(log width)/dt at or below which the vehicle is receding. The analysis's
 #: gated exits ran to -0.093 at their weakest and its gated entering cars to
@@ -171,53 +191,38 @@ class DirectionConfig:
 def load_direction_config(environment=None) -> DirectionConfig:
     """Read ``GATE_DIRECTION_*``; an unset environment means the defaults.
 
-    The gate (``MIN_FRAMES``, ``MIN_SPAN_SECONDS``) may only be tightened.
-    Loosening it is what produced the single measured false exit, so it is
-    refused here rather than left to a deployment note.
+    Exactly one class of value is fatal: a **loosened gate**
+    (``MIN_FRAMES`` below :data:`MIN_MIN_FRAMES`, ``MIN_SPAN_SECONDS`` below
+    :data:`MIN_MIN_SPAN_SECONDS`). That is a safety property -- loosening it
+    is what produced the single measured false exit -- and an operator who
+    asked for it must be told, not quietly overruled.
+
+    Every other malformed knob falls back to its shipped default with one
+    loud ``gate_direction key=… status=rejected using=…`` line, the same way
+    ``match_policy._confidence_value`` handles a mistyped confidence bar. A
+    typo in a shadow signal's threshold must not stop the gate opening: this
+    loads before the relay, the store and the recogniser are touched, and the
+    controller has to come up.
     """
     environment = os.environ if environment is None else environment
-    enabled = _boolean(environment.get("GATE_DIRECTION_ENABLED"), True)
-    exit_slope = _number(
+    enabled = _boolean_knob(environment, "GATE_DIRECTION_ENABLED", True)
+    exit_slope = _float_knob(
         environment, "GATE_DIRECTION_EXIT_SLOPE", DEFAULT_EXIT_SLOPE,
+        lambda value: -MAX_SLOPE <= value < 0,
     )
-    enter_slope = _number(
+    # The two ranges are disjoint about zero, so a band accepted here can
+    # never be inverted: `exit_slope < 0 < enter_slope` holds by construction
+    # and needs no separate ordering check.
+    enter_slope = _float_knob(
         environment, "GATE_DIRECTION_ENTER_SLOPE", DEFAULT_ENTER_SLOPE,
+        lambda value: 0 < value <= MAX_SLOPE,
     )
-    if not -MAX_SLOPE <= exit_slope < 0:
-        raise DirectionConfigError(
-            f"GATE_DIRECTION_EXIT_SLOPE must be negative and at least {-MAX_SLOPE}"
-        )
-    if not 0 < enter_slope <= MAX_SLOPE:
-        raise DirectionConfigError(
-            f"GATE_DIRECTION_ENTER_SLOPE must be positive and at most {MAX_SLOPE}"
-        )
-    if exit_slope >= enter_slope:
-        raise DirectionConfigError(
-            "GATE_DIRECTION_EXIT_SLOPE must sit below GATE_DIRECTION_ENTER_SLOPE"
-        )
-    min_frames = _integer(
-        environment, "GATE_DIRECTION_MIN_FRAMES", DEFAULT_MIN_FRAMES,
-    )
-    if not MIN_MIN_FRAMES <= min_frames <= MAX_SAMPLES:
-        raise DirectionConfigError(
-            "GATE_DIRECTION_MIN_FRAMES must be between "
-            f"{MIN_MIN_FRAMES} and {MAX_SAMPLES}"
-        )
-    min_span = _number(
-        environment, "GATE_DIRECTION_MIN_SPAN_SECONDS", DEFAULT_MIN_SPAN_SECONDS,
-    )
-    if not MIN_MIN_SPAN_SECONDS <= min_span <= MAX_SPAN_MS / 1000:
-        raise DirectionConfigError(
-            "GATE_DIRECTION_MIN_SPAN_SECONDS must be between "
-            f"{MIN_MIN_SPAN_SECONDS} and {MAX_SPAN_MS // 1000}"
-        )
-    min_brightness = _number(
+    min_frames = _min_frames(environment)
+    min_span = _min_span_seconds(environment)
+    min_brightness = _float_knob(
         environment, "GATE_DIRECTION_MIN_BRIGHTNESS", DEFAULT_MIN_BRIGHTNESS,
+        lambda value: 0 <= value <= 1,
     )
-    if not 0 <= min_brightness <= 1:
-        raise DirectionConfigError(
-            "GATE_DIRECTION_MIN_BRIGHTNESS must be between 0 and 1"
-        )
     return DirectionConfig(
         enabled=enabled,
         exit_slope=exit_slope,
@@ -481,6 +486,11 @@ class DirectionTracker:
         self._lock = Lock()
         self._passages: "OrderedDict[str, _PassageDirection]" = OrderedDict()
         self._bindings: "OrderedDict[str, str]" = OrderedDict()
+        #: Camera key -> the passage key its *current* generation lives under.
+        #: A camera identity is reusable (a repeated ``alarmTime`` is the same
+        #: key), so the generation is what makes one passage one vehicle.
+        self._generations: "OrderedDict[str, str]" = OrderedDict()
+        self._sequence = 0
         self._counts: dict[str, int] = {}
         self._since_rollup = 0
 
@@ -498,12 +508,21 @@ class DirectionTracker:
         Unbound traces key on themselves, so nothing is ever pooled by
         accident: pooling is something the processor has to ask for, with an
         identity that came from the camera.
+
+        The camera's identity is reusable, so it is not the passage on its
+        own. If the passage this key last named has been idle longer than
+        ``PASSAGE_SESSION_GAP_SECONDS`` its session is over -- a repeated
+        ``alarmTime`` from this camera is exactly that -- and its samples are
+        dropped here and a new generation started. A finished passage is
+        never appended to.
         """
         if not self._config.enabled or not trace_id or not passage:
             return
         try:
             with self._lock:
-                self._bindings[trace_id] = str(passage)
+                now = self._clock()
+                self._expire(now)
+                self._bindings[trace_id] = self._generation(str(passage), now)
                 self._bindings.move_to_end(trace_id)
                 while len(self._bindings) > MAX_TRACKED_EVENTS:
                     self._bindings.popitem(last=False)
@@ -563,28 +582,42 @@ class DirectionTracker:
             with self._lock:
                 passage = self._passages.get(self._key(trace_id))
                 if passage is None:
-                    return UNMEASURED
-                series = {
-                    source: list(samples)
-                    for source, samples in passage.series.items()
-                }
-                brightest = passage.brightest
+                    series = None
+                    brightest = None
+                else:
+                    series = {
+                        source: list(samples)
+                        for source, samples in passage.series.items()
+                    }
+                    brightest = passage.brightest
+            if series is None:
+                # Nothing about this event was ever recorded -- not a box, not
+                # even a brightness. It is still one event that was asked, so
+                # it is counted: `estimates` has to be the event count for the
+                # other counters to have a denominator.
+                self._settle("no_passage")
+                return UNMEASURED
             if not series:
                 self._settle("no_boxes")
                 return UNMEASURED
             # Night is unmeasured (n=1 dark passage in the labelled set), so
             # a dark event says so rather than reporting a slope nobody has
-            # validated.
+            # validated. The test is the *brightest* frame of the passage:
+            # one lit frame is enough for the boxes to have been measurable,
+            # and a passage is night only when none of its frames was lit.
             if brightest is not None and brightest < self._config.min_brightness:
                 self._settle("night")
                 return UNMEASURED
             best = UNMEASURED
+            candidates: dict[str, DirectionEstimate] = {}
             for source in SOURCES:
                 candidate = estimate_direction(
                     series.get(source, ()), self._config, source=source,
                 )
+                candidates[source] = candidate
                 if _prefer(candidate, best):
                     best = candidate
+            self._note_disagreement(candidates)
             self._settle(best.verdict if best.method == METHOD_BOX_WIDTH
                          else "no_boxes")
             return best
@@ -624,6 +657,35 @@ class DirectionTracker:
         """Caller holds the lock. The passage this trace belongs to."""
         return self._bindings.get(trace_id, trace_id)
 
+    def _generation(self, camera: str, now: float) -> str:
+        """Caller holds the lock. This camera key's live passage key.
+
+        A new generation whenever the last one has gone quiet for longer than
+        any real alarm's frames are spaced. The stale passage is dropped in
+        the same breath, so its boxes cannot be read by the arriving vehicle
+        even through a binding that is still lying around.
+        """
+        current = self._generations.get(camera)
+        if current is not None:
+            existing = self._passages.get(current)
+            if (existing is not None
+                    and now - existing.touched_at > PASSAGE_SESSION_GAP_SECONDS):
+                self._passages.pop(current, None)
+                self._counts["reused_key"] = self._counts.get("reused_key", 0) + 1
+                LOGGER.info(
+                    "gate_direction stage=passage_restarted camera=%s idle=%.1f",
+                    camera, now - existing.touched_at,
+                )
+                current = None
+        if current is None:
+            self._sequence += 1
+            current = f"{camera}#{self._sequence}"
+            self._generations[camera] = current
+        self._generations.move_to_end(camera)
+        while len(self._generations) > MAX_TRACKED_EVENTS:
+            self._generations.popitem(last=False)
+        return current
+
     def _passage(self, trace_id: str, at: float) -> _PassageDirection:
         """Caller holds the lock. This trace's passage, created if needed."""
         self._expire(at)
@@ -648,6 +710,40 @@ class DirectionTracker:
             self._passages.pop(key, None)
             self._counts["expired"] = self._counts.get("expired", 0) + 1
 
+    def _note_disagreement(self, candidates: dict) -> None:
+        """Journal two box sources that fitted contradicting verdicts.
+
+        ``_prefer`` keeps the earlier source in :data:`SOURCES` and discards
+        the other silently; silently is the problem. The verdict selection is
+        unchanged -- the vehicle box wins because it is the series the
+        analysis measured, then the on-device plate box because it is the
+        densest -- but a passage whose detectors disagreed is a passage the
+        shadow review has to be able to find, and it is counted so the
+        rollup line says how often it happens.
+        """
+        try:
+            verdicts = {
+                source: estimate.verdict
+                for source, estimate in candidates.items()
+                if estimate.method == METHOD_BOX_WIDTH
+                and estimate.verdict != VERDICT_UNKNOWN
+            }
+            if len(set(verdicts.values())) < 2:
+                return
+            self._count("source_disagreement")
+            LOGGER.info(
+                "gate_direction stage=source_disagreement vehicle=%s local=%s "
+                "cloud=%s using=%s",
+                verdicts.get(SOURCE_VEHICLE_BOX, "-"),
+                verdicts.get(SOURCE_LOCAL_PLATE_BOX, "-"),
+                verdicts.get(SOURCE_PLATE_BOX, "-"),
+                next(
+                    (source for source in SOURCES if source in verdicts), "-",
+                ),
+            )
+        except Exception:
+            return
+
     def _count(self, key: str) -> None:
         with self._lock:
             self._counts[key] = self._counts.get(key, 0) + 1
@@ -664,12 +760,14 @@ class DirectionTracker:
             counts = dict(self._counts)
         LOGGER.info(
             "gate_direction stage=counters estimates=%d entering=%d exiting=%d "
-            "stationary=%d unknown=%d night=%d no_boxes=%d samples=%d "
-            "evicted=%d expired=%d",
+            "stationary=%d unknown=%d night=%d no_boxes=%d no_passage=%d "
+            "samples=%d disagreements=%d reused_keys=%d evicted=%d expired=%d",
             counts.get("estimates", 0), counts.get(VERDICT_ENTERING, 0),
             counts.get(VERDICT_EXITING, 0), counts.get(VERDICT_STATIONARY, 0),
             counts.get(VERDICT_UNKNOWN, 0), counts.get("night", 0),
-            counts.get("no_boxes", 0), counts.get("samples", 0),
+            counts.get("no_boxes", 0), counts.get("no_passage", 0),
+            counts.get("samples", 0), counts.get("source_disagreement", 0),
+            counts.get("reused_key", 0),
             counts.get("evicted", 0), counts.get("expired", 0),
         )
 
@@ -678,8 +776,18 @@ def _prefer(candidate: DirectionEstimate, incumbent: DirectionEstimate) -> bool:
     """Keep the more informative of two per-source estimates.
 
     A fitted verdict beats an unfitted one; between two fitted verdicts the
-    earlier source in ``SOURCES`` wins, which is why this only ever replaces
-    an incumbent that measured less.
+    earlier source in :data:`SOURCES` wins, which is why this only ever
+    replaces an incumbent that measured less. That order is the vehicle box,
+    then the on-device plate box, then the cloud plate box: the vehicle box
+    is the series the 42-passage analysis actually measured, the on-device
+    plate box is the densest because that detector runs on every frame, and
+    the cloud plate box only exists where a paid lookup came back, which is
+    the class of frame direction is least needed for.
+
+    A later source that contradicts the winner is discarded here, but not
+    silently: :meth:`DirectionTracker._note_disagreement` journals the
+    disagreement and counts it, because two detectors reading one passage
+    differently is the first thing the shadow review needs to see.
     """
     if candidate.method != METHOD_BOX_WIDTH:
         return False
@@ -690,40 +798,83 @@ def _prefer(candidate: DirectionEstimate, incumbent: DirectionEstimate) -> bool:
     return False
 
 
-def _boolean(value, default: bool) -> bool:
+def _raw(environment, key: str) -> str | None:
+    """The set, non-empty value of ``key``, or None when it is not set."""
+    value = environment.get(key)
     if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _reject(key: str, using) -> None:
+    """One loud line per refused knob, in the shape ``match_policy`` uses."""
+    LOGGER.warning("gate_direction key=%s status=rejected using=%s", key, using)
+
+
+def _boolean_knob(environment, key: str, default: bool) -> bool:
+    raw = _raw(environment, key)
+    if raw is None:
         return default
-    text = str(value).strip().lower()
-    if not text:
-        return default
+    text = raw.lower()
     if text in {"1", "true", "yes", "on"}:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    raise DirectionConfigError("GATE_DIRECTION_ENABLED must be a boolean")
+    _reject(key, "true" if default else "false")
+    return default
 
 
-def _number(environment, key: str, default: float) -> float:
-    raw = str(environment.get(key, "") or "").strip()
-    if not raw:
+def _float_knob(environment, key: str, default: float, accepts) -> float:
+    raw = _raw(environment, key)
+    if raw is None:
         return default
     try:
         value = float(raw)
-    except ValueError as error:
-        raise DirectionConfigError(f"{key} must be a number") from error
-    if not isfinite(value):
-        raise DirectionConfigError(f"{key} must be finite")
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not isfinite(value) or not accepts(value):
+        _reject(key, default)
+        return default
     return value
 
 
-def _integer(environment, key: str, default: int) -> int:
-    raw = str(environment.get(key, "") or "").strip()
-    if not raw:
-        return default
+def _min_frames(environment) -> int:
+    """The frame half of the gate. Loosening it is the one fatal setting."""
+    raw = _raw(environment, "GATE_DIRECTION_MIN_FRAMES")
+    if raw is None:
+        return DEFAULT_MIN_FRAMES
     try:
-        return int(raw)
-    except ValueError as error:
-        raise DirectionConfigError(f"{key} must be an integer") from error
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and value < MIN_MIN_FRAMES:
+        raise DirectionConfigError(
+            f"GATE_DIRECTION_MIN_FRAMES must be at least {MIN_MIN_FRAMES}"
+        )
+    if value is None or value > MAX_SAMPLES:
+        _reject("GATE_DIRECTION_MIN_FRAMES", DEFAULT_MIN_FRAMES)
+        return DEFAULT_MIN_FRAMES
+    return value
+
+
+def _min_span_seconds(environment) -> float:
+    """The span half of the gate. Loosening it is the one fatal setting."""
+    raw = _raw(environment, "GATE_DIRECTION_MIN_SPAN_SECONDS")
+    if raw is None:
+        return DEFAULT_MIN_SPAN_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and isfinite(value) and value < MIN_MIN_SPAN_SECONDS:
+        raise DirectionConfigError(
+            "GATE_DIRECTION_MIN_SPAN_SECONDS must be at least "
+            f"{MIN_MIN_SPAN_SECONDS}"
+        )
+    if value is None or not isfinite(value) or value > MAX_SPAN_MS / 1000:
+        _reject("GATE_DIRECTION_MIN_SPAN_SECONDS", DEFAULT_MIN_SPAN_SECONDS)
+        return DEFAULT_MIN_SPAN_SECONDS
+    return value
 
 
 def _optional_ratio(value) -> float | None:

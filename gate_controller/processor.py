@@ -230,9 +230,7 @@ class GateProcessor:
                 trace.disable()
             else:
                 trace.add_frame(frame_quality)
-                self._note_scene_brightness(
-                    trace.trace_id, frame_quality.brightness,
-                )
+                self._note_scene_brightness(trace.trace_id, frame_quality)
             remaining = self._decision_timeout - (self._decision_clock() - started)
             if remaining <= 0:
                 timed_out = True
@@ -552,7 +550,11 @@ class GateProcessor:
 
         The trace's binding to its camera alarm is dropped here, so the
         tracker holds nothing for an event that is over, and the samples of
-        one alarm can never be read by a trace bound to another.
+        one alarm can never be read by a trace bound to another. Every way
+        out of this method drops it: it is a ``finally``, because the five
+        early returns above it used to leak the binding of any event whose
+        estimate was missing, refused or unserialisable, and a leaked binding
+        is a trace still pointing at a passage it may go on collecting.
         """
         estimate_of = getattr(self._recognizer, "direction_estimate", None)
         if not callable(estimate_of):
@@ -561,25 +563,31 @@ class GateProcessor:
         if not trace_id:
             return
         try:
-            estimate = estimate_of(trace_id)
-        except Exception:
-            return
-        if estimate is None:
-            return
-        try:
-            block = estimate.to_wire()
-            logging.getLogger(__name__).info(
-                "gate_direction trace_id=%s %s", trace_id, estimate.journal(),
-            )
-        except Exception:
-            return
-        trace.set_direction(block)
-        forget = getattr(self._recognizer, "forget_direction", None)
-        if callable(forget):
             try:
-                forget(trace_id)
+                estimate = estimate_of(trace_id)
             except Exception:
                 return
+            if estimate is None:
+                return
+            try:
+                block = estimate.to_wire()
+                logging.getLogger(__name__).info(
+                    "gate_direction trace_id=%s %s", trace_id, estimate.journal(),
+                )
+            except Exception:
+                return
+            trace.set_direction(block)
+        finally:
+            self._forget_direction(trace_id)
+
+    def _forget_direction(self, trace_id) -> None:
+        forget = getattr(self._recognizer, "forget_direction", None)
+        if not callable(forget):
+            return
+        try:
+            forget(trace_id)
+        except Exception:
+            return
 
     def _bind_direction(self, trace, trigger) -> None:
         """Tell the direction tracker which camera alarm this trace belongs to.
@@ -597,18 +605,23 @@ class GateProcessor:
         except Exception:
             return
 
-    def _note_scene_brightness(self, trace_id, brightness) -> None:
+    def _note_scene_brightness(self, trace_id, frame_quality) -> None:
         """Tell the direction tracker how light this frame was.
 
         The night operating point is unmeasured (one dark passage in the
         labelled set), so a dark event has to be able to say ``unknown``
         instead of reporting a slope nobody has validated.
+
+        The whole expression -- reading ``brightness`` off the measurement
+        included -- is inside the guard. It was outside it, which put a bare
+        attribute access on a shadow signal's path in the middle of the
+        decision loop, where anything it raised would have cost the event.
         """
         note = getattr(self._recognizer, "note_direction_brightness", None)
         if not callable(note):
             return
         try:
-            note(trace_id, brightness)
+            note(trace_id, frame_quality.brightness)
         except Exception:
             return
 

@@ -16,9 +16,12 @@ fit recovers the recorded slope, and the gate and the thresholds then meet
 the real measured values rather than invented ones.
 """
 
+import dataclasses
+import inspect
 import json
 import logging
 import math
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -47,7 +50,10 @@ from gate_controller.direction import (
     load_direction_config,
     passage_key,
 )
+import gate_controller.__main__
+import gate_controller.processor as processor_module
 import gate_controller.telemetry_export as telemetry_export
+from gate_controller.direction import PASSAGE_SESSION_GAP_SECONDS
 from gate_controller.models import PlateObservation, RelayResult
 from gate_controller.ocr import PlateRecognizerClient
 from gate_controller.processor import GateProcessor
@@ -376,23 +382,76 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaises(DirectionConfigError):
                     load_direction_config(environment)
 
-    def test_thresholds_that_would_invert_the_band_are_refused(self):
-        refused = (
-            {"GATE_DIRECTION_EXIT_SLOPE": "0.05"},
-            {"GATE_DIRECTION_ENTER_SLOPE": "-0.05"},
-            {"GATE_DIRECTION_EXIT_SLOPE": "-0.01", "GATE_DIRECTION_ENTER_SLOPE": "-0.02"},
-            {"GATE_DIRECTION_EXIT_SLOPE": "-50"},
-            {"GATE_DIRECTION_ENTER_SLOPE": "50"},
-            {"GATE_DIRECTION_EXIT_SLOPE": "nonsense"},
-            {"GATE_DIRECTION_EXIT_SLOPE": "nan"},
-            {"GATE_DIRECTION_MIN_FRAMES": "many"},
-            {"GATE_DIRECTION_MIN_BRIGHTNESS": "1.5"},
-            {"GATE_DIRECTION_ENABLED": "maybe"},
+    def test_only_a_loosened_gate_stops_the_controller_starting(self):
+        """Everything else is a journal line and a default, not an abort.
+
+        A mistyped knob on a shadow signal used to raise out of `main`, after
+        the local recogniser's threads had started and the store had recovered
+        its interrupted actuations. The gate is a safety property and stays
+        fatal; nothing else here is worth a gate that will not open.
+        """
+        defaults = DirectionConfig()
+        tolerated = (
+            ({"GATE_DIRECTION_ENABLED": "ture"}, "enabled", defaults.enabled),
+            ({"GATE_DIRECTION_ENABLED": "maybe"}, "enabled", defaults.enabled),
+            ({"GATE_DIRECTION_EXIT_SLOPE": "-0,06"}, "exit_slope", defaults.exit_slope),
+            ({"GATE_DIRECTION_EXIT_SLOPE": "nonsense"}, "exit_slope", defaults.exit_slope),
+            ({"GATE_DIRECTION_EXIT_SLOPE": "nan"}, "exit_slope", defaults.exit_slope),
+            ({"GATE_DIRECTION_EXIT_SLOPE": "0.05"}, "exit_slope", defaults.exit_slope),
+            ({"GATE_DIRECTION_EXIT_SLOPE": "-50"}, "exit_slope", defaults.exit_slope),
+            ({"GATE_DIRECTION_ENTER_SLOPE": "-0.05"}, "enter_slope", defaults.enter_slope),
+            ({"GATE_DIRECTION_ENTER_SLOPE": "50"}, "enter_slope", defaults.enter_slope),
+            ({"GATE_DIRECTION_MIN_BRIGHTNESS": "20"}, "min_brightness",
+             defaults.min_brightness),
+            ({"GATE_DIRECTION_MIN_BRIGHTNESS": "1.5"}, "min_brightness",
+             defaults.min_brightness),
+            ({"GATE_DIRECTION_MIN_FRAMES": "3.0"}, "min_frames", defaults.min_frames),
+            ({"GATE_DIRECTION_MIN_FRAMES": "many"}, "min_frames", defaults.min_frames),
+            ({"GATE_DIRECTION_MIN_FRAMES": "99"}, "min_frames", defaults.min_frames),
+            ({"GATE_DIRECTION_MIN_SPAN_SECONDS": "soon"}, "min_span_seconds",
+             defaults.min_span_seconds),
+            ({"GATE_DIRECTION_MIN_SPAN_SECONDS": "99999"}, "min_span_seconds",
+             defaults.min_span_seconds),
         )
-        for environment in refused:
+        for environment, field, expected in tolerated:
             with self.subTest(environment=environment):
-                with self.assertRaises(DirectionConfigError):
-                    load_direction_config(environment)
+                with self.assertLogs("gate_controller.direction", "WARNING") as logs:
+                    config = load_direction_config(environment)
+                self.assertEqual(getattr(config, field), expected)
+                key = next(iter(environment))
+                self.assertIn(
+                    f"gate_direction key={key} status=rejected using=",
+                    "\n".join(logs.output),
+                )
+
+    def test_a_band_that_would_invert_cannot_survive_the_two_ranges(self):
+        """Whatever is set, the accepted band still straddles zero."""
+        with self.assertLogs("gate_controller.direction", "WARNING"):
+            config = load_direction_config({
+                "GATE_DIRECTION_EXIT_SLOPE": "0.05",
+                "GATE_DIRECTION_ENTER_SLOPE": "-0.02",
+            })
+
+        self.assertLess(config.exit_slope, 0)
+        self.assertGreater(config.enter_slope, 0)
+        self.assertLess(config.exit_slope, config.enter_slope)
+
+    def test_the_direction_config_is_read_before_any_hardware_or_thread(self):
+        """`main` must reach its one fatal setting before it commits to anything.
+
+        Asserted on the source because the alternative is booting a relay: the
+        refusal used to sit below `store.recover_interrupted_actuations()` and
+        `local_recognizer.start()`, so a mistyped gate took the controller down
+        with threads running and the store already recovered.
+        """
+        source = inspect.getsource(gate_controller.__main__.main)
+        loaded = source.index("load_direction_config(")
+        for later in (
+            "RelayController(", "LocalStore(", "recover_interrupted_actuations(",
+            "local_recognizer.start()", "build_background_workers(",
+        ):
+            with self.subTest(after=later):
+                self.assertLess(loaded, source.index(later))
 
 
 class PassageKeyTests(unittest.TestCase):
@@ -489,6 +548,97 @@ class TrackerTests(unittest.TestCase):
         self.feed(tracker, "trace-2", [0.10])
 
         self.assertEqual(tracker.estimate("trace-2").frames, 3)
+
+    def test_a_repeated_alarm_never_reads_the_previous_vehicle_s_boxes(self):
+        """This camera repeats webhook bodies, and the key hashes `alarmTime`.
+
+        Two vehicles 40 s apart under one repeated alarm identity used to be
+        pooled into one series: the second passage's verdict was fitted from
+        boxes the first vehicle produced. The second passage must be built
+        from its own frames and nothing else.
+        """
+        tracker = self.tracker()
+        alarm = "reolink_webhook|vehicle|gate_rule|2026-09-08T10:00:00+00:00"
+        tracker.bind("trace-1", alarm)
+        self.feed(tracker, "trace-1", [0.40, 0.20, 0.10])
+        self.assertEqual(tracker.estimate("trace-1").verdict, VERDICT_EXITING)
+        tracker.forget("trace-1")
+
+        # The same alarmTime again, 40 s later: a different vehicle.
+        self.now += 40.0
+        tracker.bind("trace-2", alarm)
+        self.feed(tracker, "trace-2", [0.10, 0.20, 0.40])
+
+        estimate = tracker.estimate("trace-2")
+        self.assertEqual(estimate.frames, 3, "only its own boxes")
+        self.assertEqual(estimate.verdict, VERDICT_ENTERING)
+
+    def test_a_restarted_passage_is_journalled_and_counted(self):
+        tracker = self.tracker()
+        tracker.bind("trace-1", "alarm-a")
+        self.feed(tracker, "trace-1", [0.40])
+        self.now += PASSAGE_SESSION_GAP_SECONDS + 1.0
+
+        with self.assertLogs("gate_controller.direction", level="INFO") as logs:
+            tracker.bind("trace-2", "alarm-a")
+
+        self.assertIn("stage=passage_restarted", "\n".join(logs.output))
+        self.assertEqual(tracker.counters().get("reused_key"), 1)
+
+    def test_a_gap_inside_one_session_still_pools_its_frames(self):
+        tracker = self.tracker()
+        tracker.bind("trace-1", "alarm-a")
+        self.feed(tracker, "trace-1", [0.40])
+        tracker.forget("trace-1")
+        self.now += PASSAGE_SESSION_GAP_SECONDS - 2.0
+        tracker.bind("trace-2", "alarm-a")
+        self.feed(tracker, "trace-2", [0.20, 0.10])
+
+        self.assertEqual(tracker.estimate("trace-2").frames, 3)
+
+    def test_two_sources_that_disagree_are_journalled_and_counted(self):
+        tracker = self.tracker()
+        tracker.bind("trace-1", "alarm-a")
+        self.feed(tracker, "trace-1", [0.40, 0.20, 0.10])
+        self.now = 0.0
+        self.feed(tracker, "trace-1", [0.02, 0.04, 0.08],
+                  source=SOURCE_LOCAL_PLATE_BOX)
+
+        with self.assertLogs("gate_controller.direction", level="INFO") as logs:
+            estimate = tracker.estimate("trace-1")
+
+        journal = "\n".join(logs.output)
+        self.assertIn(
+            "gate_direction stage=source_disagreement vehicle=exiting "
+            "local=entering cloud=- using=vehicle_box",
+            journal,
+        )
+        self.assertEqual(tracker.counters().get("source_disagreement"), 1)
+        # The selection rule itself is unchanged: the vehicle box still wins.
+        self.assertEqual(estimate.verdict, VERDICT_EXITING)
+        self.assertEqual(estimate.source, SOURCE_VEHICLE_BOX)
+
+    def test_sources_that_agree_are_not_reported_as_a_disagreement(self):
+        tracker = self.tracker()
+        tracker.bind("trace-1", "alarm-a")
+        self.feed(tracker, "trace-1", [0.40, 0.20, 0.10])
+        self.now = 0.0
+        self.feed(tracker, "trace-1", [0.08, 0.04, 0.02],
+                  source=SOURCE_LOCAL_PLATE_BOX)
+
+        tracker.estimate("trace-1")
+
+        self.assertIsNone(tracker.counters().get("source_disagreement"))
+
+    def test_an_event_the_tracker_never_saw_is_still_one_estimate(self):
+        """`estimates` is the event count, so every counter has a denominator."""
+        tracker = self.tracker()
+
+        self.assertEqual(tracker.estimate("trace-1"), DirectionEstimate())
+
+        counters = tracker.counters()
+        self.assertEqual(counters.get("estimates"), 1)
+        self.assertEqual(counters.get("no_passage"), 1)
 
     def test_box_sources_are_never_fitted_as_one_series(self):
         """Vehicle widths and plate widths are on different scales."""
@@ -660,6 +810,27 @@ class _Recognizer:
         self.tracker.forget(trace_id)
 
 
+#: Keys whose value is a wall clock rather than a decision: any duration in
+#: milliseconds, and any timestamp. Two runs of the same frames make the same
+#: decision and never the same microseconds, so these are what the shadow
+#: comparison has to drop -- comparing them made it fail roughly one run in
+#: seven under load.
+_WALL_CLOCK_KEY = re.compile(r"(?:_ms|_at)\Z|\Aat\Z")
+
+
+def _without_wall_clock(value):
+    """``value`` with every wall-clock key removed, at every depth."""
+    if isinstance(value, dict):
+        return {
+            key: _without_wall_clock(item)
+            for key, item in value.items()
+            if not _WALL_CLOCK_KEY.search(key)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_wall_clock(item) for item in value]
+    return value
+
+
 class ProcessorShadowTests(unittest.TestCase):
     """The block ships on every event and changes nothing about any of them."""
 
@@ -756,6 +927,26 @@ class ProcessorShadowTests(unittest.TestCase):
         for field in ("verdict=", "slope=", "frames=", "span_ms=", "score="):
             self.assertIn(field, lines[0])
 
+    def test_wall_clock_measurements_are_scrubbed_before_the_comparison(self):
+        """The shadow comparison must compare the decision, not the stopwatch.
+
+        `ocr_attempts` carries a real `duration_ms`, so comparing the two runs
+        verbatim compared two wall clocks and failed under load. Every key
+        ending `_ms` and every timestamp goes, at every depth, on both sides.
+        """
+        scrubbed = _without_wall_clock({
+            "duration_ms": 41,
+            "attempts": [{"outcome": "ok", "duration_ms": 7, "queued_ms": 1}],
+            "stage_timestamps": {"decided_at": "2026-09-08T10:00:00Z"},
+            "decision": {"reason": "authorised", "at": "2026-09-08T10:00:00Z"},
+        })
+
+        self.assertEqual(scrubbed, {
+            "attempts": [{"outcome": "ok"}],
+            "stage_timestamps": {},
+            "decision": {"reason": "authorised"},
+        })
+
     def test_the_decision_is_identical_with_the_estimator_on_and_off(self):
         """#94's acceptance criterion: shadow mode reaches no decision path."""
         frames = [self.jpeg("shadow-a.jpg"), self.jpeg("shadow-b.jpg", colour=90)]
@@ -770,8 +961,13 @@ class ProcessorShadowTests(unittest.TestCase):
                 wire.pop("direction", None)
                 results.append((
                     outcome.opened, outcome.reason,
-                    wire["decision"], wire["actuation"], wire["ocr_attempts"],
-                    [dict(item) for item in wire["frames"]],
+                    # Every wall-clock measurement is scrubbed on both sides:
+                    # what is being asserted is that the estimator changed no
+                    # decision, not that two runs took the same microseconds.
+                    _without_wall_clock(wire["decision"]),
+                    _without_wall_clock(wire["actuation"]),
+                    _without_wall_clock(wire["ocr_attempts"]),
+                    _without_wall_clock(wire["frames"]),
                 ))
             return results
 
@@ -809,6 +1005,65 @@ class ProcessorShadowTests(unittest.TestCase):
 
         self.assertTrue(result.opened)
         self.assertNotIn("direction", result.telemetry.to_wire())
+
+    def test_the_binding_is_dropped_however_the_estimate_ends(self):
+        """Five early returns used to leave the trace bound to its passage.
+
+        A binding that outlives its event is a trace still pointing at a
+        passage, holding it against the cap and able to be read again.
+        """
+        class _NoEstimate(_Recognizer):
+            def direction_estimate(self, trace_id):
+                return None
+
+        class _Exploding(_Recognizer):
+            def direction_estimate(self, trace_id):
+                raise RuntimeError("estimator exploded")
+
+        class _Unserialisable(_Recognizer):
+            def direction_estimate(self, trace_id):
+                class _Rotten:
+                    def to_wire(self):
+                        raise RuntimeError("unserialisable")
+                return _Rotten()
+
+        for index, recogniser_type in enumerate(
+            (_NoEstimate, _Exploding, _Unserialisable)
+        ):
+            with self.subTest(recogniser=recogniser_type.__name__):
+                tracker = self.tracker()
+                recognizer = recogniser_type(tracker)
+                processor = self.processor(recognizer, name=f"forget-{index}.db")
+                self.addCleanup(processor.close)
+
+                processor.process(
+                    (self.jpeg(f"forget-{index}.jpg"),), trigger=self.trigger(),
+                )
+
+                self.assertEqual(
+                    tracker._bindings, {},
+                    "the event is over, so its binding is gone",
+                )
+
+    def test_a_frame_measurement_without_a_brightness_never_costs_the_event(self):
+        """The whole expression belongs inside the guard, the attribute too."""
+        @dataclasses.dataclass(frozen=True)
+        class _NoBrightness:
+            sequence: int = 0
+
+        original = processor_module.measure_frame_quality
+        processor_module.measure_frame_quality = (
+            lambda path, digest=None: _NoBrightness()
+        )
+        self.addCleanup(
+            setattr, processor_module, "measure_frame_quality", original,
+        )
+        processor = self.processor(_Recognizer(self.tracker()))
+        self.addCleanup(processor.close)
+
+        result = processor.process((self.jpeg("a.jpg"),), trigger=self.trigger())
+
+        self.assertTrue(result.opened)
 
     def test_a_recogniser_without_the_hooks_ships_no_block_at_all(self):
         class _Old:
@@ -1024,6 +1279,36 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("100", doc)
         self.assertIn("gate_direction stage=counters", doc)
         self.assertIn("PI_STATUS_CAPABILITY_KEYS", doc)
+
+    def test_the_night_gate_is_documented_the_way_the_code_gates(self):
+        """The code suppresses on the BRIGHTEST frame; the docs said any frame.
+
+        Both files described the opposite rule, and the tracker's own test
+        (`one lit frame of the passage is enough`) asserts the code's. A
+        deployment note that inverts a suppression rule is how an operator
+        sets `GATE_DIRECTION_MIN_BRIGHTNESS` to the wrong side of the data.
+        """
+        for name in ("docs/deployment.md", ".env.example"):
+            with self.subTest(document=name):
+                text = (self.ROOT / name).read_text(encoding="utf-8")
+                section = text[text.index("GATE_DIRECTION_MIN_BRIGHTNESS") - 800:]
+                self.assertRegex(section.lower(), r"brightest")
+                self.assertRegex(
+                    section.lower(),
+                    r"(a )?(single|one) (dark|lit) frame does\s+\*?\*?not\*?\*?",
+                )
+
+    def test_the_deployment_doc_states_the_recall_on_the_whole_set(self):
+        doc = (self.ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+
+        self.assertIn("7 of 12", doc)
+        self.assertIn("five exits fail the gate", doc)
+
+    def test_the_deployment_doc_says_what_the_replay_test_does_not_prove(self):
+        doc = (self.ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+
+        self.assertIn("42 recorded slopes", doc)
+        self.assertIn("does **not** validate the fitter against raw box widths", doc)
 
 
 if __name__ == "__main__":  # pragma: no cover

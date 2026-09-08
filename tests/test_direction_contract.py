@@ -47,8 +47,13 @@ from gate_controller.telemetry import (
 
 
 DIRECTION_KEYS = ("verdict", "method", "score", "slope", "frames", "span_ms")
-DIRECTION_VERDICT = re.compile(r"^(?:entering|exiting|stationary|unknown)$")
-DIRECTION_METHOD = re.compile(r"^(?:box_width|none)$")
+#: `\Z`, not `$`, and matched with `fullmatch`: JavaScript's `$` anchors at
+#: the very end of the string, Python's also matches *before* a trailing
+#: newline. Transcribed with `$` and `re.match`, this copy accepted
+#: `"exiting\n"` that the Worker's own `RegExp#test` would reject, which is the
+#: one direction a transcription must never be wrong in.
+DIRECTION_VERDICT = re.compile(r"(?:entering|exiting|stationary|unknown)\Z")
+DIRECTION_METHOD = re.compile(r"(?:box_width|none)\Z")
 MAX_DIRECTION_SLOPE = 10
 MAX_DIRECTION_FRAMES = 64
 MAX_DIRECTION_SPAN_MS = 600_000
@@ -93,7 +98,7 @@ def optional_number(value, minimum, maximum, field):
 
 
 def require_pattern(value, pattern, field):
-    if not isinstance(value, str) or not pattern.match(value):
+    if not isinstance(value, str) or not pattern.fullmatch(value):
         raise ContractRejection(f"{field} is invalid")
     return value
 
@@ -144,6 +149,25 @@ class TranscriptionTests(unittest.TestCase):
             self.assertRegex(verdict, DIRECTION_VERDICT)
         for method in (METHOD_BOX_WIDTH, METHOD_NONE):
             self.assertRegex(method, DIRECTION_METHOD)
+
+    def test_a_trailing_newline_is_refused_the_way_the_worker_refuses_it(self):
+        """`/^exiting$/.test('exiting\\n')` is false in JavaScript.
+
+        Python's `$` matches before a trailing newline and `re.match` does
+        not require the whole string, so this copy of the contract accepted
+        two blocks the Worker would have 400'd -- and a 400 is retried by the
+        outbox forever. The transcription is only useful if it is exact.
+        """
+        for field, value in (
+            ("verdict", "exiting\n"), ("verdict", "exiting\nrubbish"),
+            ("method", "box_width\n"), ("method", "none\nrubbish"),
+        ):
+            with self.subTest(field=field, value=value):
+                block = {**DirectionEstimate(
+                    verdict="exiting", method="box_width", slope=-0.3,
+                ).to_wire(), field: value}
+                with self.assertRaises(ContractRejection):
+                    validate_direction(block)
 
     def test_the_block_carries_exactly_the_contract_keys(self):
         block = DirectionEstimate().to_wire()
