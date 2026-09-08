@@ -40,7 +40,7 @@ from gate_controller.local_recognizer import (
 )
 from gate_controller.corpus import TrainingCorpus
 from gate_controller.match_policy import (
-    DEFAULT_POLICY, RECOMMENDED_POLICY, STRICT_POLICY,
+    DEFAULT_POLICY, RECOMMENDED_POLICY, STRICT_POLICY, apply_confidence,
 )
 from gate_controller.matching import decide_access
 from gate_controller.models import PlateObservation, RelayResult
@@ -151,9 +151,9 @@ def no_plate():
 
 
 def recognizer(script, *, mode="shadow", cloud="fallback", logger=None,
-               wall_clock=None, **kwargs):
+               wall_clock=None, min_confidence=DEFAULT_MIN_CONFIDENCE, **kwargs):
     config = LocalRecognizerConfig(
-        mode=mode, cloud=cloud, min_confidence=DEFAULT_MIN_CONFIDENCE,
+        mode=mode, cloud=cloud, min_confidence=min_confidence,
         model_dir=Path("/var/lib/gate-controller/models"),
     )
     local = LocalRecognizer(
@@ -179,7 +179,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config.detector, DEFAULT_DETECTOR)
         self.assertEqual(config.recogniser, DEFAULT_RECOGNISER)
         self.assertEqual(config.threads, 1, "the board is thermally limited")
-        self.assertEqual(config.min_confidence, 0.95)
+        self.assertEqual(
+            config.min_confidence, 0.5,
+            "0.95 was the shadow-mode measurement threshold; as the admission "
+            "gate it is the floor under agreement_min_local and would keep the "
+            "agreement rule from ever running on shipped defaults",
+        )
         self.assertEqual(str(config.model_dir), DEFAULT_MODEL_DIR)
         self.assertEqual(config.cloud, "fallback")
 
@@ -226,7 +231,7 @@ class AgreementTests(unittest.TestCase):
 
     def test_a_read_below_the_threshold_is_not_an_authorised_local_match(self):
         logger = RecordingLogger()
-        local = recognizer([read("12D3456", 0.80)], logger=logger)
+        local = recognizer([read("12D3456", 0.40)], logger=logger)
         frame = local.begin(b"frame", trace_id="trace-2", authorised={"12D3456"})
         frame.result(5)
         frame.complete_cloud("12D3456", 0.99)
@@ -983,7 +988,7 @@ class OcrClientIntegrationTests(unittest.TestCase):
         local.close()
 
     def test_a_read_below_the_threshold_falls_through_to_the_cloud(self):
-        local = recognizer([read("12D3456", 0.90)], mode="active")
+        local = recognizer([read("12D3456", 0.40)], mode="active")
         session = FakeSession([FakeResponse(cloud_payload("12D3456"))])
         client = self._client(local, session)
 
@@ -1329,6 +1334,28 @@ class ProcessorDecisionTests(unittest.TestCase):
         )
         local.close()
 
+    def test_the_11_13_48_passage_now_opens_on_the_two_readers_agreeing(self):
+        # The measured denial: local read 10CE1990 with a 0.566 per-character
+        # minimum, cloud read 10CE1990 at 0.806, agreement=match, and the gate
+        # stayed shut because each reader was judged alone against 0.90.
+        local = recognizer(
+            [read("10CE1990", 0.566, mean=0.945)], mode="active",
+            min_confidence=0.5,
+        )
+        self.addCleanup(local.close)
+        session = FakeSession([FakeResponse(cloud_payload("10CE1990", 0.806))])
+        client = PlateRecognizerClient(
+            "token", session=session, local_recognizer=local,
+            authorised=lambda: {"10CE1990"},
+        )
+        processor = self._processor(client, {"10CE1990"})
+
+        result = processor.process((self._jpeg("event.jpg", 120),))
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.decision.reason, "exact_match")
+        self.assertEqual(result.decision.observed_plate, "10CE1990")
+
     def test_an_unauthorised_local_read_never_opens_the_gate(self):
         local = recognizer([read("99ZZ9999", 0.99)], mode="active")
         session = FakeSession([FakeResponse({"results": []})])
@@ -1396,6 +1423,312 @@ class ProcessorDecisionTests(unittest.TestCase):
         self.assertEqual(relay.calls, [], "shadow mode journals and nothing else")
         self.assertEqual(len(session.calls), 1)
         local.close()
+
+
+
+class LocalPassTests(unittest.TestCase):
+    """Requirement (a) at the client seam, and (b)'s corroboration source."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _jpeg(self, name, colour=120):
+        path = self.root / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def test_an_authorised_local_read_answers_without_any_cloud_request(self):
+        local = recognizer([read("12D3456", 0.99)], mode="active")
+        self.addCleanup(local.close)
+        session = FakeSession([])
+        client = PlateRecognizerClient(
+            "token", session=session, local_recognizer=local,
+            authorised=lambda: {"12D3456"},
+        )
+
+        attempt = client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        self.assertTrue(attempt.decided)
+        self.assertEqual(attempt.observation.plate, "12D3456")
+        self.assertEqual(attempt.observation.source, "local")
+        self.assertEqual(session.calls, [])
+
+    def test_a_read_that_cannot_decide_carries_its_work_into_the_cloud_call(self):
+        local = recognizer([read("99ZZ9999", 0.99)], mode="active")
+        self.addCleanup(local.close)
+        session = FakeSession([FakeResponse(cloud_payload("12D3456", 0.97))])
+        client = PlateRecognizerClient(
+            "token", session=session, local_recognizer=local,
+            authorised=lambda: {"12D3456"},
+        )
+        path = self._jpeg("event.jpg")
+
+        attempt = client.local_pass(path, trace_id="trace-1")
+
+        self.assertFalse(attempt.decided)
+        self.assertIsNotNone(attempt.state.get("upload_bytes"))
+        self.assertIsNotNone(attempt.state.get("frame"))
+
+        observation = client.recognise(path, trace_id="trace-1", attempt=attempt)
+
+        self.assertEqual(observation.plate, "12D3456")
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(
+            local.status()["frames"], 1,
+            "the frame was inferred once, not once per stage",
+        )
+
+    def test_the_always_mode_keeps_the_cloud_request_on_the_decision_path(self):
+        # `always` exists to label every frame for the training corpus, and
+        # the cloud request is deliberately on the decision path there. The
+        # split must not silently change what that mode collects.
+        local = recognizer([read("12D3456", 0.99)], mode="active", cloud="always")
+        self.addCleanup(local.close)
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([]), local_recognizer=local,
+            authorised=lambda: {"12D3456"},
+        )
+
+        attempt = client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        self.assertFalse(attempt.decided)
+        self.assertIsNone(attempt.state)
+
+    def test_a_shadow_recogniser_never_answers_for_a_frame(self):
+        local = recognizer([read("12D3456", 0.99)], mode="shadow")
+        self.addCleanup(local.close)
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([]), local_recognizer=local,
+            authorised=lambda: {"12D3456"},
+        )
+
+        attempt = client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        self.assertFalse(attempt.decided)
+        self.assertIsNone(attempt.state)
+
+    def test_a_client_with_no_local_reader_has_nothing_to_pass(self):
+        client = PlateRecognizerClient("token", session=FakeSession([]))
+
+        attempt = client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        self.assertFalse(attempt.decided)
+        self.assertIsNone(attempt.state)
+
+    def test_an_abandoned_pass_still_journals_the_frame(self):
+        local = recognizer([read("99ZZ9999", 0.99)], mode="active")
+        self.addCleanup(local.close)
+        logger = RecordingLogger()
+        local._logger = logger
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([]), local_recognizer=local,
+            authorised=lambda: {"12D3456"},
+        )
+
+        attempt = client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+        attempt.abandon()
+
+        self.assertTrue(any(
+            "gate_local_ocr stage=active" in line for line in logger.lines
+        ), "a frame that never reached the cloud is still owed its line")
+
+
+class LocalObservationTests(unittest.TestCase):
+    """What the processor may use as corroboration, and what it may not."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _jpeg(self, name, colour=120):
+        path = self.root / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _client(self, local):
+        return PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse({"results": []})]),
+            local_recognizer=local, authorised=lambda: {"10CE1990"},
+        )
+
+    def test_a_confident_read_is_offered_as_corroboration_for_its_own_event(self):
+        local = recognizer(
+            [read("10CE1990", 0.566)], mode="active", min_confidence=0.5,
+        )
+        self.addCleanup(local.close)
+        client = self._client(local)
+
+        client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        observations = client.local_observations("trace-1")
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].plate, "10CE1990")
+        self.assertEqual(observations[0].source, "local")
+        self.assertAlmostEqual(observations[0].confidence, 0.566)
+
+    def test_another_events_reads_are_never_offered(self):
+        local = recognizer(
+            [read("10CE1990", 0.99)], mode="active", min_confidence=0.5,
+        )
+        self.addCleanup(local.close)
+        client = self._client(local)
+
+        client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+
+        self.assertEqual(client.local_observations("trace-2"), ())
+        self.assertEqual(client.local_observations(None), ())
+
+    def test_a_read_below_the_local_gate_corroborates_nothing(self):
+        # 2026-09-08 11:07:08: the on-device reader produced `131D26956` at a
+        # 0.389 per-character minimum on the very frame the cloud read
+        # `131D2696` correctly. It never entered the pool, and must not.
+        local = recognizer(
+            [read("131D26956", 0.389)], mode="active", min_confidence=0.5,
+        )
+        self.addCleanup(local.close)
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse(cloud_payload("131D2696", 0.961))]),
+            local_recognizer=local, authorised=lambda: {"131D2696"},
+        )
+        path = self._jpeg("event.jpg")
+
+        attempt = client.local_pass(path, trace_id="trace-1")
+        client.recognise(path, trace_id="trace-1", attempt=attempt)
+
+        self.assertEqual(client.local_observations("trace-1"), ())
+
+    def test_forgetting_an_event_drops_its_observations(self):
+        local = recognizer(
+            [read("10CE1990", 0.99)], mode="active", min_confidence=0.5,
+        )
+        self.addCleanup(local.close)
+        client = self._client(local)
+
+        client.local_pass(self._jpeg("event.jpg"), trace_id="trace-1")
+        client.forget_local_ocr("trace-1")
+
+        self.assertEqual(client.local_observations("trace-1"), ())
+
+
+class ShippedDefaultAgreementTests(unittest.TestCase):
+    """The agreement rule has to be reachable on what the controller ships.
+
+    Every other test of the rule sets ``min_confidence=0.5`` by hand. With the
+    admission gate at its old 0.95 default nothing under 0.95 ever reached the
+    corroboration pool, so the shipped 0.50 agreement bar was unreachable and
+    the rule could not run at all on a stock configuration.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(apply_confidence, {})
+        apply_confidence({})
+
+    def _jpeg(self, name="event.jpg", colour=120):
+        path = self.root / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _recognizer(self, script, *, environment=None):
+        config = load_local_recognizer_config(
+            environment or {"GATE_LOCAL_OCR_MODE": "active"}
+        )
+        local = LocalRecognizer(
+            config, engine_factory=engine_factory(script),
+            logger=RecordingLogger(),
+        )
+        local.start()
+        local.wait_ready(5)
+        self.addCleanup(local.close)
+        return local
+
+    def _open(self, local, cloud_score=0.806):
+        """Run the 11:13:48 event end to end and return the result."""
+        session = FakeSession([FakeResponse(cloud_payload("10CE1990", cloud_score))])
+        client = PlateRecognizerClient(
+            "token", session=session, local_recognizer=local,
+            authorised=lambda: {"10CE1990"},
+        )
+        processor = GateProcessor(
+            recognizer=client,
+            store=LocalStore(self.root / "gate.db"),
+            relay=RecordingRelay(),
+            authorised={"10CE1990"},
+            cooldown=timedelta(seconds=20),
+            clock=lambda: datetime(2026, 9, 8, 10, 13, 48, tzinfo=timezone.utc),
+        )
+        return processor.process((self._jpeg(),))
+
+    def test_the_shipped_default_admits_the_11_13_48_event(self):
+        # local 10CE1990 at 0.566, cloud the same plate at 0.806.
+        result = self._open(self._recognizer([read("10CE1990", 0.566)]))
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.decision.reason, "exact_match")
+
+    def test_agreement_opens_the_gate_when_neither_reader_could_alone(self):
+        """The same event with the cloud read below the 0.75 exact bar.
+
+        Nothing but the agreement rule can open this, so it fails outright
+        with the admission gate above the agreement bar.
+        """
+        result = self._open(
+            self._recognizer([read("10CE1990", 0.566)]), cloud_score=0.71,
+        )
+
+        self.assertTrue(result.opened)
+        self.assertEqual(result.decision.reason, "exact_match")
+
+    def test_the_shipped_default_lets_the_agreement_rule_run(self):
+        """The local read reaches the pool, which is what 0.95 prevented."""
+        local = self._recognizer([read("10CE1990", 0.566)])
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse({"results": []})]),
+            local_recognizer=local, authorised=lambda: {"10CE1990"},
+        )
+
+        client.local_pass(self._jpeg(), trace_id="trace-1")
+
+        observations = client.local_observations("trace-1")
+        self.assertEqual(
+            [(item.plate, item.source) for item in observations],
+            [("10CE1990", "local")],
+        )
+        # And the pair opens under the shipped bars even when the cloud read
+        # alone is below the 0.75 exact bar: only agreement can carry this.
+        self.assertTrue(decide_access(
+            [PlateObservation("10CE1990", 0.71, source="cloud")],
+            {"10CE1990"}, DEFAULT_POLICY, corroborations=observations,
+        ).allowed)
+
+    def test_the_old_default_would_have_kept_the_rule_unreachable(self):
+        local = self._recognizer(
+            [read("10CE1990", 0.566)],
+            environment={
+                "GATE_LOCAL_OCR_MODE": "active",
+                "GATE_LOCAL_OCR_MIN_CONFIDENCE": "0.95",
+            },
+        )
+        client = PlateRecognizerClient(
+            "token", session=FakeSession([FakeResponse({"results": []})]),
+            local_recognizer=local, authorised=lambda: {"10CE1990"},
+        )
+
+        client.local_pass(self._jpeg(), trace_id="trace-1")
+
+        self.assertEqual(
+            client.local_observations("trace-1"), (),
+            "a 0.95 admission gate is a 0.95 floor under every agreement bar",
+        )
 
 
 if __name__ == "__main__":

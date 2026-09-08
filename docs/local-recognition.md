@@ -100,11 +100,13 @@ so open the gate - only when all three of these hold:
 2. The controller's own
    [`decide_access`](../gate_controller/matching.py) authorises the local
    observations of that event. Not a copy of it, not a stricter variant of it:
-   the same function, the same `MIN_EXACT_CONFIDENCE`/`MIN_FUZZY_CONFIDENCE`
-   thresholds, the same exact-first rule, and the same two-frame
-   `two_frame_ocr_confusion` rule, under the same time-of-day matching policy
-   the processor will apply to the very same frame. A local read is subject to
-   exactly the scrutiny a cloud read has always been subject to.
+   the same function, the same per-level confidence bars
+   (`LevelRule.min_exact_confidence` / `min_fuzzy_confidence`, see
+   [plate matching](plate-matching.md#confidence-bars)), the same exact-first
+   rule, and the same two-frame `two_frame_ocr_confusion` rule, under the same
+   time-of-day matching policy the processor will apply to the very same
+   frame. A local read is subject to exactly the scrutiny a cloud read has
+   always been subject to.
 3. The plate that decision rests on is **this frame's own read**. `decide_access`
    weighs every observation of the event, so asking only whether it allows
    would let a frame that read something unrelated answer on an earlier
@@ -154,6 +156,8 @@ weak character is precisely the one deciding whether the read is the authorised
 plate or a different vehicle. The measured separation between right and wrong
 reads (0.998 against 0.772) is wide enough that a per-character minimum costs
 very little of the 415-in-458 retention the 0.95 threshold was chosen for.
+(That 0.95 was the *measurement* threshold; what ships as the admission gate is
+0.5 -- see the environment table below.)
 
 Two details that follow from the same place:
 
@@ -167,11 +171,35 @@ Two details that follow from the same place:
   straight through into `GateEvent.ocr_confidence` and out to the outbox as a
   bare `NaN` literal that no strict JSON reader accepts.
 
+### Off the cloud slot
+
+The controller has exactly one serial slot for *cloud* OCR requests
+(`GateProcessor._ocr_slot`, a `BoundedSemaphore(1)`). Until 2026-09-08 the
+local read ran inside that slot, so a 170 ms inference queued behind whatever
+cloud call was in flight for an older frame. The measured cost, 2026-09-08
+11:13:50: `local inference 170 ms` but `burst_to_ocr_ms=3654`, and the gate
+opened 11.5 s after the webhook.
+
+The local read now runs **before** the slot is taken, on the processor's own
+burst thread (`GateProcessor._recognise` -> `PlateRecognizerClient.local_pass`).
+Only frames that fall through to the cloud queue for the slot. A local grant
+while a cloud call for an older frame is still in flight opens the gate
+immediately; that in-flight call completes into the normal cooldown, which
+refuses the second activation exactly as it always has.
+
+The prepared upload travels with the frame: `local_pass` decodes, crops and
+re-encodes the JPEG once and hands the bytes to the cloud request that
+follows, so splitting the work does not double it on a board that cannot spare
+the cycles.
+
+`GATE_LOCAL_OCR_CLOUD=always` is the exception and stays exactly as it was -
+its whole purpose is to keep the cloud request on the decision path so every
+frame is labelled, and splitting it would change what it collects.
+
 ### What the guard may spend
 
-In active mode the local read happens on the OCR worker, holding the OCR slot,
-inside the burst's decision budget - so a stalled inference is not free. The
-wait is the smallest of three bounds:
+The local read still runs inside the burst's decision budget, so a stalled
+inference is not free. The wait is the smallest of three bounds:
 
 | bound | value | why |
 | --- | --- | --- |
@@ -184,6 +212,36 @@ connect/read split is re-sized **after** the local wait, from what is actually
 left - otherwise the request would be sized for a budget the guard had already
 spent. If nothing is left to spend, the frame takes a local read only if it has
 already landed, and otherwise goes straight to the cloud.
+
+And if the budget left cannot cover a cloud call at all, the frame does not
+make one. A lookup is charged whether or not the answer arrives in time, and
+on 2026-09-08 three frames of one visitor passage waited 3.4-5.6 s in the queue
+and then each spent a paid lookup that timed out. `GATE_OCR_MIN_REQUEST_SECONDS`
+(default 1.0 s, just under the measured p50 of every attempt that completed
+3-6 September) is the floor; below it the frame is journalled
+`gate_ocr stage=cloud_skipped reason=insufficient_budget` and decided as
+`decision_timeout`, with **no** `ocr_timeout` attempt recorded, because
+nothing was sent and nothing was billed.
+
+### Corroborating the cloud read
+
+A confident local read is kept for its event, keyed by trace id, and offered to
+the processor's own `decide_access` as a *corroboration*
+(`PlateRecognizerClient.local_observations`). It takes no part in the exact or
+fuzzy rules; it exists so the
+[agreement rule](plate-matching.md#when-both-readers-agree) can see that both
+readers produced the same string and lower each one's bar. A read below
+`GATE_LOCAL_OCR_MIN_CONFIDENCE` never enters the pool, so it corroborates
+nothing.
+
+That makes `GATE_LOCAL_OCR_MIN_CONFIDENCE` a **floor under**
+`GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*`, not an independent knob: the
+effective local agreement bar is the larger of the two. This is why the
+shipped default is 0.5 rather than the 0.95 the shadow-mode measurement used.
+At 0.95 the 2026-09-08 11:13:48 event -- local `10CE1990` at 0.566, cloud the
+same plate at 0.806 -- was dropped before the 0.50 agreement bar written for
+it could see it, and the agreement rule could not run at all on shipped
+defaults.
 
 ### The time-of-day matching policy
 
@@ -217,8 +275,14 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_DETECTOR` | `yolo-v9-t-384-license-plate-end2end` | Any detector registered in `open-image-models`. |
 | `GATE_LOCAL_OCR_RECOGNISER` | `cct-xs-v2-global-model` | Any OCR model registered in `fast-plate-ocr`. |
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
-| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.95` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision. |
+| `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.5` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision *and* admission to the corroboration pool, so it is the floor under `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` too. 0.95 is the shadow-mode measurement threshold and is too high to be the admission gate: it would keep the agreement rule from ever running on the shipped 0.50 agreement bar. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
+| `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
+
+The confidence bars the shared matching applies - including the ones that
+lower when both readers agree - live with the matching levels, not here. See
+[plate matching](plate-matching.md#confidence-bars) for the `GATE_MATCH_*`
+keys.
 
 `GATE_LOCAL_OCR_CLOUD=always` keeps the labelling but gives up the latency win:
 the cloud request runs on the decision path exactly as it does today, and the
@@ -375,6 +439,55 @@ gate_local_ocr stage=shadow trace_id=4af8401d-... local_plate=131D2696 \
 
 A frame where the local reader was skipped or failed still produces a line, with
 `local_plate=-`.
+
+`authorised=` still labels each reader against the **full** bar for its band,
+not the agreement bar. So a passage the agreement rule opened is journalled
+`authorised=none` with `decision_source=cloud`, and the line that says what
+actually happened is the `gate_match` one below. Keeping the label at the full
+bar is deliberate: it is the evidence the promotion decision rests on, and it
+has to keep meaning what it has always meant.
+
+### Per decision
+
+Two lines were added on 2026-09-08. Both are journal-only: nothing about the
+event payload or the telemetry envelope changed, and the Worker's allowlists
+were not touched.
+
+```
+gate_match stage=agreement_grant plate=10CE1990 local_score=0.566 \
+  cloud_score=0.806 match_rule=exact level=standard band=08:00-22:00 \
+  min_local=0.50 min_cloud=0.70
+```
+
+The gate opened because both readers produced the same plate, at a bar neither
+would have cleared alone. `match_rule` is `exact` or `ocr_confusion`; the event
+itself carries the reason it would otherwise have carried.
+
+```
+gate_ocr stage=cloud_skipped reason=insufficient_budget remaining_ms=487 \
+  required_ms=1000
+```
+
+A queued frame whose remaining decision budget could not cover a cloud lookup,
+so none was posted and none was billed. Count them against the monthly
+allowance the same way you count `authorised=`:
+
+```
+journalctl -u file-monitor.service --since '-7 days' \
+  | grep -c 'stage=cloud_skipped'
+```
+
+Two more lines changed rather than appeared:
+
+* `gate_trigger_capture outcome=presence_ended reason=plate_read` is **gone**.
+  A read no longer ends a presence session; only a grant (`reason=opened`), a
+  confident read of a plate nothing authorised is near (`reason=plate_denied`),
+  or a final pipeline answer does.
+* `gate_burst stage=skipped cause=event_already_opened
+  recorded_reason=queue_coalesced` marks a queued frame whose own passage had
+  already opened the gate, dropped before it could buy a lookup that could not
+  change anything. The persisted event says `queue_coalesced`, which is what
+  the line's second field names: nothing new goes on the wire.
 
 ## Reading a week of agreement
 

@@ -600,6 +600,67 @@ class OcrPlateRegionTests(unittest.TestCase):
         # fraction of the frame than it was of the 810-high cropped upload.
         self.assertIn("gate_ocr plate_box=0.500,0.375,0.100,0.075 frame=full", "\n".join(logs.output))
 
+    def test_two_frames_prepared_at_once_keep_their_own_geometry(self):
+        """The local pass and a cloud request now prepare uploads in parallel.
+
+        The local pass runs on the decision thread while a cloud request for
+        an older frame is still in flight on its own thread, so a geometry
+        stashed on the client is one frame's crop read back as another's --
+        the plate box lands in the wrong place in the journal and in the
+        corpus sidecar. The geometry belongs to the call, not the client.
+        """
+        from PIL import Image
+        box = {"xmin": 960, "ymin": 405, "xmax": 1152, "ymax": 486}
+        payload = {"results": [{"plate": "12D3456", "score": 0.93, "box": box}]}
+        smaller = self.root / "smaller.jpg"
+        Image.new("RGB", (1280, 720), color=(10, 10, 10)).save(smaller, format="JPEG")
+        client = PlateRecognizerClient(
+            "token", session=self.recording_session(payload), max_upload_width=1920,
+        )
+
+        prepared = Event()
+        release = Event()
+        lines = []
+
+        class SequencingLogger:
+            """Hold the 4K frame between preparing its upload and using it."""
+
+            def __init__(self):
+                self.held = False
+
+            def info(self, message, *args):
+                rendered = message % args if args else message
+                lines.append(rendered)
+                if "upload_downscale=applied" in rendered and not self.held:
+                    self.held = True
+                    prepared.set()
+                    release.wait(5)
+
+            def warning(self, message, *args):
+                lines.append(message % args if args else message)
+
+        with patch.object(ocr_module, "_LOGGER", SequencingLogger()):
+            first = Thread(
+                target=client.recognise, args=(self.path,), daemon=True,
+            )
+            first.start()
+            self.assertTrue(prepared.wait(5), "the 4K frame never prepared its upload")
+            # The 1280-wide frame needs no downscale, so it prepares and
+            # journals its own box while the 4K frame is still held.
+            client.recognise(smaller)
+            release.set()
+            first.join(5)
+
+        boxes = [line for line in lines if "plate_box=" in line]
+        self.assertIn(
+            "gate_ocr plate_box=0.750,0.562,0.150,0.113 frame=full", boxes,
+            "the 1280-wide frame's own box",
+        )
+        self.assertIn(
+            "gate_ocr plate_box=0.500,0.375,0.100,0.075 frame=full", boxes,
+            "the 4K frame read back another frame's crop",
+        )
+
     def test_a_malformed_box_is_ignored(self):
         payload = {"results": [{"plate": "12D3456", "score": 0.93, "box": {"xmin": "a"}}]}
         client = PlateRecognizerClient("token", session=self.recording_session(payload), max_upload_width=1920)

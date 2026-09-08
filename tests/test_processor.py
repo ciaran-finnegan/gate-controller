@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Queue as ThreadQueue
 from threading import Event, Lock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from unittest.mock import patch
 from PIL import Image
 from requests import exceptions as requests_exceptions
@@ -14,7 +14,7 @@ from requests import exceptions as requests_exceptions
 import gate_controller.images as image_tools
 import gate_controller.processor as processor_module
 from gate_controller.models import PlateObservation, RelayResult
-from gate_controller.ocr import OcrResponseError
+from gate_controller.ocr import LocalPass, OcrResponseError
 from gate_controller.outbox import EvidenceSpool, OutboxWorker
 from gate_controller.processor import GateProcessor
 from gate_controller.relay import RelayController
@@ -2666,3 +2666,370 @@ class RecognisedPlateBesideFailedFrameTests(unittest.TestCase):
             result = self._processor(store, RecordingRelay([]), recognizer).process(frames)
 
             self.assertEqual(result.reason, "ocr_error")
+
+
+class TwoPhaseRecognizer:
+    """A recogniser split the way the real client is: local read, then cloud.
+
+    ``local_pass`` is what the processor runs off its serial OCR slot;
+    ``recognise`` is the cloud request that holds it. The two are deliberately
+    separate here so a test can make the cloud slow and the local read fast,
+    and see which one the gate waits for.
+    """
+
+    def __init__(self, *, local_delay=0.0, cloud_delay=0.0, local_plate=None,
+                 local_confidence=0.0, cloud_observation=None,
+                 local_observations=()):
+        self.local_delay = local_delay
+        self.cloud_delay = cloud_delay
+        self.local_plate = local_plate
+        self.local_confidence = local_confidence
+        self.cloud_observation = cloud_observation or PlateObservation(None, 0.0)
+        self._local_observations = tuple(local_observations)
+        self.cloud_calls = []
+        self.local_calls = []
+        self.cloud_entered = Event()
+
+    def local_pass(self, path, *, trace_id=None, budget=None):
+        self.local_calls.append(path)
+        sleep(self.local_delay)
+        if self.local_plate is None:
+            return LocalPass(state={"frame": None})
+        return LocalPass(
+            observation=PlateObservation(
+                self.local_plate, self.local_confidence, source="local",
+            ),
+            state={"frame": None},
+        )
+
+    def local_observations(self, trace_id):
+        return self._local_observations
+
+    def recognise(self, path, timeout=None, trace_id=None, budget=None, attempt=None):
+        self.cloud_calls.append(path)
+        self.cloud_entered.set()
+        sleep(self.cloud_delay)
+        return self.cloud_observation
+
+
+class FastLocalDecisionTests(unittest.TestCase):
+    """Requirement (a): a local grant never queues behind a cloud call."""
+
+    def _jpeg(self, directory: str, name: str, colour: int = 128) -> Path:
+        path = Path(directory) / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _processor(self, directory, recognizer, database="gate.db", **kwargs):
+        options = {
+            "cooldown": timedelta(seconds=0),
+            "clock": lambda: datetime.now(timezone.utc),
+            "decision_timeout": 7.0,
+        }
+        options.update(kwargs)
+        return GateProcessor(
+            recognizer=recognizer,
+            store=LocalStore(Path(directory) / database),
+            relay=RecordingRelay([]),
+            authorised={"12D3456"},
+            **options,
+        )
+
+    def test_a_local_grant_lands_while_a_cloud_call_for_an_older_frame_runs(self):
+        # 2026-09-08 11:13:50: a 170 ms local read waited 3,654 ms because the
+        # single OCR slot was held by cloud calls for earlier frames, and the
+        # gate opened 11.5 s after the webhook. The local read must not queue
+        # for that slot at all.
+        with tempfile.TemporaryDirectory() as directory:
+            older = self._jpeg(directory, "older.jpg", 64)
+            newer = self._jpeg(directory, "newer.jpg", 200)
+            blocking = TwoPhaseRecognizer(cloud_delay=2.5)
+            slow = self._processor(directory, blocking, "slow.db")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=0.17, local_plate="12D3456", local_confidence=0.99,
+            )
+            fast = self._processor(directory, recognizer)
+            # One serial cloud slot between them: that is what the processor's
+            # BoundedSemaphore(1) is, and what the older frame is holding.
+            fast._ocr_slot = slow._ocr_slot
+
+            blocker = Thread(target=slow.process, args=((older,),), daemon=True)
+            blocker.start()
+            self.assertTrue(
+                blocking.cloud_entered.wait(2.0),
+                "the older frame never reached its cloud request",
+            )
+
+            started = monotonic()
+            result = fast.process((newer,))
+            elapsed = monotonic() - started
+            blocker.join(5.0)
+
+            self.assertTrue(result.opened)
+            self.assertEqual(
+                recognizer.cloud_calls, [],
+                "a local grant must not spend a cloud lookup",
+            )
+            self.assertLess(
+                elapsed, 1.0,
+                f"the local decision waited {elapsed:.2f}s for the cloud slot",
+            )
+
+    def test_a_frame_that_needs_the_cloud_still_takes_the_serial_slot(self):
+        # The other half of (a): only frames that fall through to the cloud
+        # enter the cloud queue, and those still queue exactly as before.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(len(recognizer.cloud_calls), 1)
+            self.assertEqual(len(recognizer.local_calls), 1)
+
+    def test_a_cloud_lookup_is_not_billed_when_the_budget_cannot_cover_it(self):
+        # 2026-09-08 11:19:54-11:20:02: three visitor frames waited 3.4-5.6 s
+        # in the queue and then each spent a paid lookup that timed out.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "late.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                min_cloud_request_seconds=1.0,
+            )
+            # The frame has already spent 6.5 s of its 7 s budget queueing.
+            clock.value = 6.5
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,), decision_started_at=0.0)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "decision_timeout")
+            self.assertEqual(
+                recognizer.cloud_calls, [],
+                "the lookup was billed against a budget it could not finish in",
+            )
+            combined = "\n".join(logs.output)
+            self.assertIn(
+                "gate_ocr stage=cloud_skipped reason=insufficient_budget", combined,
+            )
+            self.assertNotIn(
+                "ocr_timeout", combined,
+                "a request that was never posted is not a timed-out lookup",
+            )
+
+    def test_a_budget_that_can_still_cover_a_lookup_reaches_the_cloud(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "prompt.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                min_cloud_request_seconds=1.0,
+            )
+            clock.value = 5.0
+
+            result = processor.process((frame,), decision_started_at=0.0)
+
+            self.assertTrue(result.opened)
+            self.assertEqual(len(recognizer.cloud_calls), 1)
+
+    def test_a_min_request_floor_above_the_decision_budget_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(
+                directory, recognizer, decision_timeout=0.5,
+                min_cloud_request_seconds=30.0,
+            )
+
+            self.assertEqual(processor._min_cloud_request_seconds, 0.0)
+            self.assertTrue(processor.process((frame,)).opened)
+
+    def test_the_slot_queue_wait_stays_in_burst_to_ocr_ms(self):
+        """`burst_to_ocr_ms` means "burst until the cloud request starts".
+
+        Every measurement taken to date reads it that way -- the PR's own
+        evidence is a `burst_to_ocr_ms=3654` slot wait. Marking recognition at
+        the local pass instead moved that wait into `ocr_ms` and made this
+        release's numbers incomparable with every earlier one.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=0.3, cloud_delay=0.05,
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            durations = result.telemetry.stage_durations
+            self.assertLess(
+                durations.ocr_ms, 200,
+                "ocr_ms must be the cloud request, not the local pass",
+            )
+            self.assertGreaterEqual(
+                durations.burst_to_ocr_ms, 300,
+                "the wait before the cloud request belongs to burst_to_ocr_ms",
+            )
+
+    def test_a_locally_decided_frame_is_still_timed_from_when_it_was_read(self):
+        # No cloud request is ever made for this frame, so nothing else would
+        # mark recognition for it: `ocr_ms` keeps carrying the local read,
+        # exactly where it sat before the pass was split off the slot.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=0.3, local_plate="12D3456", local_confidence=0.99,
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(recognizer.cloud_calls, [])
+            self.assertEqual(len(result.telemetry.ocr_attempts), 1)
+            self.assertGreaterEqual(result.telemetry.stage_durations.ocr_ms, 250)
+
+    def test_a_local_pass_that_overruns_cannot_overrun_the_decision(self):
+        # `local_pass` decodes, crops and re-encodes the JPEG before inference
+        # starts, and that prep answers to no budget of its own. On the
+        # decision thread a 3 s pass carried a 1.5 s decision to 3.01 s.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "slow.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=3.0, local_plate="12D3456", local_confidence=0.99,
+            )
+            processor = self._processor(
+                directory, recognizer, decision_timeout=1.5,
+            )
+
+            started = monotonic()
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                result = processor.process((frame,))
+            elapsed = monotonic() - started
+
+            self.assertLess(
+                elapsed, 2.5,
+                f"the deadline no longer bounds the event: {elapsed:.2f}s",
+            )
+            self.assertFalse(result.opened)
+            self.assertIn(
+                "gate_ocr stage=local_pass_overran", "\n".join(logs.output),
+            )
+
+    def test_a_skipped_lookup_leaves_no_half_started_ocr_attempt(self):
+        # The budget guard skips the request before anything is billed. It
+        # must not stamp `ocr_started_at` on an event with no attempts, nor
+        # leave the trace's pending mark set for the next frame to inherit.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "late.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                min_cloud_request_seconds=1.0,
+            )
+            clock.value = 6.5
+
+            result = processor.process((frame,), decision_started_at=0.0)
+
+            self.assertEqual(result.telemetry.ocr_attempts, ())
+            self.assertIsNone(result.telemetry.stage_timestamps.ocr_started_at)
+            self.assertIsNone(result.telemetry.stage_durations.burst_to_ocr_ms)
+
+    def test_an_unreadable_min_request_floor_falls_back_to_the_default(self):
+        for value in (float("nan"), float("inf"), "not a number", -1.0):
+            self.assertEqual(
+                processor_module._bounded_min_cloud_request(value, 7.0),
+                processor_module.DEFAULT_MIN_CLOUD_REQUEST_SECONDS,
+                f"{value!r} should have fallen back to the shipped floor",
+            )
+
+
+class AgreementCorroborationTests(unittest.TestCase):
+    """Requirement (b) from the processor's side: trace-keyed and fail-closed."""
+
+    def _jpeg(self, directory: str, name: str, colour: int = 128) -> Path:
+        path = Path(directory) / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _processor(self, directory, recognizer):
+        return GateProcessor(
+            recognizer=recognizer,
+            store=LocalStore(Path(directory) / "gate.db"),
+            relay=RecordingRelay([]),
+            authorised={"10CE1990"},
+            cooldown=timedelta(seconds=0),
+            clock=lambda: datetime(2026, 9, 8, 10, 13, tzinfo=timezone.utc),
+            decision_timeout=7.0,
+        )
+
+    def test_two_readers_open_where_neither_could_have_opened_alone(self):
+        # 2026-09-08 11:13:48: local read 10CE1990 at a 0.566 per-character
+        # minimum, cloud read the same plate, agreement=match -- and it was
+        # denied because each reader was judged on its own.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "agreed.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("10CE1990", 0.71),
+                local_observations=(
+                    PlateObservation("10CE1990", 0.566, source="local"),
+                ),
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(result.decision.reason, "exact_match")
+            self.assertEqual(result.decision.observed_plate, "10CE1990")
+
+    def test_the_same_cloud_read_with_no_corroboration_is_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "alone.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("10CE1990", 0.71),
+            )
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+
+    def test_a_recogniser_that_raises_corroborates_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "raising.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("10CE1990", 0.71),
+            )
+            recognizer.local_observations = lambda trace_id: 1 / 0
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+
+    def test_corroborations_are_only_ever_asked_for_by_this_events_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "traced.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("10CE1990", 0.71),
+            )
+            asked = []
+
+            def observations(trace_id):
+                asked.append(trace_id)
+                return ()
+
+            recognizer.local_observations = observations
+            result = self._processor(directory, recognizer).process((frame,))
+
+            self.assertEqual(len(set(asked)), 1)
+            self.assertEqual(asked[0], result.telemetry.to_wire()["trace_id"])

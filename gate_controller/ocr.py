@@ -24,6 +24,38 @@ MAX_UPLOAD_WIDTH = 3840
 UPLOAD_JPEG_QUALITY = 85
 
 
+@dataclass
+class LocalPass:
+    """What the on-device reader did for one frame, before any cloud request.
+
+    Returned by :meth:`PlateRecognizerClient.local_pass`, which the processor
+    runs *outside* its single serial OCR slot. ``observation`` is the local
+    answer when it may decide the frame on its own; ``state`` carries the work
+    already done -- the prepared upload bytes, the geometry, and the frame's
+    pairing handle -- into the cloud request that follows when it may not.
+
+    Nothing here holds the OCR slot, so a 170 ms local read never waits behind
+    a 2.5 s cloud call for an older frame.
+    """
+
+    observation: PlateObservation | None = None
+    state: dict | None = None
+
+    @property
+    def decided(self) -> bool:
+        return self.observation is not None
+
+    def abandon(self) -> None:
+        """No cloud request will follow. Settle the frame so it is journalled."""
+        frame = (self.state or {}).get("frame")
+        if frame is None:
+            return
+        try:
+            frame.abandon_cloud()
+        except Exception:
+            return
+
+
 @dataclass(frozen=True)
 class _UploadGeometry:
     """How the uploaded image maps back onto the camera frame."""
@@ -317,7 +349,6 @@ class PlateRecognizerClient:
         self._precropped_directory = (
             Path(precropped_directory).resolve() if precropped_directory is not None else None
         )
-        self._upload_geometry: _UploadGeometry | None = None
         # Optional TrainingCorpus: keeps every uploaded frame and answer.
         self._corpus = corpus
         # Optional LocalRecognizer: reads the very same upload bytes on the
@@ -344,9 +375,65 @@ class PlateRecognizerClient:
             raise ValueError("max_upload_width is outside the safe range")
         self._max_upload_width = max_upload_width
 
+    def local_pass(self, path: Path, *, trace_id: str | None = None,
+                   budget: float | None = None) -> LocalPass:
+        """Read this frame on the device, off the serial cloud OCR slot.
+
+        The processor calls this *before* it queues for the slot, so a local
+        grant lands the instant inference returns even while a cloud request
+        for an older frame is still in flight. Only frames the local reader
+        could not answer go on to hold the slot.
+
+        Never raises: any failure here is simply "no local answer", and the
+        frame falls through to the cloud exactly as it did before. In
+        ``GATE_LOCAL_OCR_CLOUD=always`` this does nothing at all -- that mode
+        deliberately keeps the cloud request on the decision path so every
+        frame is labelled for the corpus, and splitting it here would change
+        what it collects.
+        """
+        empty = LocalPass()
+        local = self._local
+        if local is None or not local.enabled or not local.config.active:
+            return empty
+        if local.config.cloud == CLOUD_ALWAYS:
+            return empty
+        try:
+            with self._activity.activity("ocr"):
+                return self._local_pass(path, trace_id, budget)
+        except Exception:
+            _LOGGER.warning("gate_ocr stage=local_pass_failed")
+            return empty
+
+    def _local_pass(self, path: Path, trace_id, budget) -> LocalPass:
+        upload, geometry = self._open_upload(path)
+        try:
+            image = self._corpus_image(upload)
+        finally:
+            upload.close()
+        if not image:
+            # Without the bytes there is nothing to read locally, and nothing
+            # worth carrying into the cloud request either.
+            return LocalPass()
+        state: dict = {
+            "frame": None,
+            "deadline": self._budget_deadline(budget),
+            "upload_bytes": image,
+            "geometry": geometry,
+        }
+        frame = self._local.begin(
+            image, trace_id=trace_id, geometry=geometry,
+            authorised=self._authorised, policy=self._match_policy,
+        )
+        state["frame"] = frame
+        observation = self._local_decision(
+            path, trace_id, frame, image, geometry, state,
+        )
+        return LocalPass(observation=observation, state=state)
+
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None,
                   trace_id: str | None = None,
-                  budget: float | None = None) -> PlateObservation:
+                  budget: float | None = None,
+                  attempt: LocalPass | None = None) -> PlateObservation:
         """Read one frame.
 
         ``budget`` is the seconds of decision time left for this frame when
@@ -354,15 +441,21 @@ class PlateRecognizerClient:
         the socket timeouts around whatever it did spend; without it the
         request behaves exactly as it always has.
 
+        ``attempt`` is a :class:`LocalPass` the caller already ran off the OCR
+        slot. Its prepared upload and its local read are reused rather than
+        redone, so the frame is decoded and inferred once per frame however
+        the caller splits the work.
+
         The whole read is held open on the activity gate, so a corpus upload
         defers before it starts and abandons if it is already running. The
         gate is a counter and a timestamp behind one lock; it adds nothing
         measurable to the frame.
         """
         with self._activity.activity("ocr"):
-            return self._recognise(path, timeout, trace_id, budget)
+            return self._recognise(path, timeout, trace_id, budget, attempt)
 
-    def _recognise(self, path: Path, timeout, trace_id, budget=None) -> PlateObservation:
+    def _recognise(self, path: Path, timeout, trace_id, budget=None,
+                   attempt: LocalPass | None = None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
@@ -371,7 +464,9 @@ class PlateRecognizerClient:
             generation = self._session_generation
         # The local read belongs to the frame, not to a network attempt: a
         # retry reuses the same handle instead of inferring twice.
-        state: dict = {"frame": None, "deadline": self._budget_deadline(budget)}
+        state: dict = (attempt.state if attempt is not None and attempt.state else None) or {
+            "frame": None, "deadline": self._budget_deadline(budget),
+        }
         retries = 0
         try:
             while True:
@@ -544,12 +639,9 @@ class PlateRecognizerClient:
                 raise OcrResponseError(
                     "OCR request was abandoned", CAUSE_REQUEST_ABANDONED
                 )
-        upload = self._open_upload(path)
-        geometry = self._upload_geometry
         local_enabled = self._local is not None and self._local.enabled
-        corpus_image = (
-            self._corpus_image(upload)
-            if self._corpus is not None or local_enabled else None
+        upload, geometry, corpus_image = self._upload_for(
+            path, state, want_bytes=self._corpus is not None or local_enabled,
         )
         frame = state.get("frame") or NULL_FRAME
         if local_enabled and corpus_image and state.get("frame") is None:
@@ -683,6 +775,21 @@ class PlateRecognizerClient:
         )
         return decided or observation
 
+    def _upload_for(self, path: Path, state: dict, *, want_bytes: bool):
+        """The bytes to post, the geometry they map back through, and a copy.
+
+        A :meth:`local_pass` that already prepared this frame hands its bytes
+        over here, so the JPEG is decoded, cropped and re-encoded once per
+        frame rather than once per stage. Without one this behaves exactly as
+        it always did.
+        """
+        prepared = state.get("upload_bytes")
+        if prepared:
+            return BytesIO(prepared), state.get("geometry"), prepared
+        upload, geometry = self._open_upload(path)
+        image = self._corpus_image(upload) if want_bytes else None
+        return upload, geometry, image
+
     def _budget_deadline(self, budget) -> float | None:
         """When the decision this request belongs to gives up, if it said."""
         if budget is None:
@@ -760,6 +867,20 @@ class PlateRecognizerClient:
                 image, None, path, geometry, local=recognition, cloud="skipped",
             )
         return recognition.observation()
+
+    def local_observations(self, trace_id: str | None) -> tuple:
+        """This event's confident on-device reads, for the agreement rule.
+
+        Keyed by trace id, so a read of one event can never corroborate
+        another. An empty tuple leaves the processor's decision exactly as it
+        would be with no local reader at all.
+        """
+        if self._local is None or not trace_id:
+            return ()
+        try:
+            return tuple(self._local.observations(trace_id))
+        except Exception:
+            return ()
 
     def local_ocr_summary(self, trace_id: str | None):
         """The compact per-event local block for the telemetry payload."""
@@ -844,17 +965,24 @@ class PlateRecognizerClient:
             return False
 
     def _open_upload(self, path: Path):
-        """Return the bytes to upload: the file itself, or a cropped, bounded copy.
+        """Return ``(bytes to upload, geometry)``: the file itself, or a cropped, bounded copy.
 
         The plate region is cut out first at native resolution (unless the
         decoder already produced a region-only frame), then the result is
         downscaled only if it is still wider than the limit. The original
         file is never modified. Any decode problem falls back to uploading
-        the file unchanged so OCR still runs.
+        the file unchanged so OCR still runs, with a ``None`` geometry.
+
+        The geometry is *returned*, never stashed on the client. Two threads
+        prepare uploads for the same client now -- the local pass runs on the
+        decision thread while a cloud request for an older frame is still in
+        flight on the request thread -- and an instance attribute would let
+        one frame's crop be read back as another's, putting the plate box in
+        the wrong place in the journal and the corpus sidecar.
         """
         precropped = self._is_precropped(path)
         region = None if precropped else self._plate_region
-        self._upload_geometry = None
+        geometry = None
         try:
             with Image.open(path) as image:
                 frame_width, frame_height = image.size
@@ -869,12 +997,12 @@ class PlateRecognizerClient:
                     else crop_width
                 )
                 target_height = max(1, round(crop_height * target_width / crop_width))
-                self._upload_geometry = _UploadGeometry(
+                geometry = _UploadGeometry(
                     frame_width, frame_height, left, top, crop_width, crop_height,
                     target_width, target_height, precropped, region is not None,
                 )
                 if region is None and target_width == frame_width:
-                    return path.open("rb")
+                    return path.open("rb"), geometry
                 # draft() lets the JPEG decoder skip detail the resize would
                 # discard. It scales the whole frame by a power of two, so the
                 # crop box is rescaled to whatever size the decoder chose.
@@ -892,15 +1020,14 @@ class PlateRecognizerClient:
                 decoded.save(buffer, format="JPEG", quality=UPLOAD_JPEG_QUALITY)
         except (OSError, ValueError, Image.DecompressionBombError):
             _LOGGER.warning("gate_ocr upload_downscale=failed")
-            self._upload_geometry = None
-            return path.open("rb")
+            return path.open("rb"), None
         buffer.seek(0)
         _LOGGER.info(
             "gate_ocr upload_downscale=applied source_width=%d upload_width=%d upload_bytes=%d crop=%s",
             frame_width, decoded.width, buffer.getbuffer().nbytes,
             f"{left},{top},{right},{bottom}" if region is not None else "none",
         )
-        return buffer
+        return buffer, geometry
 
     def _log_plate_box(self, box, geometry) -> None:
         """Journal where the plate sat, as fractions of the whole camera frame.

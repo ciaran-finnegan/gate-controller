@@ -30,8 +30,10 @@ to the strictest available behaviour rather than a wider match.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from math import isfinite
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 LOGGER = logging.getLogger(__name__)
@@ -59,6 +61,43 @@ MATCH_RULE_OCR_CONFUSION = "ocr_confusion"
 MATCH_RULE_EDIT_DISTANCE = "edit_distance"
 
 
+#: What the controller required of every read before the thresholds moved onto
+#: the level. It is also where a *bad* environment value lands: an unreadable
+#: knob must not silently choose the laxer new default.
+LEGACY_MIN_CONFIDENCE = 0.90
+
+#: The lowest bar an operator may configure. Below this a "bar" is not a bar:
+#: ``GATE_MATCH_MIN_CONFIDENCE_STANDARD=0`` admits a 0.0-confidence exact read,
+#: and ``1e-9`` is the same thing with a decimal point in it. Both readers
+#: score far above 0.10 even on garbage -- the measured separation on this site
+#: is 0.998 on correct reads against 0.772 on wrong ones, and the lowest bar
+#: anything here ships with is the 0.50 local agreement bar -- so 0.10 is
+#: already five times laxer than the laxest shipped value while still being a
+#: number the reader can fail. A value below it is a typo or a disabled bar,
+#: not a posture, and is refused like any other unusable value.
+MIN_CONFIGURABLE_CONFIDENCE = 0.10
+
+#: The confidence bars, per level. ``field`` is the :class:`LevelRule`
+#: attribute, ``prefix`` the environment key stem (``<prefix>_STANDARD`` /
+#: ``<prefix>_STRICT``), and the mapping the shipped default for each level.
+#:
+#: The daytime (``standard``) exact bar sits well below the overnight one on
+#: purpose. An exact match is a character-for-character equality with an
+#: authorised plate: to open the gate wrongly the reader has to hallucinate a
+#: specific eight-character registration, which no low-confidence read does by
+#: accident. A *fuzzy* match is a read that is deliberately not the authorised
+#: plate, so its bar stays higher. Overnight, ``strict`` keeps every bar at
+#: the historical 0.90 and is unchanged by this release.
+CONFIDENCE_FIELDS = (
+    ("min_exact_confidence", "GATE_MATCH_MIN_CONFIDENCE", {"strict": 0.90, "standard": 0.75}),
+    ("min_fuzzy_confidence", "GATE_MATCH_MIN_FUZZY_CONFIDENCE", {"strict": 0.90, "standard": 0.85}),
+    ("agreement_min_local_confidence", "GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE",
+     {"strict": 0.90, "standard": 0.50}),
+    ("agreement_min_cloud_confidence", "GATE_MATCH_AGREEMENT_MIN_CLOUD_CONFIDENCE",
+     {"strict": 0.90, "standard": 0.70}),
+)
+
+
 class MatchPolicyError(ValueError):
     """A settings document could not be read as a plate matching policy."""
 
@@ -82,6 +121,16 @@ class LevelRule:
     #: Shortest normalised read eligible for a non-exact match. A two-edit
     #: budget against a three-character read is noise, not a plate.
     min_observed_length: int
+    #: Confidence a single read must carry to open the gate on an exact,
+    #: character-for-character match with an authorised plate.
+    min_exact_confidence: float = LEGACY_MIN_CONFIDENCE
+    #: Confidence each of the two frames must carry for a non-exact match.
+    min_fuzzy_confidence: float = LEGACY_MIN_CONFIDENCE
+    #: When the on-device reader and the cloud reader independently produced
+    #: the *same* normalised plate for the same event, each only has to clear
+    #: its own bar below. See :func:`gate_controller.matching.decide_access`.
+    agreement_min_local_confidence: float = LEGACY_MIN_CONFIDENCE
+    agreement_min_cloud_confidence: float = LEGACY_MIN_CONFIDENCE
 
     @property
     def allows_fuzzy(self) -> bool:
@@ -112,6 +161,80 @@ LEVELS: dict[str, LevelRule] = {
 #: Ordered strictest-first, so an unusable schedule can fall back to the
 #: safest level without a lookup table of its own.
 LEVEL_ORDER = (LEVEL_STRICT, LEVEL_STANDARD)
+
+
+def confidence_environment_key(prefix: str, level: str) -> str:
+    return f"{prefix}_{level.upper()}"
+
+
+def _confidence_value(raw: object, key: str, default: float,
+                      warned: set[str]) -> float:
+    """Read one confidence knob, failing closed to the historical 0.90.
+
+    A value that is not a number, is not finite (``nan`` and ``inf`` both),
+    or falls outside :data:`MIN_CONFIGURABLE_CONFIDENCE`-1 is refused --
+    ``0`` and ``1e-9`` included, because a bar no read can fail is not a bar.
+    It does **not** fall back to this release's laxer default: a knob the
+    operator meant to set and mistyped must leave the gate no wider than it
+    was before the knob existed.
+    """
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    if not text:
+        return default
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        value = None
+    if (value is None or not isfinite(value)
+            or not MIN_CONFIGURABLE_CONFIDENCE <= value <= 1.0):
+        if key not in warned:
+            warned.add(key)
+            LOGGER.warning(
+                "match_confidence key=%s status=rejected using=%.2f", key,
+                LEGACY_MIN_CONFIDENCE,
+            )
+        return LEGACY_MIN_CONFIDENCE
+    return value
+
+
+def load_confidence(environment=None) -> dict[str, dict[str, float]]:
+    """The per-level confidence bars in force, from ``GATE_MATCH_*``."""
+    environment = os.environ if environment is None else environment
+    warned: set[str] = set()
+    thresholds: dict[str, dict[str, float]] = {}
+    for level in LEVEL_ORDER:
+        fields = {}
+        for field, prefix, defaults in CONFIDENCE_FIELDS:
+            key = confidence_environment_key(prefix, level)
+            try:
+                raw = environment.get(key)
+            except Exception:
+                raw = None
+            fields[field] = _confidence_value(
+                raw, key, defaults[level], warned,
+            )
+        thresholds[level] = fields
+    return thresholds
+
+
+def apply_confidence(environment=None) -> None:
+    """Rebuild :data:`LEVELS` with the configured bars.
+
+    Read once at import, and again only when something deliberately
+    re-reads the environment. :func:`level_rule` consults ``LEVELS`` on every
+    call, so a rebuilt table reaches every decision without any policy object
+    being rebuilt.
+    """
+    thresholds = load_confidence(environment)
+    for level, fields in thresholds.items():
+        rule = LEVELS.get(level)
+        if rule is not None:
+            LEVELS[level] = replace(rule, **fields)
+
+
+apply_confidence()
 
 
 def level_rule(level: object) -> LevelRule:

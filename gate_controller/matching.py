@@ -1,8 +1,11 @@
+import logging
 from collections.abc import Iterable
 from datetime import datetime
+from math import isfinite
 
 from .match_policy import (
     DEFAULT_POLICY,
+    LEGACY_MIN_CONFIDENCE,
     MATCH_RULE_EDIT_DISTANCE,
     MATCH_RULE_EXACT,
     MATCH_RULE_OCR_CONFUSION,
@@ -13,8 +16,18 @@ from .match_policy import (
 from .models import MatchDecision, PlateObservation
 
 
-MIN_EXACT_CONFIDENCE = 0.90
-MIN_FUZZY_CONFIDENCE = 0.90
+LOGGER = logging.getLogger(__name__)
+
+#: The bars are per level now (``LevelRule.min_exact_confidence`` and
+#: ``min_fuzzy_confidence``, set from ``GATE_MATCH_*`` -- see
+#: ``docs/plate-matching.md``). These two names are kept because they are what
+#: the controller required before the schedule existed, and because they are
+#: still what a rejected environment value falls back to.
+MIN_EXACT_CONFIDENCE = LEGACY_MIN_CONFIDENCE
+MIN_FUZZY_CONFIDENCE = LEGACY_MIN_CONFIDENCE
+
+SOURCE_LOCAL = "local"
+SOURCE_CLOUD = "cloud"
 _CONFUSION_GROUPS = (frozenset(("0", "O")), frozenset(("1", "I", "L")),
                      frozenset(("2", "Z")), frozenset(("5", "S")),
                      frozenset(("8", "B")))
@@ -35,11 +48,19 @@ def decide_access(
     policy: MatchPolicy | None = None,
     *,
     now: datetime | None = None,
+    corroborations: Iterable[PlateObservation] = (),
 ) -> MatchDecision:
     """Apply exact-first, fail-closed plate matching to OCR observations.
 
     ``policy`` selects the fuzziness level in force at ``now``. Omitting it
     keeps the controller's shipped behaviour: ``standard`` around the clock.
+
+    ``corroborations`` are reads of the *same event* by the other reader --
+    in practice the on-device recogniser's reads of the frames the cloud
+    answered for. They never take part in the exact or fuzzy rules above, so
+    those two behave exactly as they always have; they exist only so the
+    agreement rule below can see that two independent readers produced the
+    same string. Passing none disables the agreement rule entirely.
     """
     resolved = (policy or DEFAULT_POLICY).resolve(now)
     rule = resolved.rule
@@ -52,8 +73,12 @@ def decide_access(
     ]
 
     for observed_plate, observation in normalised_observations:
+        # A non-finite confidence is not a confidence: `inf >= bar` is true for
+        # every bar, so it is refused here exactly as the agreement rule
+        # refuses it, rather than walking through the comparison.
         if (observed_plate and observed_plate in authorised_plates
-                and observation.confidence >= MIN_EXACT_CONFIDENCE):
+                and isfinite(observation.confidence)
+                and observation.confidence >= rule.min_exact_confidence):
             return MatchDecision(
                 allowed=True,
                 reason="exact_match",
@@ -71,6 +96,13 @@ def decide_access(
         )
         if decision is not None:
             return decision
+
+    decision = _decide_agreement(
+        normalised_observations, corroborations, authorised_plates, rule,
+        resolved,
+    )
+    if decision is not None:
+        return decision
 
     # Report the best-read plate on a denial so an unknown vehicle is
     # reviewable; it never widens the match.
@@ -101,7 +133,7 @@ def _decide_fuzzy(
     candidates: dict[str, dict[str, int]] = {}
     confidences: dict[str, float] = {}
     for observed_plate, observation in normalised_observations:
-        if not observed_plate or observation.confidence < MIN_FUZZY_CONFIDENCE:
+        if not observed_plate or observation.confidence < rule.min_fuzzy_confidence:
             continue
         if len(observed_plate) < rule.min_observed_length:
             continue
@@ -118,7 +150,7 @@ def _decide_fuzzy(
     for observed_plate, matched_plates in candidates.items():
         frame_count = sum(
             1 for plate, observation in normalised_observations
-            if plate == observed_plate and observation.confidence >= MIN_FUZZY_CONFIDENCE
+            if plate == observed_plate and observation.confidence >= rule.min_fuzzy_confidence
         )
         if frame_count < rule.min_frames:
             continue
@@ -146,6 +178,153 @@ def _decide_fuzzy(
                 **_policy_fields(resolved),
             )
     return None
+
+
+def _decide_agreement(
+    normalised_observations: list[tuple[str, PlateObservation]],
+    corroborations: Iterable[PlateObservation],
+    authorised_plates: set[str],
+    rule: LevelRule,
+    resolved: ResolvedPolicy,
+) -> MatchDecision | None:
+    """Two independent readers, the same string, a lower bar on each.
+
+    The exact and fuzzy rules above ask one reader for a confident read. This
+    one asks two readers -- the cloud service and the on-device recogniser --
+    for the *same* normalised plate, and in exchange lowers what each has to
+    carry to ``agreement_min_cloud_confidence`` and
+    ``agreement_min_local_confidence`` for the band in force.
+
+    It is deliberately narrow, and every narrowing is a fail-closed one:
+
+    * both readers must be present. One reader agreeing with itself across two
+      frames is the two-frame fuzzy rule, not this one, and a controller with
+      no on-device reader can never reach this branch at all.
+    * the agreed plate must still authorise under *this band's* rule -- exact
+      membership, or the band's own one-confusion rule against a single
+      authorised candidate *on the number of frames that band requires of
+      each reader separately*. Agreement lowers what a read has to carry; it
+      never buys an extra edit, it never lets one reader's second frame stand
+      in for the other's missing one, and under ``strict`` it never buys
+      anything but an exact match.
+    * a non-finite confidence (``nan``, ``inf``) is not a confidence. It is
+      dropped before any comparison, so it cannot walk through a ``>=``.
+
+    Callers key ``corroborations`` by trace id, so reads of one event can
+    never corroborate another.
+    """
+    readers_by_plate: dict[str, dict[str, list]] = {}
+
+    def remember(plate: str | None, observation) -> None:
+        plate = normalise_plate(plate or "")
+        if not plate:
+            return
+        try:
+            confidence = float(getattr(observation, "confidence", 0.0))
+        except (TypeError, ValueError):
+            return
+        if not isfinite(confidence):
+            return
+        source = getattr(observation, "source", SOURCE_CLOUD) or SOURCE_CLOUD
+        minimum = (
+            rule.agreement_min_local_confidence if source == SOURCE_LOCAL
+            else rule.agreement_min_cloud_confidence
+        )
+        if confidence < minimum:
+            return
+        readers = readers_by_plate.setdefault(plate, {})
+        seen = readers.setdefault(source, [confidence, 0])
+        seen[0] = max(seen[0], confidence)
+        # Each reader reads each frame at most once, so its own count is a
+        # lower bound on the frames that carried this plate.
+        seen[1] += 1
+
+    for observed_plate, observation in normalised_observations:
+        remember(observed_plate, observation)
+    for observation in corroborations or ():
+        remember(getattr(observation, "plate", None), observation)
+
+    for plate in sorted(readers_by_plate):
+        readers = readers_by_plate[plate]
+        local = readers.get(SOURCE_LOCAL)
+        cloud = readers.get(SOURCE_CLOUD)
+        if local is None or cloud is None:
+            continue
+        match_rule, distance, authorised_plate = _agreement_match(
+            plate, authorised_plates, rule, min(local[1], cloud[1]),
+        )
+        if match_rule is None:
+            continue
+        local, cloud = local[0], cloud[0]
+        _log_agreement(plate, local, cloud, match_rule, rule, resolved)
+        return MatchDecision(
+            allowed=True,
+            reason=(
+                "exact_match" if match_rule == MATCH_RULE_EXACT
+                else _fuzzy_reason(rule)
+            ),
+            authorised_plate=authorised_plate,
+            observed_plate=plate,
+            confidence=max(local, cloud),
+            match_rule=match_rule,
+            edit_distance=distance,
+            **_policy_fields(resolved),
+        )
+    return None
+
+
+def _agreement_match(
+    plate: str, authorised_plates: set[str], rule: LevelRule, frames: int,
+) -> tuple[str | None, int | None, str | None]:
+    """How an agreed plate authorises under ``rule``, if it does at all.
+
+    ``frames`` is how many frames of this event *each* reader carried the
+    plate on -- the smaller of the two counts -- so the band's own two-frame
+    requirement still stands for a non-exact match. Taking the larger would
+    let one reader's second frame stand in for the other's missing one, which
+    is the one-reader case the two-frame fuzzy rule already covers at a much
+    higher bar. An exact match has never needed a second frame and does not
+    gain one here.
+    """
+    if plate in authorised_plates:
+        return MATCH_RULE_EXACT, 0, plate
+    if not rule.allows_fuzzy or len(plate) < rule.min_observed_length:
+        return None, None, None
+    if frames < rule.min_frames:
+        return None, None, None
+    matches = {
+        candidate: distance
+        for candidate, distance in (
+            (candidate, _match_distance(plate, candidate, rule))
+            for candidate in authorised_plates
+        )
+        if distance is not None
+    }
+    if len(matches) != 1:
+        # Nothing close, or close to more than one authorised plate. Both are
+        # denials; agreement never picks a favourite.
+        return None, None, None
+    candidate, distance = next(iter(matches.items()))
+    match_rule = (
+        MATCH_RULE_OCR_CONFUSION if rule.confusion_only
+        else MATCH_RULE_EDIT_DISTANCE
+    )
+    return match_rule, distance, candidate
+
+
+def _log_agreement(plate, local, cloud, match_rule, rule, resolved) -> None:
+    """Journal-only. The wire reason stays the one the app already knows."""
+    try:
+        LOGGER.info(
+            "gate_match stage=agreement_grant plate=%s local_score=%.3f "
+            "cloud_score=%.3f match_rule=%s level=%s band=%s "
+            "min_local=%.2f min_cloud=%.2f",
+            plate, local, cloud, match_rule, resolved.level, resolved.band,
+            rule.agreement_min_local_confidence,
+            rule.agreement_min_cloud_confidence,
+        )
+    except Exception:
+        return
 
 
 def _fuzzy_reason(rule: LevelRule) -> str:

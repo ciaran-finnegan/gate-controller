@@ -502,6 +502,79 @@ class ProcessingTraceTests(unittest.TestCase):
         durations = telemetry.to_wire()["stage_durations"]
         self.assertEqual(durations, {"ocr_ms": 0})
 
+    def test_a_discarded_ocr_start_leaves_nothing_behind(self):
+        """A frame marked and then refused before any request was made.
+
+        The OCR slot was taken, or the remaining budget could not cover a
+        billable lookup. Without taking the mark back the trace stamps
+        `ocr_started_at` on an event with no attempts at all, and the next
+        frame's `mark_ocr_start` is ignored because one is still pending.
+        """
+        monotonic = iter((10.0, 10.2, 10.5, 10.9, 11.4))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        trace.mark_burst()
+        trace.mark_ocr_start()
+        trace.discard_ocr_start()
+        telemetry = trace.finish()
+
+        self.assertIsNone(telemetry.stage_timestamps.ocr_started_at)
+        self.assertNotIn("burst_to_ocr_ms", telemetry.to_wire()["stage_durations"])
+        self.assertEqual(telemetry.ocr_attempts, ())
+
+    def test_a_discarded_start_does_not_swallow_the_next_frames_mark(self):
+        monotonic = iter((10.0, 10.2, 10.5, 11.0, 11.5, 12.0))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        trace.mark_burst()
+        trace.mark_ocr_start()
+        trace.discard_ocr_start()
+        trace.mark_ocr_start()
+        trace.add_ocr_attempt(OcrAttemptTelemetry(frame_sequence=0, status="no_plate"))
+        telemetry = trace.finish()
+
+        # Marked at 11.0, recorded at 11.5: the discarded 10.5 is gone, and
+        # burst_to_ocr_ms runs to the mark that survived.
+        self.assertAlmostEqual(telemetry.stage_durations.ocr_ms, 500)
+        self.assertAlmostEqual(telemetry.stage_durations.burst_to_ocr_ms, 800)
+
+    def test_an_ocr_start_may_be_back_dated_to_when_the_read_began(self):
+        # A frame the on-device pass answered never queues for the slot, so
+        # the mark is taken from when that read started, not when it returned.
+        monotonic = iter((10.0, 10.2, 11.0, 11.5, 12.0))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        trace.mark_burst()
+        trace.mark_ocr_start(10.4)
+        trace.add_ocr_attempt(OcrAttemptTelemetry(frame_sequence=0, status="recognized"))
+        telemetry = trace.finish()
+
+        self.assertAlmostEqual(telemetry.stage_durations.burst_to_ocr_ms, 200)
+        self.assertAlmostEqual(telemetry.stage_durations.ocr_ms, 1100)
+
+    def test_a_back_dated_mark_is_never_in_the_future(self):
+        monotonic = iter((10.0, 10.2, 11.0, 11.5, 12.0))
+        trace = ProcessingTrace(
+            monotonic_clock=lambda: next(monotonic),
+            wall_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+        trace.mark_burst()
+        trace.mark_ocr_start(99.0)
+        trace.add_ocr_attempt(OcrAttemptTelemetry(frame_sequence=0, status="recognized"))
+        telemetry = trace.finish()
+
+        self.assertAlmostEqual(telemetry.stage_durations.ocr_ms, 500)
+
     def test_ocr_start_and_end_boundaries_do_not_double_count_work(self):
         monotonic = iter((10.0, 10.1, 10.15, 10.4, 10.45, 10.65, 10.7, 10.8, 11.0))
         trace = ProcessingTrace(
