@@ -462,7 +462,33 @@ second request while one is in flight is coalesced and counted, never queued.
 A capture that cannot start is skipped and journalled and **never retried**, so
 no failure can become a loop. Length is bounded three times over — ffmpeg's own
 `-t`, a wall-clock read deadline, and a byte cap that stops a runaway stream
-without ever holding it — and the child runs at `nice 19` under `RLIMIT_AS`.
+without ever holding it — and the child runs at `nice 19` under `RLIMIT_AS` of
+`GATE_AUDIO_CAPTURE_MAX_ADDRESS_SPACE_BYTES` (default 1 GiB, floor 256 MiB,
+ceiling 2 GiB).
+
+**Why 1 GiB and not the network probe's 64 MiB.** `RLIMIT_AS` bounds address
+space, not resident memory, and it counts every shared library the loader maps
+before ffmpeg runs a line of its own code. The first limit here was 128 MiB and
+it was too small for that alone: on the Pi on 2026-09-08 every capture died
+55 ms in with `outcome=failed reason=exit_status`, and the child's stderr said
+`error while loading shared libraries: libcodec2.so.1.0: failed to map segment
+from shared object`. The same command under `ulimit -v 131072` reproduces it;
+without the limit it produced 24,393 bytes of valid AAC in 3 s. Resident memory
+was never the issue — a `-vn -c:a copy` stream copy decodes nothing, so RSS
+stays at 2.5–50 MB. 1 GiB clears the mappings and is still far below the 3.4 GB
+runaway ffmpeg that OOM-killed the board on 2026-09-07, which is what the limit
+exists to stop. The probe's `ping` children are unaffected and keep their own
+64 MiB.
+
+**A failed capture says why.** The child's stderr is read alongside its stdout
+(never after it, so a chatty child cannot block on a full pipe) and the last
+200 characters are journalled on the failure line:
+
+```
+gate_audio_capture outcome=failed reason=exit_status stderr=error while loading shared libraries: libcodec2.so.1.0: failed to map segment from shared object
+```
+
+The same tail appears as `last_capture.stderr` in the audio section of status.
 Both trigger points are non-blocking by construction, which matters most for
 the relay one: it runs while the relay is energised, so it does nothing but
 take an uncontended lock and write a few fields.

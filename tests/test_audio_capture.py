@@ -1,13 +1,18 @@
 import json
+import os
+import resource
 import subprocess
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
+from gate_controller import audio_capture, net_probe
 from gate_controller.audio_capture import (
-    AudioCaptureConfig, AudioClipRecorder, AudioClipStore, DEFAULT_SOURCE,
+    AudioCaptureConfig, AudioClipRecorder, AudioClipStore,
+    DEFAULT_CHILD_ADDRESS_SPACE_BYTES, DEFAULT_SOURCE,
     load_audio_capture_config,
 )
 
@@ -26,11 +31,16 @@ class FakeProcess:
     always ready, which is exactly the behaviour the bounded reader needs.
     """
 
-    def __init__(self, output=b"", returncode=0):
+    def __init__(self, output=b"", returncode=0, errors=None):
         handle = tempfile.TemporaryFile()
         handle.write(output)
         handle.seek(0)
         self.stdout = handle
+        self.stderr = None
+        if errors is not None:
+            self.stderr = tempfile.TemporaryFile()
+            self.stderr.write(errors)
+            self.stderr.seek(0)
         self.returncode = returncode
         self.killed = False
 
@@ -179,7 +189,7 @@ class RecorderTests(unittest.TestCase):
         self.metrics = {"soc_temp_c": 70.0, "load_1m": 0.4,
                         "mem_available_kib": 2_000_000}
 
-    def recorder(self, *, output=None, returncode=0, **overrides):
+    def recorder(self, *, output=None, returncode=0, errors=None, **overrides):
         config = AudioCaptureConfig(**{
             "enabled": True, "directory": self.root, "clip_seconds": 40.0,
             "min_interval_seconds": 20.0, **overrides,
@@ -187,7 +197,9 @@ class RecorderTests(unittest.TestCase):
 
         def popen(command, **kwargs):
             self.spawned.append(command)
-            return FakeProcess(adts() if output is None else output, returncode)
+            return FakeProcess(
+                adts() if output is None else output, returncode, errors=errors,
+            )
 
         return AudioClipRecorder(
             config,
@@ -445,24 +457,126 @@ class RecorderTests(unittest.TestCase):
 
         self.assertEqual(len(self.spawned), 0)
 
-    def test_the_child_is_spawned_without_a_shell_and_with_stderr_discarded(self):
+    def test_the_child_is_spawned_without_a_shell_and_with_its_stderr_kept(self):
         recorder = self.recorder()
-        captured = {}
-
-        def popen(command, **kwargs):
-            captured.update(kwargs)
-            captured["command"] = command
-            return FakeProcess(adts())
-
-        recorder._popen = popen
-        recorder.on_camera_event(Event())
-        recorder.run_once()
+        captured = self.spawn_kwargs(recorder)
 
         self.assertIsInstance(captured["command"], tuple)
-        self.assertEqual(captured["stderr"], subprocess.DEVNULL)
+        # Kept, not discarded: the tail of it is what makes a failure
+        # diagnosable from the journal.
+        self.assertEqual(captured["stderr"], subprocess.PIPE)
         self.assertEqual(captured["stdin"], subprocess.DEVNULL)
         self.assertTrue(captured["close_fds"])
         self.assertIsNotNone(captured["preexec_fn"])
+
+    # -- the child's bounds -----------------------------------------------
+
+    def test_the_audio_child_gets_an_address_space_ffmpeg_can_load_into(self):
+        """128 MiB could not even map ffmpeg's shared libraries (Pi, 2026-09-08)."""
+        recorder = self.recorder()
+
+        limits = self.applied_limits(self.spawn_kwargs(recorder)["preexec_fn"])
+
+        self.assertEqual(limits, [(1024 * 1024 * 1024, 1024 * 1024 * 1024)])
+
+    def test_the_probe_children_keep_their_own_much_smaller_limit(self):
+        """Only the audio child is raised; ping needs nothing like this."""
+        self.assertEqual(net_probe.CHILD_ADDRESS_SPACE_BYTES, 64 * 1024 * 1024)
+        self.assertLess(
+            net_probe.CHILD_ADDRESS_SPACE_BYTES, DEFAULT_CHILD_ADDRESS_SPACE_BYTES,
+        )
+
+    def test_the_address_space_limit_is_tunable_but_never_unbounded(self):
+        config = load_audio_capture_config(
+            {"GATE_AUDIO_CAPTURE_MAX_ADDRESS_SPACE_BYTES": str(512 * 1024 * 1024)}, None,
+        )
+        self.assertEqual(config.child_address_space_bytes, 512 * 1024 * 1024)
+
+        recorder = AudioClipRecorder(
+            AudioCaptureConfig(enabled=True, directory=self.root,
+                               child_address_space_bytes=512 * 1024 * 1024),
+            store=AudioClipStore(self.root),
+            popen=lambda command, **kwargs: FakeProcess(adts()),
+            clock=lambda: self.time[0], wall_clock=lambda: self.wall[0],
+            host_metrics=lambda: dict(self.metrics),
+        )
+        self.assertEqual(
+            self.applied_limits(self.spawn_kwargs(recorder)["preexec_fn"]),
+            [(512 * 1024 * 1024, 512 * 1024 * 1024)],
+        )
+        with self.assertRaises(ValueError):
+            load_audio_capture_config(
+                {"GATE_AUDIO_CAPTURE_MAX_ADDRESS_SPACE_BYTES": "134217728"}, None,
+            )
+        with self.assertRaises(ValueError):
+            load_audio_capture_config(
+                {"GATE_AUDIO_CAPTURE_MAX_ADDRESS_SPACE_BYTES": "17179869184"}, None,
+            )
+
+    # -- diagnosing a failure ---------------------------------------------
+
+    def test_a_failing_child_journals_the_tail_of_what_it_complained_about(self):
+        message = (b"ffmpeg: error while loading shared libraries: "
+                   b"libcodec2.so.1.0: failed to map segment from shared object\n")
+        recorder = self.recorder(output=b"", returncode=1, errors=message)
+        recorder.on_camera_event(Event())
+
+        with self.assertLogs("gate_controller.audio_capture", level="WARNING") as logs:
+            self.assertFalse(recorder.run_once())
+
+        line = "\n".join(logs.output)
+        self.assertIn("outcome=failed reason=exit_status", line)
+        self.assertIn("failed to map segment from shared object", line)
+        self.assertEqual(len(logs.output), 1, logs.output)
+        self.assertIn(
+            "libcodec2.so.1.0", recorder.status()["last_capture"]["stderr"],
+        )
+
+    def test_a_chatty_child_cannot_flood_the_journal(self):
+        recorder = self.recorder(output=b"", returncode=1, errors=b"x\n" * 100_000)
+        recorder.on_camera_event(Event())
+
+        with self.assertLogs("gate_controller.audio_capture", level="WARNING") as logs:
+            recorder.run_once()
+
+        tail = recorder.status()["last_capture"]["stderr"]
+        self.assertEqual(len(tail), 200)
+        self.assertNotIn("\n", tail)
+        self.assertEqual(len(logs.output), 1)
+
+    def test_a_child_that_said_nothing_still_journals_one_line(self):
+        recorder = self.recorder(output=b"", returncode=1, errors=b"")
+        recorder.on_camera_event(Event())
+
+        with self.assertLogs("gate_controller.audio_capture", level="WARNING") as logs:
+            recorder.run_once()
+
+        self.assertIn("stderr=-", "\n".join(logs.output))
+        self.assertIsNone(recorder.status()["last_capture"]["stderr"])
+
+    def test_a_real_child_that_floods_stderr_neither_blocks_nor_loses_its_clip(self):
+        """Over a pipe buffer of stderr, with no reader, would wedge the child.
+
+        The only test here that spawns a real process, because it is the one
+        thing a stand-in cannot show: stderr is a pipe now, so it has to be
+        read in the same loop as stdout or a chatty child blocks on the write
+        and never reaches the -t it was given.
+        """
+        noise = ("i=0; while [ $i -lt 5000 ]; do "
+                 "printf 'noisy line %d padded out to fill the pipe buffer\\n' $i >&2; "
+                 "i=$((i+1)); done; ")
+        recorder = self.recorder()
+        recorder._popen = subprocess.Popen
+        script = noise + r"printf '\377\361\120\200\000\037\374'; head -c 4096 /dev/zero"
+        with mock.patch.object(
+            AudioClipRecorder, "command",
+            new=property(lambda self: ("/bin/sh", "-c", script)),
+        ), mock.patch.object(audio_capture, "_child_limiter", lambda limit: None):
+            recorder.on_camera_event(Event())
+            self.assertTrue(recorder.run_once())
+
+        self.assertEqual(recorder.status()["captured"], 1)
+        self.assertEqual(len(list(self.root.glob("*.aac"))), 1)
 
     def test_a_disabled_recorder_does_nothing_at_either_entry_point(self):
         recorder = AudioClipRecorder(
@@ -475,6 +589,38 @@ class RecorderTests(unittest.TestCase):
         self.assertFalse(recorder.run_once())
 
     # -- helpers ----------------------------------------------------------
+
+    def spawn_kwargs(self, recorder) -> dict:
+        """Run one capture and return what the child would have been spawned with."""
+        captured = {}
+
+        def popen(command, **kwargs):
+            captured.update(kwargs)
+            captured["command"] = command
+            return FakeProcess(adts())
+
+        recorder._popen = popen
+        recorder.on_camera_event(Event())
+        recorder.run_once()
+        return captured
+
+    def applied_limits(self, preexec) -> list:
+        """The RLIMIT_AS the hook would apply, without applying it here.
+
+        The hook runs between fork and exec on the Pi; running it for real in
+        the test process would cap this interpreter's own address space and
+        renice it.
+        """
+        limits = []
+
+        def setrlimit(which, limit):
+            self.assertEqual(which, resource.RLIMIT_AS)
+            limits.append(limit)
+
+        with mock.patch.object(resource, "setrlimit", setrlimit), \
+                mock.patch.object(os, "nice", lambda value: 0):
+            preexec()
+        return limits
 
     def only_sidecar(self) -> dict:
         sidecars = sorted(self.root.glob("*.json"))
