@@ -20,6 +20,12 @@ CPUQuota=20%
 TasksMax=64
 UMask=0077
 ReadWritePaths=/run/gate-camera
+# The IR lease record. /run is tmpfs and is recreated empty at boot, so a lease
+# kept there does not survive the power cut it most needs to survive: the camera
+# is separately powered and would hold the leased state indefinitely. This
+# directory is owner-only; nothing outside this service reads it.
+StateDirectory=gate-camera
+StateDirectoryMode=0700
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -43,7 +49,7 @@ CapabilityBoundingSet=
 IPAddressDeny=any
 IPAddressAllow=localhost
 InaccessiblePaths=-/var/lib/gate-controller -/opt/gate-controller -/opt/gate-controller-deploy -/usr/local/libexec/gate-controller -/etc/gate-media-gateway.env -/etc/gate-media-auth.env -/etc/gate-media-turn.env -/var/lib/gate-media -/dev/gpiomem -/dev/gpiochip0 -/dev/gpiochip1 -/dev/gpiochip2 -/dev/gpiochip3
-NoExecPaths=/run/gate-camera /tmp /var/tmp /dev/shm
+NoExecPaths=/run/gate-camera /var/lib/gate-camera /tmp /var/tmp /dev/shm
 
 [Install]
 WantedBy=multi-user.target

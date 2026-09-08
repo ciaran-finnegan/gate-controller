@@ -32,9 +32,18 @@ from .state import STATE_PATH, StatePublisher
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8767
 MAX_REQUEST_BYTES = 4096
+# Per-connection socket timeout. Long enough for cloudflared to send a request
+# it has already opened a connection for, short enough that a half-open
+# connection cannot hold one of the service's few threads indefinitely.
+REQUEST_TIMEOUT_SECONDS = 10
 RUNTIME_ROOT = "/run/gate-camera"
 TOKEN_PATH = f"{RUNTIME_ROOT}/token.json"
-LEASE_PATH = f"{RUNTIME_ROOT}/lease.json"
+# The lease outlives the machine, so it cannot live on tmpfs. `/run` is recreated
+# empty at boot, which is exactly the moment a lease matters most: the camera is
+# separately powered, so a power cut during a lease used to leave it holding the
+# leased state with nothing left on the Pi that knew to put it back.
+STATE_ROOT = "/var/lib/gate-camera"
+LEASE_PATH = f"{STATE_ROOT}/lease.json"
 SNAPSHOT_MIN_INTERVAL_SECONDS = 2.0
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_WAIT_SECONDS = 15.0
@@ -114,19 +123,33 @@ class CameraControlService:
             )
         # Reserved before the camera is touched, so two concurrent posts of one
         # key produce one lease, not two: the loser waits for the winner and
-        # then answers from the lease the winner actually created.
-        first = self._reserve(key)
-        if not first.wait_if_replay():
-            return self._replay(key)
+        # then answers from the lease the winner actually created -- or repeats
+        # the failure the winner met, which is the only honest answer when the
+        # camera call the key stands for did not succeed.
+        call, owned = self._reserve(key)
+        if not owned:
+            return self._replay(key, call)
         try:
             self._admit(self._ir_limiter, "ir_rate_limited")
+        except RateLimited as error:
+            # Refused before the camera was touched, so the key stands for
+            # nothing: it is released for a later retry, and only the caller
+            # already queued behind it is told what happened.
+            self._release(key, call)
+            call.fail(error)
+            raise
+        try:
             snapshot = self._controller.set_state(
                 request["state"], request["lease_minutes"]
             )
-        except BaseException:
-            self._forget(key)
+        except BaseException as error:
+            # The camera was called and did not confirm. The key keeps that
+            # outcome for its whole life, so a replay is answered with the same
+            # failure and the same status rather than with a "completed" that
+            # carries the state from before the change.
+            call.fail(error)
             raise
-        first.complete()
+        call.complete()
         response = self._completed(snapshot)
         response["idempotency_key"] = key
         return response
@@ -165,36 +188,52 @@ class CameraControlService:
             "ir": ir_snapshot,
         }
 
-    def _replay(self, key) -> dict:
+    def _replay(self, key, call) -> dict:
         """Answer a repeat post from the live lease, never from a frozen copy.
 
         A stored response would keep serving the `observed_at` and the
         `lease_seconds_remaining` of the original call, so a client that retried
         a minute later would be told the lease had a minute more left than it
         really did -- and would leave IR on trusting it.
+
+        Three outcomes, and only one of them is `completed`. The owner failed:
+        its error is raised here too, with the status it earned, because
+        answering `completed` with a snapshot taken *before* the change told the
+        app a change had landed when the camera had refused it. The owner is
+        still in flight when the wait runs out: neither answer is known to be
+        true, so the caller is told exactly that.
         """
+        if not call.event.wait(timeout=IDEMPOTENCY_WAIT_SECONDS):
+            raise IdempotentCallInFlight()
+        if call.error is not None:
+            raise call.error
         response = self._completed(self._controller.snapshot())
         response["idempotency_key"] = key
         return response
 
     def _reserve(self, key):
+        """Return ``(call, owned)``: the shared outcome record and who owns it."""
         with self._idempotency_lock:
             self._expire_locked()
             entry = self._idempotency.get(key)
             if entry is not None:
-                return _Reservation(entry[1], owned=False)
-            reservation = _Reservation(threading.Event(), owned=True)
-            self._idempotency[key] = (self._clock(), reservation.event)
+                return entry[1], False
+            call = _IdempotentCall()
+            self._idempotency[key] = (self._clock(), call)
             while len(self._idempotency) > MAX_IDEMPOTENCY_ENTRIES:
                 self._idempotency.popitem(last=False)
-            return reservation
+            return call, True
 
-    def _forget(self, key) -> None:
-        """Drop a reservation whose call failed, so the caller may retry it."""
+    def _release(self, key, call) -> None:
+        """Drop a key whose call never reached the camera, so it may be retried.
+
+        The record itself is settled by the caller either way: a waiter holds a
+        reference to it, so it is woken even when the key has been evicted from
+        the map by the entry cap or by the TTL.
+        """
         with self._idempotency_lock:
-            entry = self._idempotency.pop(key, None)
-        if entry is not None:
-            entry[1].set()
+            if self._idempotency.get(key, (None, None))[1] is call:
+                self._idempotency.pop(key, None)
 
     def _expire_locked(self) -> None:
         cutoff = self._clock() - IDEMPOTENCY_TTL_SECONDS
@@ -202,22 +241,23 @@ class CameraControlService:
             self._idempotency.pop(key, None)
 
 
-class _Reservation:
-    """One idempotency key held by whichever request reached the camera first."""
+class _IdempotentCall:
+    """One idempotency key's shared outcome: in flight, completed, or failed."""
 
-    def __init__(self, event, *, owned: bool):
-        self.event = event
-        self._owned = owned
-
-    def wait_if_replay(self) -> bool:
-        """True when this caller owns the key; False once the winner has landed."""
-        if self._owned:
-            return True
-        self.event.wait(timeout=IDEMPOTENCY_WAIT_SECONDS)
-        return False
+    def __init__(self):
+        self.event = threading.Event()
+        self.error = None
 
     def complete(self) -> None:
         self.event.set()
+
+    def fail(self, error) -> None:
+        self.error = error
+        self.event.set()
+
+
+class IdempotentCallInFlight(Exception):
+    """A replay whose owner had still not answered when the wait ran out."""
 
 
 class _RateLimiter:
@@ -301,6 +341,13 @@ class CameraControlHandler(BaseHTTPRequestHandler):
     server_version = "gate-camera-control"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    # Every socket read on a connection is bounded, so a client that opens one
+    # and then says nothing -- or stops mid-headers, or holds a keep-alive
+    # connection open after its last request -- is dropped instead of parking a
+    # thread for ever. `TasksMax=64` makes twenty such connections an outage.
+    # It bounds reads and writes, not the handler: a `POST /camera/ir` that has
+    # to log in first takes 10-20 s inside the service and is unaffected.
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self):  # noqa: N802 - required by BaseHTTPRequestHandler
         path = self._route()
@@ -436,6 +483,13 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         except CameraError:
             journal(self.server.logger, "camera_error")
             self._respond_json(502, {"error": "camera_error"})
+        except IdempotentCallInFlight:
+            # Not `completed`, and not a definite failure either: the first post
+            # of this key is still talking to the camera. `502
+            # camera_indeterminate` is the one answer the app records as
+            # indeterminate rather than as a landed change or a refusal.
+            journal(self.server.logger, "ir_idempotent_in_flight")
+            self._respond_json(502, {"error": "camera_indeterminate"})
         except ValueError:
             self._respond_json(400, {"error": "invalid_request"})
         except Exception:
@@ -537,6 +591,12 @@ def main(argv=None) -> int:
     # heartbeat path depends on. tmpfiles.d normally gets there first; this is
     # the case where it did not.
     os.chmod(RUNTIME_ROOT, 0o755)
+    # The lease directory is the opposite: nothing outside this service ever
+    # reads it, so it stays owner-only. `StateDirectory=gate-camera` in the unit
+    # normally creates it; under `ProtectSystem=strict` this call can only
+    # succeed when it did, which is the loud failure we want if it is missing.
+    os.makedirs(STATE_ROOT, mode=0o700, exist_ok=True)
+    os.chmod(STATE_ROOT, 0o700)
     service = build_service(settings, logger=logger)
     # A lease that outlived the previous process must never leave IR on.
     service.controller.restore_default_on_start()

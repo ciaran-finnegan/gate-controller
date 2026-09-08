@@ -4,6 +4,14 @@ Turning the IR illuminator on at night re-creates the specular return off the
 near gate post and degrades plate recognition, so every change here is a bounded
 lease.  The lease is persisted before the camera is touched, so a restart in the
 middle of a lease still reverts to the configured default.
+
+The lease record lives on durable storage (systemd ``StateDirectory=``), not in
+``/run``: a lease kept on tmpfs is erased by the power cut it most needs to
+survive, and the camera is separately powered, so it would hold the leased state
+for ever.  Because a record can still be lost -- an operator clearing the state
+directory, a filesystem restored from elsewhere -- startup also *reconciles*: it
+reads the camera once and puts it back to the configured default when what it
+finds is not the default and no lease explains it.
 """
 
 import contextlib
@@ -26,6 +34,11 @@ DIRECT_READ_MAX_AGE_SECONDS = 5.0
 REVERT_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 MAX_LEASE_FILE_BYTES = 4 * 1024
 BACKGROUND_REFRESH_SECONDS = 30.0
+# A lease timestamp more than a year from now is not a lease, it is a corrupt or
+# hostile record: `datetime.fromtimestamp(1e18)` raises out of `_isoformat`, and
+# that exception escapes `snapshot()` -- which the state publisher calls -- so
+# the heartbeat freezes at `service_unhealthy` and the revert never runs.
+MAX_LEASE_CLOCK_SKEW_SECONDS = 365 * 24 * 60 * 60
 
 
 class IrController:
@@ -58,7 +71,19 @@ class IrController:
         self._revert_failed = False
         self._revert_attempts = 0
         self._next_revert_attempt_at = 0.0
-        self._lease = self._load_lease()
+        self._lease, corrupt = self._load_lease()
+        if corrupt:
+            # A record that exists but cannot be trusted is treated as an
+            # already-expired lease: the state it named is unknowable, so the
+            # camera is put back to the configured default through the ordinary
+            # revert path, with its retries and its journal line, rather than
+            # being left wherever the unreadable record left it.
+            now = self._clock()
+            self._lease = {
+                "state": self._default_state, "expires_at": now, "set_at": now,
+            }
+            self._journal("lease_corrupt", state=self._default_state)
+            self._write_lease(self._lease)
 
     @property
     def default_state(self) -> str:
@@ -73,12 +98,48 @@ class IrController:
         return self._max_lease_minutes
 
     def restore_default_on_start(self) -> None:
-        """Revert an outstanding lease before the service accepts any request."""
+        """Put the camera back to the default before the service answers anyone.
+
+        A lease record is the fast path: revert it and clear it.  With no record
+        the camera still has to be *asked*, because the record can be lost while
+        the lease it described is still in force -- the state directory wiped, a
+        power cut in the days when the record lived on tmpfs -- and the camera is
+        separately powered, so nothing else would ever bring it back.
+        """
         with self._lock:
-            if self._lease is None:
+            outstanding = self._lease is not None
+        if outstanding:
+            self._journal("startup_revert", state=self._default_state)
+            self._revert(stage="startup_revert")
+            return
+        self._reconcile_on_start()
+
+    def _reconcile_on_start(self) -> None:
+        """One bounded read, and a revert only if the camera disagrees.
+
+        Nothing is written on the strength of a camera we could not read: an
+        unobserved camera stays unobserved and is reported as `unknown`, exactly
+        as it is at any other time.  A camera that answers with the configured
+        default is left alone, so a restart loop still cannot become a login
+        storm -- it costs one `GetIrLights` on the cached token, never a write.
+        """
+        if not self.refresh_observation():
+            self._journal("startup_reconcile", outcome="not_observed")
+            return
+        with self._lock:
+            observed = self._observed_state
+            if observed is None or observed == self._default_state:
                 return
-        self._journal("startup_revert", state=self._default_state)
-        self._revert(stage="startup_revert")
+            # Reconstructed as an already-expired lease so the ordinary revert
+            # path owns it: the retry backoff, `revert_failed` in the heartbeat,
+            # and a record that survives another restart mid-reconcile.
+            now = self._clock()
+            self._lease = {"state": observed, "expires_at": now, "set_at": now}
+            self._write_lease(self._lease)
+        self._journal(
+            "startup_reconcile", state=self._default_state, observed=observed
+        )
+        self._revert(stage="startup_reconcile")
 
     def state(self, *, refresh_max_age=OBSERVATION_MAX_AGE_SECONDS) -> dict:
         """Return the published state, refreshing a stale observation first.
@@ -136,25 +197,26 @@ class IrController:
                 now = self._clock()
                 expires_at = now + minutes * 60
                 reverting = state == self._default_state
-                previous_lease = self._lease
-                # Persist the lease before the camera changes so a crash between
-                # the two still reverts on the next start.
-                self._write_lease(None if reverting else {
-                    "state": state, "expires_at": expires_at, "set_at": now,
-                })
+                # Persist a new lease before the camera changes so a crash
+                # between the two still reverts on the next start. A cancel
+                # removes nothing yet: until the camera confirms, the record is
+                # the only thing that guarantees a later revert, so it is cleared
+                # after the call succeeds, exactly as `_revert` does it.
+                if not reverting:
+                    self._write_lease({
+                        "state": state, "expires_at": expires_at, "set_at": now,
+                    })
             try:
                 self._client.set_ir_state(state)
             except CameraError as error:
                 with self._lock:
-                    self._record_error_locked(error)
+                    self._record_error_locked(error, invalidates_observation=True)
                     # A failed call is indeterminate: the camera may have applied
                     # it. Keep whichever record guarantees a later revert - the
-                    # new lease when one was requested, the previous lease when
-                    # this was itself a revert - rather than the record that
-                    # assumes success.
-                    if reverting:
-                        self._write_lease(previous_lease)
-                    else:
+                    # new lease when one was requested, the untouched previous
+                    # lease when this was itself a revert - rather than the
+                    # record that assumes success.
+                    if not reverting:
                         self._lease = {
                             "state": state, "expires_at": expires_at, "set_at": now,
                         }
@@ -169,6 +231,7 @@ class IrController:
                 self._last_error = None
                 if reverting:
                     self._lease = None
+                    self._write_lease(None)
                     self._revert_failed = False
                     self._revert_attempts = 0
                     self._journal("ir_revert", state=state, outcome="completed")
@@ -220,7 +283,7 @@ class IrController:
                 self._client.set_ir_state(self._default_state)
             except CameraError as error:
                 with self._lock:
-                    self._record_error_locked(error)
+                    self._record_error_locked(error, invalidates_observation=True)
                     self._revert_failed = True
                     self._revert_attempts += 1
                     backoff = REVERT_RETRY_SECONDS[
@@ -277,9 +340,19 @@ class IrController:
         except Exception:
             return False
 
-    def _record_error_locked(self, error) -> None:
+    def _record_error_locked(self, error, *, invalidates_observation=False) -> None:
+        """Record a camera failure, and forget the observation it invalidated.
+
+        Any failed *mutation* invalidates it, whatever the failure was: a plain
+        `CameraError` -- a nonzero `rspCode`, an unexpected status, a body that
+        is not JSON -- means the camera was asked to change and did not say
+        whether it did.  Keeping the pre-change observation `fresh` published
+        `ready` with the old state, so the heartbeat said `Off` while the camera
+        may well have been `Auto`.  A busy or unreachable camera invalidates it
+        even on a read, because neither answer says anything about the camera.
+        """
         self._last_error = error.code
-        if isinstance(error, (CameraBusy, CameraUnreachable)):
+        if invalidates_observation or isinstance(error, (CameraBusy, CameraUnreachable)):
             self._observed_state = None
             self._observed_at = None
         self._journal(error.code, retry_after=error.retry_after)
@@ -313,41 +386,57 @@ class IrController:
         return lease_minutes
 
     def _load_lease(self):
+        """Return ``(lease, corrupt)``: no record, a usable one, or an unusable one.
+
+        The three cases are distinct. No file means no lease. A usable record is
+        reverted on start. An unusable one -- unreadable, unparseable, or naming
+        a time that is not a time -- must not be silently read as "no lease",
+        because the camera may still be holding whatever it described.
+        """
         if self._lease_path is None:
-            return None
+            return None, False
         flags = os.O_RDONLY | os.O_NONBLOCK
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(self._lease_path, flags)
+        except FileNotFoundError:
+            return None, False
         except OSError:
-            return None
+            return None, True
         try:
             metadata = os.fstat(descriptor)
             if (not stat.S_ISREG(metadata.st_mode)
                     or not 0 < metadata.st_size <= MAX_LEASE_FILE_BYTES):
-                return None
+                return None, True
             body = os.read(descriptor, metadata.st_size)
         except OSError:
-            return None
+            return None, True
         finally:
             os.close(descriptor)
         try:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            return None
+            return None, True
         if (not isinstance(decoded, dict)
                 or set(decoded) != {"state", "expires_at", "set_at"}
                 or decoded["state"] not in IR_STATES):
-            return None
+            return None, True
+        now = self._clock()
         for key in ("expires_at", "set_at"):
             value = decoded[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return None
+                return None, True
+            # Bounded to a year either side of now. Beyond that the value is not
+            # a timestamp this service ever wrote, and rendering it would raise
+            # out of `_isoformat` and out of `snapshot()` with it.
+            if (not math.isfinite(value)
+                    or abs(float(value) - now) > MAX_LEASE_CLOCK_SKEW_SECONDS):
+                return None, True
         return {
             "state": decoded["state"],
             "expires_at": float(decoded["expires_at"]),
             "set_at": float(decoded["set_at"]),
-        }
+        }, False
 
     def _write_lease(self, lease) -> None:
         if self._lease_path is None:

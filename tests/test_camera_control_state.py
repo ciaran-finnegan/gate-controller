@@ -1,6 +1,7 @@
 import configparser
 import json
 import os
+import subprocess
 import time
 import unittest
 from pathlib import Path
@@ -23,6 +24,12 @@ def read_unit(relative_path):
     parser.optionxform = str
     parser.read(REPOSITORY_ROOT / relative_path, encoding="utf-8")
     return parser
+
+
+def _controller_reasons():
+    from gate_controller.camera_control_state import _REASONS
+
+    return _REASONS
 
 
 def ready_document(now=None, **overrides):
@@ -224,6 +231,45 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertEqual("/usr/bin/python3 -m gate_camera_control", unit["ExecStart"])
         self.assertEqual("/run/gate-camera", unit["ReadWritePaths"])
 
+    def test_the_ir_lease_is_kept_on_storage_that_survives_a_power_cut(self):
+        """`/run` is tmpfs, and a lease on tmpfs dies with the thing it guards.
+
+        The camera has its own supply, so a power cut during a lease left it
+        holding the leased state while the record that would have reverted it
+        was erased by the boot that recreated `/run`.
+        """
+        from gate_camera_control.__main__ import LEASE_PATH, STATE_ROOT
+
+        unit = read_unit("deployment/systemd/gate-camera-control.service")["Service"]
+        installer = (
+            REPOSITORY_ROOT / "deployment/install-camera-control.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual("/var/lib/gate-camera", STATE_ROOT)
+        self.assertEqual("/var/lib/gate-camera/lease.json", LEASE_PATH)
+        self.assertFalse(LEASE_PATH.startswith("/run/"))
+        self.assertEqual("gate-camera", unit["StateDirectory"])
+        self.assertEqual("0700", unit["StateDirectoryMode"])
+        self.assertIn("d $CAMERA_STATE_ROOT 0700", installer)
+        self.assertIn("CAMERA_STATE_ROOT=/var/lib/gate-camera", installer)
+
+    def test_the_installer_names_a_missing_source_value_instead_of_dying(self):
+        """`set -u` turned the intended message into "$2: unbound variable".
+
+        `require_option_value "$1" "${2-}"` always passed two arguments, so the
+        count-based guard never fired and the assignment below it aborted the
+        script with bash's own error.
+        """
+        result = subprocess.run(
+            ["/bin/bash", str(REPOSITORY_ROOT / "deployment/install-camera-control.sh"),
+             "--source"],
+            capture_output=True, text=True, timeout=60,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--source requires a value", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
     def test_the_service_cannot_reach_anything_but_loopback_by_default(self):
         unit = read_unit("deployment/systemd/gate-camera-control.service")["Service"]
 
@@ -325,6 +371,88 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertIn("GATE_CAMERA_PASSWORD=", template)
         self.assertIn("GATE_CAMERA_IR_DEFAULT=Off", template)
         self.assertNotIn("MTX_", template)
+
+    def test_the_docs_send_the_installer_at_the_managed_release_tree(self):
+        """`/opt/gate-controller/releases/<sha>` does not exist.
+
+        The updater unpacks into `/opt/gate-controller-deploy/releases/<sha>`,
+        so the documented command fails with "must be a directory" on the one
+        step an operator has to run by hand after every release.
+        """
+        for relative in ("docs/camera-control.md", "docs/deployment.md"):
+            with self.subTest(document=relative):
+                text = (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
+
+                self.assertIn(
+                    "install-camera-control.sh --source "
+                    "/opt/gate-controller-deploy/releases/",
+                    text,
+                )
+                self.assertNotIn("--source /opt/gate-controller/releases/", text)
+
+    def test_the_documented_rollback_does_not_assume_the_default_is_off(self):
+        """`GATE_CAMERA_IR_DEFAULT` may be `Auto`.
+
+        Posting a hard-coded `{"state":"Off"}` at a deployment whose default is
+        `Auto` does not cancel the lease -- it creates one, in the opposite
+        direction, immediately before the service that would revert it is
+        stopped.
+        """
+        text = (REPOSITORY_ROOT / "docs/camera-control.md").read_text(encoding="utf-8")
+        rollback = text.split("## Rollback", 1)[1]
+
+        self.assertNotIn('-d \'{"state":"Off"}\'', rollback)
+        self.assertIn('["ir"]["default"]', rollback)
+
+    def test_the_documented_snapshot_methods_match_the_ones_the_code_serves(self):
+        from gate_camera_control.__main__ import _SNAPSHOT_PATHS
+
+        text = (REPOSITORY_ROOT / "docs/camera-control.md").read_text(encoding="utf-8")
+
+        self.assertEqual({"/camera/snap", "/camera/snapshot"}, set(_SNAPSHOT_PATHS))
+        self.assertIn(
+            "### `GET /camera/snap` — also served at `POST /camera/snap`, "
+            "and `GET`/`POST /camera/snapshot`",
+            text,
+        )
+
+    def test_the_documented_reboot_behaviour_is_the_behaviour(self):
+        text = (REPOSITORY_ROOT / "docs/camera-control.md").read_text(encoding="utf-8")
+
+        self.assertIn("/var/lib/gate-camera/lease.json", text)
+        self.assertIn("StateDirectory=gate-camera", text)
+        self.assertNotIn("/run/gate-camera/lease.json", text)
+
+    def test_the_heartbeat_block_key_set_and_reason_enum_are_frozen(self):
+        """PR #36's Worker narrows on exactly these keys and these reasons.
+
+        `narrowedCameraControlCapabilities` drops the whole block when a
+        required key is missing or a reason is not in its list, so the control
+        disappears from the app. Nothing in this service may widen or rename
+        them without the Worker changing first.
+        """
+        from gate_camera_control.state import IR_STATES, REASONS
+
+        document = ready_document(state="Auto", effective_until="2026-09-08T21:14:11+00:00")
+        block = document["camera_control"]
+
+        self.assertEqual({"observed_at", "camera_control"}, set(document))
+        self.assertEqual({"available", "reason", "ir"}, set(block))
+        self.assertEqual(
+            {"state", "default", "effective_until", "revert_failed"}, set(block["ir"])
+        )
+        self.assertEqual(
+            ("ready", "not_observed", "camera_busy", "camera_unreachable",
+             "camera_error"),
+            REASONS,
+        )
+        self.assertEqual(("Auto", "Off"), IR_STATES)
+        # The two the controller adds when the service is absent, and no others.
+        self.assertEqual(
+            {"ready", "not_configured", "service_unhealthy", "not_observed",
+             "camera_busy", "camera_unreachable", "camera_error"},
+            set(_controller_reasons()),
+        )
 
     def test_the_controller_environment_example_gains_no_camera_credentials(self):
         example = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")

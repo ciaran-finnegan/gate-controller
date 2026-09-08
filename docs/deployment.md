@@ -1007,7 +1007,7 @@ does not republish `/usr/local/lib/gate-camera-control` — that path sits outsi
 the managed release tree so an auto-update cannot silently change the one process
 holding camera credentials — so a release that changes `gate_camera_control/` or
 `gate_media_config.py` does not reach the running service until
-`sudo deployment/install-camera-control.sh --source /opt/gate-controller/releases/<sha>`
+`sudo deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>`
 is run.
 
 The full HTTP contract, environment keys, journal lines, failure modes, and

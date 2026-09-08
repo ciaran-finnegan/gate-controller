@@ -13,8 +13,11 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
+import gate_camera_control.__main__ as camera_control_main
 from gate_camera_control.__main__ import (
+    CameraControlHandler,
     CameraControlServer,
     CameraControlService,
     build_service,
@@ -309,6 +312,33 @@ class CameraControlEnvironmentTests(unittest.TestCase):
         self.assertEqual(0o644, stat.S_IMODE(target.stat().st_mode))
         self.assertNotIn("s3cret", target.read_text(encoding="ascii"))
 
+    def test_the_egress_pin_can_never_be_wider_than_one_address(self):
+        """`/32` is an IPv4 host route, and an IPv6 lie.
+
+        `fd00::54` used to render `IPAddressAllow=fd00::54/32`, which allows
+        2**96 addresses -- the whole point of the pin, gone. IPv6 is refused
+        outright instead, because `http.client` splits a bare IPv6 literal at
+        its last colon and would never have reached the camera anyway.
+        """
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = {"GATE_CAMERA_USERNAME": "gate", "GATE_CAMERA_PASSWORD": "s3cret"}
+        ipv4 = Path(directory.name) / "ipv4.conf"
+        ipv6 = Path(directory.name) / "ipv6.conf"
+
+        write_camera_address_dropin(ipv4, {**base, "GATE_CAMERA_HOST": "192.168.0.54"})
+
+        self.assertEqual(
+            "[Service]\nIPAddressAllow=192.168.0.54/32\n",
+            ipv4.read_text(encoding="ascii"),
+        )
+
+        for host in ("fd00::54", "2001:db8::1"):
+            with self.subTest(host=host):
+                with self.assertRaises(MediaConfigError):
+                    write_camera_address_dropin(ipv6, {**base, "GATE_CAMERA_HOST": host})
+                self.assertFalse(ipv6.exists())
+
     def test_an_invalid_environment_writes_no_pin_at_all(self):
         """A drop-in with an empty prefix would pin nothing; write none instead."""
         directory = TemporaryDirectory()
@@ -587,11 +617,133 @@ class IrLeaseTests(unittest.TestCase):
         self.assertFalse(lease_path.exists())
         self.assertIn("startup_revert", self.journal.stages())
 
-    def test_a_restart_with_no_outstanding_lease_never_touches_the_camera(self):
+    def test_a_restart_with_no_outstanding_lease_never_writes_to_the_camera(self):
+        """It reads once, and changes nothing when the camera already agrees.
+
+        The read is what makes a lost lease record recoverable. It costs one
+        `GetIrLights` on the cached token, so a restart loop still cannot become
+        a login storm, and no `SetIrLights` is issued at all.
+        """
         controller = self.build()
+
         controller.restore_default_on_start()
 
-        self.assertEqual([], self.camera.commands)
+        self.assertEqual(["GetIrLights"], self.camera.commands)
+        self.assertEqual("Off", self.camera.ir_state)
+
+    def test_a_lease_record_lost_with_the_reboot_still_ends_the_lease(self):
+        """The failure the persisted lease was supposed to prevent.
+
+        `/run` is tmpfs and is recreated empty at boot, so a power cut during a
+        lease took the record with it. The camera is on its own supply, kept the
+        leased state, and nothing on the Pi was left that knew to put it back --
+        the heartbeat published `ready` with `Auto` and no expiry, for ever.
+        """
+        controller = self.build()
+        controller.set_state("Auto", 60)
+        lease_path = Path(self.directory.name) / "lease.json"
+        lease_path.unlink()
+        self.assertEqual("Auto", self.camera.ir_state)
+
+        restarted = self.build()
+        restarted.restore_default_on_start()
+
+        self.assertEqual("Off", self.camera.ir_state)
+        self.assertIsNone(restarted.snapshot()["effective_until"])
+        self.assertFalse(lease_path.exists())
+        self.assertIn("startup_reconcile", self.journal.stages())
+
+    def test_a_camera_that_will_not_answer_on_start_is_never_written_to(self):
+        """Nothing is written on the strength of a camera we could not read."""
+        controller = self.build()
+        controller.set_state("Auto", 60)
+        (Path(self.directory.name) / "lease.json").unlink()
+        writes = self.camera.commands.count("SetIrLights")
+        self.camera.command_status = 500
+
+        restarted = self.build()
+        restarted.restore_default_on_start()
+
+        self.assertEqual(writes, self.camera.commands.count("SetIrLights"))
+        self.assertEqual("unknown", restarted.snapshot()["state"])
+
+    def test_a_lease_timestamp_outside_any_sane_window_is_corrupt_not_a_lease(self):
+        """`expires_at: 1e18` used to freeze the whole service.
+
+        `_isoformat` raised `OSError` out of `snapshot()`, which the state
+        publisher calls, so the heartbeat stuck at `service_unhealthy` and the
+        revert never ran. An unusable record is not "no lease": the camera may
+        still be holding whatever it described, so the default is restored.
+        """
+        lease_path = Path(self.directory.name) / "lease.json"
+        lease_path.write_text(
+            json.dumps({"state": "Auto", "expires_at": 1e18, "set_at": 1e18}),
+            encoding="utf-8",
+        )
+        self.camera.ir_state = "Auto"
+
+        controller = self.build()
+
+        document = state_document(controller.snapshot())
+        self.assertEqual("Off", document["camera_control"]["ir"]["default"])
+        self.assertIn("lease_corrupt", self.journal.stages())
+
+        controller.restore_default_on_start()
+
+        self.assertEqual("Off", self.camera.ir_state)
+        self.assertFalse(lease_path.exists())
+
+    def test_a_change_that_fails_outright_leaves_the_state_unknown_not_stale(self):
+        """A plain `CameraError` says nothing about whether the change landed.
+
+        Only `camera_busy` and `camera_unreachable` used to clear the
+        observation, so a nonzero `rspCode` or an unexpected status left the
+        pre-change reading fresh: the heartbeat published `ready` with `Off`
+        while the camera may well have been switched to `Auto`.
+        """
+        controller = self.build()
+        self.assertTrue(controller.refresh_observation())
+        self.assertEqual("Off", controller.snapshot()["state"])
+        self.camera.command_status = 500
+
+        with self.assertRaises(CameraError):
+            controller.set_state("Auto", 10)
+
+        snapshot = controller.snapshot()
+        self.assertEqual("unknown", snapshot["state"])
+        self.assertEqual("camera_error", snapshot["last_error"])
+        self.assertFalse(state_document(snapshot)["camera_control"]["available"])
+        # The lease is still kept, so the revert still fires.
+        self.assertIsNotNone(snapshot["effective_until"])
+        self.camera.command_status = 200
+        self.clock.advance(601)
+        self.assertTrue(controller.run_due_revert())
+        self.assertEqual("Off", self.camera.ir_state)
+
+    def test_a_cancel_keeps_the_lease_on_disk_until_the_camera_confirms(self):
+        """The record has to outlive the call that ends it.
+
+        Removing it first opens a window -- a crash, a power cut, an OOM kill --
+        in which the lease is gone and the camera is still holding the leased
+        state. `_revert` already wrote the removal after the camera confirmed;
+        the cancel path did it the other way round.
+        """
+        controller = self.build()
+        controller.set_state("Auto", 10)
+        lease_path = Path(self.directory.name) / "lease.json"
+        seen = []
+        original = controller._client.set_ir_state
+
+        def watched(state):
+            seen.append(lease_path.exists())
+            return original(state)
+
+        controller._client.set_ir_state = watched
+        controller.set_state("Off", 10)
+
+        self.assertEqual([True], seen)
+        self.assertFalse(lease_path.exists())
+        self.assertEqual("Off", self.camera.ir_state)
 
     def test_a_failed_revert_is_retried_with_backoff_and_stays_visible(self):
         controller = self.build()
@@ -877,6 +1029,90 @@ class CameraControlHttpTests(unittest.TestCase):
             payload["ir"]["effective_until"] == results[0]["ir"]["effective_until"]
             for payload in results
         ))
+
+    def test_a_replayed_key_repeats_the_failure_rather_than_reporting_success(self):
+        """A replay of a call that failed must not be answered `completed`.
+
+        Two concurrent posts of one key: the owner's `SetIrLights` raises and it
+        answers 502, while the duplicate used to be handed
+        `200 {"status":"completed"}` built from a snapshot taken *before* the
+        change -- the app recorded a landed IR change the camera had refused.
+        """
+        body = {"state": "Auto", "lease_minutes": 5, "idempotency_key": "poisoned"}
+        self.camera.command_status = 500
+
+        status, first, _ = self.json_request("POST", "/camera/ir", body)
+
+        self.assertEqual(502, status)
+        self.assertEqual("camera_error", first["error"])
+
+        self.camera.command_status = 200
+        status, second, _ = self.json_request("POST", "/camera/ir", body)
+
+        self.assertEqual(502, status)
+        self.assertEqual("camera_error", second["error"])
+        # The replay is answered from the record, not from a second attempt.
+        self.assertEqual(1, self.journal.stages().count("ir_set"))
+
+    def test_a_replay_that_outlives_the_wait_is_never_called_completed(self):
+        """The owner is still talking to the camera; nothing is known yet.
+
+        `502 camera_indeterminate` is the answer PR #36's `setIrState` records
+        as indeterminate: a 2xx of any shape is `completed` there, and a 4xx or
+        a `503 camera_busy` is `failed`. Neither is true here.
+        """
+        key = "still-in-flight"
+        call, owned = self.service._reserve(key)
+        self.assertTrue(owned)
+        self.assertFalse(call.event.is_set())
+
+        with mock.patch.object(
+            camera_control_main, "IDEMPOTENCY_WAIT_SECONDS", 0.05
+        ):
+            status, payload, _ = self.json_request("POST", "/camera/ir", {
+                "state": "Auto", "lease_minutes": 5, "idempotency_key": key,
+            })
+
+        self.assertEqual(502, status)
+        self.assertEqual("camera_indeterminate", payload["error"])
+        self.assertNotIn("status", payload)
+        self.assertEqual(0, self.camera.commands.count("SetIrLights"))
+
+    def test_a_stalled_connection_is_closed_rather_than_parking_a_thread(self):
+        """`TasksMax=64`: twenty half-open connections used to be an outage.
+
+        `BaseHTTPRequestHandler.timeout` is `None` by default, so a connection
+        that opened and then said nothing held its thread for ever.
+        """
+        self.assertEqual(10, CameraControlHandler.timeout)
+
+        with mock.patch.object(CameraControlHandler, "timeout", 0.5):
+            connection = socket.create_connection(
+                ("127.0.0.1", self.server.server_address[1]), timeout=10
+            )
+            self.addCleanup(connection.close)
+            # A request line that never ends: the server is left reading.
+            connection.sendall(b"GET /camera/state")
+            started = time.monotonic()
+
+            self.assertEqual(b"", connection.recv(4096))
+
+        self.assertLess(time.monotonic() - started, 5)
+        # The service itself is untouched by the dropped connection.
+        self.assertEqual(200, self.json_request("GET", "/camera/state")[0])
+
+    def test_a_still_is_served_on_every_path_and_method_the_docs_name(self):
+        for method, path in (
+            ("GET", "/camera/snap"), ("POST", "/camera/snap"),
+            ("GET", "/camera/snapshot"), ("POST", "/camera/snapshot"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.service._last_snapshot_at = None
+                status, headers, payload = self.request(method, path)
+
+                self.assertEqual(200, status)
+                self.assertEqual("image/jpeg", headers["Content-Type"])
+                self.assertTrue(payload.startswith(b"\xff\xd8\xff"))
 
     def test_head_returns_the_headers_of_the_get_and_no_body(self):
         connection = HTTPConnection(

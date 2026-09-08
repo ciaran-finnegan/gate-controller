@@ -350,11 +350,16 @@ def write_camera_address_dropin(path, values: Mapping[str, str]) -> None:
     `IPAddressAllow=` has an empty prefix and so pins nothing.
 
     The address is re-rendered from what `ipaddress` parsed, so the pin is
-    exactly the canonical address the service will dial.
+    exactly the canonical address the service will dial, and the prefix is the
+    address family's own host length: a hard-coded `/32` on an IPv6 address
+    would pin 2**96 addresses rather than one. `_validate_camera_host` rejects
+    IPv6 outright, so this is the second of the two guards, not the only one.
     """
     settings = validate_camera_control_environment(values)
     address = ipaddress.ip_address(settings["GATE_CAMERA_HOST"])
-    body = f"[Service]\nIPAddressAllow={address}/32\n".encode("ascii")
+    body = (
+        f"[Service]\nIPAddressAllow={address}/{address.max_prefixlen}\n"
+    ).encode("ascii")
     _atomic_write_trusted_file(path, body, mode=0o644)
 
 
@@ -368,15 +373,25 @@ def relevant_camera_control_environment(
 
 
 def _validate_camera_host(value: str) -> None:
-    """The camera host must be one exact reachable private address.
+    """The camera host must be one exact reachable private IPv4 address.
 
     The systemd unit pins the service's egress to loopback plus this address, so
     a hostname would make that pin unverifiable.
+
+    IPv6 is rejected rather than supported. `http.client` splits a bare IPv6
+    literal at its last colon, so `fd00::54` would be dialled as host `fd00:`
+    port `54` and never reach the camera; the address would still have been
+    written into the egress pin, where an IPv4-shaped `/32` covers 2**96
+    addresses. Refusing the configuration is the honest end of that: the camera
+    is an IPv4 device on the gate LAN, and a bracketed-literal client is the
+    change to make if that ever stops being true.
     """
     try:
         address = ipaddress.ip_address(value)
     except ValueError as error:
         raise MediaConfigError("camera host must be one exact IP address") from error
+    if address.version != 4:
+        raise MediaConfigError("camera host must be an IPv4 address")
     if (str(address) != value or address.is_unspecified or address.is_loopback
             or address.is_multicast or address.is_link_local or address.is_reserved):
         raise MediaConfigError("camera host must be one exact reachable IP address")

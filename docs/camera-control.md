@@ -23,7 +23,9 @@ before changing anything here.
   no zone control: it is all or nothing.
 
 Therefore every change this service accepts is a **bounded lease** that reverts
-to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart. The
+to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
+reboot: the lease record lives on durable storage, and a start that finds no
+usable record reads the camera once and puts it back if it disagrees. The
 service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
 exposure is a measured setting and stays a reviewed, on-Pi operation. The camera
 command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`, `Snap`, and
@@ -37,7 +39,8 @@ no request body can widen it.
 | The controller never gains camera credentials | `file-monitor.service` reads no camera env; it learns the IR state only from the nonsecret `/run/gate-camera/state.json` |
 | The media gateway secret is not widened | The camera env is a **separate** file. `validate_gateway_static_environment()` pins the gateway key set, so camera-API keys cannot be bolted onto it, and the service is not in group `gate-media` |
 | Its own identity | System user and group `gate-camera-control`; the installer refuses to run if that account shares a group with the media or controller services, or with `gpio` |
-| Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the drop-in `gate-camera-control.service.d/10-camera-address.conf`, which the validator writes itself (`camera-control --write-address-dropin`) so the address never passes through the installer's shell. `GATE_CAMERA_HOST` must be one exact reachable IP so that pin is verifiable |
+| Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the drop-in `gate-camera-control.service.d/10-camera-address.conf`, which the validator writes itself (`camera-control --write-address-dropin`) so the address never passes through the installer's shell. `GATE_CAMERA_HOST` must be one exact reachable IPv4 address so that pin is one
+host route and is verifiable |
 | Its own remote door | A separate Cloudflare Tunnel hostname (`gate-camera.*`) with its own Access application and its own service token — deliberately not the `gate-command` token |
 | No camera payloads leak | Every response is a bounded JSON status (or JPEG bytes); no camera payload, URL, token, or credential appears in a response or in the journal |
 | Loopback only | Binds `127.0.0.1:8767`; `--host` refuses anything else |
@@ -62,6 +65,13 @@ the same headers and no body; `HEAD /camera/snap` reports `image/jpeg` without
 taking a picture, so it never spends the snapshot budget. A request the parser
 could not read at all is answered `400 {"error":"invalid_request"}` with a real
 status line and `Connection: close`.
+
+Every socket read on a connection is bounded at **10 s**. A client that opens a
+connection and then says nothing, stops mid-headers, or holds a keep-alive
+connection open after its last request is dropped rather than parking one of the
+service's few threads: `TasksMax=64` makes twenty such connections an outage.
+The bound is on the socket, not on the handler, so a `POST /camera/ir` that has
+to log in first — 10-20 s inside the service — is unaffected.
 
 Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 
@@ -141,13 +151,30 @@ so a client that retries a minute later is told how much of the lease is left
 now, not how much was left when the lease was created. The key is reserved
 before the camera is touched, so two concurrent posts of one key produce one
 lease and one camera call; the second waits for the first and then answers from
-what the first actually created. A call that fails releases its key, so the
-caller may retry it.
+what the first actually created.
+
+A key records how its call ended, not merely that it happened:
+
+- the call succeeded — a replay is `200 completed`, recomputed from the live
+  lease as above;
+- the camera refused it or did not confirm — a replay raises the **same**
+  failure with the same status. Answering `completed` from a snapshot taken
+  before the change told the caller a change had landed that the camera had
+  refused;
+- the service refused it before touching the camera (`429 rate_limited`) — the
+  key stands for nothing and is released, so the caller may retry it;
+- the first call is still in flight when a duplicate's 15 s wait runs out —
+  `502 {"error":"camera_indeterminate"}`. Nothing is known yet, and this is the
+  one status the app records as indeterminate rather than as a landed change
+  (any `2xx`) or a definite refusal (`4xx`, `503 camera_busy`).
 
 Setting `state` to the configured default cancels the lease immediately — that
 is the "revert now" action.
 
-### `GET /camera/snap` — also served at `GET`/`POST /camera/snapshot`
+### `GET /camera/snap` — also served at `POST /camera/snap`, and `GET`/`POST /camera/snapshot`
+
+`POST` is accepted on both spellings for callers that cannot issue a `GET`;
+it takes no body and behaves identically.
 
 Returns `200` with `Content-Type: image/jpeg` and one bounded 4K JPEG from the
 camera's `Snap` API (a few hundred KB, about 0.45 s). Rate limited to **one per
@@ -164,6 +191,7 @@ Worker's decision.
 | `413` | `{"error":"request_too_large"}` | body over 4096 bytes |
 | `429` | `{"error":"rate_limited","retry_after":2}` | any endpoint budget above; `Retry-After` header set |
 | `502` | `{"error":"camera_error"}` | the camera answered, but not usably |
+| `502` | `{"error":"camera_indeterminate"}` | a replay of an `idempotency_key` whose first call was still in flight after 15 s. Not a failure and not a success; do not infer an IR state from it |
 | `503` | `{"error":"camera_busy","retry_after":60}` | circuit breaker open after a camera 502 or a camera that did not answer, or the 60 s login throttle is holding; `Retry-After` header set. **Do not retry** — surface the wait |
 | `503` | `{"error":"camera_unreachable"}` | the camera did not answer at all. This is the *first* such failure; it also opens the breaker, so an immediate retry is `503 camera_busy` |
 | `500` | `{"error":"internal_error"}` | unexpected; nothing about the camera is disclosed |
@@ -244,7 +272,7 @@ anything outside this table is rejected. Template:
 
 | Key | Required | Default | Rules |
 | --- | --- | --- | --- |
-| `GATE_CAMERA_HOST` | yes | — | exactly one reachable IP address; loopback, unspecified, multicast, link-local and reserved are rejected, and hostnames are rejected so the systemd `/32` pin stays verifiable |
+| `GATE_CAMERA_HOST` | yes | — | exactly one reachable **IPv4** address; loopback, unspecified, multicast, link-local and reserved are rejected, and hostnames are rejected so the systemd `/32` pin stays verifiable. IPv6 is rejected outright: `http.client` splits a bare IPv6 literal at its last colon and would never reach the camera, and an IPv4-shaped `/32` on such an address would pin 2**96 of them |
 | `GATE_CAMERA_USERNAME` | yes | — | 1–256 bytes |
 | `GATE_CAMERA_PASSWORD` | yes | — | 1–256 bytes |
 | `GATE_CAMERA_IR_DEFAULT` | no | `Off` | exactly `Auto` or `Off` |
@@ -271,6 +299,10 @@ gate_camera_control stage=ir_set lease_seconds=600 outcome=completed state=Auto
 gate_camera_control stage=ir_revert outcome=completed state=Off
 gate_camera_control stage=ir_revert attempt=2 outcome=camera_busy retry_after=10 state=Off
 gate_camera_control stage=startup_revert state=Off
+gate_camera_control stage=startup_reconcile observed=Auto state=Off
+gate_camera_control stage=startup_reconcile outcome=not_observed
+gate_camera_control stage=lease_corrupt state=Off
+gate_camera_control stage=ir_idempotent_in_flight
 gate_camera_control stage=breaker_open retry_after=60
 gate_camera_control stage=camera_busy retry_after=60
 gate_camera_control stage=camera_unreachable
@@ -297,7 +329,9 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | Camera unreachable | `503 camera_unreachable` and the breaker opens for 60 s, so the retries after it are `503 camera_busy`; `state.json` keeps `last_error` and its own `observed_at`, so the app says "unknown", never "Off" |
 | Nothing has called the camera yet | `state.json` reads `not_observed`, not `camera_unreachable`; the 30 s background refresh clears it without an operator doing anything |
 | A read flood during an expiring lease | reads are single-flighted, skipped while a revert is queued, and rate limited; the revert waits for at most one in-flight call |
-| Service restart mid-lease | the lease is persisted to `/run/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. With no lease record on disk the camera is not touched at all, so a restart loop cannot become a login storm. A lost revert timer can never leave IR in the temporary state |
+| Service restart mid-lease | the lease is persisted to `/var/lib/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. A lost revert timer can never leave IR in the temporary state |
+| Reboot or power cut mid-lease | the record is on durable storage (`StateDirectory=gate-camera`), not in `/run`, which the boot recreates empty — the camera is separately powered, so a lease whose record died with the tmpfs would have been held indefinitely. It is reverted on the next start exactly as a service restart is |
+| The lease record is lost or unreadable anyway | on start, with no usable record, the service **reads** the camera once: a state that is not `GATE_CAMERA_IR_DEFAULT` is put back and journaled `startup_reconcile`; a state that matches it, or a camera that will not answer, is left alone. That read is one `GetIrLights` on the cached token, so a restart loop still cannot become a login storm, and nothing is ever written on the strength of a camera that could not be read. A record that exists but is unusable — bad JSON, or a timestamp outside a year either side of now — is journaled `lease_corrupt` and treated as an expired lease, so the default is restored through the ordinary revert path |
 | A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |
 | Revert call itself fails | retried with 5/10/20/40/60 s backoff for the life of the process; `ir.revert_failed` stays true in `state.json`; every attempt is journaled |
 | Two operators toggling at once | serialised under one lock, last write wins, both journaled |
@@ -345,8 +379,10 @@ sudo deployment/install-camera-control.sh --source "$PWD"
 It creates the `gate-camera-control` system user, refuses it if it is in `gpio`
 or shares a group with the media or controller services, publishes
 `/usr/local/lib/gate-camera-control`, installs the unit and the `/32` drop-in
-derived from `GATE_CAMERA_HOST`, creates `/run/gate-camera` through
-`/etc/tmpfiles.d/gate-camera.conf`, then enables and starts the service. If the
+derived from `GATE_CAMERA_HOST`, creates `/run/gate-camera` and the durable
+`/var/lib/gate-camera` (0700) through `/etc/tmpfiles.d/gate-camera.conf` —
+the unit's `StateDirectory=gate-camera` creates the latter too — then enables
+and starts the service. If the
 environment file is empty or invalid it publishes **nothing**, removes the
 address drop-in, leaves the service **disabled**, and says so. A failure part way
 through stops and disables the service rather than leaving it enabled against
@@ -409,7 +445,7 @@ holds camera credentials. The cost is that a release carrying a change to
 service until the installer is re-run:
 
 ```bash
-sudo deployment/install-camera-control.sh --source /opt/gate-controller/releases/<sha>
+sudo deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>
 ```
 
 ## Rollback
@@ -420,9 +456,14 @@ returns the deployment to exactly today's behaviour, except that the app's
 
 ```bash
 # 1. Make sure IR is back at the configured default before stopping the service,
-#    because a stopped service cannot run its revert.
+#    because a stopped service cannot run its revert. Setting the state to the
+#    configured default *is* the cancel, so read the default rather than
+#    assuming it: GATE_CAMERA_IR_DEFAULT may be Auto, and posting a hard-coded
+#    "Off" at such a deployment creates a lease instead of ending one.
+default=$(curl -s http://127.0.0.1:8767/camera/state \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["ir"]["default"])')
 curl -s -X POST http://127.0.0.1:8767/camera/ir \
-  -H 'Content-Type: application/json' -d '{"state":"Off"}'
+  -H 'Content-Type: application/json' -d "{\"state\":\"$default\"}"
 
 # 2. Stop and disable.
 sudo systemctl disable --now gate-camera-control.service
@@ -431,7 +472,7 @@ sudo systemctl disable --now gate-camera-control.service
 sudo rm -f /etc/systemd/system/gate-camera-control.service
 sudo rm -rf /etc/systemd/system/gate-camera-control.service.d
 sudo rm -f /etc/tmpfiles.d/gate-camera.conf
-sudo rm -rf /usr/local/lib/gate-camera-control /run/gate-camera
+sudo rm -rf /usr/local/lib/gate-camera-control /run/gate-camera /var/lib/gate-camera
 sudo rm -f /etc/gate-camera-control.env
 sudo systemctl daemon-reload
 ```

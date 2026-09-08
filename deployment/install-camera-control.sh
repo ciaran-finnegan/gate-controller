@@ -11,6 +11,12 @@ CAMERA_ENV=/etc/gate-camera-control.env
 CAMERA_LIBRARY=/usr/local/lib/gate-camera-control
 CAMERA_TMPFILES=/etc/tmpfiles.d/gate-camera.conf
 CAMERA_RUNTIME_ROOT=/run/gate-camera
+# Durable, owner-only, and deliberately not under /run: the IR lease record has
+# to survive a reboot, or a power cut during a lease leaves the separately
+# powered camera holding the leased state with nothing left that knows to
+# revert it. systemd's StateDirectory= creates it too; this is the same
+# directory, declared where the rest of the layout is.
+CAMERA_STATE_ROOT=/var/lib/gate-camera
 CAMERA_SERVICE=gate-camera-control.service
 CAMERA_USER=gate-camera-control
 SYSTEMD_ROOT=/etc/systemd/system
@@ -35,9 +41,15 @@ fail() {
   return 1
 }
 
+# `require_option_value "$1" "${2-}"` always passes two arguments -- a quoted
+# expansion of an unset positional is still an argument -- so counting them
+# proved nothing, the guard never fired, and `--source` with nothing after it
+# died on `set -u` with "$2: unbound variable" instead of saying what was wrong.
+# The value itself is what has to be non-empty.
 require_option_value() {
   local option=$1
-  [[ $# -ge 2 ]] || fail "$option requires a value"
+  local value=${2-}
+  [[ -n $value ]] || fail "$option requires a value"
 }
 
 validate_root_file() {
@@ -165,6 +177,7 @@ publish_unit() {
     "$SYSTEMD_ROOT/$CAMERA_SERVICE"
   install -o root -g root -m 0644 /dev/stdin "$CAMERA_TMPFILES" <<EOF
 d $CAMERA_RUNTIME_ROOT 0755 $CAMERA_USER $CAMERA_USER -
+d $CAMERA_STATE_ROOT 0700 $CAMERA_USER $CAMERA_USER -
 EOF
   systemd-tmpfiles --create "$CAMERA_TMPFILES"
 }
@@ -211,7 +224,7 @@ main() {
     case $1 in
       --source)
         require_option_value "$1" "${2-}"
-        SOURCE=$2
+        SOURCE=${2-}
         shift 2
         ;;
       -h|--help)
