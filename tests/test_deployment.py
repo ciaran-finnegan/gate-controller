@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deployment import gate_controller_updater as updater
+from gate_controller import trigger_capture
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,25 @@ class CloudflareDocumentationTests(unittest.TestCase):
         self.assertIn("GATE_TRIGGER_CAPTURE_DELAY_SECONDS", camera)
         self.assertNotIn("far edge", plate_camera)
         self.assertIn("Do not enable it\nbefore that check", plate_camera)
+
+    def test_the_example_environment_carries_the_presence_conclusive_bar(self):
+        # The bar that decides how many paid lookups a denied passage costs
+        # was documented in the camera notes and nowhere an operator edits.
+        environment = (REPOSITORY_ROOT / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-810a.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("GATE_PRESENCE_CONCLUSIVE_CONFIDENCE=0.75", environment)
+        self.assertIn(
+            f"GATE_PRESENCE_CONCLUSIVE_CONFIDENCE="
+            f"{trigger_capture.DEFAULT_CONCLUSIVE_READ_CONFIDENCE}",
+            environment,
+            "the example and the shipped default have drifted apart",
+        )
+        self.assertIn("GATE_PRESENCE_CONCLUSIVE_CONFIDENCE", camera)
 
     def test_readme_describes_the_active_cloudflare_remote_control_path(self):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")

@@ -47,6 +47,13 @@ MIN_OCR_TIMEOUT_SECONDS = 0.1
 # cannot finish, and it costs the same as one that could.
 # GATE_OCR_MIN_REQUEST_SECONDS re-derives it when the uplink changes.
 DEFAULT_MIN_CLOUD_REQUEST_SECONDS = 1.0
+# The local pass runs before the cloud request and is bounded so that an
+# overrunning pass cannot eat the reserve the cloud request needs (see
+# `_local_pass_deadline`). This is both the slack left over the reserve --
+# the pass is settled a little *before* the reserve is reached, because the
+# wait itself returns fractionally late -- and the floor the pass is never
+# bounded below, so a tight budget still buys an on-device read.
+LOCAL_PASS_MARGIN_SECONDS = 0.05
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -578,6 +585,26 @@ class GateProcessor:
         except Exception:
             return ()
 
+    def _local_pass_deadline(self, deadline: float) -> float:
+        """When the local pass must be settled by, so the cloud keeps its reserve.
+
+        Given the whole remaining budget, a pass that overruns leaves nothing
+        behind it: the `_min_cloud_request_seconds` guard below then skips the
+        cloud request it was supposed to fall back to, and the frame is denied
+        with no decision and no lookup. Holding back the reserve (plus a
+        little slack, because the wait returns fractionally after its timeout)
+        keeps the fallback affordable. The floor is the last word: a budget
+        too small to hold both still buys an on-device read, which is the
+        cheaper and faster of the two answers.
+        """
+        if self._min_cloud_request_seconds <= 0:
+            return deadline
+        reserved = (
+            deadline - self._min_cloud_request_seconds - LOCAL_PASS_MARGIN_SECONDS
+        )
+        floor = self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS
+        return min(deadline, max(reserved, floor))
+
     def _run_local_pass(self, path: Path, deadline: float, trace_id):
         """The on-device read, taken before queueing for the cloud OCR slot.
 
@@ -586,16 +613,18 @@ class GateProcessor:
         behind one. A failure here is not a failure of the frame -- it falls
         through to the cloud exactly as it would have without a local reader.
 
-        It runs on its own thread, bounded by the decision deadline. The
-        recogniser bounds its own *inference* wait, but the pass also decodes,
-        crops and re-encodes the JPEG before inference starts, and that prep
-        answers to no budget at all: on the decision thread a slow frame could
-        carry a 1.5 s decision past 3 s. Bounded here, the deadline bounds the
-        whole event again, and a pass that finishes too late is settled off
-        the decision thread rather than left hanging.
+        It runs on its own thread, bounded by `_local_pass_deadline` rather
+        than by the decision deadline itself. The recogniser bounds its own
+        *inference* wait, but the pass also decodes, crops and re-encodes the
+        JPEG before inference starts, and that prep answers to no budget at
+        all: on the decision thread a slow frame could carry a 1.5 s decision
+        past 3 s. Bounded here, the deadline bounds the whole event again, and
+        a pass that finishes too late is settled off the decision thread
+        rather than left hanging.
         """
         if self._local_pass is None:
             return None
+        deadline = self._local_pass_deadline(deadline)
         if deadline - self._decision_clock() <= 0:
             return None
         result: Queue = Queue(maxsize=1)

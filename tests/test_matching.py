@@ -454,6 +454,26 @@ class AgreementRuleTests(unittest.TestCase):
                         [_cloud("10CE1990", confidence)], {"10CE1990"}, policy,
                     ).allowed)
 
+    def test_the_fuzzy_rule_refuses_a_non_finite_confidence_too(self):
+        """The last rule that was still asking the question negatively.
+
+        `_decide_fuzzy` skipped a read on `confidence < min_fuzzy_confidence`,
+        and no bar is above `inf`, so two frames of `inf` walked a one-edit
+        misread of an authorised plate straight through the confusion rule.
+        """
+        for policy in (_standard_policy(), _strict_policy()):
+            for confidence in (float("inf"), float("nan")):
+                with self.subTest(level=policy.bands[0].level, value=confidence):
+                    decision = decide_access(
+                        [_cloud("1OCE1990", confidence)] * 2,
+                        {"10CE1990"}, policy,
+                    )
+
+                    self.assertFalse(
+                        decision.allowed,
+                        f"{confidence!r} cleared every fuzzy bar",
+                    )
+
     def test_agreement_buys_no_extra_edit(self):
         # Two readers agreeing on a plate two edits away is still two edits.
         decision = decide_access(

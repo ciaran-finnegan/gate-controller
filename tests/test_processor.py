@@ -2925,6 +2925,56 @@ class FastLocalDecisionTests(unittest.TestCase):
                 "gate_ocr stage=local_pass_overran", "\n".join(logs.output),
             )
 
+    def test_an_overrunning_local_pass_still_leaves_the_cloud_its_reserve(self):
+        # The pass was handed the whole remaining budget, so a pass that
+        # overran left `remaining <= 0` and the min-request guard below it
+        # skipped the very cloud call the pass was supposed to fall back to:
+        # a 1.5 s decision with a 3 s pass denied the frame with no decision
+        # and no lookup at all. The reserve has to survive the pass.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "slow.jpg")
+            recognizer = TwoPhaseRecognizer(
+                local_delay=3.0, local_plate="12D3456", local_confidence=0.99,
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(
+                directory, recognizer, decision_timeout=1.5,
+                min_cloud_request_seconds=1.0,
+            )
+
+            started = monotonic()
+            result = processor.process((frame,))
+            elapsed = monotonic() - started
+
+            self.assertEqual(
+                len(recognizer.cloud_calls), 1,
+                "the overrunning pass ate the budget the cloud call needed",
+            )
+            self.assertTrue(result.opened)
+            self.assertNotEqual(result.reason, "decision_timeout")
+            self.assertLess(
+                elapsed, 1.5,
+                f"the cloud call missed the deadline it was reserved: {elapsed:.2f}s",
+            )
+
+    def test_the_reserve_never_squeezes_the_local_pass_out_entirely(self):
+        # A budget too small to hold both still buys the on-device read: it is
+        # the cheaper and the faster of the two answers, and a floor of zero
+        # would turn every tight frame into a paid lookup.
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer = TwoPhaseRecognizer()
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                min_cloud_request_seconds=1.0,
+            )
+            clock.value = 0.9
+
+            deadline = processor._local_pass_deadline(1.2)
+
+            self.assertGreater(deadline, clock.value)
+            self.assertLessEqual(deadline, 1.2)
+
     def test_a_skipped_lookup_leaves_no_half_started_ocr_attempt(self):
         # The budget guard skips the request before anything is billed. It
         # must not stamp `ocr_started_at` on an event with no attempts, nor

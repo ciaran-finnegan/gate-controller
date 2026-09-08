@@ -42,6 +42,19 @@ def normalise_plate(value: str) -> str:
                    if character.isascii() and character.isalnum())
 
 
+def _clears(confidence: float, minimum: float) -> bool:
+    """Whether ``confidence`` is a real number that clears ``minimum``.
+
+    Stated positively on purpose. A negative form -- skip when
+    ``confidence < minimum`` -- lets ``inf`` and any other non-finite value
+    through every bar it is compared against, because they are less than
+    nothing. The boundaries already reject non-finite confidences before a
+    read reaches here; this is the same check the exact and agreement rules
+    make for themselves, kept so no single boundary is load-bearing.
+    """
+    return isfinite(confidence) and confidence >= minimum
+
+
 def decide_access(
     observations: Iterable[PlateObservation],
     authorised: Iterable[str],
@@ -133,7 +146,8 @@ def _decide_fuzzy(
     candidates: dict[str, dict[str, int]] = {}
     confidences: dict[str, float] = {}
     for observed_plate, observation in normalised_observations:
-        if not observed_plate or observation.confidence < rule.min_fuzzy_confidence:
+        if not observed_plate or not _clears(
+                observation.confidence, rule.min_fuzzy_confidence):
             continue
         if len(observed_plate) < rule.min_observed_length:
             continue
@@ -150,7 +164,8 @@ def _decide_fuzzy(
     for observed_plate, matched_plates in candidates.items():
         frame_count = sum(
             1 for plate, observation in normalised_observations
-            if plate == observed_plate and observation.confidence >= rule.min_fuzzy_confidence
+            if plate == observed_plate
+            and _clears(observation.confidence, rule.min_fuzzy_confidence)
         )
         if frame_count < rule.min_frames:
             continue
