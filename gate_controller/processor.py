@@ -687,17 +687,25 @@ class GateProcessor:
         cloud request it was supposed to fall back to, and the frame is denied
         with no decision and no lookup. Holding back the reserve (plus a
         little slack, because the wait returns fractionally after its timeout)
-        keeps the fallback affordable. The floor is the last word: a budget
-        too small to hold both still buys an on-device read, which is the
-        cheaper and faster of the two answers.
+        keeps the fallback affordable. A budget too small to hold both still
+        buys an on-device read, which is the cheaper and faster of the two
+        answers -- and there is nothing to hold back for, because the request
+        it was protecting is going to be skipped either way.
         """
         if self._min_cloud_request_seconds <= 0:
             return deadline
         reserved = (
             deadline - self._min_cloud_request_seconds - LOCAL_PASS_MARGIN_SECONDS
         )
-        floor = self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS
-        return min(deadline, max(reserved, floor))
+        if reserved <= self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS:
+            # The reserve cannot be honoured, so the `_min_cloud_request_seconds`
+            # guard below is going to skip the cloud request whatever the pass
+            # does. Every remaining millisecond is the local read's. The old
+            # margin-wide floor was worse than nothing here: a 4K decode alone
+            # is ~60 ms on the Pi, so the pass was abandoned before inference
+            # could start (2026-09-09 10:10:59, frame 2047ae83).
+            return deadline
+        return min(deadline, reserved)
 
     def _run_local_pass(self, path: Path, deadline: float, trace_id):
         """The on-device read, taken before queueing for the cloud OCR slot.

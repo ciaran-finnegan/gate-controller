@@ -552,8 +552,17 @@ class PlateRecognizerClient:
             authorised=self._authorised, policy=self._match_policy,
         )
         state["frame"] = frame
+        # Off the slot, the processor has already held the cloud request's
+        # reserve out of ``budget`` (`GateProcessor._local_pass_deadline`), so
+        # the whole of what is left is the local read's. Keeping the in-slot
+        # reserve here as well left the pass with no wait at all whenever
+        # under ~3 s of the decision remained, and a 172 ms read that landed a
+        # moment later was never looked at again: `_local_decision` had
+        # returned, and `_corroborations` is only consulted from
+        # `decide_access`, which needs a cloud observation to be reached
+        # (2026-09-09 10:10:59, 131D2696 read at 0.999, gate stayed shut).
         observation = self._local_decision(
-            path, trace_id, frame, image, geometry, state,
+            path, trace_id, frame, image, geometry, state, reserve=0.0,
         )
         return LocalPass(observation=observation, state=state)
 
@@ -607,6 +616,15 @@ class PlateRecognizerClient:
         # prepared off the slot, so it is set on whichever state we ended up
         # with: a reused pass must still be able to report that it posted.
         state["on_post_started"] = on_post_started
+        # A reused pass carries the deadline *it* was bounded by, which the
+        # processor holds short of the decision's so the cloud keeps its
+        # reserve. The request itself answers to the decision deadline, so
+        # re-read it from this call's budget: sized to the pass's bound, which
+        # a pass that used its budget has already passed, `_bounded_timeout`
+        # hands the socket the (0.1, 0.1) floor and bills a certain
+        # `read_timeout`.
+        if budget is not None:
+            state["deadline"] = self._budget_deadline(budget)
         retries = 0
         try:
             while True:
@@ -993,7 +1011,8 @@ class PlateRecognizerClient:
         read = min(read, max(MIN_SOCKET_TIMEOUT_SECONDS, remaining - connect))
         return (connect, read)
 
-    def _local_decision(self, path: Path, trace_id, frame, image, geometry, state):
+    def _local_decision(self, path: Path, trace_id, frame, image, geometry, state,
+                        *, reserve: float | None = None):
         """The local read, when it may answer for this frame. Else None.
 
         Only ``GATE_LOCAL_OCR_MODE=active`` reaches past the first line. The
@@ -1008,6 +1027,10 @@ class PlateRecognizerClient:
         what is left of this event's total local waiting. The guard runs on
         the ``gate-ocr-request`` worker holding the OCR slot, so time spent
         here is time the burst does not have.
+
+        ``reserve`` overrides that cloud reserve for a caller whose budget was
+        already reserved from; left unset, the recogniser's own default
+        applies and this path is unchanged.
         """
         if not self._local.config.active:
             return None
@@ -1015,7 +1038,11 @@ class PlateRecognizerClient:
         started = self._clock()
         remaining = None if deadline is None else deadline - started
         try:
-            recognition = frame.result(self._local.wait_seconds(trace_id, remaining))
+            wait = (
+                self._local.wait_seconds(trace_id, remaining) if reserve is None
+                else self._local.wait_seconds(trace_id, remaining, reserve=reserve)
+            )
+            recognition = frame.result(wait)
         finally:
             self._local.record_event_wait(trace_id, self._clock() - started)
         if not self._local.decides(frame, recognition):

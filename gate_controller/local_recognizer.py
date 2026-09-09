@@ -1039,7 +1039,8 @@ class LocalRecognizer:
             policy=policy,
         ).result(timeout)
 
-    def wait_seconds(self, trace_id, remaining: float | None) -> float:
+    def wait_seconds(self, trace_id, remaining: float | None, *,
+                     reserve: float = LOCAL_DECISION_CLOUD_RESERVE_SECONDS) -> float:
         """How long this frame may block on its local read.
 
         The smallest of three bounds: the stuck-engine ceiling, whatever the
@@ -1047,11 +1048,17 @@ class LocalRecognizer:
         and what is left of this event's own waiting budget. Returns 0.0 when
         there is nothing to spend, in which case the caller takes the read
         only if it has already landed.
+
+        ``reserve`` is that cloud request's share. It defaults to the whole of
+        it, which is right whenever ``remaining`` is the decision's own budget.
+        A caller whose budget has already been reserved from -- the off-slot
+        local pass, bounded by `GateProcessor._local_pass_deadline` -- passes
+        0.0 rather than holding the same seconds back twice.
         """
         seconds = LOCAL_DECISION_TIMEOUT_SECONDS
         if remaining is not None:
             try:
-                spare = float(remaining) - LOCAL_DECISION_CLOUD_RESERVE_SECONDS
+                spare = float(remaining) - reserve
             except (TypeError, ValueError):
                 spare = 0.0
             seconds = min(seconds, spare if isfinite(spare) else 0.0)
