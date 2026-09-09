@@ -16,7 +16,7 @@ from gate_controller.backpressure import (
 from gate_controller.corpus import TrainingCorpus
 from gate_controller.corpus_upload import (
     CloudflareCorpusSender, CorpusUploadAborted, CorpusUploadConfig,
-    CorpusUploadError, CorpusUploadWorker, PacedBody,
+    CorpusUploadError, CorpusUploadUnshippable, CorpusUploadWorker, PacedBody,
     load_corpus_upload_config,
 )
 
@@ -452,6 +452,219 @@ class ConfigurationTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError, msg=f"{variable}={value}"):
                 load_corpus_upload_config({variable: value})
+
+
+class GateAudioTests(CorpusUploadTestCase):
+    """The clips ``audio_capture`` actually writes, in the place it writes them.
+
+    ADTS AAC under ``<corpus>/audio``, with a sidecar that names its own
+    ``kind`` -- ``gate_audio``, what the capture is -- and carries no
+    ``artefact`` block at all. The suffix table is what says which artefact
+    family the corpus ships it as, and it had no ``.aac`` row, so from the
+    first clip on 2026-09-08 every one of them was refused as an unknown
+    suffix while the frames beside them shipped normally.
+    """
+
+    def clip(self, stem="20260908T120500000000Z-abcdef123456", *, payload=None,
+             sidecar=None):
+        payload = b"\xff\xf1" + b"gate audio" * 8 if payload is None else payload
+        directory = self.root / "audio"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        clip_path = directory / (stem + ".aac")
+        clip_path.write_bytes(payload)
+        (directory / (stem + ".json")).write_text(json.dumps(sidecar or {
+            "schema_version": 1,
+            "kind": "gate_audio",
+            "clip_id": stem.split("-", 1)[0],
+            "captured_at": "2026-09-08T12:05:00+00:00",
+            "label": "actuated",
+            "actuation": {"source": "plate", "offset_seconds": 3.2},
+            "audio": {
+                "codec": "aac_lc", "sample_rate_hz": 16000, "channels": 1,
+                "raw_copy": True, "decoded": False, "captured_seconds": 40.0,
+            },
+        }))
+        return clip_path
+
+    def test_a_gate_audio_clip_uploads_as_audio_with_its_sidecar(self):
+        clip = self.clip()
+        sender = RecordingSender()
+
+        self.assertEqual(self.worker(sender).run_once(), 1)
+
+        artefact_id, document = sender.sent[0]
+        payload = clip.read_bytes() if clip.exists() else None
+        self.assertIsNone(payload, "the clip left the card once the cloud had it")
+        self.assertEqual(document["kind"], "audio")
+        self.assertEqual(document["media_type"], "audio/aac")
+        self.assertEqual(document["captured_at"], "2026-09-08T12:05:00+00:00")
+        self.assertEqual(
+            base64.b64decode(document["data_base64"]), b"\xff\xf1" + b"gate audio" * 8,
+        )
+        self.assertEqual(
+            artefact_id,
+            hashlib.sha256(b"\xff\xf1" + b"gate audio" * 8).hexdigest(),
+            "idempotency is the digest of the clip, as it is for a frame",
+        )
+        self.assertEqual(document["sha256"], artefact_id)
+        self.assertFalse((self.root / "audio" / "20260908T120500000000Z-abcdef123456.json").exists())
+
+    def test_the_sidecar_travels_with_the_clip_it_labels(self):
+        """A clip without its sidecar is not a training example.
+
+        ``offset_seconds`` is what locates the relay pulse inside 40 s of
+        audio, so it is the field that makes the clip worth keeping at all.
+        """
+        self.clip()
+
+        sender = RecordingSender()
+        self.assertEqual(self.worker(sender).run_once(), 1)
+
+        _, document = sender.sent[0]
+        self.assertEqual(document["sidecar"]["label"], "actuated")
+        self.assertEqual(document["sidecar"]["actuation"]["offset_seconds"], 3.2)
+        self.assertEqual(document["sidecar"]["kind"], "gate_audio")
+        self.assertIs(document["sidecar"]["audio"]["decoded"], False)
+
+    def test_frames_and_clips_share_one_queue_oldest_first(self):
+        frame = self.record()
+        clip = self.clip("20260908T120500000000Z-abcdef123456")
+        sender = RecordingSender()
+
+        self.assertEqual(self.worker(sender).run_once(), 2)
+
+        self.assertEqual(
+            [document["kind"] for _, document in sender.sent], ["frame", "audio"],
+            "the frame was captured on the 7th and the clip on the 8th",
+        )
+        self.assertFalse(frame.exists())
+        self.assertFalse(clip.exists())
+        self.assertEqual(self.corpus.pending(), [])
+
+    def test_a_mixed_corpus_still_stands_down_for_the_gate(self):
+        self.record()
+        self.clip()
+        sender = RecordingSender()
+        gate = self.gate()
+        worker = self.worker(sender, gate)
+
+        with gate.activity("camera_event"):
+            self.assertEqual(worker.run_once(), 0)
+
+        self.assertEqual(sender.sent, [])
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_GATE_ACTIVITY)
+        self.assertEqual(worker.status()["pending"], 2,
+                         "the frame and the clip are both still on the card")
+
+    def test_a_mixed_corpus_waits_for_the_outbox_and_the_quiet_window(self):
+        self.record()
+        self.clip()
+        sender = RecordingSender()
+        pending = [1]
+        gate = ActivityGate(
+            quiet_seconds=60.0, pending_events=lambda: pending[0], clock=self.clock,
+        )
+        worker = self.worker(sender, gate)
+        with gate.activity("burst"):
+            pass
+
+        self.clock.advance(30)
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_QUIET_WINDOW)
+
+        self.clock.advance(31)
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_EVENT_DELIVERY)
+
+        pending[0] = 0
+        self.assertEqual(worker.run_once(), 2)
+
+    def test_a_clip_the_cloud_refuses_never_blocks_the_frames_behind_it(self):
+        """The Worker's media types are an allow-list, and it is deployed apart.
+
+        A controller that ships ``audio/aac`` to a Worker that has not learnt
+        it yet gets HTTP 400 on the oldest artefact in the queue, every pass,
+        for ever. Counting that as a failure would stop the frames behind it
+        too, so a refusal on the merits stands the artefact aside and leaves it
+        on the card for the deploy that accepts it.
+        """
+        clip = self.clip("20260907T110000000000Z-abcdef123456")
+        frame = self.record()
+        refused = []
+
+        class Refusing(RecordingSender):
+            def __call__(self, artefact_id, chunks):
+                body = b"".join(chunks)
+                document = json.loads(body.decode("utf-8"))
+                if document["kind"] == "audio":
+                    refused.append(artefact_id)
+                    raise CorpusUploadUnshippable("HTTP 400")
+                self.sent.append((artefact_id, document))
+
+        sender = Refusing()
+        worker = self.worker(sender)
+
+        self.assertEqual(worker.run_once(), 1)
+
+        self.assertEqual(len(refused), 1)
+        self.assertEqual([document["kind"] for _, document in sender.sent], ["frame"])
+        self.assertFalse(frame.exists(), "the frame behind it still shipped")
+        self.assertTrue(clip.exists(), "and the clip is still on the card")
+        self.assertEqual(worker.status()["unshippable"], 1)
+        self.assertEqual(worker.status()["consecutive_failures"], 0)
+
+
+class RefusalTests(unittest.TestCase):
+    """What the sender makes of the cloud saying no."""
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class Client:
+        def __init__(self, error):
+            self.error = error
+
+        def post_stream(self, path, chunks, **kwargs):
+            b"".join(chunks)
+            raise self.error
+
+    def send(self, error):
+        CloudflareCorpusSender(self.Client(error), "primary")("a" * 64, [b"{}"])
+
+    def test_a_refusal_on_the_merits_is_unshippable_not_a_failure(self):
+        for status in (400, 413, 415, 422):
+            error = RuntimeError(f"HTTP {status}")
+            error.response = self.Response(status)
+            with self.subTest(status=status):
+                with self.assertRaises(CorpusUploadUnshippable):
+                    self.send(error)
+
+    def test_a_bad_minute_is_still_retried(self):
+        for status in (401, 403, 404, 429, 500, 503):
+            error = RuntimeError(f"HTTP {status}")
+            error.response = self.Response(status)
+            with self.subTest(status=status):
+                with self.assertRaises(RuntimeError) as raised:
+                    self.send(error)
+                self.assertNotIsInstance(raised.exception, CorpusUploadUnshippable)
+        with self.assertRaises(OSError):
+            self.send(OSError("connection reset"))
+
+    def test_a_stand_down_is_never_mistaken_for_a_refusal(self):
+        """`requests` wraps whatever the body generator raised.
+
+        An abandoned transfer can arrive carrying a response object; it is a
+        stand-down for the gate and must not be recorded against the artefact.
+        """
+        aborted = CorpusUploadAborted("a gate event started")
+        error = RuntimeError("HTTP 400")
+        error.response = self.Response(400)
+        error.__cause__ = aborted
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.send(error)
+        self.assertNotIsInstance(raised.exception, CorpusUploadUnshippable)
 
 
 if __name__ == "__main__":
