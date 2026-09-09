@@ -547,14 +547,23 @@ def validated_camera_control_environment(environment) -> dict[str, str]:
 
 
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
-                  logger=None, connection_factory=None) -> CameraControlService:
-    """Wire the client and the IR controller from validated settings."""
+                  logger=None, connection_factory=None,
+                  clock=time.time) -> CameraControlService:
+    """Wire the client and the IR controller from validated settings.
+
+    One clock is threaded through the whole service -- the token bucket, the
+    snapshot interval, the lease expiry and the login throttle all read it. In
+    production it is the wall clock. A caller that passes its own gets a
+    service whose every deadline it controls, which is what lets the tests
+    assert on the limiter rather than on how fast the machine happened to be.
+    """
     logger = logger or logging.getLogger("gate_camera_control")
     client = ReolinkClient(
         settings["GATE_CAMERA_HOST"],
         settings["GATE_CAMERA_USERNAME"],
         settings["GATE_CAMERA_PASSWORD"],
         token_path=token_path,
+        clock=clock,
         connection_factory=connection_factory,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
@@ -564,9 +573,10 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         lease_path=lease_path,
         default_lease_minutes=int(settings["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"]),
         max_lease_minutes=int(settings["GATE_CAMERA_IR_LEASE_MAX_MINUTES"]),
+        clock=clock,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
-    return CameraControlService(controller, client, logger=logger)
+    return CameraControlService(controller, client, clock=clock, logger=logger)
 
 
 def main(argv=None) -> int:
