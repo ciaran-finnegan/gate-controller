@@ -699,6 +699,103 @@ class LocalStoreTests(unittest.TestCase):
         self.assertEqual(existing, [(None,)])
         self.assertTrue(still_counted, "an existing opened row still holds the window")
 
+    def test_relaxes_the_not_null_on_ocr_confidence_in_an_existing_database(self):
+        """The live Pi database created the column `NOT NULL DEFAULT 0`.
+
+        A frame no reader saw has no score to record, and since the app's
+        ingest contract took `ocr_confidence` as optional the controller writes
+        that absence as NULL. SQLite cannot relax the constraint in place, so
+        the table is rebuilt -- and the rebuild has to carry every existing row
+        and score across untouched, and leave the indexes the cooldown lookups
+        depend on standing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("""
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY, received_at TEXT NOT NULL,
+                        decision_at TEXT, relay_activated_at TEXT,
+                        source TEXT NOT NULL, reason TEXT NOT NULL,
+                        opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE,
+                        authorised_plate TEXT, observed_plate TEXT,
+                        ocr_confidence REAL NOT NULL DEFAULT 0
+                    )
+                """)
+                connection.execute(
+                    """
+                    INSERT INTO events (
+                        id, received_at, relay_activated_at, source, reason, opened,
+                        idempotency_key, observed_plate, ocr_confidence
+                    ) VALUES (
+                        7, '2026-08-13T10:00:00+00:00', '2026-08-13T10:00:01+00:00',
+                        'ocr', 'exact_match', 1, 'image:legacy', '10CE1990', 0.999
+                    )
+                    """
+                )
+                connection.commit()
+
+            store = LocalStore(database)
+            skipped = store.record_event(GateEvent(
+                source="ocr", reason="queue_coalesced", opened=False,
+                idempotency_key="image:coalesced",
+                received_at=datetime(2026, 8, 13, 10, 0, 2, tzinfo=timezone.utc),
+            ))
+
+            with closing(sqlite3.connect(database)) as connection:
+                notnull = {
+                    row[1]: row[3]
+                    for row in connection.execute("PRAGMA table_info(events)")
+                }
+                preserved = connection.execute(
+                    "SELECT id, observed_plate, ocr_confidence FROM events WHERE id = 7"
+                ).fetchone()
+                recorded = connection.execute(
+                    "SELECT ocr_confidence FROM events WHERE id = ?", (skipped,)
+                ).fetchone()[0]
+                indexes = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                        " AND tbl_name = 'events'"
+                    )
+                }
+            still_counted = store.was_opened_since(
+                datetime(2026, 8, 13, 9, 59, tzinfo=timezone.utc)
+            )
+
+        self.assertFalse(notnull["ocr_confidence"], "the column now accepts NULL")
+        self.assertIn("actuation_outcome", notnull, "the rebuild kept the later column")
+        self.assertEqual(preserved, (7, "10CE1990", 0.999), "every score survived")
+        self.assertIsNone(recorded, "a frame no reader saw records no score")
+        self.assertLessEqual(
+            {"events_relay_cooldown", "events_received_cooldown"}, indexes,
+        )
+        self.assertTrue(still_counted, "the existing pulse still holds the window")
+
+    def test_the_nullable_rebuild_does_not_run_twice(self):
+        """Opening a database already created nullable leaves it alone."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            LocalStore(database)
+            with closing(sqlite3.connect(database)) as connection:
+                before = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'events'"
+                ).fetchone()[0]
+
+            LocalStore(database)
+
+            with closing(sqlite3.connect(database)) as connection:
+                after = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'events'"
+                ).fetchone()[0]
+                leftovers = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%nullable%'"
+                ).fetchall()
+
+        self.assertEqual(before, after)
+        self.assertNotIn('"events"', before, "a fresh database is never rebuilt")
+        self.assertEqual(leftovers, [], "the scratch table is renamed, never left")
+
     def test_a_cooldown_record_is_not_evidence_that_the_relay_pulsed(self):
         """`opened` says the gate was open; only a pulse holds the window."""
         with tempfile.TemporaryDirectory() as directory:

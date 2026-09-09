@@ -25,6 +25,30 @@ _OUTBOX_READY = "ready"
 _OUTBOX_AWAITING_TELEMETRY = "awaiting_telemetry"
 _OUTBOX_TELEMETRY_READY = "telemetry_ready"
 _OUTBOX_LOCAL_ONLY = "local_only"
+#: The `events` table, written once and used twice: to create it, and to
+#: rebuild it when an older database still carries the `NOT NULL DEFAULT 0` it
+#: was first created with on `ocr_confidence`. A frame no reader saw has no
+#: score to record, so the column has to hold NULL for it.
+_EVENTS_COLUMNS_DDL = """
+                    id INTEGER PRIMARY KEY, received_at TEXT NOT NULL, decision_at TEXT,
+                    relay_activated_at TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
+                    opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE, authorised_plate TEXT,
+                    observed_plate TEXT, ocr_confidence REAL,
+                    actuation_outcome TEXT
+"""
+_EVENTS_COLUMNS = (
+    "id", "received_at", "decision_at", "relay_activated_at", "source", "reason",
+    "opened", "idempotency_key", "authorised_plate", "observed_plate",
+    "ocr_confidence", "actuation_outcome",
+)
+#: Dropping the table drops its indexes with it, so the rebuild recreates
+#: exactly these two.
+_EVENTS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS events_relay_cooldown"
+    " ON events (opened, relay_activated_at)",
+    "CREATE INDEX IF NOT EXISTS events_received_cooldown"
+    " ON events (opened, received_at)",
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -986,16 +1010,45 @@ class LocalStore:
     def _connect(self):
         return sqlite3.connect(self.path, timeout=5)
 
+    @staticmethod
+    def _relax_ocr_confidence(connection: sqlite3.Connection) -> None:
+        """Let `events.ocr_confidence` hold NULL on a database that predates it.
+
+        The column was created `NOT NULL DEFAULT 0`, from a time when the
+        app's ingest contract required a number there. It takes
+        `optionalNumber` now, so a frame no reader saw records the absence of
+        a score rather than a measured zero -- and NULL is what that is.
+
+        SQLite cannot relax a column constraint in place, so the table is
+        rebuilt around it: every row and every score is copied across
+        untouched, the two `events` indexes are recreated (dropping a table
+        drops its indexes), and only the constraint changes. Dropping and
+        re-adding `events` is safe because nothing here turns on
+        `PRAGMA foreign_keys`; the REFERENCES clauses in `outbox`,
+        `actuation_claims` and `event_telemetry` are inert schema text that
+        goes on naming `events` across the swap.
+
+        Guarded by `PRAGMA table_info`, so it runs once for a given database
+        and not at all for one created nullable.
+        """
+        columns = ", ".join(_EVENTS_COLUMNS)
+        connection.execute(
+            f"CREATE TABLE events_nullable_confidence ({_EVENTS_COLUMNS_DDL})"
+        )
+        connection.execute(
+            f"INSERT INTO events_nullable_confidence ({columns})"
+            f" SELECT {columns} FROM events"
+        )
+        connection.execute("DROP TABLE events")
+        connection.execute("ALTER TABLE events_nullable_confidence RENAME TO events")
+        for statement in _EVENTS_INDEX_DDL:
+            connection.execute(statement)
+        _LOGGER.info("store_migration status=applied column=events.ocr_confidence nullable=true")
+
     def _migrate(self) -> None:
         with closing(self._connect()) as connection, connection:
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY, received_at TEXT NOT NULL, decision_at TEXT,
-                    relay_activated_at TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
-                    opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE, authorised_plate TEXT,
-                    observed_plate TEXT, ocr_confidence REAL NOT NULL DEFAULT 0,
-                    actuation_outcome TEXT
-                );
+            connection.executescript(f"""
+                CREATE TABLE IF NOT EXISTS events ({_EVENTS_COLUMNS_DDL});
                 CREATE TABLE IF NOT EXISTS actuation_claims (
                     id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
                     claimed_at TEXT NOT NULL, state TEXT NOT NULL,
@@ -1022,8 +1075,8 @@ class LocalStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS events_relay_cooldown ON events (opened, relay_activated_at);
-                CREATE INDEX IF NOT EXISTS events_received_cooldown ON events (opened, received_at);
+                {_EVENTS_INDEX_DDL[0]};
+                {_EVENTS_INDEX_DDL[1]};
                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_per_event ON outbox (event_id);
                 CREATE INDEX IF NOT EXISTS event_telemetry_created_at
                     ON event_telemetry (created_at);
@@ -1036,6 +1089,11 @@ class LocalStore:
                 # what those rows meant: none of them was a granted decision that
                 # skipped the relay.
                 connection.execute("ALTER TABLE events ADD COLUMN actuation_outcome TEXT")
+            if any(
+                row[1] == "ocr_confidence" and row[3]
+                for row in connection.execute("PRAGMA table_info(events)")
+            ):
+                self._relax_ocr_confidence(connection)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(actuation_claims)")}
             for name in (
                 "terminal_status", "terminal_detail", "activation_attempt_at",
@@ -1266,8 +1324,15 @@ def _decode_pending_event(encoded: str) -> GateEvent:
         ),
         authorised_plate=payload.get("authorised_plate"),
         observed_plate=payload.get("observed_plate"),
-        ocr_confidence=float(payload.get("ocr_confidence", 0.0)),
+        # A pending event written for a frame no reader saw has no score, and
+        # a claim recovered after a restart must not invent one: `null` and a
+        # key an older build never wrote both come back as `None`.
+        ocr_confidence=_optional_confidence(payload.get("ocr_confidence")),
     )
+
+
+def _optional_confidence(value: object) -> float | None:
+    return None if value is None else float(value)
 
 
 def _encode_optional_json(payload: dict | None) -> str | None:
