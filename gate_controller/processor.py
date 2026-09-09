@@ -687,17 +687,30 @@ class GateProcessor:
         cloud request it was supposed to fall back to, and the frame is denied
         with no decision and no lookup. Holding back the reserve (plus a
         little slack, because the wait returns fractionally after its timeout)
-        keeps the fallback affordable. The floor is the last word: a budget
-        too small to hold both still buys an on-device read, which is the
-        cheaper and faster of the two answers.
+        keeps the fallback affordable. A budget too small to hold both still
+        buys an on-device read, which is the cheaper and faster of the two
+        answers -- and there is nothing to hold back for, because the request
+        it was protecting is going to be skipped either way.
         """
         if self._min_cloud_request_seconds <= 0:
             return deadline
         reserved = (
             deadline - self._min_cloud_request_seconds - LOCAL_PASS_MARGIN_SECONDS
         )
-        floor = self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS
-        return min(deadline, max(reserved, floor))
+        if reserved <= self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS:
+            # The reserve cannot be honoured. Below `_min_cloud_request_seconds`
+            # of budget the guard in `_recognise` is going to skip the cloud
+            # request whatever the pass does, so every remaining millisecond is
+            # the local read's. In the 2 * margin band just above it the request
+            # is still affordable and this spends its budget on the local read
+            # instead -- deliberately: a ~172 ms on-device read that can open
+            # the gate beats a cloud request with barely 1 s to cross a
+            # 4.5 Mbit/s uplink. What it must not do is what the old
+            # margin-wide floor did, which was worse than either: a 4K decode
+            # alone is ~60 ms on the Pi, so the pass was abandoned before
+            # inference could start (2026-09-09 10:10:59, frame 2047ae83).
+            return deadline
+        return min(deadline, reserved)
 
     def _run_local_pass(self, path: Path, deadline: float, trace_id):
         """The on-device read, taken before queueing for the cloud OCR slot.
