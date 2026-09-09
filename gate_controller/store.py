@@ -1030,20 +1030,49 @@ class LocalStore:
 
         Guarded by `PRAGMA table_info`, so it runs once for a given database
         and not at all for one created nullable.
+
+        The whole swap runs inside one explicit `BEGIN IMMEDIATE`, because
+        `sqlite3` opens a transaction for DML only: left to itself it would
+        commit the `CREATE` on its own and then wrap the rest, so an exception
+        or a power cut would roll the copy back but leave the scratch table
+        standing -- and the next boot would die on `CREATE TABLE
+        events_nullable_confidence`, out of `LocalStore.__init__`, before
+        `main()` claims the relay. The gate stays shut until a human drops a
+        table. So the scratch table is dropped first, committed on its own,
+        and everything that follows either lands together or not at all: the
+        old `events` or the new one, never neither.
         """
         columns = ", ".join(_EVENTS_COLUMNS)
-        connection.execute(
-            f"CREATE TABLE events_nullable_confidence ({_EVENTS_COLUMNS_DDL})"
+        rows = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        _LOGGER.info(
+            "store_migration status=started column=events.ocr_confidence nullable=true rows=%d",
+            rows,
         )
-        connection.execute(
-            f"INSERT INTO events_nullable_confidence ({columns})"
-            f" SELECT {columns} FROM events"
+        # Whatever an interrupted earlier run left behind, cleared before the
+        # transaction that must not trip over it.
+        connection.execute("DROP TABLE IF EXISTS events_nullable_confidence")
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                f"CREATE TABLE events_nullable_confidence ({_EVENTS_COLUMNS_DDL})"
+            )
+            connection.execute(
+                f"INSERT INTO events_nullable_confidence ({columns})"
+                f" SELECT {columns} FROM events"
+            )
+            connection.execute("DROP TABLE events")
+            connection.execute("ALTER TABLE events_nullable_confidence RENAME TO events")
+            for statement in _EVENTS_INDEX_DDL:
+                connection.execute(statement)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        _LOGGER.info(
+            "store_migration status=applied column=events.ocr_confidence nullable=true rows=%d",
+            rows,
         )
-        connection.execute("DROP TABLE events")
-        connection.execute("ALTER TABLE events_nullable_confidence RENAME TO events")
-        for statement in _EVENTS_INDEX_DDL:
-            connection.execute(statement)
-        _LOGGER.info("store_migration status=applied column=events.ocr_confidence nullable=true")
 
     def _migrate(self) -> None:
         with closing(self._connect()) as connection, connection:
@@ -1094,6 +1123,11 @@ class LocalStore:
                 for row in connection.execute("PRAGMA table_info(events)")
             ):
                 self._relax_ocr_confidence(connection)
+            else:
+                _LOGGER.info(
+                    "store_migration status=skipped column=events.ocr_confidence"
+                    " nullable=true detail=already_migrated"
+                )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(actuation_claims)")}
             for name in (
                 "terminal_status", "terminal_detail", "activation_attempt_at",
@@ -1298,7 +1332,7 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _encode_pending_event(event: GateEvent) -> str:
-    return json.dumps({
+    payload = {
         "source": event.source,
         "reason": event.reason,
         "idempotency_key": event.idempotency_key,
@@ -1306,8 +1340,18 @@ def _encode_pending_event(event: GateEvent) -> str:
         "decision_at": _optional_timestamp(event.decision_at),
         "authorised_plate": event.authorised_plate,
         "observed_plate": event.observed_plate,
-        "ocr_confidence": event.ocr_confidence,
-    }, sort_keys=True)
+    }
+    # Absent, not null. A claim written by this build can be read back by the
+    # build that was running before it -- a rollback leaves the row where it
+    # is -- and that decoder does `float(payload.get("ocr_confidence", 0.0))`,
+    # which raises TypeError on a null and is swallowed by the blanket except
+    # around the recovery loop: the interrupted actuation would be skipped
+    # silently, and go on being skipped. Omitting the key hands the old
+    # decoder its own 0.0 default and the new one `None`, which is the same
+    # "no score" either way.
+    if event.ocr_confidence is not None:
+        payload["ocr_confidence"] = event.ocr_confidence
+    return json.dumps(payload, sort_keys=True)
 
 
 def _decode_pending_event(encoded: str) -> GateEvent:

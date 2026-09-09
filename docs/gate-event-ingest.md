@@ -140,6 +140,7 @@ granted or denied:
 | `no_match` on a plate that was read | that read's score |
 | `no_match` where every attempt came back without a plate | `null` |
 | `exact_match`, fuzzy grants, and grants skipped by cooldown | that read's score |
+| `remote_command`, and the prompt and expiry outcomes beside it | `null` — no camera and no reader are involved in an open the app asked for |
 
 The test is the plate, not the reason: `_measured_confidence` in
 `gate_controller/processor.py` reports `MatchDecision.confidence` only when the
@@ -156,7 +157,13 @@ came back with nothing.
 Locally, `events.ocr_confidence` was created `NOT NULL DEFAULT 0`. SQLite cannot
 relax a column constraint in place, so `LocalStore._relax_ocr_confidence`
 rebuilds the table once — copying every row and score across and recreating the
-two `events` indexes — guarded by `PRAGMA table_info`. Note that
+two `events` indexes — guarded by `PRAGMA table_info`. The rebuild drops any
+scratch table an interrupted earlier run left behind, then does the whole swap
+inside one `BEGIN IMMEDIATE`, so an abort leaves either the old `events` or the
+new one and the next boot starts cleanly rather than dying in
+`LocalStore.__init__` before the relay is claimed. It logs one INFO line when
+it starts (with the row count), one when it lands, and one saying it was
+skipped when the database is already nullable. Note that
 `gateEventPayloadFingerprint` includes `ocr_confidence`, so an outbox row
 written as `0` before this change and resent after it is a different
 fingerprint, not a duplicate; nothing rewrites already-queued payloads.

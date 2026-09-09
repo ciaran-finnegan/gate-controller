@@ -9,10 +9,77 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gate_controller.models import GateEvent
-from gate_controller.store import LocalStore
+from gate_controller.store import (
+    LocalStore, _decode_pending_event, _encode_pending_event,
+)
 from gate_controller.telemetry import (
     EventTelemetry, FrameTelemetry, StageDurations, TriggerTelemetry,
 )
+
+#: `events` as the live Pi's database created it, before `ocr_confidence`
+#: could hold "no reader saw this frame".
+_LEGACY_EVENTS_DDL = """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY, received_at TEXT NOT NULL,
+        decision_at TEXT, relay_activated_at TEXT,
+        source TEXT NOT NULL, reason TEXT NOT NULL,
+        opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE,
+        authorised_plate TEXT, observed_plate TEXT,
+        ocr_confidence REAL NOT NULL DEFAULT 0
+    )
+"""
+
+
+def _write_legacy_events_database(path):
+    """One pre-migration database holding one opened row with a real score."""
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(_LEGACY_EVENTS_DDL)
+        connection.execute(
+            """
+            INSERT INTO events (
+                id, received_at, relay_activated_at, source, reason, opened,
+                idempotency_key, observed_plate, ocr_confidence
+            ) VALUES (
+                7, '2026-08-13T10:00:00+00:00', '2026-08-13T10:00:01+00:00',
+                'ocr', 'exact_match', 1, 'image:legacy', '10CE1990', 0.999
+            )
+            """
+        )
+        connection.commit()
+
+
+def _events_notnull(connection):
+    return {row[1]: row[3] for row in connection.execute("PRAGMA table_info(events)")}
+
+
+class _RaiseAfter:
+    """A connection that dies once a given statement has run.
+
+    Stands in for the power cut, or the exception, that the rebuild has to
+    survive: the statement itself lands, and everything after it does not.
+    """
+
+    def __init__(self, connection, statement):
+        self._connection = connection
+        self._statement = statement
+        self._armed = False
+
+    def execute(self, sql, *args):
+        if self._armed:
+            raise RuntimeError("power cut")
+        result = self._connection.execute(sql, *args)
+        if self._statement in sql:
+            self._armed = True
+        return result
+
+    def __enter__(self):
+        return self._connection.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._connection.__exit__(*exc_info)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def _telemetry(trace_id="ae2398aa-7107-44f4-a723-290de0f8c7b2", *, reason="exact_match"):
@@ -795,6 +862,211 @@ class LocalStoreTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertNotIn('"events"', before, "a fresh database is never rebuilt")
         self.assertEqual(leftovers, [], "the scratch table is renamed, never left")
+
+    def test_a_scratch_table_left_by_an_interrupted_rebuild_does_not_brick_the_boot(self):
+        """The scratch table is the wreckage of a rebuild that did not finish.
+
+        `sqlite3` opens a transaction for DML, not DDL, so a `CREATE TABLE`
+        that is not inside an explicit one commits on its own: an exception or
+        a power cut after it leaves `events_nullable_confidence` behind with
+        the data still whole. `CREATE TABLE events_nullable_confidence` on the
+        next boot then raises out of `LocalStore.__init__`, before `main()`
+        claims the relay or starts the webhook listener, and systemd restarts
+        into the same wall until a human drops the table. The gate stays shut
+        the whole time.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            _write_legacy_events_database(database)
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "CREATE TABLE events_nullable_confidence"
+                    " (id INTEGER PRIMARY KEY, junk TEXT)"
+                )
+                connection.commit()
+
+            store = LocalStore(database)
+            skipped = store.record_event(GateEvent(
+                source="ocr", reason="queue_coalesced", opened=False,
+                idempotency_key="image:coalesced",
+                received_at=datetime(2026, 8, 13, 10, 0, 2, tzinfo=timezone.utc),
+            ))
+
+            with closing(sqlite3.connect(database)) as connection:
+                nullable = not _events_notnull(connection)["ocr_confidence"]
+                preserved = connection.execute(
+                    "SELECT id, observed_plate, ocr_confidence FROM events WHERE id = 7"
+                ).fetchone()
+                recorded = connection.execute(
+                    "SELECT ocr_confidence FROM events WHERE id = ?", (skipped,)
+                ).fetchone()[0]
+                leftovers = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%nullable%'"
+                ).fetchall()
+
+        self.assertTrue(nullable, "the rebuild completed on the second boot")
+        self.assertEqual(preserved, (7, "10CE1990", 0.999), "every score survived")
+        self.assertIsNone(recorded, "a frame no reader saw records no score")
+        self.assertEqual(leftovers, [], "and the wreckage is gone")
+
+    def test_an_abort_mid_rebuild_leaves_one_whole_events_table_and_a_bootable_database(self):
+        """Whichever statement dies, the next boot has to get past `__init__`.
+
+        The swap runs inside one `BEGIN IMMEDIATE`, so an abort rolls back to
+        the old `events` -- rows, scores and indexes all standing -- or, past
+        the commit, lands on the new one. Never neither, and never a scratch
+        table that stops the boot after it.
+        """
+        aborts = (
+            "CREATE TABLE events_nullable_confidence",
+            "INSERT INTO events_nullable_confidence",
+            "DROP TABLE events",
+            "ALTER TABLE events_nullable_confidence RENAME TO events",
+            "CREATE INDEX IF NOT EXISTS events_received_cooldown",
+        )
+        for abort_after in aborts:
+            with self.subTest(abort_after=abort_after):
+                with tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / "gate.db"
+                    _write_legacy_events_database(database)
+
+                    original = LocalStore._connect
+
+                    def failing_connect(store, _original=original):
+                        return _RaiseAfter(_original(store), abort_after)
+
+                    with mock.patch.object(LocalStore, "_connect", failing_connect):
+                        with self.assertRaises(RuntimeError):
+                            LocalStore(database)
+
+                    with closing(sqlite3.connect(database)) as connection:
+                        surviving = connection.execute(
+                            "SELECT id, observed_plate, ocr_confidence FROM events"
+                        ).fetchall()
+                        leftovers = connection.execute(
+                            "SELECT name FROM sqlite_master WHERE name LIKE '%nullable%'"
+                        ).fetchall()
+
+                    store = LocalStore(database)
+                    with closing(sqlite3.connect(database)) as connection:
+                        nullable = not _events_notnull(connection)["ocr_confidence"]
+                        rows = connection.execute(
+                            "SELECT id, observed_plate, ocr_confidence FROM events"
+                        ).fetchall()
+                        indexes = {
+                            row[0] for row in connection.execute(
+                                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                                " AND tbl_name = 'events'"
+                            )
+                        }
+                    still_counted = store.was_opened_since(
+                        datetime(2026, 8, 13, 9, 59, tzinfo=timezone.utc)
+                    )
+
+                self.assertEqual(
+                    surviving, [(7, "10CE1990", 0.999)],
+                    "an abort keeps one whole events table, old or new",
+                )
+                self.assertEqual(leftovers, [], "and no scratch table to trip on")
+                self.assertTrue(nullable, "the next boot completes the rebuild")
+                self.assertEqual(rows, [(7, "10CE1990", 0.999)], "with the row intact")
+                self.assertLessEqual(
+                    {"events_relay_cooldown", "events_received_cooldown"}, indexes,
+                    "and both cooldown indexes standing",
+                )
+                self.assertTrue(still_counted, "the existing pulse still holds the window")
+
+    def test_the_rebuild_never_turns_foreign_keys_on(self):
+        """Dropping `events` out from under three REFERENCES clauses.
+
+        `outbox`, `actuation_claims` and `event_telemetry` all name
+        `events(id)`. The rebuild drops and re-adds the table they name, which
+        is only safe while `PRAGMA foreign_keys` is off -- SQLite's default,
+        and nothing in the store may quietly start turning it on.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            _write_legacy_events_database(database)
+            observed = []
+
+            original = LocalStore._connect
+
+            def watching_connect(store, _original=original):
+                connection = _original(store)
+                observed.append(
+                    connection.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
+                return connection
+
+            with mock.patch.object(LocalStore, "_connect", watching_connect):
+                store = LocalStore(database)
+                store.record_event_with_outbox(
+                    GateEvent(
+                        source="ocr", reason="queue_coalesced", opened=False,
+                        idempotency_key="image:coalesced",
+                        received_at=datetime(2026, 8, 13, 10, 0, 2, tzinfo=timezone.utc),
+                    ),
+                    {"event_id": None},
+                )
+
+        self.assertTrue(observed, "the store opened at least one connection")
+        self.assertEqual(set(observed), {0}, "foreign keys stay off on every connection")
+
+    def test_the_rebuild_says_in_the_journal_that_it_started_and_when_it_is_skipped(self):
+        """A rebuild that dies mid-flight has to have said it was running.
+
+        The success line alone cannot distinguish a boot that skipped the
+        rebuild from one that hung inside it, and the row count is the only
+        hint at how long a Pi will sit there.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            _write_legacy_events_database(database)
+            with self.assertLogs("gate_controller.store", level="INFO") as migrating:
+                LocalStore(database)
+            with self.assertLogs("gate_controller.store", level="INFO") as reopening:
+                LocalStore(database)
+
+        started = [line for line in migrating.output if "status=started" in line]
+        applied = [line for line in migrating.output if "status=applied" in line]
+        skipped = [line for line in reopening.output if "status=skipped" in line]
+        self.assertEqual(len(started), 1, migrating.output)
+        self.assertIn("rows=1", started[0])
+        self.assertEqual(len(applied), 1, migrating.output)
+        self.assertEqual(len(skipped), 1, reopening.output)
+        self.assertEqual(
+            [line for line in reopening.output if "status=started" in line], [],
+            "an already-nullable database is not rebuilt again",
+        )
+
+    def test_a_pending_event_without_a_score_omits_the_key_the_old_build_reads(self):
+        """A rollback leaves this row for the previous release to decode.
+
+        That decoder does `float(payload.get("ocr_confidence", 0.0))`. A JSON
+        `null` makes it raise `TypeError`, which the blanket `except` around
+        the recovery loop swallows as a malformed row -- so the interrupted
+        actuation is skipped, silently, on that boot and every boot after it.
+        Omitting the key hands the old decoder its 0.0 default and this one
+        `None`, which is the same absent score either way.
+        """
+        received_at = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+        unmeasured = _encode_pending_event(GateEvent(
+            source="ocr", reason="queue_coalesced", opened=False,
+            idempotency_key="image:coalesced", received_at=received_at,
+            decision_at=received_at,
+        ))
+        measured = _encode_pending_event(GateEvent(
+            source="ocr", reason="no_match", opened=False,
+            idempotency_key="image:read", received_at=received_at,
+            decision_at=received_at, observed_plate="10CE1990", ocr_confidence=0.42,
+        ))
+
+        self.assertNotIn("ocr_confidence", json.loads(unmeasured))
+        # Verbatim from the release this one can be rolled back to.
+        self.assertEqual(0.0, float(json.loads(unmeasured).get("ocr_confidence", 0.0)))
+        self.assertIsNone(_decode_pending_event(unmeasured).ocr_confidence)
+        self.assertEqual(0.42, json.loads(measured)["ocr_confidence"])
+        self.assertEqual(0.42, _decode_pending_event(measured).ocr_confidence)
 
     def test_a_cooldown_record_is_not_evidence_that_the_relay_pulsed(self):
         """`opened` says the gate was open; only a pulse holds the window."""
