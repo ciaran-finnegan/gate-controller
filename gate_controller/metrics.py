@@ -915,8 +915,14 @@ class MetricsRing:
             # A post landed, so any earlier loss is a closed episode and the
             # minutes it delivered start ageing out of their own accord.
             self._retire_sent_locked()
-        if delivered:
-            self._drops.delivered()
+            if delivered:
+                # Under the ring's lock, which is what serialises the drop
+                # logger: `_evict_locked` is the only other caller and it runs
+                # holding it. Closing the episode outside the lock would let a
+                # burst thread's eviction land in the count of the episode
+                # just closed, or be zeroed before it was ever journalled.
+                # Nothing here does I/O beyond one log record.
+                self._drops.delivered()
 
     def quota_status(self) -> dict:
         """The two quota keys the heartbeat's `cloud` block already accepts.
