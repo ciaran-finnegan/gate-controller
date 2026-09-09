@@ -7,9 +7,11 @@ the raw candidates, scores and box so a review step can confirm or correct
 it. Writing never raises into the recognition path.
 
 The pair is an *artefact*, not specifically a frame. The sidecar names its
-``kind`` and ``media_type``, so the audio capture that is coming next -- the
-gate opening and closing -- is another artefact in this same directory and
-travels the same pipeline, rather than needing a second one.
+``kind`` and ``media_type``, so the gate's own audio -- the clips
+``gate_controller.audio_capture`` records in the ``audio`` directory beside
+this one -- is another artefact travelling this same pipeline rather than
+needing a second one. ``pending`` walks those subdirectories; the size bound
+below does not, because each store prunes only what it wrote.
 
 This directory is a **buffer, not the archive**. ``gate_controller.corpus_upload``
 ships each artefact to R2 and calls :meth:`TrainingCorpus.discard` once the
@@ -43,6 +45,14 @@ FRAME_KIND = "frame"
 FRAME_MEDIA_TYPE = "image/jpeg"
 FRAME_SUFFIX = ".jpg"
 SIDECAR_SUFFIX = ".json"
+#: How far under the corpus root :meth:`TrainingCorpus.pending` looks. The root
+#: is depth 0 and the gate's audio clips are at depth 1, in the ``audio``
+#: directory ``load_audio_capture_config`` puts beside the corpus. It is a
+#: bound rather than an unlimited walk because this directory is on an SD card
+#: in a warm cabinet, the poll runs every five minutes, and a symlink or a
+#: mount somebody leaves under the corpus must not turn that poll into a
+#: filesystem crawl.
+MAX_SCAN_DEPTH = 2
 
 
 @dataclass(frozen=True)
@@ -143,12 +153,71 @@ class TrainingCorpus:
         """The artefacts still on the card, oldest first.
 
         The stem starts with a UTC timestamp, so sorting the names sorts by
-        capture time. A pair missing either half is not offered: half an
-        artefact is not something to upload, and the size backstop will
-        eventually reclaim it.
+        capture time -- across directories as well as within one, which is
+        what makes a single ordering out of the frames at the root and the
+        audio clips beneath it. A pair missing either half is not offered:
+        half an artefact is not something to upload, and the size backstop
+        will eventually reclaim it.
+
+        The subdirectories are walked because the corpus root is not the only
+        place artefacts land: the gate's audio clips are written to ``audio``
+        beside it, deliberately sharing this pair-and-stem convention so that
+        one uploader carries both. A pass that read only the root would leave
+        every clip on the card for ever, which is exactly what happened
+        between the first capture and this fix.
+        """
+        artefacts: list[CorpusArtefact] = []
+        for directory in self._scan_directories():
+            artefacts.extend(self._pairs_in(directory))
+        # Sorting on the stem alone, not the path, so a clip recorded before a
+        # frame is uploaded before it whichever directory each sits in.
+        artefacts.sort(key=lambda artefact: artefact.stem)
+        return artefacts if limit is None else artefacts[:max(0, limit)]
+
+    def _scan_directories(self) -> list[Path]:
+        """The corpus root and the artefact directories beneath it.
+
+        Breadth first and depth bounded. Hidden names are skipped -- they are
+        the half-written temporaries ``_write_private`` leaves -- and so are
+        symlinks, which are the one way a bounded walk could still escape the
+        corpus.
+
+        ``scandir`` rather than ``iterdir`` because the root holds a frame for
+        every OCR request the controller has not shipped yet: the directory
+        entry already says whether it is a directory, and asking the SD card
+        again for each of those thousands of files, every poll, is a cost with
+        nothing to show for it.
+        """
+        found = [self.directory]
+        frontier = [(self.directory, 0)]
+        while frontier:
+            directory, depth = frontier.pop(0)
+            if depth >= MAX_SCAN_DEPTH:
+                continue
+            try:
+                with os.scandir(directory) as entries:
+                    children = sorted(
+                        entry.name for entry in entries
+                        if not entry.name.startswith(".")
+                        and entry.is_dir(follow_symlinks=False)
+                    )
+            except OSError:
+                continue
+            for name in children:
+                child = directory / name
+                found.append(child)
+                frontier.append((child, depth + 1))
+        return found
+
+    def _pairs_in(self, directory: Path) -> list["CorpusArtefact"]:
+        """The complete payload/sidecar pairs in one directory.
+
+        Pairing never crosses a directory: a frame at the root and a sidecar
+        under ``audio`` that happened to share a stem are two half artefacts,
+        not one whole one.
         """
         try:
-            entries = list(self.directory.iterdir())
+            entries = list(directory.iterdir())
         except OSError:
             return []
         payloads: dict[str, Path] = {}
@@ -161,29 +230,35 @@ class TrainingCorpus:
                 sidecars.add(name[: -len(SIDECAR_SUFFIX)])
             else:
                 payloads.setdefault(entry.stem, entry)
-        artefacts = [
+        return [
             CorpusArtefact(
                 stem=stem,
                 payload_path=payloads[stem],
-                sidecar_path=self.directory / (stem + SIDECAR_SUFFIX),
+                sidecar_path=directory / (stem + SIDECAR_SUFFIX),
             )
             for stem in sorted(sidecars & payloads.keys())
         ]
-        return artefacts if limit is None else artefacts[:max(0, limit)]
 
-    def discard(self, stem: str) -> bool:
+    def discard(self, artefact) -> bool:
         """Drop one artefact that is safely in the cloud.
+
+        Takes the :class:`CorpusArtefact` ``pending`` handed out, or a bare
+        stem for one written at the root. The artefact is what says *which
+        directory*: a clip lives under ``audio`` and deleting the root path of
+        its stem would delete nothing, leaving the uploader to ship the same
+        clip on every pass for ever.
 
         Called only after the cloud has confirmed the artefact is stored, so
         this is the step that turns the card from an archive into a buffer.
         Accounting happens under the same lock ``record`` uses: a stale byte
         total would make the backstop prune live pairs it does not need to.
         """
+        directory, stem = self._locate(artefact)
         freed = 0
         removed = False
         with self._lock:
-            for suffix in (SIDECAR_SUFFIX, *self._payload_suffixes(stem)):
-                path = self.directory / (stem + suffix)
+            for suffix in (SIDECAR_SUFFIX, *self._payload_suffixes(directory, stem)):
+                path = directory / (stem + suffix)
                 try:
                     size = path.stat().st_size
                     path.unlink()
@@ -193,11 +268,24 @@ class TrainingCorpus:
                 removed = True
             if removed:
                 self._discarded += 1
-                if self._total_bytes is not None:
+                # Only the root is accounted -- see `_account` -- so only bytes
+                # freed at the root come off the total. Subtracting an audio
+                # clip that was never added would walk the total down towards
+                # zero and quietly disable the size backstop.
+                if self._total_bytes is not None and directory == self.directory:
                     self._total_bytes = max(0, self._total_bytes - freed)
         return removed
 
-    def _payload_suffixes(self, stem: str) -> tuple[str, ...]:
+    def _locate(self, artefact) -> tuple[Path, str]:
+        """The directory and stem of an artefact, however it was named."""
+        stem = getattr(artefact, "stem", artefact)
+        payload_path = getattr(artefact, "payload_path", None)
+        directory = (
+            Path(payload_path).parent if payload_path is not None else self.directory
+        )
+        return directory, str(stem)
+
+    def _payload_suffixes(self, directory: Path, stem: str) -> tuple[str, ...]:
         """Every non-sidecar suffix written under ``stem``.
 
         Read from the directory rather than assumed, so an audio artefact is
@@ -205,7 +293,7 @@ class TrainingCorpus:
         """
         try:
             return tuple(
-                path.suffix for path in self.directory.glob(stem + ".*")
+                path.suffix for path in directory.glob(stem + ".*")
                 if path.is_file() and path.suffix != SIDECAR_SUFFIX
             )
         except OSError:
@@ -229,6 +317,15 @@ class TrainingCorpus:
         return self.directory
 
     def _account(self, added: int) -> None:
+        """The bytes this corpus wrote, which is the root and only the root.
+
+        ``pending`` reads the subdirectories too, but reading is not owning.
+        The audio clips under ``audio`` are written and bounded by
+        ``AudioClipStore``, which has its own byte cap and its own retention
+        window; counting them here would give one directory two pruners with
+        different ideas about what to delete, and the one that does not know
+        about the upload would be free to delete a clip on its way to R2.
+        """
         if self._total_bytes is None:
             self._total_bytes = sum(
                 entry.stat().st_size for entry in self.directory.iterdir() if entry.is_file()
@@ -237,6 +334,12 @@ class TrainingCorpus:
             self._total_bytes += added
 
     def _prune_locked(self, directory: Path) -> None:
+        """The backstop, over the frames at the root and nothing else.
+
+        Scoped to what ``_account`` counts, and to the two suffixes this class
+        writes, so the subdirectories ``pending`` now walks are read from and
+        never deleted from here.
+        """
         if self._total_bytes is None or self._total_bytes <= self._max_bytes:
             return
         pairs = sorted(

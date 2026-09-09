@@ -782,11 +782,12 @@ the relay one: it runs while the relay is energised, so it does nothing but
 take an uncontended lock and write a few fields.
 
 Clips are written as `<stem>.aac` plus `<stem>.json` with the same stem
-convention, permissions (0700 directory, 0600 files) and pruning as the image
-corpus, in an `audio` directory beside `GATE_TRAINING_CORPUS_DIR` unless
-`GATE_AUDIO_CAPTURE_DIR` overrides it. An exporter that walks the corpus root
-pairing a payload with its sidecar therefore carries audio without a second
-uploader; `kind: "gate_audio"` is what tells the two apart.
+convention and permissions (0700 directory, 0600 files) as the image corpus,
+in an `audio` directory beside `GATE_TRAINING_CORPUS_DIR` unless
+`GATE_AUDIO_CAPTURE_DIR` overrides it. The corpus uploader walks that
+directory and ships the pairs as `kind=audio` — see [Audio](#audio) below —
+while pruning stays with each store: the corpus prunes its frames at the root
+and the clips are pruned here, by the retention window and cap below.
 
 **Retention.** Clips are kept for `GATE_AUDIO_CAPTURE_RETENTION_DAYS` (default
 30) inside a `GATE_AUDIO_CAPTURE_MAX_TOTAL_BYTES` cap (default 256 MiB),
@@ -865,8 +866,37 @@ prevent.
 
 The pipeline moves **artefacts**, not frames. A sidecar names its `kind` and
 `media_type`, and discovery, upload, indexing and discard all read those
-rather than assuming a JPEG. When audio capture lands it needs to write a clip
-and a sidecar under the same stem convention and nothing here changes.
+rather than assuming a JPEG. The gate's own clips ship this way: they go to
+R2 under `corpus/<controller>/audio/<YYYY>/<MM>/<DD>/<sha256>.aac`, indexed in
+`corpus_artefacts` beside the frames, with their sidecar — the one that says
+`label: actuated` and where in the clip the relay fired — stored alongside as
+the artefact's `.json`.
+
+Two things had to be true for that and neither was, so no clip recorded from
+2026-09-08 left the card:
+
+* **Discovery walks the subdirectories.** The clips are in `audio`, not at the
+  corpus root, and `pending` read only the root. It now walks one level down,
+  skipping hidden names and symlinks, and sorts the whole queue on the stem so
+  frames and clips travel in capture order. Discard follows the artefact to
+  the directory it was found in.
+* **`.aac` is a known suffix.** A clip's sidecar names *its own* kind —
+  `gate_audio`, what the capture is — and carries no `artefact` block, so the
+  suffix table is what says which family the corpus ships it as. It had no
+  `.aac` row and every clip was refused as an unknown suffix.
+
+**The Worker's media types are an allow-list and it deploys separately.**
+`audio/aac` must be accepted there — magic bytes and extension — *before* a
+controller that sends it. Until then the endpoint answers 400, which the
+sender treats as a refusal on the merits: the clip is stood aside as
+`stage=unshippable`, kept on the card, and the frames behind it keep shipping
+rather than queueing behind an artefact that will be refused on every pass.
+
+The two stores stay separately bounded. The corpus prunes what it wrote, at
+the root, under `GATE_TRAINING_CORPUS_MAX_BYTES`; the clips are pruned by
+their own retention window and cap. Reading a directory is not owning it, and
+one directory with two pruners would eventually mean the one that knows
+nothing about the upload deleting a clip on its way to R2.
 
 ## Controller Cutover And Decommission
 

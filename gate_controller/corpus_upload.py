@@ -5,9 +5,10 @@ anywhere. At the size cap the oldest examples are deleted permanently, and
 cards in warm Pis fail. Both losses are silent and neither is recoverable, so
 the corpus belongs in R2 with its index in D1.
 
-What makes this safe is not the size of the transfer -- a day of corpus is
-about 5.6 MB, roughly ten seconds of a 4.5 Mbit/s uplink -- but never spending
-those seconds at the wrong moment. The rules, in the order they are checked:
+What makes this safe is not the size of the transfer -- a day of frames is
+about 5.6 MB, roughly ten seconds of a 4.5 Mbit/s uplink, and the gate's audio
+clips add a few hundred kilobytes each -- but never spending those seconds at
+the wrong moment. The rules, in the order they are checked:
 
 1. **Nothing while the gate is working.** A camera event, a presence session
    or an OCR request in flight blocks a start outright.
@@ -77,13 +78,20 @@ BACKOFF_BASE_SECONDS = 60.0
 BACKOFF_MAX_SECONDS = 3600.0
 UPLOAD_READ_TIMEOUT_SECONDS = 120.0
 
-#: What each payload suffix is, and which artefact family it belongs to. The
-#: audio rows are here already: adding capture means writing the file, not
-#: teaching this module a second pipeline.
+#: What each payload suffix is, and which artefact family it belongs to. This
+#: table is what a sidecar without an ``artefact`` block falls back to, and for
+#: the gate's audio clips it is the only answer there is: their sidecar names
+#: its own ``kind`` -- ``gate_audio``, what the capture is -- and not the
+#: artefact family the corpus ships under.
+#:
+#: ``.aac`` is what ``audio_capture`` actually writes -- ADTS frames copied
+#: from the camera's own stream -- and its absence here is why three days of
+#: clips were refused as an unknown suffix and never left the card.
 MEDIA_TYPES = {
     ".jpg": ("frame", "image/jpeg"),
     ".jpeg": ("frame", "image/jpeg"),
     ".png": ("frame", "image/png"),
+    ".aac": ("audio", "audio/aac"),
     ".wav": ("audio", "audio/wav"),
     ".flac": ("audio", "audio/flac"),
     ".opus": ("audio", "audio/ogg"),
@@ -157,14 +165,29 @@ class CloudflareCorpusSender:
         self._controller_id = controller_id
 
     def __call__(self, artefact_id: str, chunks) -> None:
-        acknowledgement = self.client.post_stream(
-            "/api/controller/corpus",
-            chunks,
-            content_type="application/json",
-            headers={"Idempotency-Key": _idempotency_key(self._controller_id, artefact_id)},
-            max_response_bytes=4096,
-            timeout=(2, UPLOAD_READ_TIMEOUT_SECONDS),
-        )
+        try:
+            acknowledgement = self.client.post_stream(
+                "/api/controller/corpus",
+                chunks,
+                content_type="application/json",
+                headers={"Idempotency-Key": _idempotency_key(self._controller_id, artefact_id)},
+                max_response_bytes=4096,
+                timeout=(2, UPLOAD_READ_TIMEOUT_SECONDS),
+            )
+        except Exception as error:
+            if _caused_by_abort(error):
+                raise
+            status = _refusal_status(error)
+            if status is None:
+                raise
+            # The contract refused this artefact on its merits, and it will
+            # refuse the identical bytes on every future pass. Charging that to
+            # the backoff would park the whole corpus behind one artefact --
+            # the oldest is offered first, so a single refusal at the head of
+            # the queue would stop the frames behind it shipping at all.
+            raise CorpusUploadUnshippable(
+                f"the corpus endpoint refused the artefact with HTTP {status}"
+            ) from error
         if not _is_corpus_acknowledgement(acknowledgement, artefact_id):
             raise CorpusUploadError("corpus endpoint did not confirm the artefact")
 
@@ -364,7 +387,9 @@ class CorpusUploadWorker:
             if _caused_by_abort(error):
                 raise CorpusUploadAborted("a gate event started") from error
             raise
-        self._corpus.discard(artefact.stem)
+        # The artefact, not its stem: it carries the directory it was found
+        # in, and a clip under `audio` is not deleted by a root path.
+        self._corpus.discard(artefact)
         self._uploaded += 1
         self._failures = 0
         self._retry_at = None
@@ -579,6 +604,31 @@ def _media_type(value) -> str | None:
 
 def _reason(error: Exception) -> str:
     return " ".join(str(error).split())[:120] or type(error).__name__
+
+
+#: Refusals that are about the artefact rather than the moment. Everything
+#: else -- 401 and 403 while a token is being rotated, 404 before a deploy,
+#: 429, any 5xx, a dropped connection -- is the cloud having a bad minute and
+#: is retried with the usual backoff.
+REFUSAL_STATUSES = frozenset({400, 413, 415, 422})
+
+
+def _refusal_status(error: BaseException) -> int | None:
+    """The HTTP status of a deterministic refusal, or None.
+
+    Read off the exception rather than by catching ``requests.HTTPError``, so
+    this module keeps working against any client that reports a status the
+    same way.
+    """
+    seen = 0
+    cause: BaseException | None = error
+    while cause is not None and seen < 8:
+        status = getattr(getattr(cause, "response", None), "status_code", None)
+        if isinstance(status, int) and status in REFUSAL_STATUSES:
+            return status
+        cause = cause.__cause__ or cause.__context__
+        seen += 1
+    return None
 
 
 def _caused_by_abort(error: BaseException) -> bool:
