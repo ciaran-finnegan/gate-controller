@@ -1,6 +1,7 @@
 import configparser
 import json
 import os
+import stat
 import subprocess
 import time
 import unittest
@@ -373,22 +374,47 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertNotIn("MTX_", template)
 
     def test_the_docs_send_the_installer_at_the_managed_release_tree(self):
-        """`/opt/gate-controller/releases/<sha>` does not exist.
+        """`/opt/gate-controller/releases/<sha>` does not exist, and the
+        release tree keeps git's file modes.
 
         The updater unpacks into `/opt/gate-controller-deploy/releases/<sha>`,
-        so the documented command fails with "must be a directory" on the one
-        step an operator has to run by hand after every release.
+        so a command aimed at `/opt/gate-controller/releases/` fails with "must
+        be a directory". Releases up to 1d98e6e also shipped this script mode
+        0644, so `sudo "$RELEASE/deployment/install-camera-control.sh"` fails
+        there with "command not found": the one step an operator has to run by
+        hand after every release must be documented through `bash`.
         """
         for relative in ("docs/camera-control.md", "docs/deployment.md"):
             with self.subTest(document=relative):
                 text = (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
 
+                self.assertIn("/opt/gate-controller-deploy/releases/", text)
+                self.assertNotIn("--source /opt/gate-controller/releases/", text)
                 self.assertIn(
-                    "install-camera-control.sh --source "
-                    "/opt/gate-controller-deploy/releases/",
+                    'sudo bash "$RELEASE/deployment/install-camera-control.sh" '
+                    '--source "$RELEASE"',
                     text,
                 )
-                self.assertNotIn("--source /opt/gate-controller/releases/", text)
+                self.assertNotIn("sudo deployment/install-camera-control.sh", text)
+                self.assertNotIn(
+                    'sudo "$RELEASE/deployment/install-camera-control.sh"', text
+                )
+
+    def test_the_installer_scripts_carry_their_execute_bit(self):
+        """The release tree is a git checkout, so it publishes git's modes.
+
+        `install-camera-control.sh` was committed 0644, which made the documented
+        direct invocation fail on the Pi with "command not found". Keep the bit
+        set on every operator-run installer.
+        """
+        for relative in (
+            "deployment/install.sh",
+            "deployment/install-camera-control.sh",
+            "deployment/install-media.sh",
+        ):
+            with self.subTest(script=relative):
+                mode = (REPOSITORY_ROOT / relative).stat().st_mode
+                self.assertTrue(mode & stat.S_IXUSR, f"{relative} is not executable")
 
     def test_the_documented_rollback_does_not_assume_the_default_is_off(self):
         """`GATE_CAMERA_IR_DEFAULT` may be `Auto`.
