@@ -183,6 +183,186 @@ class ActuationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.reason, "cooldown")
         self.assertEqual(pending, [("command-1", "failed", "cooldown")])
 
+    def test_persisted_cooldown_records_the_grant_rather_than_a_denial(self):
+        """The store's cooldown: another event pulsed the relay recently.
+
+        The decision on this frame was still a grant -- the plate matched, at
+        the confidence the reader gave it -- so that is what the event says.
+        Only the actuation was skipped, and ``actuation_outcome`` says so.
+        """
+        now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            coordinator = ActuationCoordinator(store, RecordingRelay(), clock=lambda: now)
+            coordinator.actuate(GateEvent(
+                source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-1",
+                received_at=now, decision_at=now, authorised_plate="10CE1990",
+                observed_plate="10CE1990", ocr_confidence=0.999,
+            ))
+
+            coalesced = coordinator.actuate(GateEvent(
+                source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-2",
+                received_at=now, decision_at=now, authorised_plate="10CE1990",
+                observed_plate="10CE1990", ocr_confidence=0.999,
+            ), outbox_payload={})
+            payload = store.event_payload(coalesced.event_id)
+
+        self.assertEqual(coalesced.reason, "cooldown")
+        self.assertFalse(coalesced.opened, "no second pulse was attempted")
+        self.assertTrue(payload["opened"])
+        self.assertEqual(payload["reason"], "exact_match")
+        self.assertEqual(payload["observed_plate"], "10CE1990")
+        self.assertEqual(payload["ocr_confidence"], 0.999)
+        self.assertIsNone(payload["relay_activated_at"])
+
+    def test_in_process_cooldown_records_the_grant_rather_than_a_denial(self):
+        """The same, for the coordinator's own last-attempt guard.
+
+        This is the branch that fires when the claim is granted but the relay
+        was pulsed within the cooldown by this same process.
+        """
+        wall = [datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)]
+        monotonic_now = [100.0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            relay = RecordingRelay()
+            coordinator = ActuationCoordinator(
+                store, relay, cooldown=timedelta(seconds=20),
+                clock=lambda: wall[0], monotonic_clock=lambda: monotonic_now[0],
+            )
+            coordinator.actuate(GateEvent(
+                source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-1",
+                received_at=wall[0], decision_at=wall[0], authorised_plate="11WH2571",
+                observed_plate="11WH2571", ocr_confidence=0.998,
+            ))
+            # The wall clock jumps an hour, so the persisted evidence is out of
+            # the window and the claim succeeds; only the monotonic guard is
+            # left to refuse the second pulse.
+            wall[0] += timedelta(hours=1)
+            monotonic_now[0] += 1
+            coalesced = coordinator.actuate(GateEvent(
+                source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-2",
+                received_at=wall[0], decision_at=wall[0], authorised_plate="11WH2571",
+                observed_plate="11WH2571", ocr_confidence=0.998,
+            ), command_ack=("command-1", wall[0]))
+            payload = store.event_payload(coalesced.event_id)
+            acks = store.pending_command_acks()
+
+        self.assertEqual(coalesced.reason, "cooldown")
+        self.assertEqual(relay.calls, [("ocr", "ocr-1")])
+        self.assertTrue(payload["opened"])
+        self.assertEqual(payload["reason"], "exact_match")
+        self.assertEqual(payload["ocr_confidence"], 0.998)
+        self.assertEqual(
+            acks, [("command-1", "failed", "cooldown")],
+            "the caller is still told the relay did not fire",
+        )
+
+    def _cooldown_pair(self, store, *, second_inhibition, in_process):
+        """Grant once, then present a second matched frame inside the cooldown.
+
+        ``in_process`` picks which of the two cooldown branches answers: the
+        persisted one that ``claim_actuation`` refuses, or the coordinator's own
+        last-attempt guard, reached by jumping the wall clock past the persisted
+        window so only the monotonic evidence is left.
+        """
+        wall = [datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)]
+        monotonic_now = [100.0]
+        relay = RecordingRelay()
+        coordinator = ActuationCoordinator(
+            store, relay, cooldown=timedelta(seconds=20),
+            clock=lambda: wall[0], monotonic_clock=lambda: monotonic_now[0],
+            boot_id="boot-1",
+        )
+        coordinator.actuate(GateEvent(
+            source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-1",
+            received_at=wall[0], decision_at=wall[0], authorised_plate="10CE1990",
+            observed_plate="10CE1990", ocr_confidence=0.999,
+        ))
+        if in_process:
+            wall[0] += timedelta(hours=1)
+            monotonic_now[0] += 1
+        else:
+            wall[0] += timedelta(seconds=2)
+            monotonic_now[0] += 2
+            # Leave only the persisted evidence: a fresh coordinator over the
+            # same store has no in-process last attempt to remember.
+            coordinator = ActuationCoordinator(
+                store, relay, cooldown=timedelta(seconds=20),
+                clock=lambda: wall[0], monotonic_clock=lambda: monotonic_now[0],
+                boot_id="boot-1",
+            )
+        coalesced = coordinator.actuate(GateEvent(
+            source="ocr", reason="exact_match", opened=False, idempotency_key="ocr-2",
+            received_at=wall[0], decision_at=wall[0], authorised_plate="10CE1990",
+            observed_plate="10CE1990", ocr_confidence=0.999,
+        ), outbox_payload={}, pre_activation_inhibit=lambda: second_inhibition)
+        return relay, coalesced
+
+    def test_persisted_cooldown_records_a_denial_when_authorisation_was_revoked(self):
+        """The plate came off the list between the match and the actuation.
+
+        A pulse would have been held off by ``pre_activation_inhibit`` under the
+        relay's lock. The cooldown branch never reaches that lock, so the check
+        has to run before the short-circuit -- otherwise a withdrawn
+        authorisation is the one way a revoked plate still reads as a grant.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            relay, coalesced = self._cooldown_pair(
+                store, second_inhibition=("failed", "authorisation_revoked"),
+                in_process=False,
+            )
+            payload = store.event_payload(coalesced.event_id)
+
+        self.assertEqual(coalesced.reason, "authorisation_revoked")
+        self.assertEqual(coalesced.terminal_status, "failed")
+        self.assertEqual(coalesced.terminal_detail, "authorisation_revoked")
+        self.assertFalse(coalesced.opened)
+        self.assertEqual(relay.calls, [("ocr", "ocr-1")], "no second pulse")
+        self.assertFalse(payload["opened"], "a revoked plate is not a grant")
+        self.assertEqual(payload["reason"], "authorisation_revoked")
+        self.assertIsNone(payload["relay_activated_at"])
+
+    def test_in_process_cooldown_records_a_denial_when_the_deadline_expired(self):
+        """The same ordering, on the coordinator's own last-attempt guard."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalStore(Path(directory) / "gate.db")
+            relay, coalesced = self._cooldown_pair(
+                store, second_inhibition=("failed", "decision_timeout"),
+                in_process=True,
+            )
+            payload = store.event_payload(coalesced.event_id)
+
+        self.assertEqual(coalesced.reason, "decision_timeout")
+        self.assertEqual(coalesced.terminal_status, "failed")
+        self.assertEqual(coalesced.terminal_detail, "decision_timeout")
+        self.assertFalse(coalesced.opened)
+        self.assertEqual(relay.calls, [("ocr", "ocr-1")], "no second pulse")
+        self.assertFalse(payload["opened"])
+        self.assertEqual(payload["reason"], "decision_timeout")
+
+    def test_an_uninhibited_match_in_cooldown_is_still_recorded_as_a_grant(self):
+        """The check gates the grant; it does not replace it.
+
+        Both branches, so neither ordering can quietly start denying the frames
+        this change exists to record honestly.
+        """
+        for in_process in (False, True):
+            with self.subTest(in_process=in_process), \
+                    tempfile.TemporaryDirectory() as directory:
+                store = LocalStore(Path(directory) / "gate.db")
+                _relay, coalesced = self._cooldown_pair(
+                    store, second_inhibition=None, in_process=in_process
+                )
+                payload = store.event_payload(coalesced.event_id)
+
+                self.assertEqual(coalesced.reason, "cooldown")
+                self.assertTrue(payload["opened"])
+                self.assertEqual(payload["reason"], "exact_match")
+                self.assertEqual(payload["ocr_confidence"], 0.999)
+                self.assertIsNone(payload["relay_activated_at"])
+
     def test_relay_failure_finalization_durably_queues_a_failed_command_ack(self):
         now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:

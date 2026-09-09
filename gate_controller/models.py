@@ -62,6 +62,18 @@ class GateEvent:
     authorised_plate: str | None = None
     observed_plate: str | None = None
     ocr_confidence: float = 0.0
+    #: Why an event that was *granted* never pulsed the relay -- today only
+    #: ``"cooldown"``, meaning the gate was already open for the vehicle in
+    #: front of it. ``None`` on every other event, including denials.
+    #:
+    #: ``opened`` answers "was the gate open for this vehicle"; this field and
+    #: ``relay_activated_at`` answer "did *this* event work the relay". The
+    #: distinction matters twice: the cooldown window must count only real
+    #: pulses (see ``LocalStore._was_opened_since``), and the app must not be
+    #: told a car was refused when it had just been let in. It is a local
+    #: column only: ``LocalStore._event_payload`` does not select it, so it
+    #: never reaches the ingest contract, which would reject the unknown key.
+    actuation_outcome: str | None = None
 
 
 @dataclass(frozen=True)

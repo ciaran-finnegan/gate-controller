@@ -58,13 +58,37 @@ class ActuationCoordinator:
             except Exception:
                 return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
                                           "actuation_inhibit_error")
+
+            def inhibition_now():
+                """The relay-path preconditions, asked before crediting a grant.
+
+                A cooldown row is now a *grant* (see ``_cooldown_event``), so it
+                has to clear the same bar the pulse would have: the frame is
+                still fresh, the plate is still authorised, the decision
+                deadline has not passed, the processor is still open. On the
+                pulsing path this same callable runs under the relay's lock
+                immediately before the GPIO write; here it runs before the
+                cooldown short-circuit, because a decision whose authorisation
+                was revoked between the match and the actuation must be
+                recorded as the denial it is, not as a grant we happened not to
+                have to work the relay for.
+                """
+                if pre_activation_inhibit is None:
+                    return None
+                return pre_activation_inhibit()
+
             if claim.status == "cooldown":
-                cooldown_event = GateEvent(
-                    source=event.source, reason="cooldown", opened=False, idempotency_key=key,
-                    received_at=event.received_at, decision_at=claim_time,
-                    authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
-                    ocr_confidence=event.ocr_confidence,
-                )
+                inhibition = inhibition_now()
+                if inhibition is not None:
+                    inhibited = _inhibited_event(event, key, self._clock(), inhibition[1])
+                    event_id = self._store.record_terminal_outcome(
+                        inhibited, status=inhibition[0], detail=inhibition[1],
+                        outbox_payload=outbox_payload, command_ack=command_ack,
+                    )
+                    return ActuationExecution(
+                        False, inhibition[1], event_id, inhibition[0], inhibition[1]
+                    )
+                cooldown_event = _cooldown_event(event, key, claim_time)
                 event_id = self._store.record_terminal_outcome(
                     cooldown_event, status="failed", detail="cooldown",
                     outbox_payload=outbox_payload, command_ack=command_ack,
@@ -75,26 +99,25 @@ class ActuationCoordinator:
             if (self._last_attempt_monotonic is not None
                     and monotonic_now - self._last_attempt_monotonic
                     < self._cooldown.total_seconds()):
-                cooldown_event = GateEvent(
-                    source=event.source, reason="cooldown", opened=False,
-                    idempotency_key=key, received_at=event.received_at,
-                    decision_at=claim_time, authorised_plate=event.authorised_plate,
-                    observed_plate=event.observed_plate,
-                    ocr_confidence=event.ocr_confidence,
-                )
+                inhibition = inhibition_now()
+                if inhibition is None:
+                    terminal = _cooldown_event(event, key, claim_time)
+                    status, detail = "failed", "cooldown"
+                else:
+                    terminal = _inhibited_event(event, key, self._clock(), inhibition[1])
+                    status, detail = inhibition
                 try:
                     event_id = self._store.finalize_actuation(
-                        claim, cooldown_event, terminal_status="failed",
-                        terminal_detail="cooldown", outbox_payload=outbox_payload,
+                        claim, terminal, terminal_status=status,
+                        terminal_detail=detail, outbox_payload=outbox_payload,
                         command_ack=command_ack,
+                        retain_activation_attempt=False,
                     )
                 except Exception:
                     return ActuationExecution(
                         False, "indeterminate_claim", None, "failed", "indeterminate_claim"
                     )
-                return ActuationExecution(
-                    False, "cooldown", event_id, "failed", "cooldown"
-                )
+                return ActuationExecution(False, detail, event_id, status, detail)
             try:
                 self._store.mark_actuation_attempt(
                     claim, claim_time, event=event, outbox_payload=outbox_payload,
@@ -207,6 +230,48 @@ class ActuationCoordinator:
     def _reconcile_outbox(self, event_id: int | None, payload: dict | None) -> None:
         if event_id is not None and payload is not None:
             self._store.ensure_outbox(event_id, payload)
+
+
+def _cooldown_event(event: GateEvent, key: str, claim_time: datetime) -> GateEvent:
+    """The record of a decision that was granted while the gate was already open.
+
+    The relay is not pulsed a second time, but nothing about the *decision*
+    changed: the plate was authorised, at the confidence the reader gave it.
+    Recording it as a denial with ``reason="cooldown"`` was a lie the app
+    faithfully repeated -- on 8 September 2026 nine such rows read
+    "10-CE-1990 / Access Denied / 99.9%" for a car that had just been let in.
+
+    So the decision travels intact -- ``opened`` true, the match reason, the
+    plates and the confidence -- and the fact that this event did not work the
+    relay is carried by ``actuation_outcome`` locally, by the null
+    ``relay_activated_at`` on the wire, and by ``telemetry.actuation``
+    (``claim="cooldown"``, ``attempted=false``) for anyone reading the detail.
+    """
+    return GateEvent(
+        source=event.source, reason=event.reason, opened=True, idempotency_key=key,
+        received_at=event.received_at, decision_at=claim_time,
+        authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
+        ocr_confidence=event.ocr_confidence, actuation_outcome="cooldown",
+    )
+
+
+def _inhibited_event(event: GateEvent, key: str, at: datetime, reason: str) -> GateEvent:
+    """The record of a decision that lost its grounds before it could act.
+
+    The frame went stale, the plate was withdrawn from the authorised list, the
+    decision deadline passed, or the processor closed -- between the match and
+    the actuation. On the pulsing path the relay is held off and the event is
+    written as a denial named after the check that stopped it. A decision in
+    cooldown gets the same treatment, and for the same reason: it would
+    otherwise be the one way a revoked authorisation could still read as
+    "Access Granted" in the app.
+    """
+    return GateEvent(
+        source=event.source, reason=reason, opened=False, idempotency_key=key,
+        received_at=event.received_at, decision_at=at,
+        authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
+        ocr_confidence=event.ocr_confidence,
+    )
 
 
 def _linux_boot_id() -> str | None:
