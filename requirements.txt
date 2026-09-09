@@ -51,7 +51,7 @@ fast-plate-ocr==1.1.0; (platform_machine == "aarch64" or platform_machine == "ar
 # Exact transitive dependencies of those three; keep these aligned with their
 # metadata, exactly as the requests block above is kept aligned with its own.
 # Same markers, so a release still installs nothing new on x86-64 CI.
-numpy==2.4.6; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+numpy==2.5.3; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 opencv-python-headless==5.0.0.93; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 protobuf==7.36.1; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 flatbuffers==25.12.19; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
