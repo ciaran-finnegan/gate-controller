@@ -698,12 +698,17 @@ class GateProcessor:
             deadline - self._min_cloud_request_seconds - LOCAL_PASS_MARGIN_SECONDS
         )
         if reserved <= self._decision_clock() + LOCAL_PASS_MARGIN_SECONDS:
-            # The reserve cannot be honoured, so the `_min_cloud_request_seconds`
-            # guard below is going to skip the cloud request whatever the pass
-            # does. Every remaining millisecond is the local read's. The old
-            # margin-wide floor was worse than nothing here: a 4K decode alone
-            # is ~60 ms on the Pi, so the pass was abandoned before inference
-            # could start (2026-09-09 10:10:59, frame 2047ae83).
+            # The reserve cannot be honoured. Below `_min_cloud_request_seconds`
+            # of budget the guard in `_recognise` is going to skip the cloud
+            # request whatever the pass does, so every remaining millisecond is
+            # the local read's. In the 2 * margin band just above it the request
+            # is still affordable and this spends its budget on the local read
+            # instead -- deliberately: a ~172 ms on-device read that can open
+            # the gate beats a cloud request with barely 1 s to cross a
+            # 4.5 Mbit/s uplink. What it must not do is what the old
+            # margin-wide floor did, which was worse than either: a 4K decode
+            # alone is ~60 ms on the Pi, so the pass was abandoned before
+            # inference could start (2026-09-09 10:10:59, frame 2047ae83).
             return deadline
         return min(deadline, reserved)
 
