@@ -8,8 +8,9 @@ missing producer.
 Three rules shape everything here.
 
 **Bounded by construction.** The ring is memory only, keyed by the minute and
-capped at :data:`DEFAULT_RING_MINUTES` minutes; the oldest minute is dropped
-when the cap is reached. Nothing accumulates without a ceiling, nothing is
+capped at :data:`DEFAULT_RING_MINUTES` minutes; a delivered minute is retired
+once it is past the retry window and the oldest minute is dropped when the cap
+is reached anyway. Nothing accumulates without a ceiling, nothing is
 written to the SD card except the one small month-to-date counter the quota
 burn-down cannot be reconstructed without.
 
@@ -55,6 +56,18 @@ MAX_BUCKETS_PER_POST = 12
 #: it is exactly twelve whole buckets, which is why minutes are only ever
 #: offered a whole bucket at a time.
 MAX_MINUTES_PER_POST = MAX_BUCKETS_PER_POST * BUCKET_MINUTES
+#: How long a *delivered* minute is kept before the ring retires it.
+#:
+#: A minute that has been posted is only still held for two reasons, both of
+#: them short-lived: `_burst_minute_key_locked` refuses to re-open a minute --
+#: or a bucket -- the app already has, and it reaches back at most one bucket;
+#: and a re-send of the same batch has to stay idempotent. One post's worth of
+#: minutes covers both with an order of magnitude to spare, and retiring the
+#: rest keeps the ring's capacity where it is needed: undelivered data. Left
+#: to age out on capacity alone, three hours of ordinary delivered minutes
+#: filled the ring and journalled every eviction as if something had been
+#: lost (the `ring_full dropped=` lines seen hourly on 2026-09-09).
+SENT_RETENTION_MINUTES = MAX_MINUTES_PER_POST
 #: The contract's ceiling for a minute's heartbeat count.
 MAX_HEARTBEATS_PER_MINUTE = 60
 #: The contract's ceiling for every recognition counter (1e7).
@@ -308,6 +321,63 @@ class _StageLogger:
         self._last_logged_at = None
 
 
+class _DropLogger:
+    """Journal lost minutes once per episode, not once per minute.
+
+    The counting sibling of :class:`_StageLogger`, and rate-limited the same
+    way: the first loss after a delivery is journalled at once -- that is the
+    transition worth waking to -- and while the loss continues at most one
+    further line an hour carries the count since the last one. A successful
+    post closes the episode, so the next loss reads as a new transition rather
+    than a running total nobody can date.
+
+    Only *undelivered* minutes come here. A delivered minute leaving the ring
+    is housekeeping, not loss, and says nothing at all.
+    """
+
+    def __init__(self, *, logger: logging.Logger | None = None,
+                 repeat_interval: float = 3600.0,
+                 clock: Callable[[], float] | None = None):
+        self._logger = logger or LOGGER
+        self._repeat_interval = repeat_interval
+        self._clock = clock or (lambda: _utc_now().timestamp())
+        self._episode_total = 0
+        self._since_last_line = 0
+        self._last_logged_at: float | None = None
+
+    def dropped(self, count: int, *, capacity: int) -> None:
+        if count <= 0:
+            return
+        self._episode_total += count
+        self._since_last_line += count
+        try:
+            now = self._clock()
+        except Exception:
+            now = None
+        if (
+            now is not None and self._last_logged_at is not None
+            and now - self._last_logged_at < self._repeat_interval
+        ):
+            return
+        self._last_logged_at = now
+        self._logger.warning(
+            "gate_metrics stage=ring_full unsent_dropped=%d since_last=%d capacity=%d",
+            self._episode_total, self._since_last_line, capacity,
+        )
+        self._since_last_line = 0
+
+    def delivered(self) -> None:
+        """A post landed: whatever was lost before it is a closed episode."""
+        if self._episode_total:
+            self._logger.info(
+                "gate_metrics stage=ring_recovered unsent_dropped=%d",
+                self._episode_total,
+            )
+        self._episode_total = 0
+        self._since_last_line = 0
+        self._last_logged_at = None
+
+
 class QuotaLedger:
     """The controller's own count of the cloud lookups it spent this month.
 
@@ -526,7 +596,14 @@ class MetricsRing:
         self._retry_counts = retry_counts or drain_retry_counts
         self._lock = Lock()
         self._sent: set[str] = set()
+        #: Undelivered minutes the ring had to drop -- real loss. Minutes that
+        #: were delivered and then retired are not counted here.
         self._dropped_minutes = 0
+        self._drops = _DropLogger(clock=self._drop_clock)
+
+    def _drop_clock(self) -> float:
+        """The ring's own clock, as the seconds the drop logger paces on."""
+        return self._clock().timestamp()
 
     # -- recording ---------------------------------------------------------
     def record_heartbeat(self) -> None:
@@ -733,19 +810,53 @@ class MetricsRing:
         return counters
 
     def _evict_locked(self) -> None:
+        """Retire what has been delivered; count only what has not.
+
+        Two different things happen when a minute leaves the ring, and the
+        journal used to call them both a loss. A minute the app has already
+        stored leaves because it is finished with -- ordinary housekeeping,
+        silent. A minute that never got out is data the owner will not see on
+        the health tiles, and that is worth a line.
+
+        Retirement runs first, so on a healthy gate the capacity limit is
+        never reached at all: the ring settles at roughly
+        :data:`SENT_RETENTION_MINUTES` delivered minutes plus whatever is
+        still in flight, and the remaining capacity stands ready for an
+        outage.
+        """
+        self._retire_sent_locked()
+        dropped = 0
         while len(self._minutes) > self._max_minutes:
             # By key, not by insertion order, which a clock stepped backwards
             # by NTP would otherwise make the wrong thing to trust -- the same
             # reason `unsent_minutes` sorts rather than iterating.
             oldest = min(self._minutes)
             self._minutes.pop(oldest, None)
-            self._sent.discard(oldest)
+            if oldest in self._sent:
+                self._sent.discard(oldest)
+                continue
             self._dropped_minutes += 1
-            if self._dropped_minutes == 1 or self._dropped_minutes % 60 == 0:
-                LOGGER.warning(
-                    "gate_metrics stage=ring_full dropped=%d capacity=%d",
-                    self._dropped_minutes, self._max_minutes,
-                )
+            dropped += 1
+        if dropped:
+            self._drops.dropped(dropped, capacity=self._max_minutes)
+
+    def _retire_sent_locked(self) -> None:
+        """Drop delivered minutes older than the retry/backfill window.
+
+        Bounded by the clock rather than by count so that the window means the
+        same thing whether the gate is busy or idle. Anything unexpected from
+        the clock retires nothing and leaves the capacity limit to do its job.
+        """
+        if not self._sent:
+            return
+        try:
+            horizon = minute_key(
+                self._clock() - timedelta(minutes=SENT_RETENTION_MINUTES))
+        except Exception:
+            return
+        for key in [key for key in self._sent if key < horizon]:
+            self._sent.discard(key)
+            self._minutes.pop(key, None)
 
     # -- reading -----------------------------------------------------------
     def unsent_minutes(self, *, limit: int = MAX_MINUTES_PER_POST,
@@ -793,12 +904,25 @@ class MetricsRing:
             entry.get("minute_start") if isinstance(entry, dict) else entry
             for entry in minutes or ()
         }
+        delivered = False
         with self._lock:
             for key in keys:
                 if isinstance(key, str):
                     self._sent.add(key)
+                    delivered = True
             # `_sent` can only name minutes the ring still holds.
             self._sent &= set(self._minutes)
+            # A post landed, so any earlier loss is a closed episode and the
+            # minutes it delivered start ageing out of their own accord.
+            self._retire_sent_locked()
+            if delivered:
+                # Under the ring's lock, which is what serialises the drop
+                # logger: `_evict_locked` is the only other caller and it runs
+                # holding it. Closing the episode outside the lock would let a
+                # burst thread's eviction land in the count of the episode
+                # just closed, or be zeroed before it was ever journalled.
+                # Nothing here does I/O beyond one log record.
+                self._drops.delivered()
 
     def quota_status(self) -> dict:
         """The two quota keys the heartbeat's `cloud` block already accepts.
@@ -854,6 +978,11 @@ class MetricsRing:
             return False
 
     def status(self) -> dict:
+        """What the ring holds. ``minutes_dropped`` counts *undelivered*
+        minutes only -- data the app will never see. Delivered minutes retired
+        after :data:`SENT_RETENTION_MINUTES` are not a loss and are not
+        counted, which is why a healthy controller reports zero however long
+        it has been up."""
         with self._lock:
             held = len(self._minutes)
             pending = sum(1 for key in self._minutes if key not in self._sent)
