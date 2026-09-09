@@ -18,7 +18,7 @@ from .direction import passage_key
 from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
 from .matching import decide_access, normalise_plate
-from .models import GateEvent, ProcessingResult
+from .models import GateEvent, MatchDecision, ProcessingResult
 from .ocr import classify_failure_cause
 from .telemetry import (
     MatchPolicyTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
@@ -370,7 +370,7 @@ class GateProcessor:
             opened=False, idempotency_key=idempotency_key,
             received_at=received_at, decision_at=decision_at,
             authorised_plate=decision.authorised_plate, observed_plate=decision.observed_plate,
-            ocr_confidence=decision.confidence,
+            ocr_confidence=_measured_confidence(decision),
         )
         if not decision.allowed:
             # A frame that failed must not hide a plate another frame read:
@@ -487,6 +487,9 @@ class GateProcessor:
             source="ocr", reason=reason, opened=False,
             idempotency_key=idempotency_key,
             received_at=received_at or self._clock(), decision_at=self._clock(),
+            # No reader ran on this frame -- that is what "skipped" means --
+            # so there is no plate and no score. Both stay at their `None`
+            # default rather than being reported as a 0% read.
         )
         event_id = self._record(event, paths)
         result = ProcessingResult(False, reason, event_id)
@@ -1165,8 +1168,27 @@ def _denied_event(key, received_at, decision_at, reason, decision=None):
         received_at=received_at, decision_at=decision_at,
         authorised_plate=decision.authorised_plate if decision else None,
         observed_plate=decision.observed_plate if decision else None,
-        ocr_confidence=decision.confidence if decision else 0.0,
+        ocr_confidence=_measured_confidence(decision),
     )
+
+
+def _measured_confidence(decision: MatchDecision | None) -> float | None:
+    """The score a reader actually measured, or ``None`` if none did.
+
+    ``MatchDecision.confidence`` defaults to ``0.0``, and a bare ``no_match``
+    -- the verdict on a burst whose every attempt came back without a plate,
+    and the only decision the matcher returns with no ``observed_plate`` --
+    carries that default. Forwarding it would tell the app "0%" for a frame
+    nothing was read on. Every decision that *is* backed by a read names the
+    plate it read, granted or denied, so ``observed_plate`` is the test: a
+    denial with a real score (``no_match`` on an unknown plate,
+    ``ambiguous_fuzzy_match``) keeps it, including a genuine measured ``0.0``.
+
+    Annotation only. The decision was already taken by the time this runs.
+    """
+    if decision is None or not decision.observed_plate:
+        return None
+    return decision.confidence
 
 
 def _is_fresh(now: datetime, received_at: datetime, max_age: timedelta) -> bool:

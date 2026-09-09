@@ -325,10 +325,10 @@ burst queue are dropped before they are read
 recorded_reason=queue_coalesced`): the relay cooldown would refuse a second
 activation anyway, so the only thing another lookup could buy is the bill. The
 frame is recorded as `queue_coalesced`, the same reason as any other burst
-given up without being decided. No reader ran on it, so the `ocr_confidence: 0`
-it carries is a contract requirement rather than a measurement; see
-[gate event ingest](gate-event-ingest.md) for the reason table and the app
-change that would let it be null.
+given up without being decided. No reader ran on it, so it carries
+`ocr_confidence: null` rather than a score nothing measured; see
+[gate event ingest](gate-event-ingest.md) for the reason table and the rest of
+the null rule.
 
 A frame that leaves the pipeline without a decision — coalesced out of a full
 queue, or lost to a processing error — is reported back to the session as

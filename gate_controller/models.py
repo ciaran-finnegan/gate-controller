@@ -61,7 +61,17 @@ class GateEvent:
     relay_activated_at: datetime | None = None
     authorised_plate: str | None = None
     observed_plate: str | None = None
-    ocr_confidence: float = 0.0
+    #: The score behind ``observed_plate``, or ``None`` when no reader
+    #: measured one on this frame -- a burst coalesced out of the queue, a
+    #: truncated upload, a decision deadline that expired before any read
+    #: came back. ``0.0`` is a measurement ("the reader saw this plate and was
+    #: certain of nothing"); the absence of one is ``None``, and the app
+    #: renders it as an em dash rather than as "0%". The ingest contract takes
+    #: ``ocr_confidence`` as ``optionalNumber(0, 1)``, so the null goes on the
+    #: wire as it stands here. Never read by the decision path: matching works
+    #: from ``PlateObservation.confidence``, and this field is only what the
+    #: event says afterwards.
+    ocr_confidence: float | None = None
     #: Why an event that was *granted* never pulsed the relay -- today only
     #: ``"cooldown"``, meaning the gate was already open for the vehicle in
     #: front of it. ``None`` on every other event, including denials.

@@ -115,29 +115,55 @@ recorded, and the nine cooldown rows are the ones this change moves.
 | `ocr_error` | 1 | attempted | the reader errored — an error, not a refusal |
 | `stale_burst`, `processing_error`, `image_too_large`, `ocr_busy` | — | **no** | the frame was rejected before or instead of a read |
 
-## Open defect: `ocr_confidence: 0` on frames no reader saw
+## No reader, no score: `ocr_confidence: null`
 
-A frame that never reached a reader has no score. The contract validates
-`ocr_confidence` with `requireNumber(value, 0, 1)` — **not** `optionalNumber` —
-so `null` is a 400 and so is omitting the key. The controller therefore has to
-send `0`, and the app renders it as "0%". On 8 September that was 33 of the 123
-`opened=false` rows (`queue_coalesced`, `upload_incomplete`, and the
-`decision_timeout` frames that never got a slot).
+A frame that never reached a reader has no score, and since 9 September 2026 it
+says so. The contract validates `ocr_confidence` with
+`optionalNumber(event.ocr_confidence, 0, 1, 'ocr_confidence')`
+(`access-gate-ui` #53, deployed): `null` and a missing key both store no score,
+and the Logs page renders that as "—". Anything present and non-null is still
+`requireNumber(0, 1)`, so a `NaN` or a `1.5` is a 400 exactly as before.
 
-**This cannot be fixed on the controller side.** The app has to move first, in
-this order:
+Until then the controller had to send `0`, which the app rendered as "0%". On 8
+September that was 33 of the 123 `opened=false` rows — `queue_coalesced`,
+`upload_incomplete`, and the `decision_timeout` frames that never got a slot.
 
-1. `worker/contracts/gate-event-ingest/contract.ts`: change `ocr_confidence` to
-   `optionalNumber(event.ocr_confidence, 0, 1, 'ocr_confidence')` and make
-   `ParsedGateEvent.ocrConfidence` `number | null`. Note that
-   `gateEventPayloadFingerprint` includes `ocr_confidence`, so a resend that
-   changes 0 to null is a different fingerprint, not a duplicate.
-2. D1: make `gate_events.score` nullable; `score` is currently
-   `Math.round(event.ocrConfidence * 10_000) / 100`.
-3. The Logs page: render a null score as "—", not "0%".
+**What the controller sends now.** A frame that produced no observation from
+either reader carries `null`; a frame a reader measured carries the real score,
+granted or denied:
 
-Once the contract accepts it, the controller change is one line in
-`gate_controller/processor.py`'s `_denied_event` and `record_skipped` — send
-`None` when no OCR attempt was made. Until then, `telemetry.ocr_attempts == []`
-is already on the wire and is the reliable signal that the zero is not a
-measurement.
+| Event | `ocr_confidence` |
+|---|---|
+| `queue_coalesced`, `upload_incomplete`, `ocr_busy`, `stale_burst` before a read | `null` |
+| `decision_timeout` with no read behind it | `null` |
+| `decision_timeout` after a read that returned a plate | that read's score |
+| `no_match` on a plate that was read | that read's score |
+| `no_match` where every attempt came back without a plate | `null` |
+| `exact_match`, fuzzy grants, and grants skipped by cooldown | that read's score |
+| `remote_command`, and the prompt and expiry outcomes beside it | `null` — no camera and no reader are involved in an open the app asked for |
+
+The test is the plate, not the reason: `_measured_confidence` in
+`gate_controller/processor.py` reports `MatchDecision.confidence` only when the
+decision names an `observed_plate`, because that is the one decision shape a
+reader is behind. `MatchDecision.confidence` defaults to `0.0`, and a bare
+`no_match` — the verdict on a burst whose every attempt came back empty — is
+the only decision that carries that default with no plate. A genuinely measured
+`0.0` is still sent as `0.0`.
+
+`telemetry.ocr_attempts` remains the fuller account: `[]` for a frame no reader
+ran on, and an `ocr_timeout` or `ocr_error` entry for one where a reader ran and
+came back with nothing.
+
+Locally, `events.ocr_confidence` was created `NOT NULL DEFAULT 0`. SQLite cannot
+relax a column constraint in place, so `LocalStore._relax_ocr_confidence`
+rebuilds the table once — copying every row and score across and recreating the
+two `events` indexes — guarded by `PRAGMA table_info`. The rebuild drops any
+scratch table an interrupted earlier run left behind, then does the whole swap
+inside one `BEGIN IMMEDIATE`, so an abort leaves either the old `events` or the
+new one and the next boot starts cleanly rather than dying in
+`LocalStore.__init__` before the relay is claimed. It logs one INFO line when
+it starts (with the row count), one when it lands, and one saying it was
+skipped when the database is already nullable. Note that
+`gateEventPayloadFingerprint` includes `ocr_confidence`, so an outbox row
+written as `0` before this change and resent after it is a different
+fingerprint, not a duplicate; nothing rewrites already-queued payloads.

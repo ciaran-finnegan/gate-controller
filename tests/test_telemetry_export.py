@@ -111,6 +111,35 @@ class TelemetryExportTests(unittest.TestCase):
                 for forbidden in ("image", "path", "token", "secret", "credential")
             ))
 
+    def test_export_carries_an_unmeasured_score_through_as_an_absence(self):
+        """A frame no reader saw exports no score, in either format.
+
+        `events.ocr_confidence` is NULL for those, and both writers have to
+        pass that through rather than substituting a zero: an analyst counting
+        low-confidence reads must not find these among them.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, event_id = self._store_with_telemetry(root)
+            with closing(sqlite3.connect(store.path)) as connection:
+                stored = connection.execute(
+                    "SELECT ocr_confidence FROM events WHERE id = ?", (event_id,)
+                ).fetchone()[0]
+            as_json = root / "telemetry.json"
+            as_csv = root / "telemetry.csv"
+            since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+            export_telemetry(store, format="json", since=since, output=as_json)
+            export_telemetry(store, format="csv", since=since, output=as_csv)
+
+            exported = json.loads(as_json.read_text(encoding="utf-8"))
+            with as_csv.open(newline="", encoding="utf-8") as source:
+                rows = list(csv.DictReader(source))
+            self.assertIsNone(stored, "the event was recorded without a score")
+            self.assertIsNone(exported[0]["ocr_confidence"])
+            self.assertIn('"ocr_confidence": null', as_json.read_text(encoding="utf-8"))
+            self.assertEqual(rows[0]["ocr_confidence"], "")
+
     def test_atomic_failure_preserves_existing_output_and_removes_temporary_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

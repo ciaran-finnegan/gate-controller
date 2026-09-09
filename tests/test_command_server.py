@@ -1,8 +1,10 @@
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -111,6 +113,38 @@ class DirectCommandExecutorTests(unittest.TestCase):
 
         self.assertEqual(response, {"status": "failed", "detail": "wrong_controller"})
         self.assertEqual(self.relay.pulses, 0)
+
+    def test_an_open_the_app_asked_for_records_no_score(self):
+        """No camera, no frame, no reader: there is nothing to be confident about.
+
+        `DirectCommandExecutor` builds its `GateEvent` without an
+        `ocr_confidence`, which used to mean the `0.0` default and a Logs page
+        reading "0%" beside the reads that genuinely scored badly. The
+        contract takes the column as optional now, so the absence goes out as
+        `null` and stores as NULL.
+        """
+        database = Path(self.directory.name) / "gate.db"
+        executor = DirectCommandExecutor(
+            "primary", ActuationCoordinator(self.store, self.relay, clock=lambda: self.now),
+            self.store,
+            prompt_player=type("PromptPlayer", (), {"play": lambda self, key: True})(),
+            clock=lambda: self.now,
+        )
+
+        executor.execute(self.valid_payload)
+        executor.execute({
+            **self.valid_payload, "command": "play_prompt",
+            "idempotency_key": "request-2", "prompt_key": "arrival",
+        })
+
+        with closing(sqlite3.connect(database)) as connection:
+            scores = connection.execute(
+                "SELECT idempotency_key, ocr_confidence FROM events ORDER BY id"
+            ).fetchall()
+
+        self.assertEqual(scores, [
+            ("command:request-1", None), ("command:request-2", None),
+        ])
 
     def test_repeated_prompt_command_plays_once(self):
         played = []
