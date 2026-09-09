@@ -1,8 +1,10 @@
 import configparser
+import contextlib
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,38 @@ def read_unit(relative_path):
     parser.optionxform = str
     parser.read(REPOSITORY_ROOT / relative_path, encoding="utf-8")
     return parser
+
+
+def keep_this_signal_ignored(signal_number, frame):
+    """Match SIG_IGN for us while children still inherit SIG_DFL."""
+
+
+@contextlib.contextmanager
+def signals_a_child_shell_can_trap(*signal_numbers):
+    """Stop an inherited SIG_IGN from disarming a child shell's traps.
+
+    A shell cannot trap or reset a signal that was already ignored when it
+    started, and it says nothing when asked to: the trap is silently dropped
+    and the signal never arrives. A process started as a background job of a
+    non-interactive shell inherits SIGINT (and SIGQUIT) as SIG_IGN, so running
+    the suite with `&`, under `make -j`, or from a supervisor that ignores a
+    signal would otherwise hand the shell under test a trap it can never take.
+
+    Ignored signals here are given a Python handler that does nothing, so this
+    process keeps behaving as though they were ignored, while exec'd children
+    start from SIG_DFL and can install their own traps. Dispositions that are
+    not SIG_IGN are already inherited in a trappable state and are left alone.
+    """
+    restore = {}
+    try:
+        for number in signal_numbers:
+            if signal.getsignal(number) is signal.SIG_IGN:
+                restore[number] = signal.SIG_IGN
+                signal.signal(number, keep_this_signal_ignored)
+        yield
+    finally:
+        for number, handler in restore.items():
+            signal.signal(number, handler)
 
 
 class CloudflareDocumentationTests(unittest.TestCase):
@@ -2322,11 +2356,27 @@ rollback
             )
 
     def test_signal_rollback_uses_conventional_nonzero_exit_status(self):
-        for signal_name, expected_status in (("INT", 130), ("TERM", 143)):
+        # The shell reports why it did not reach the trap, so a harness fault
+        # can never be mistaken for a rollback that exited cleanly.
+        trap_was_refused = 97
+        trap_never_ran = 98
+        for signal_name, signal_number, expected_status in (
+            ("INT", signal.SIGINT, 130),
+            ("TERM", signal.SIGTERM, 143),
+        ):
             with self.subTest(signal=signal_name):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     backup = Path(temporary_directory) / "backup"
                     backup.mkdir()
+                    # Listed through a redirection, because `trap -p` has to
+                    # run in the shell that owns the trap rather than in a
+                    # subshell that may have reset it, and matched on the
+                    # handler: a shell that refused the trap reports either
+                    # nothing or the inherited `trap -- '' SIG`, depending on
+                    # its version.
+                    armed = shlex.quote(
+                        str(Path(temporary_directory) / "armed-traps")
+                    )
                     command = f"""
 source deployment/install.sh
 ACTIVATION_STARTED=false
@@ -2334,17 +2384,33 @@ BACKUP_DIR={shlex.quote(str(backup))}
 STAGING=
 ROLLBACK_OWNER_SUBSHELL=$BASH_SUBSHELL
 trap 'rollback {expected_status}' {signal_name}
+trap -p {signal_name} >{armed}
+[[ $(<{armed}) == *rollback* ]] || exit {trap_was_refused}
 kill -s {signal_name} $$
+exit {trap_never_ran}
 """
-                    completed = subprocess.run(
-                        ["bash", "-c", command],
-                        cwd=REPOSITORY_ROOT,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        check=False,
-                    )
+                    with signals_a_child_shell_can_trap(signal_number):
+                        completed = subprocess.run(
+                            ["bash", "-c", command],
+                            cwd=REPOSITORY_ROOT,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=False,
+                        )
 
+                    self.assertNotEqual(
+                        trap_was_refused,
+                        completed.returncode,
+                        f"the shell refused to trap SIG{signal_name}, so this "
+                        "run proved nothing about rollback",
+                    )
+                    self.assertNotEqual(
+                        trap_never_ran,
+                        completed.returncode,
+                        f"SIG{signal_name} never reached the trap, so this run "
+                        "proved nothing about rollback",
+                    )
                     self.assertEqual(
                         expected_status, completed.returncode, completed.stderr
                     )
