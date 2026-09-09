@@ -151,12 +151,20 @@ sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 ## Cloudflare Tunnel
 
 Cloudflare Tunnel exposes only the loopback command endpoint and the hardened
-nginx WHEP gateway. Copy `deployment/cloudflared/gate-controller-tunnel.yml` to the Pi,
-replace the example tunnel UUID, credentials path, and hostnames with the values
-created in Cloudflare, then store its credentials JSON at the configured
-root-owned path. Do not add ingress rules for the controller database, GPIO,
-MediaMTX API or metrics, the media authorization sidecar, or SSH. The final
-catch-all `http_status:404` rule is required.
+nginx WHEP gateway. The live tunnel is **remotely managed**: the Pi runs
+`cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token`,
+the tunnel's configuration source is `cloudflare`, and there is no
+`/etc/cloudflared/config.yml` and no `cert.pem` on the Pi. Ingress rules and
+DNS records are therefore edited in the Cloudflare account — the Zero Trust
+dashboard or the tunnel configurations API — never on the Pi, and
+`cloudflared tunnel route dns` cannot run there.
+`deployment/cloudflared/gate-controller-tunnel.yml` is kept only as a reference
+for the shape of the ingress list; it is not the live source of truth. The
+procedure, with the API calls, is in
+[Gate camera control § Install, step 6](camera-control.md#6-only-then-ingress-and-dns--in-the-cloudflare-account-not-on-the-pi).
+Do not add ingress rules for the controller database, GPIO, MediaMTX API or
+metrics, the media authorization sidecar, or SSH. The final catch-all
+`http_status:404` rule is required.
 
 Protect `gate-command.example.com` with a Cloudflare Access application that
 accepts only the Worker service token used for direct commands. Apply the
@@ -169,12 +177,18 @@ HTTP service. Verify the Access application, service-token policy, and Worker
 request path as a deployment smoke check. Do not run live Cloudflare account or
 policy commands from this repository or installer.
 
-Before installing or starting the tunnel, validate its ingress rules and confirm
-the command hostname chooses the loopback command service:
+Confirm the command hostname chooses the loopback command service by reading the
+tunnel's ingress list back from the account (Zero Trust dashboard → Networks →
+Tunnels → the gate tunnel → Public Hostname, or `GET
+/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations`). The local
+`cloudflared tunnel ingress validate` / `ingress rule` commands only apply to a
+locally managed tunnel run from a config file, which the live deployment is
+not; use them against `deployment/cloudflared/gate-controller-tunnel.yml` only
+to sanity-check an edit to that reference file:
 
 ```sh
-sudo cloudflared tunnel ingress validate --config /etc/cloudflared/gate-controller-tunnel.yml
-sudo cloudflared tunnel ingress rule https://gate-command.example.com --config /etc/cloudflared/gate-controller-tunnel.yml
+cloudflared tunnel ingress validate --config deployment/cloudflared/gate-controller-tunnel.yml
+cloudflared tunnel ingress rule https://gate-command.example.com --config deployment/cloudflared/gate-controller-tunnel.yml
 ```
 
 The loopback command server runs inside `file-monitor.service`, sharing the
@@ -188,9 +202,10 @@ sudo systemctl status file-monitor.service
 curl --fail-with-body http://127.0.0.1:8765/not-found || test $? -eq 22
 ```
 
-Run `cloudflared` with the validated configuration through the operator-managed
-Cloudflare package/service workflow. Do not run Cloudflare account commands or
-create tunnel credentials from the controller installer.
+Run `cloudflared` through the operator-managed Cloudflare package/service
+workflow with the tunnel's connector token in root-owned `/etc/cloudflared/token`.
+Do not run Cloudflare account commands or create tunnel credentials from the
+controller installer.
 
 The managed systemd drop-in keeps transport selection on `auto`, which first
 tries QUIC and falls back to HTTP/2 when UDP cannot connect. All four outbound
@@ -1401,7 +1416,7 @@ sidecar, WHIP, RTSP serving, or camera administration.
 
 Camera *settings* (the IR illuminator and the on-demand 4K still) are owned by a
 separate isolated service, `gate-camera-control`, installed with
-`deployment/install-camera-control.sh --source "$PWD"`. It is the only process
+`bash deployment/install-camera-control.sh --source <release tree>`. It is the only process
 that holds camera API credentials, in its own root-owned mode-0600
 `/etc/gate-camera-control.env`. Those credentials are deliberately not added to
 `/etc/gate-media-gateway.env`: that file's key set is pinned by
@@ -1425,8 +1440,12 @@ an unauthenticated camera control on the public internet.
    `sudo python3 gate_media_config.py camera-control --env /etc/gate-camera-control.env`.
    Silence means valid. The installer runs the same check before it publishes,
    so a rejected file never replaces the running library.
-3. **Run the installer**:
-   `sudo deployment/install-camera-control.sh --source "$PWD"`.
+3. **Run the installer, through `bash`**, from the running release tree:
+   `RELEASE=$(readlink -f /opt/gate-controller-deploy/current)` then
+   `sudo bash "$RELEASE/deployment/install-camera-control.sh" --source "$RELEASE"`.
+   Not `sudo "$RELEASE/deployment/..."`: the release tree keeps git's file
+   modes, and releases up to 1d98e6e shipped the script without its execute
+   bit, so the direct form fails there with "command not found".
 4. **Verify locally**, with `systemctl status gate-camera-control` and
    `curl -s http://127.0.0.1:8767/camera/state`, and confirm the egress pin is
    really in force: `systemctl show gate-camera-control -p IPAddressAllow` must
@@ -1437,9 +1456,15 @@ an unauthenticated camera control on the public internet.
 5. **Create the Cloudflare Access application and a separate service token for
    it — before any DNS route or ingress rule exists.** Not the `gate-command`
    token: the blast radius is different.
-6. **Then** add the ingress rule to
-   `deployment/cloudflared/gate-controller-tunnel.yml` ahead of the catch-all,
-   create the DNS route, and reload cloudflared.
+6. **Then** add the ingress rule in the Cloudflare account, ahead of the
+   `http_status:404` catch-all — Zero Trust dashboard → the tunnel → Public
+   Hostname, or `PUT /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations`
+   — and create the DNS record as a proxied CNAME to
+   `<tunnel-id>.cfargotunnel.com` (the dashboard does both in one save). The
+   tunnel is remotely managed, so nothing is edited or reloaded on the Pi, and
+   `cloudflared tunnel route dns` cannot run there. See
+   [Gate camera control § Install, step 6](camera-control.md#6-only-then-ingress-and-dns--in-the-cloudflare-account-not-on-the-pi)
+   for the exact calls.
 7. **Store the service token in the Worker**, exactly as the `gate-command`
    token is stored. The token never goes near the Pi.
 
@@ -1448,8 +1473,8 @@ does not republish `/usr/local/lib/gate-camera-control` — that path sits outsi
 the managed release tree so an auto-update cannot silently change the one process
 holding camera credentials — so a release that changes `gate_camera_control/` or
 `gate_media_config.py` does not reach the running service until
-`sudo deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>`
-is run.
+`sudo bash /opt/gate-controller-deploy/releases/<sha>/deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>`
+is run (through `bash`, for the reason in step 3).
 
 The full HTTP contract, environment keys, journal lines, failure modes, and
 rollback are in [Gate camera control](camera-control.md).

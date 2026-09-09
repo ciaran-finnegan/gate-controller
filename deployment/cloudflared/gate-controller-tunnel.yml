@@ -1,3 +1,14 @@
+# REFERENCE ONLY — this file is not the live tunnel configuration.
+#
+# The deployed tunnel is remotely managed: the Pi runs
+#   cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+# and its ingress rules live in the Cloudflare account (Zero Trust dashboard,
+# or PUT /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations). There
+# is no config.yml and no cert.pem on the Pi, so editing this file changes
+# nothing, and `cloudflared tunnel route dns` cannot run there. This file is
+# kept to show the intended shape of the ingress list: one loopback service per
+# hostname, nothing else exposed, and the http_status:404 catch-all last. See
+# docs/camera-control.md § Install, step 6, for the procedure.
 tunnel: 11111111-1111-4111-8111-111111111111
 credentials-file: /etc/cloudflared/11111111-1111-4111-8111-111111111111.json
 ingress:

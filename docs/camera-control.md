@@ -372,9 +372,19 @@ publishes anything, so a rejected file never replaces the running library.
 
 ### 3. Run the installer
 
+Run it through `bash`, from the release tree the controller is running:
+
 ```bash
-sudo deployment/install-camera-control.sh --source "$PWD"
+RELEASE=$(readlink -f /opt/gate-controller-deploy/current)
+sudo bash "$RELEASE/deployment/install-camera-control.sh" --source "$RELEASE"
 ```
+
+Always invoke it through `bash`, never as `sudo "$RELEASE/deployment/..."`.
+The release tree keeps the mode each file has in git, and releases up to
+1d98e6e carried this script without its execute bit, so on those releases the
+direct form fails with "command not found". The `bash` form works on every
+release, and it is the form the updater's own `bash -n` syntax check exercises.
+From a git checkout, `--source "$PWD"` does the same thing.
 
 It creates the `gate-camera-control` system user, refuses it if it is in `gpio`
 or shares a group with the media or controller services, publishes
@@ -420,15 +430,67 @@ In Cloudflare Zero Trust, create a **separate** Access application for the
 `gate-command` token: the blast radius is different. Both must exist and the
 policy must be saved before the hostname resolves anywhere.
 
-### 6. Only then: ingress, DNS, and a cloudflared reload
+### 6. Only then: ingress and DNS — in the Cloudflare account, not on the Pi
 
-Add the hostname to `deployment/cloudflared/gate-controller-tunnel.yml` ahead of
-the catch-all rule, create the DNS route, and reload:
+The live tunnel is **remotely managed**. The Pi runs
+`cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token`;
+the tunnel's configuration source is `cloudflare`, and there is no
+`/etc/cloudflared/config.yml` and no `cert.pem` anywhere on the Pi. Its ingress
+rules and DNS records live in the Cloudflare account, so nothing in this step
+touches the Pi and nothing on it needs a reload. In particular
+`cloudflared tunnel route dns` **cannot** run on the Pi — it fails with "Error
+locating origin cert" — and `deployment/cloudflared/gate-controller-tunnel.yml`
+is only a reference for the shape of the ingress list, **not** the live
+configuration; editing it changes nothing.
+
+Use either of the two routes below. Both must leave the `http_status:404`
+catch-all as the last rule.
+
+**Zero Trust dashboard.** Networks → Tunnels → the gate tunnel → Public
+Hostname → Add a public hostname: hostname `gate-camera.example.com`, type
+`HTTP`, URL `127.0.0.1:8767`. Saving creates the ingress rule *and* the proxied
+CNAME to `<tunnel-id>.cfargotunnel.com` in one step, which is exactly why step
+5 has to be complete first: the hostname resolves the moment you save.
+
+**API.** The configurations endpoint replaces the *whole* ingress list, so read
+it first and send it back with the new rule inserted ahead of the catch-all and
+every existing rule kept exactly as returned. Run this from a workstation with
+an API token holding *Account → Cloudflare Tunnel → Edit* and *Zone → DNS →
+Edit*; the Pi holds only the connector token, which cannot change the tunnel's
+configuration.
 
 ```bash
-sudo cloudflared tunnel route dns <tunnel> gate-camera.example.com
-sudo systemctl reload cloudflared
+ACCOUNT_ID=<account-id>; TUNNEL_ID=<tunnel-id>; ZONE_ID=<zone-id>
+CONFIG="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations"
+curl -s "$CONFIG" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq .result.config.ingress
+curl -s -X PUT "$CONFIG" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --json '{
+  "config": {"ingress": [
+    {"hostname": "gate-command.example.com", "service": "http://127.0.0.1:8765"},
+    {"hostname": "gate-media.example.com",   "service": "http://127.0.0.1:8891"},
+    {"hostname": "gate-camera.example.com",  "service": "http://127.0.0.1:8767"},
+    {"service": "http_status:404"}
+  ]}
+}'
+curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --json '{
+  "type": "CNAME", "proxied": true,
+  "name": "gate-camera.example.com", "content": "'"$TUNNEL_ID"'.cfargotunnel.com"
+}'
 ```
+
+The connector picks the new configuration up over its existing connection, so
+there is no `systemctl reload` or restart on the Pi. Confirm it arrived, then
+confirm from anywhere *off* the Pi that Access is in front of the hostname:
+
+```bash
+sudo journalctl -u cloudflared -n 50 --no-pager | grep -i 'configuration'
+curl -sI https://gate-camera.example.com/camera/state | head -1
+```
+
+The journal must show a configuration update line. The `curl` must get an
+Access response — a `302` to the login page or a `403` — and never the
+tunnel's `404` (the rule did not apply) or a `200` (nothing is in front of the
+service: remove the DNS record immediately and go back to step 5).
 
 ### 7. Store the service token in the Worker
 
@@ -445,8 +507,13 @@ holds camera credentials. The cost is that a release carrying a change to
 service until the installer is re-run:
 
 ```bash
-sudo deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>
+RELEASE=/opt/gate-controller-deploy/releases/<sha>   # or $(readlink -f /opt/gate-controller-deploy/current)
+sudo bash "$RELEASE/deployment/install-camera-control.sh" --source "$RELEASE"
 ```
+
+As in step 3, invoke it through `bash`: releases up to 1d98e6e publish the
+script mode 0644, so the direct `sudo "$RELEASE/deployment/..."` form fails
+there with "command not found".
 
 ## Rollback
 
