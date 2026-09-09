@@ -10,8 +10,8 @@ from threading import Event, Thread
 from gate_controller import ocr
 from gate_controller.metrics import (
     BUCKET_MINUTES, DEFAULT_LOOKUP_QUOTA, MAX_MINUTES_PER_POST, MetricsRing,
-    QuotaLedger, build_metrics_ring, metrics_enabled, metrics_rollup_seconds,
-    minute_key, recognition_lookup_quota,
+    QuotaLedger, SENT_RETENTION_MINUTES, build_metrics_ring, metrics_enabled,
+    metrics_rollup_seconds, minute_key, recognition_lookup_quota,
 )
 from gate_controller.telemetry import (
     EventTelemetry, LocalOcrTelemetry, OcrAttemptTelemetry, StageDurations,
@@ -366,6 +366,85 @@ class MetricsRingTests(unittest.TestCase):
         self.assertEqual(status["capacity"], 5)
         self.assertEqual(status["minutes_dropped"], 35)
         self.assertLessEqual(len(ring.unsent_minutes()), 5)
+
+    def run_for(self, minutes: int, *, ring=None, deliver: bool = True) -> None:
+        """Live minutes, with the rollup collecting whole closed buckets."""
+        ring = ring or self.ring
+        for _ in range(minutes):
+            ring.record_heartbeat()
+            self.clock.advance(minutes=1)
+            batch = ring.unsent_minutes()
+            if deliver and batch:
+                ring.mark_sent(batch)
+
+    def test_four_hours_of_delivered_minutes_say_nothing(self):
+        # The 2026-09-09 regression: past three hours of uptime the ring began
+        # evicting minutes the app had already stored, and journalled every
+        # one of them as `ring_full` -- an hourly warning about nothing.
+        with self.assertNoLogs("gate_controller.metrics", level="WARNING"):
+            self.run_for(240)
+
+        status = self.ring.status()
+        self.assertEqual(status["minutes_dropped"], 0)
+        # Delivered minutes are retired at the retry window, so the ring never
+        # reaches its capacity at all on a healthy gate.
+        self.assertLessEqual(status["minutes_held"], SENT_RETENTION_MINUTES + BUCKET_MINUTES)
+
+    def test_four_hours_with_the_app_down_warn_once_about_the_unsent_minutes(self):
+        with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
+            self.run_for(240, deliver=False)
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("gate_metrics stage=ring_full", logs.output[0])
+        self.assertIn("capacity=180", logs.output[0])
+        # 240 minutes recorded, 180 held: sixty minutes of real loss, and the
+        # counters line says so.
+        self.assertEqual(self.ring.status()["minutes_dropped"], 60)
+
+    def test_the_loss_warning_is_one_line_an_hour_carrying_the_count_since(self):
+        ring = MetricsRing(clock=self.clock, max_minutes=5, retry_counts=lambda: {})
+
+        with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
+            self.run_for(245, ring=ring, deliver=False)
+
+        # 240 minutes of loss, one line at the transition and one an hour
+        # after that -- four lines, not 240, and never a bare running total
+        # nobody can date: each says how many were lost since the last one.
+        self.assertEqual(len(logs.output), 4)
+        self.assertIn("unsent_dropped=1 since_last=1 capacity=5", logs.output[0])
+        self.assertIn("unsent_dropped=61 since_last=60 capacity=5", logs.output[1])
+        self.assertIn("unsent_dropped=181 since_last=60 capacity=5", logs.output[-1])
+        self.assertEqual(ring.status()["minutes_dropped"], 240)
+
+    def test_a_delivered_post_closes_the_loss_episode(self):
+        ring = MetricsRing(clock=self.clock, max_minutes=5, retry_counts=lambda: {})
+
+        with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
+            self.run_for(10, ring=ring, deliver=False)
+        self.assertEqual(len(logs.output), 1)
+
+        with self.assertLogs("gate_controller.metrics", level="INFO") as logs:
+            ring.mark_sent(ring.unsent_minutes())
+        self.assertIn("gate_metrics stage=ring_recovered", logs.output[0])
+
+        # The next loss is a fresh transition, journalled at once rather than
+        # waiting out the hour the previous episode had started.
+        with self.assertLogs("gate_controller.metrics", level="WARNING") as logs:
+            self.run_for(10, ring=ring, deliver=False)
+        self.assertIn("unsent_dropped=1 since_last=1", logs.output[0])
+
+    def test_delivered_minutes_are_retired_and_leave_the_ring_for_the_unsent(self):
+        self.run_for(90)
+        status = self.ring.status()
+
+        # Ninety minutes lived through, and only the retry window's worth is
+        # still held: the older ones were delivered and are finished with, so
+        # the ring's capacity stands ready for an outage rather than for a
+        # backlog of what the app already has.
+        self.assertLess(status["minutes_held"], 90)
+        self.assertLessEqual(
+            status["minutes_held"], SENT_RETENTION_MINUTES + BUCKET_MINUTES)
+        self.assertEqual(status["minutes_dropped"], 0)
 
     def test_recording_never_raises_into_the_pipeline(self):
         class Exploding:

@@ -552,9 +552,11 @@ below the gate:
   No wait is ever below 5 s, on either path: a cycle that runs just before a
   boundary would otherwise compute a wait of a millisecond and come straight
   back, flushing the ledger each time, for a bucket that has already closed;
-- the ring is memory only and fixed at 180 minutes; the oldest minute is
-  dropped when it is full, and nothing but the small month-to-date counter is
-  written to the SD card;
+- the ring is memory only and fixed at 180 minutes; a minute the app has
+  already stored is retired an hour after it was posted -- past the retry
+  window it is finished with -- so the capacity is held for undelivered data,
+  and the oldest minute is dropped when it is full. Nothing but the small
+  month-to-date counter is written to the SD card;
 - no bucket is ever delivered in pieces, so none is half-counted, and each
   `bucket_start` goes out once.
 
@@ -565,7 +567,8 @@ below the gate:
 | `gate_metrics stage=rollup_failed detail=<http_status or error class> consecutive=<n>` | The POST failed; repeated at most every ten minutes |
 | `gate_metrics stage=rollup_recovered failures=<n>` | It is delivering again |
 | `gate_metrics stage=deferred reason=<activity>` / `stage=resumed` | Stood down for a gate decision, and back |
-| `gate_metrics stage=ring_full dropped=<n> capacity=<n>` | Minutes are ageing out undelivered -- the cloud path has been down for hours |
+| `gate_metrics stage=ring_full unsent_dropped=<n> since_last=<n> capacity=<n>` | Minutes are ageing out **undelivered** -- the cloud path has been down for hours and that data is gone. One line when the loss starts, then at most one an hour carrying the count since the last. Delivered minutes leaving the ring are housekeeping and say nothing |
+| `gate_metrics stage=ring_recovered unsent_dropped=<n>` | A post landed and closed the episode above; `<n>` is what it cost |
 | `gate_metrics stage=quota_write_failed detail=<error class>` / `stage=quota_read_failed` | The month-to-date counter could not be persisted or read; counting continues in memory |
 | `gate_metrics stage=quota_unreported detail=<load or write>` / `stage=quota_reported` | The burn-down is being withheld because the ledger cannot vouch for it, and the moment it can again. The tile reads "not reported" in between, never `0` |
 | `gate_metrics stage=record_failed` / `stage=cycle_failed` | A metric was dropped rather than allowed to raise into the pipeline |
