@@ -596,6 +596,28 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     if trigger_capture is not None:
         trigger_capture.attach(inject_trigger_burst)
 
+    note_still = getattr(trigger_capture, "note_still", None)
+    select_hot_frames = getattr(hot_frame_provider, "select", None)
+
+    def announce_still(received_at):
+        """The camera's own FTP still just completed in the watch directory.
+
+        Two things want to know, and only one of them answers. The hot-frame
+        provider returns the frames to add to this burst, exactly as before.
+        The trigger capture only listens: the webhook for the same alarm
+        arrives a fraction of a second later (median +0.32 s), and its
+        immediate hot keyframe is then the same instant the camera has just
+        uploaded, so telling it here saves a second paid lookup on one
+        picture. Its failure must never cost the burst its hot frames, so it
+        is kept out of the provider's answer entirely.
+        """
+        if callable(note_still):
+            try:
+                note_still(received_at)
+            except Exception:
+                LOGGER.exception("gate_still_arrival_handler_failed")
+        return select_hot_frames(received_at) if callable(select_hot_frames) else ()
+
     collector = BurstCollector(
         enqueue, quiet_window=quiet_window,
         ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
@@ -613,7 +635,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         max_candidate_bytes=max_candidate_bytes,
         max_pending_candidates=max_burst_candidates,
         on_first_completed=(
-            hot_frame_provider.select if hot_frame_provider is not None else None
+            announce_still
+            if callable(select_hot_frames) or callable(note_still) else None
         ),
         ignored_roots=(
             ((hot_frame_provider.output_directory,)

@@ -200,6 +200,28 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
+    def test_the_duplicate_still_window_defaults_to_two_seconds_and_is_bounded(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.still_duplicate_seconds, 2.0)
+
+        tuned = load_trigger_capture_config(
+            {"GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS": "0.75"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual(tuned.still_duplicate_seconds, 0.75)
+        # 0 is the off switch, not an invalid value.
+        disabled = load_trigger_capture_config(
+            {"GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS": "0"},
+            Path("/uploads"), webhook_enabled=True,
+        )
+        self.assertEqual(disabled.still_duplicate_seconds, 0.0)
+        for value in ("6", "-1", "soon"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_trigger_capture_config(
+                    {"GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS": value},
+                    Path("/u"), webhook_enabled=True,
+                )
+
     def test_clear_stream_defaults_to_compressed_and_validates_session_settings(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
         self.assertEqual((config.clear_stream_mode, config.session_fps, config.session_seconds), ("compressed", 5.0, 45.0))
@@ -1323,3 +1345,156 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         self.assertFalse(load_trigger_capture_config(
             {"GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES": "false"}, Path("/u"), webhook_enabled=True,
         ).hot_keyframes)
+
+
+class DuplicateStillTests(unittest.TestCase):
+    """The camera photographs one instant and sends it twice.
+
+    2026-09-10 21:52: the FTP still landed at 21:52:21.761 and the hot
+    keyframe of the series had been decoded at 21:52:21.71. Both went through
+    the on-device reader and then a paid cloud lookup, both answered "no
+    plate", for one lookup and about 2.3 s of serial pipeline time that could
+    not have said anything the other did not.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.injected = []
+        self.clock = {"now": 10.0}
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _capture(self, *, window=2.0, count=3, wall_clock=None):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            delay_seconds=1.5, capture_count=count, spacing_seconds=1.0,
+            still_duplicate_seconds=window,
+        )
+        source = FakeKeyframeSource([(9.4, jpeg())], clock=lambda: self.clock["now"])
+        capture = TriggerFrameCapture(
+            config, popen=never_spawn, clock=lambda: self.clock["now"],
+            wall_clock=wall_clock or (
+                lambda: datetime(2026, 9, 10, 21, 52, 22, tzinfo=timezone.utc)
+            ),
+            frame_source=source,
+        )
+        capture.attach(lambda paths, received_at, trigger: self.injected.append(paths))
+        return capture, source
+
+    def _stop(self, source):
+        """A stop event that runs the clock forward over each wait.
+
+        A fresh keyframe lands during every wait, as one does at the camera's
+        1x interval, so the later slots have something newer to take.
+        """
+        clock = self.clock
+
+        class Stop:
+            def __init__(self):
+                self.pauses = []
+
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                self.pauses.append(seconds)
+                clock["now"] += seconds
+                source.frames.append((clock["now"] - 0.2, jpeg((80, 40))))
+                return False
+
+        return Stop()
+
+    def test_a_still_of_the_same_instant_gives_up_the_immediate_keyframe(self):
+        capture, source = self._capture()
+        capture.note_still(9.2)  # the still landed 0.3 s before the webhook
+        stop = self._stop(source)
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 2, "only the immediate slot is given up")
+        self.assertEqual(len(self.injected), 2)
+        # The vehicle at rest is what the later slots are for, and the still
+        # cannot stand in for them: their waits are untouched.
+        self.assertEqual(stop.pauses, [1.5, 1.0])
+        self.assertIn(
+            "outcome=skipped_duplicate_still event_type=vehicle still_age_ms=300",
+            "\n".join(logs.output),
+        )
+        self.assertEqual(capture.status()["skipped"]["duplicate_still"], 1)
+        self.assertEqual(capture.status()["skipped"]["still_duplicate_seconds"], 2.0)
+
+    def test_without_a_still_the_immediate_keyframe_is_taken_as_before(self):
+        """Daytime with a slow FTP path, or FTP off: nothing changes."""
+        capture, source = self._capture()
+        stop = self._stop(source)
+
+        injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 3)
+        self.assertEqual(stop.pauses, [1.5, 1.0])
+        self.assertEqual(capture.status()["skipped"]["duplicate_still"], 0)
+
+    def test_a_still_older_than_the_window_keeps_the_immediate_keyframe(self):
+        """A still from the previous passage is not this alarm's picture."""
+        capture, source = self._capture()
+        capture.note_still(7.0)  # 2.5 s before the webhook, outside the 2 s window
+        stop = self._stop(source)
+
+        injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 3)
+        self.assertEqual(capture.status()["skipped"]["duplicate_still"], 0)
+
+    def test_a_still_landing_just_after_the_webhook_is_the_same_duplicate(self):
+        """The still is first by measurement, not by guarantee."""
+        capture, source = self._capture()
+        capture.note_still(9.9)  # 0.4 s *after* the webhook
+        stop = self._stop(source)
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 2)
+        self.assertIn("still_age_ms=-400", "\n".join(logs.output))
+
+    def test_the_arrival_ingress_records_is_read_as_a_wall_clock_time(self):
+        """The worker hands over the datetime it stamped the upload with."""
+        capture, source = self._capture()
+        capture.note_still(
+            datetime(2026, 9, 10, 21, 52, 21, 700_000, tzinfo=timezone.utc),
+        )
+        stop = self._stop(source)
+
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.capture_series(event(), 10.0, stop)
+
+        self.assertEqual(injected, 2)
+        self.assertIn("still_age_ms=300", "\n".join(logs.output))
+
+    def test_an_arrival_that_cannot_be_placed_is_treated_as_this_moment(self):
+        """A naive datetime cannot be subtracted from an aware one.
+
+        Ingress still has the file in hand, so the honest reading is "now"
+        rather than "never": the window decides whether that matters.
+        """
+        capture, source = self._capture()
+        capture.note_still(datetime(2026, 9, 10, 21, 52, 21, 700_000))
+        stop = self._stop(source)
+
+        injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 2)
+        self.assertEqual(capture.status()["skipped"]["duplicate_still"], 1)
+
+    def test_the_duplicate_window_can_be_turned_off(self):
+        capture, source = self._capture(window=0.0)
+        capture.note_still(9.5)
+        stop = self._stop(source)
+
+        injected = capture.capture_series(event(), 9.5, stop)
+
+        self.assertEqual(injected, 3)
+        self.assertEqual(capture.status()["skipped"]["duplicate_still"], 0)

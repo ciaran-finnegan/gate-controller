@@ -126,6 +126,20 @@ DEFAULT_CONCLUSIVE_READ_CONFIDENCE = 0.75
 # Below this a "conclusive read" is not conclusive, so the session would stop
 # retrying on noise. The same reasoning as the matching bars' own floor.
 MIN_CONCLUSIVE_READ_CONFIDENCE = 0.10
+# The camera's vehicle alarm uploads its FTP still and posts its webhook at
+# almost the same moment, the still first (2026-09-07: +0.07 to +1.59 s,
+# median +0.32 s). Within this window of the webhook, the still and the hot
+# keyframe are the same instant photographed twice, and reading both costs a
+# second paid cloud lookup for nothing. 2 s covers the measured spread with
+# room to spare; 0 disables the check.
+DEFAULT_STILL_DUPLICATE_SECONDS = 2.0
+MAX_STILL_DUPLICATE_SECONDS = 5.0
+# How far back a reported still arrival may be dragged when it is given as a
+# wall-clock timestamp. Ingress normally hands over an arrival milliseconds
+# old, and never more than its own readability window; anything beyond this is
+# a stepped clock rather than a measurement, and is clamped to a still far
+# outside any duplicate window instead of being believed.
+MAX_STILL_ARRIVAL_AGE_SECONDS = 30.0
 RELAY_PULSE_ALLOWANCE_SECONDS = 5.0
 MIN_DECISION_TIMEOUT_SECONDS = 0.5
 MAX_DECISION_TIMEOUT_SECONDS = 30.0
@@ -200,6 +214,9 @@ class TriggerCaptureConfig:
     # looking at a different vehicle and stops offering frames. It gates no
     # actuation: see DEFAULT_CONCLUSIVE_READ_CONFIDENCE.
     conclusive_read_confidence: float = DEFAULT_CONCLUSIVE_READ_CONFIDENCE
+    # Skip the immediate hot-keyframe slot when the camera's own FTP still of
+    # the same instant landed this close to the webhook. 0 disables.
+    still_duplicate_seconds: float = DEFAULT_STILL_DUPLICATE_SECONDS
 
 
 def load_trigger_capture_config(
@@ -301,6 +318,13 @@ def load_trigger_capture_config(
         ),
         MIN_CONCLUSIVE_READ_CONFIDENCE, 1.0, DEFAULT_CONCLUSIVE_READ_CONFIDENCE,
     )
+    still_duplicate = _number(
+        environment.get(
+            "GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS",
+            str(DEFAULT_STILL_DUPLICATE_SECONDS),
+        ),
+        0.0, MAX_STILL_DUPLICATE_SECONDS,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -328,6 +352,7 @@ def load_trigger_capture_config(
         session_seconds=session_seconds,
         source_fps=source_fps,
         conclusive_read_confidence=conclusive_confidence,
+        still_duplicate_seconds=still_duplicate,
     )
 
 
@@ -483,9 +508,14 @@ class TriggerFrameCapture:
         self._skipped_empty = 0
         self._skipped_clipped = 0
         self._skipped_corrupt = 0
+        self._skipped_duplicate_still = 0
         self._unresolved_sessions = 0
         self._below_bar_sessions = 0
         self._last_skip: str | None = None
+        # When the camera's own FTP still last landed, on this object's clock.
+        # Written by the worker's ingress thread, read by the capture thread.
+        self._still_lock = Lock()
+        self._last_still_at: float | None = None
         self._live_session = False
         self._last_stillness: float | None = None
         # Presence-session bookkeeping, shared with the worker's result hook.
@@ -554,6 +584,35 @@ class TriggerFrameCapture:
             outcome, getattr(event, "event_type", "unknown"),
         )
         return outcome
+
+    def note_still(self, received_at=None) -> None:
+        """Record that the camera's own FTP still landed in the watch tree.
+
+        Called from the worker's ingress thread the moment a completed upload
+        becomes the first candidate of a burst, so the capture thread can tell
+        that the keyframe it is about to take is the picture the camera has
+        already sent. ``received_at`` is that arrival: a ``datetime`` (what
+        ingress records), a monotonic reading of this object's own clock, or
+        None for "just now". A timestamp that cannot be made sense of - a
+        naive datetime, a clock that has stepped - is treated as "just now"
+        rather than refused, because ingress genuinely has the file in hand at
+        this moment; the window below is what decides whether that matters.
+        """
+        now = self._clock()
+        landed_at = now
+        if isinstance(received_at, datetime):
+            try:
+                age = (self._wall_clock() - received_at).total_seconds()
+            except (AttributeError, OverflowError, TypeError, ValueError):
+                age = 0.0
+            if not isfinite(age):
+                age = 0.0
+            landed_at = now - min(max(age, 0.0), MAX_STILL_ARRIVAL_AGE_SECONDS)
+        elif isinstance(received_at, (int, float)) and not isinstance(received_at, bool):
+            if isfinite(float(received_at)):
+                landed_at = float(received_at)
+        with self._still_lock:
+            self._last_still_at = landed_at
 
     def run_forever(self, stop_event) -> None:
         if not self.config.enabled:
@@ -800,7 +859,15 @@ class TriggerFrameCapture:
     def capture_series(self, event, scheduled_at, stop_event) -> int:
         """Take a short bounded series: with hot keyframes the frame decoded
         moments before the alarm goes first, immediately; the rest wait for
-        the vehicle to stop (the delay, then the spacing between frames)."""
+        the vehicle to stop (the delay, then the spacing between frames).
+
+        The immediate slot is given up when the camera's own FTP still of the
+        same instant has just landed: on 2026-09-10 at 21:52 the still landed
+        at 21:52:21.761 and the hot keyframe had been decoded at 21:52:21.71,
+        and the pipeline read both, serially, for one paid cloud lookup and
+        about 2.3 s more than the passage needed. Only that slot is skipped -
+        the later ones are what see the vehicle at rest, and the still cannot
+        stand in for them."""
         injected = 0
         after = None
         slots = self.config.capture_count
@@ -814,8 +881,18 @@ class TriggerFrameCapture:
             self._session_changed.clear()
         self._start_live_session()
         if self._frame_source is not None:
-            after, count = self._capture_slot(event, scheduled_at, after=after)
-            injected += count
+            still_age = self._duplicate_still_age(scheduled_at)
+            if still_age is None:
+                after, count = self._capture_slot(event, scheduled_at, after=after)
+                injected += count
+            else:
+                self._skipped_duplicate_still += 1
+                LOGGER.info(
+                    "gate_trigger_capture outcome=skipped_duplicate_still "
+                    "event_type=%s still_age_ms=%d",
+                    getattr(event, "event_type", "unknown"),
+                    round(still_age * 1000),
+                )
             slots -= 1
         for index in range(slots):
             wait = self.config.delay_seconds if index == 0 else self.config.spacing_seconds
@@ -824,6 +901,24 @@ class TriggerFrameCapture:
             after, count = self._capture_slot(event, scheduled_at, after=after)
             injected += count
         return injected
+
+    def _duplicate_still_age(self, scheduled_at) -> float | None:
+        """How far the camera's own still landed from this webhook, when the
+        two are close enough to be one instant. None means nothing to skip.
+
+        The window is absolute: the still is normally first, but the order is
+        not guaranteed and a still a fraction of a second *after* the webhook
+        is the same duplicate. Positive means the still came first.
+        """
+        window = self.config.still_duplicate_seconds
+        if window <= 0 or scheduled_at is None:
+            return None
+        with self._still_lock:
+            landed_at = self._last_still_at
+        if landed_at is None:
+            return None
+        age = scheduled_at - landed_at
+        return age if abs(age) <= window else None
 
     def _capture_slot(self, event, scheduled_at, *, after):
         try:
@@ -1048,9 +1143,11 @@ class TriggerFrameCapture:
                 "empty_scene": self._skipped_empty,
                 "clipped": self._skipped_clipped,
                 "corrupt": self._skipped_corrupt,
+                "duplicate_still": self._skipped_duplicate_still,
                 "empty_scene_threshold": self.config.empty_scene_threshold,
                 "max_highlight_clipping": self.config.max_highlight_clipping,
                 "max_flat_fraction": self.config.max_flat_fraction,
+                "still_duplicate_seconds": self.config.still_duplicate_seconds,
             },
         }
 
