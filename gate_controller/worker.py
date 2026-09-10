@@ -36,6 +36,10 @@ class BurstIdentity:
     # A burst injected by webhook-triggered capture carries its own sanitized
     # trigger; the FTP path resolves one from the correlator instead.
     trigger: TriggerTelemetry | None = None
+    # How much the frame differed from its predecessor when the capture chose
+    # it (0 is stationary), or None when the capture could not say. Internal:
+    # it reaches the processor's `prepare`, never the wire.
+    stillness: float | None = None
 
     @property
     def camera_event(self) -> tuple | None:
@@ -521,8 +525,15 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                shutdown=None, max_burst_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                on_timed_skipped=None, trigger_resolver=None,
-               hot_frame_provider=None, trigger_capture=None, on_result=None) -> None:
-    """Watch completed JPEG uploads and process ranked bursts without blocking collection."""
+               hot_frame_provider=None, trigger_capture=None, on_result=None,
+               prepare=None) -> None:
+    """Watch completed JPEG uploads and process ranked bursts without blocking collection.
+
+    With ``prepare`` (the processor's fast-lane half of a decision) the burst
+    thread only ever runs the on-device read, and a second thread -- the cloud
+    lane -- waits for cloud answers, so a frame the device can read is decided
+    the moment it lands rather than behind every cloud call ahead of it.
+    """
     bursts = BoundedBurstQueue(max_pending_bursts)
     note_result = getattr(trigger_capture, "note_result", None)
     if callable(note_result):
@@ -586,11 +597,11 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     if not callable(superseded):
         superseded = None
 
-    def inject_trigger_burst(paths, received_at, trigger):
+    def inject_trigger_burst(paths, received_at, trigger, stillness=None):
         # A webhook-triggered clear frame enters the same bounded queue as an
         # FTP burst, with its own content identity and sanitized trigger.
         paths = tuple(Path(path) for path in paths)
-        identity = BurstIdentity(content_digest(paths[0]), trigger)
+        identity = BurstIdentity(content_digest(paths[0]), trigger, stillness)
         enqueue((paths, received_at, monotonic(), datetime.now(timezone.utc), identity))
 
     if trigger_capture is not None:
@@ -626,10 +637,17 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     observer.schedule(handler, str(directory), recursive=True)
     stop_event = Event()
     failures = Queue()
+    cloud_lane = None
+    if prepare is not None:
+        cloud_lane = CloudLane(
+            emit, on_error=on_error, on_result=on_result, on_dropped=report_lost,
+            superseded=superseded, coalesce=coalesce,
+        )
     processing_args = (
         bursts, emit, on_error,
         lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
         trigger_resolver, on_result, report_lost, superseded, coalesce,
+        prepare, cloud_lane,
     )
     processing_thread = Thread(
         target=_supervise_worker,
@@ -637,6 +655,13 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
               stop_event, failures),
         daemon=True, name="GateBurstProcessor",
     )
+    cloud_lane_thread = None
+    if cloud_lane is not None:
+        cloud_lane_thread = Thread(
+            target=_supervise_worker,
+            args=("GateCloudLane", cloud_lane.run, (), stop_event, failures),
+            daemon=True, name="GateCloudLane",
+        )
     background_threads = [
         Thread(
             target=_supervise_worker,
@@ -666,6 +691,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         startup_reconciliation_pending = startup_reconciler.run_batch()
         processing_thread.start()
         processing_started = True
+        if cloud_lane_thread is not None:
+            cloud_lane_thread.start()
         for thread in background_threads:
             thread.start()
             started_background_threads.append(thread)
@@ -692,6 +719,22 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                     report_lost(dropped[0], "service_stopping")
                     _remove_uploads(dropped[0])
             processing_thread.join()
+            if cloud_lane is not None:
+                # The burst thread has stopped, so nothing can be submitted
+                # any more; what is still waiting in the lane is given up the
+                # same way, and its prepared state settled.
+                for entry in cloud_lane.stop():
+                    item, prepared = entry[0], entry[1]
+                    try:
+                        prepared.discard("service_stopping")
+                    finally:
+                        try:
+                            report_dropped(item, "service_stopping")
+                        finally:
+                            report_lost(item[0], "service_stopping")
+                            _remove_uploads(item[0])
+                if cloud_lane_thread is not None:
+                    cloud_lane_thread.join()
         try:
             if shutdown is not None:
                 shutdown()
@@ -716,11 +759,96 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     raise WorkerFailure(f"critical worker {name} failed: {error}") from error
 
 
+class CloudLane:
+    """The serial cloud lane: bursts the on-device read could not decide.
+
+    The processor's OCR slot already guarantees one cloud request in flight;
+    what this lane adds is that *waiting* for it is no longer the burst
+    thread's job. On 2026-09-10 at 21:52:26 a session frame whose local read
+    was a perfect 131D2696 sat in the burst queue for 4.15 s while that thread
+    waited on cloud lookups for two frames that could not be read, and the
+    gate opened 8.9 s after the alarm. A burst arrives here already prepared
+    (identity, trace, local pass); this thread only finishes it.
+    """
+
+    def __init__(self, emit, *, on_error=None, on_result=None, on_dropped=None,
+                 superseded=None, coalesce=None):
+        self._emit = emit
+        self._on_error = on_error
+        self._on_result = on_result
+        self._on_dropped = on_dropped
+        self._superseded = superseded
+        self._coalesce = coalesce
+        self._queue: Queue = Queue()
+        self._lock = Lock()
+        self._closed = False
+
+    def submit(self, item, prepared, options, trigger_summary, timing) -> bool:
+        """Queue a prepared burst for the cloud. False once the lane has closed."""
+        with self._lock:
+            if self._closed:
+                return False
+            self._queue.put((item, prepared, options, trigger_summary, timing))
+            return True
+
+    @property
+    def pending(self) -> int:
+        return self._queue.qsize()
+
+    def run(self) -> None:
+        while True:
+            entry = self._queue.get()
+            if entry is None:
+                return
+            item, prepared, options, trigger_summary, timing = entry
+            paths, received_at = item[0], item[1]
+            # Asked again here, not only on the burst thread: this burst may
+            # have waited behind a lookup during which its own passage opened.
+            if (
+                self._superseded is not None and self._coalesce is not None
+                and _is_superseded(self._superseded, paths)
+            ):
+                LOGGER.info(
+                    "gate_burst stage=skipped cause=event_already_opened "
+                    "recorded_reason=queue_coalesced lane=cloud"
+                )
+                prepared.discard("event_already_opened")
+                self._coalesce(item)
+                continue
+            _decide_burst(
+                paths, received_at, timing, {**options, "prepared": prepared},
+                trigger_summary, self._emit, self._on_error, self._on_result,
+                self._on_dropped,
+            )
+
+    def stop(self) -> list:
+        """Close the lane and return the entries still waiting in it, undecided."""
+        with self._lock:
+            self._closed = True
+            pending = []
+            while True:
+                try:
+                    pending.append(self._queue.get_nowait())
+                except Empty:
+                    break
+            self._queue.put(None)
+        return [entry for entry in pending if entry is not None]
+
+
 def _process_bursts(
     bursts, emit, on_error=None, ranker=None, trigger_resolver=None, on_result=None,
-    on_dropped=None, superseded=None, coalesce=None,
+    on_dropped=None, superseded=None, coalesce=None, prepare=None, cloud_lane=None,
 ) -> None:
+    """The burst thread; the fast lane when given a `prepare` and a `cloud_lane`.
+
+    With both, every burst is taken as far as the on-device read here and
+    handed to the cloud lane only when that read could not decide it, so this
+    thread never waits on the network and a frame the device can read is
+    decided the moment it lands. Without them the thread decides each burst
+    in full, exactly as it did before 2026-09-10.
+    """
     ranker = ranker or rank_images
+    fast_lane = prepare is not None and cloud_lane is not None
     while True:
         item = bursts.get()
         if item is None:
@@ -743,41 +871,96 @@ def _process_bursts(
             )
             coalesce(item)
             continue
-        trigger_summary = _TRIGGER_UNSET
-        try:
-            options = {}
-            identity = None
-            if timing and isinstance(timing[-1], BurstIdentity):
-                identity = timing.pop()
-                options["idempotency_key"] = identity.idempotency_key
-            if identity is not None and identity.trigger is not None:
-                trigger_summary = identity.trigger
-                options["trigger"] = trigger_summary
-            elif trigger_resolver is not None:
-                trigger_summary = _resolve_trigger(
-                    trigger_resolver, received_at,
+        options, trigger_summary, timing, identity = _burst_options(
+            item, trigger_resolver,
+        )
+        if fast_lane:
+            prepare_options = dict(options)
+            if identity is not None and identity.stillness is not None:
+                prepare_options["stillness"] = identity.stillness
+            try:
+                prepared = prepare(paths, received_at, *timing, **prepare_options)
+            except Exception as error:
+                _report_processing_error(
+                    on_error, paths, error, received_at, trigger_summary,
                 )
-                options["trigger"] = trigger_summary
-            result = emit(paths, received_at, *timing, **options)
-        except Exception as error:
-            _report_processing_error(
-                on_error, paths, error, received_at, trigger_summary,
-            )
-            # No result exists, so the frame is lost as far as its capture is
-            # concerned; say so instead of leaving it pending.
-            if on_dropped is not None:
-                try:
-                    on_dropped(paths, "processing_error")
-                except Exception:
-                    LOGGER.exception("gate_burst_drop_handler_failed")
-        else:
-            if on_result is not None:
-                try:
-                    on_result(paths, result)
-                except Exception:
-                    LOGGER.exception("gate_burst_result_handler_failed")
-        finally:
-            _remove_uploads(paths)
+                _report_lost(on_dropped, paths, "processing_error")
+                _remove_uploads(paths)
+                continue
+            if prepared.needs_cloud:
+                if cloud_lane.submit(item, prepared, options, trigger_summary, timing):
+                    continue
+                # The lane has closed under this burst: the service is
+                # stopping, and the burst is given up like any other.
+                prepared.discard("service_stopping")
+                if coalesce is not None:
+                    _give_up(coalesce, item, "service_stopping")
+                else:
+                    _report_lost(on_dropped, paths, "service_stopping")
+                    _remove_uploads(paths)
+                continue
+            options["prepared"] = prepared
+        _decide_burst(
+            paths, received_at, timing, options, trigger_summary,
+            emit, on_error, on_result, on_dropped,
+        )
+
+
+def _burst_options(item, trigger_resolver):
+    """What a burst carries into the processor: its options, trigger and timing."""
+    paths, received_at, *timing = item
+    options = {}
+    identity = None
+    trigger_summary = _TRIGGER_UNSET
+    if timing and isinstance(timing[-1], BurstIdentity):
+        identity = timing.pop()
+        options["idempotency_key"] = identity.idempotency_key
+    if identity is not None and identity.trigger is not None:
+        trigger_summary = identity.trigger
+        options["trigger"] = trigger_summary
+    elif trigger_resolver is not None:
+        trigger_summary = _resolve_trigger(trigger_resolver, received_at)
+        options["trigger"] = trigger_summary
+    return options, trigger_summary, timing, identity
+
+
+def _decide_burst(paths, received_at, timing, options, trigger_summary,
+                  emit, on_error, on_result, on_dropped) -> None:
+    """Decide one burst, report it, and remove its uploads. Never raises."""
+    try:
+        result = emit(paths, received_at, *timing, **options)
+    except Exception as error:
+        _report_processing_error(
+            on_error, paths, error, received_at, trigger_summary,
+        )
+        # No result exists, so the frame is lost as far as its capture is
+        # concerned; say so instead of leaving it pending.
+        _report_lost(on_dropped, paths, "processing_error")
+    else:
+        if on_result is not None:
+            try:
+                on_result(paths, result)
+            except Exception:
+                LOGGER.exception("gate_burst_result_handler_failed")
+    finally:
+        _remove_uploads(paths)
+
+
+def _report_lost(on_dropped, paths, reason: str) -> None:
+    if on_dropped is None:
+        return
+    try:
+        on_dropped(paths, reason)
+    except Exception:
+        LOGGER.exception("gate_burst_drop_handler_failed")
+
+
+def _give_up(coalesce, item, reason: str) -> None:
+    """Coalesce with a reason where the hook takes one, plainly where it does not."""
+    try:
+        coalesce(item, reason)
+    except TypeError:
+        coalesce(item)
 
 
 def _is_superseded(superseded, paths) -> bool:

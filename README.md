@@ -136,7 +136,10 @@ doubtful read — waits for a busy OCR slot instead of discarding a frame, and
 retries a connect timeout once. A queued frame is dropped unread when a newer
 frame of the same alarm arrives, when its own passage has already opened, or
 when its remaining decision budget could not cover the lookup it would be
-billed for (`GATE_OCR_MIN_REQUEST_SECONDS`). The RLC-810A document describes
+billed for (`GATE_OCR_MIN_REQUEST_SECONDS`). The on-device read runs on a
+fast lane that never waits for a cloud answer, and a moving frame it found no
+plate in is decided without a lookup at all
+(`GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS`). The RLC-810A document describes
 the session and its journal lines.
 `GATE_TRAINING_CORPUS_DIR` keeps every uploaded frame and OCR answer on the Pi
 (bounded by `GATE_TRAINING_CORPUS_MAX_BYTES`) as training data for a local
