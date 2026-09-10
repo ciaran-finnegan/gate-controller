@@ -5,8 +5,8 @@ import inspect
 import json
 import logging
 import math
-from collections.abc import Iterable
-from dataclasses import replace
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -18,7 +18,7 @@ from .direction import passage_key
 from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
 from .matching import decide_access, normalise_plate
-from .models import GateEvent, MatchDecision, ProcessingResult
+from .models import GateEvent, MatchDecision, PlateObservation, ProcessingResult
 from .ocr import classify_failure_cause
 from .telemetry import (
     MatchPolicyTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
@@ -55,10 +55,23 @@ DEFAULT_MIN_CLOUD_REQUEST_SECONDS = 1.0
 # wait itself returns fractionally late -- and the floor the pass is never
 # bounded below, so a tight budget still buys an on-device read.
 LOCAL_PASS_MARGIN_SECONDS = 0.05
+# A frame the on-device detector found no plate in, while the vehicle was
+# still moving, is not sent to the cloud either. The capture measures
+# stillness as the difference between a frame and its predecessor (0 is
+# stationary); on the night of 2026-09-10 the frames that decided passages
+# sat at 0.001-0.002, a creeping car at 0.009 and a moving one at 0.014-0.034,
+# and half of all cloud lookups since 2026-09-08 (111 of 210, 274 s of waiting)
+# answered "no plate" on frames the device had already found nothing in.
+# GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS re-derives it; 0 disables the rule.
+DEFAULT_CLOUD_SKIP_STILLNESS = 0.005
+CLOUD_SKIP_MOVING_NO_PLATE = "moving_no_plate"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
 })
+# `_recognise` is told apart from "the fast lane ran the local pass and it
+# found nothing" (None) and "nobody has run it yet" by this sentinel.
+_NOT_PREPARED = object()
 
 
 class _OcrBusy(TimeoutError):
@@ -78,6 +91,65 @@ class _OcrDeadlineExceeded(TimeoutError):
         self.attempted = attempted
 
 
+@dataclass
+class PreparedBurst:
+    """A burst the fast lane has taken as far as the on-device read.
+
+    Everything a decision needs that never touches the network: the content
+    identity, the open trace with its timing marks, and the local pass for the
+    first frame. :meth:`GateProcessor.process` finishes it, on whichever thread
+    has the time -- the burst thread when the device decided the frame, the
+    cloud lane when it did not.
+    """
+
+    paths: tuple[Path, ...]
+    digests: tuple[str, ...]
+    idempotency_key: str
+    received_at: datetime
+    #: The decision clock's origin for this burst: the deadline runs from here.
+    started: float
+    trace: object
+    trigger: TriggerTelemetry | None
+    #: The on-device read for ``paths[0]``, when the fast lane ran one.
+    local_attempt: object | None = None
+    local_pass_started: float | None = None
+    local_pass_ran: bool = False
+    #: Why the cloud will not be asked for the first frame, or None.
+    cloud_skip: str | None = None
+    stillness: float | None = None
+    #: The answer for a burst the store already holds; nothing else applies.
+    duplicate: ProcessingResult | None = None
+    consumed: bool = False
+    discard_hook: Callable | None = field(default=None, repr=False)
+
+    @property
+    def decided(self) -> bool:
+        attempt = self.local_attempt
+        return attempt is not None and bool(getattr(attempt, "decided", False))
+
+    @property
+    def needs_cloud(self) -> bool:
+        """Whether finishing this burst may have to wait on a cloud request."""
+        return self.duplicate is None and not self.decided and self.cloud_skip is None
+
+    def recognise_options(self, sequence: int) -> dict:
+        """What `_recognise` is told about the pass the fast lane already ran."""
+        if sequence != 0 or not self.local_pass_ran:
+            return {}
+        self.consumed = True
+        return {
+            "prepared_attempt": self.local_attempt,
+            "local_pass_started": self.local_pass_started,
+            "cloud_skip": self.cloud_skip,
+            "stillness": self.stillness,
+        }
+
+    def discard(self, reason: str) -> None:
+        """This burst will never be decided: settle whatever it opened."""
+        if self.discard_hook is not None:
+            self.discard_hook(self, reason)
+
+
 class GateProcessor:
     def __init__(self, recognizer, store, relay, authorised: Iterable[str],
                  cooldown: timedelta = timedelta(seconds=20), outbox=None, clock=None,
@@ -86,7 +158,8 @@ class GateProcessor:
                  activation_guard_seconds: float | None = None,
                  decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
-                 match_policy=None, min_cloud_request_seconds: float | None = None):
+                 match_policy=None, min_cloud_request_seconds: float | None = None,
+                 cloud_skip_stillness: float | None = None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -159,16 +232,39 @@ class GateProcessor:
         self._min_cloud_request_seconds = _bounded_min_cloud_request(
             min_cloud_request_seconds, decision_timeout,
         )
+        self._cloud_skip_stillness = _bounded_cloud_skip_stillness(cloud_skip_stillness)
 
-    def process(self, paths: Iterable[Path], received_at: datetime | None = None,
+    def prepare(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
                 processing_started_at: datetime | None = None, *,
                 trigger: TriggerTelemetry | dict | None = None,
-                idempotency_key: str | None = None) -> ProcessingResult:
+                idempotency_key: str | None = None,
+                stillness: float | None = None,
+                local_pass: bool = True) -> PreparedBurst:
+        """Take a burst as far as the on-device read without touching the network.
+
+        This is the fast lane's half of a decision: the burst's identity, its
+        trace, and the local pass for the first frame -- a few hundred
+        milliseconds at most. :meth:`process` finishes it with ``prepared=``,
+        on whichever thread has time: the burst thread when the device decided
+        the frame, the cloud lane when it did not.
+
+        Until 2026-09-10 the local pass ran inside :meth:`process`, on the one
+        thread that also waited for cloud answers, so a frame the device could
+        decide in 230 ms still queued behind every cloud call ahead of it. At
+        21:52:26 that night a perfect read of the authorised plate waited
+        4.15 s for two lookups on frames that could not be read, and the gate
+        opened 8.9 s after the alarm instead of about 4.7 s.
+
+        ``stillness`` is the capture's own measure of how much the frame
+        differs from its predecessor (0 is stationary). When the detector
+        finds nothing in a frame that is still moving, the cloud is not asked
+        for it either (``cloud_skip``): a vehicle that is still turning in
+        shows an oblique, smeared plate that neither reader has ever read, and
+        the frame that will read is the one taken once it stops.
+        """
         trigger = _trigger_telemetry(trigger)
         started = self._decision_clock() if decision_started_at is None else decision_started_at
-        deadline = started + self._decision_timeout
-        activation_deadline = deadline - self._activation_guard_seconds
         candidates = _unique_content_candidates(tuple(Path(path) for path in paths))
         paths = tuple(path for path, _digest in candidates)
         digests = tuple(digest for _path, digest in candidates)
@@ -179,7 +275,15 @@ class GateProcessor:
                 event_id = event_id.event_id if event_id else self._store.event_id(idempotency_key)
                 if event_id is not None:
                     self._store.ensure_outbox(event_id, self._outbox_payload(paths))
-            return ProcessingResult(False, self._store.actuation_claim_status(idempotency_key) or "duplicate_event")
+            duplicate = ProcessingResult(
+                False,
+                self._store.actuation_claim_status(idempotency_key) or "duplicate_event",
+            )
+            return PreparedBurst(
+                paths=paths, digests=digests, idempotency_key=idempotency_key,
+                received_at=received_at or self._clock(), started=started,
+                trace=None, trigger=trigger, duplicate=duplicate,
+            )
         trace = self._new_trace()
         trace.set_trigger(trigger)
         self._bind_direction(trace, trigger)
@@ -194,13 +298,74 @@ class GateProcessor:
         if decision_started_at is None:
             trace.mark_burst()
         received_at = received_at or self._clock()
+        prepared = PreparedBurst(
+            paths=paths, digests=digests, idempotency_key=idempotency_key,
+            received_at=received_at, started=started, trace=trace, trigger=trigger,
+            discard_hook=self._discard_prepared,
+        )
+        if not local_pass or self._local_pass is None or not paths:
+            return prepared
+        deadline = started + self._decision_timeout
+        if deadline - self._decision_clock() <= 0:
+            # `process` records the timeout; there is nothing to read into it.
+            return prepared
+        if not _is_fresh(self._clock(), received_at, self._max_image_age):
+            return prepared
+        pass_started = self._decision_clock()
+        attempt = self._run_local_pass(paths[0], deadline, trace.trace_id)
+        elapsed_ms = max(0.0, self._decision_clock() - pass_started) * 1000.0
+        decided = attempt is not None and attempt.decided
+        # Journal only, as in `_recognise`: `stage_durations` is an allow-list
+        # on the app's side.
+        logging.getLogger(__name__).info(
+            "gate_ocr stage=local_pass local_pass_ms=%d decided=%s lane=fast",
+            round(elapsed_ms), "true" if decided else "false",
+        )
+        prepared.local_pass_ran = True
+        prepared.local_attempt = attempt
+        prepared.local_pass_started = pass_started
+        prepared.stillness = stillness
+        if (
+            not decided
+            and attempt is not None
+            and self._cloud_skip_stillness > 0
+            and stillness is not None
+            and math.isfinite(stillness)
+            and stillness > self._cloud_skip_stillness
+            and bool(getattr(attempt, "saw_no_plate", False))
+        ):
+            prepared.cloud_skip = CLOUD_SKIP_MOVING_NO_PLATE
+        return prepared
+
+    def process(self, paths: Iterable[Path], received_at: datetime | None = None,
+                decision_started_at: float | None = None,
+                processing_started_at: datetime | None = None, *,
+                trigger: TriggerTelemetry | dict | None = None,
+                idempotency_key: str | None = None,
+                prepared: PreparedBurst | None = None) -> ProcessingResult:
+        if prepared is None:
+            # No fast lane ahead of this call: the local pass runs where it
+            # always did, inside `_recognise`, and nothing else changes.
+            prepared = self.prepare(
+                paths, received_at, decision_started_at, processing_started_at,
+                trigger=trigger, idempotency_key=idempotency_key, local_pass=False,
+            )
+        if prepared.duplicate is not None:
+            return prepared.duplicate
+        paths, digests = prepared.paths, prepared.digests
+        idempotency_key, trace = prepared.idempotency_key, prepared.trace
+        received_at, started = prepared.received_at, prepared.started
+        deadline = started + self._decision_timeout
+        activation_deadline = deadline - self._activation_guard_seconds
         now = self._clock()
         if self._decision_clock() - started >= self._decision_timeout:
+            self._abandon_local(prepared)
             return self.record_skipped(
                 paths, "decision_timeout", received_at, trace=trace,
                 idempotency_key=idempotency_key,
             )
         if not _is_fresh(now, received_at, self._max_image_age):
+            self._abandon_local(prepared)
             return self.record_skipped(
                 paths, "stale_burst", received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -208,6 +373,7 @@ class GateProcessor:
         try:
             authorised = self._authorised()
         except Exception:
+            self._abandon_local(prepared)
             return self.record_skipped(
                 paths, "authorisation_error", received_at, trace=trace,
                 idempotency_key=idempotency_key,
@@ -254,6 +420,7 @@ class GateProcessor:
                 observation = self._recognise(
                     path, deadline, mark_ocr_start, first_attempt=sequence == 0,
                     trace_id=trace.trace_id, on_post_started=mark_post_started,
+                    **prepared.recognise_options(sequence),
                 )
             except _OcrBusy:
                 # The slot was taken, or the processor closed under the frame.
@@ -336,6 +503,10 @@ class GateProcessor:
                 break
         if not (decision and decision.allowed) and self._decision_clock() - started >= self._decision_timeout:
             timed_out = True
+        if prepared.local_pass_ran and not prepared.consumed:
+            # The loop never reached the first frame: settle the read the
+            # fast lane took, so its journal line is not left pending.
+            self._abandon_local(prepared)
         if decision is None:
             # A burst that spent its whole deadline waiting for a busy OCR slot
             # never tried the frame; say so rather than blaming the clock.
@@ -645,6 +816,40 @@ class GateProcessor:
             wall_clock=self._telemetry_wall_clock,
         )
 
+    @staticmethod
+    def _abandon_local(prepared: PreparedBurst) -> None:
+        """Settle a fast-lane read that no cloud request will ever follow."""
+        attempt = prepared.local_attempt
+        if attempt is None:
+            return
+        try:
+            attempt.abandon()
+        except Exception:
+            return
+
+    def _discard_prepared(self, prepared: PreparedBurst, reason: str) -> None:
+        """A prepared burst that will never be decided: drop what it opened.
+
+        The local read is settled so its journal line is written, and the
+        trace's bindings in the recogniser -- the per-event local block and
+        the direction tracker's alarm key -- are released, exactly as
+        `_finish_result` would have released them.
+        """
+        self._abandon_local(prepared)
+        trace = prepared.trace
+        trace_id = getattr(trace, "trace_id", None) if trace is not None else None
+        if trace_id:
+            forget = getattr(self._recognizer, "forget_local_ocr", None)
+            if callable(forget):
+                try:
+                    forget(trace_id)
+                except Exception:
+                    pass
+            self._forget_direction(trace_id)
+        logging.getLogger(__name__).info(
+            "gate_burst stage=prepared_discarded reason=%s", reason,
+        )
+
     def _record(self, event: GateEvent, paths: Iterable[Path] = ()) -> int:
         payload = self._outbox_payload(paths, await_telemetry=True)
         return self._store.record_event_with_outbox(event, payload)
@@ -770,12 +975,43 @@ class GateProcessor:
 
     def _recognise(self, path: Path, deadline: float, on_start=None, *,
                    first_attempt: bool = False, trace_id: str | None = None,
-                   on_post_started=None):
+                   on_post_started=None, prepared_attempt=_NOT_PREPARED,
+                   local_pass_started: float | None = None,
+                   cloud_skip: str | None = None, stillness: float | None = None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
         attempt = None
-        if self._local_pass is not None:
+        if prepared_attempt is not _NOT_PREPARED:
+            # The fast lane already read this frame on the device. Its answer
+            # is used as it stands rather than paying for the inference twice;
+            # the timing mark is the pass's own start, so `burst_to_ocr_ms`
+            # keeps meaning "time until this frame's recognition began".
+            attempt = prepared_attempt
+            recognition_began = (
+                self._decision_clock() if local_pass_started is None else local_pass_started
+            )
+            if attempt is not None and attempt.decided:
+                if on_start is not None:
+                    on_start(recognition_began)
+                return attempt.observation
+            if cloud_skip is not None:
+                if attempt is not None:
+                    attempt.abandon()
+                logging.getLogger(__name__).info(
+                    "gate_ocr stage=cloud_skipped reason=%s stillness=%s threshold=%.3f",
+                    cloud_skip,
+                    "unavailable" if stillness is None else f"{stillness:.3f}",
+                    self._cloud_skip_stillness,
+                )
+                if on_start is not None:
+                    on_start(recognition_began)
+                # The device's answer stands for the frame: nothing was read,
+                # and nothing was billed.
+                return PlateObservation(
+                    plate=None, confidence=0.0, source="local", cloud_lookup=False,
+                )
+        elif self._local_pass is not None:
             # `on_start` is deliberately NOT fired here. `burst_to_ocr_ms` has
             # meant "burst to the cloud request starting" in every measurement
             # taken to date, and it is what the OCR-slot queue wait shows up
@@ -1255,6 +1491,26 @@ def _abandon_late_local_pass(result) -> None:
         abandon()
     except Exception:
         return
+
+
+def _bounded_cloud_skip_stillness(value) -> float:
+    """The stillness above which a frame with no plate is not sent to the cloud.
+
+    ``0`` disables the rule. An unreadable or out-of-range value keeps the
+    shipped default rather than either skipping frames it should not or
+    quietly switching the rule off.
+    """
+    try:
+        threshold = DEFAULT_CLOUD_SKIP_STILLNESS if value is None else float(value)
+    except (TypeError, ValueError):
+        threshold = math.nan
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        logging.getLogger(__name__).warning(
+            "gate_ocr cloud_skip_stillness=%r status=rejected using=%.3f",
+            value, DEFAULT_CLOUD_SKIP_STILLNESS,
+        )
+        threshold = DEFAULT_CLOUD_SKIP_STILLNESS
+    return threshold
 
 
 def _bounded_min_cloud_request(value, decision_timeout: float) -> float:

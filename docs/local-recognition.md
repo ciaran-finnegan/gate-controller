@@ -171,7 +171,7 @@ Two details that follow from the same place:
   straight through into `GateEvent.ocr_confidence` and out to the outbox as a
   bare `NaN` literal that no strict JSON reader accepts.
 
-### Off the cloud slot
+### Off the cloud slot, and off the cloud lane
 
 The controller has exactly one serial slot for *cloud* OCR requests
 (`GateProcessor._ocr_slot`, a `BoundedSemaphore(1)`). Until 2026-09-08 the
@@ -180,17 +180,58 @@ cloud call was in flight for an older frame. The measured cost, 2026-09-08
 11:13:50: `local inference 170 ms` but `burst_to_ocr_ms=3654`, and the gate
 opened 11.5 s after the webhook.
 
-The local read now runs **before** the slot is taken, on the processor's own
-burst thread (`GateProcessor._recognise` -> `PlateRecognizerClient.local_pass`).
-Only frames that fall through to the cloud queue for the slot. A local grant
-while a cloud call for an older frame is still in flight opens the gate
-immediately; that in-flight call completes into the normal cooldown, which
-refuses the second activation exactly as it always has.
+Moving the read off the slot was not enough. It still ran on the one burst
+thread, and that thread blocked inside every cloud request, so a frame the
+device could decide still waited for the cloud call ahead of it. Measured on
+2026-09-10 at 21:52: frame 2768 (the car stopped at the gate, `131D2696` read
+on the device at 1.000) sat in the queue from 21:52:26.16 to 21:52:30.31 while
+lookups for two frames that could not be read went out and came back, and the
+gate opened 8.9 s after the alarm instead of about 4.7 s. Over the three days
+before that, the 17 locally decided frames had waited a median 1.6 s and a
+p90 of 4.1 s (`docs/reviews/2026-09-10-night-passage-2152.md`).
+
+The burst thread is now the **fast lane** and never waits on the network. For
+every burst it runs `GateProcessor.prepare`: identity, trace, and the local
+pass for the first frame. A frame the device decides is finished right there
+(`process(prepared=...)`: decision, store, relay). A frame it cannot decide is
+handed to the **cloud lane** (`worker.CloudLane`, thread `GateCloudLane`),
+which finishes it through the same `process`: the cloud request, the slot, the
+deadline and every rule below are unchanged, they just no longer hold up the
+next frame's read. A local grant while a cloud call for an older frame is in
+flight opens the gate immediately; that call completes into the normal
+cooldown, which refuses the second activation, and a burst still *waiting*
+for the lane when its passage opens is given up unbilled
+(`gate_burst stage=skipped cause=event_already_opened ... lane=cloud`).
+
+Journal lines: `gate_ocr stage=local_pass ... lane=fast` for the read.
+`burst_to_ocr_ms` still means "burst to the start of the read that decided";
+for a cloud-decided frame that includes its wait for the lane, which is the
+number to watch.
 
 The prepared upload travels with the frame: `local_pass` decodes, crops and
 re-encodes the JPEG once and hands the bytes to the cloud request that
 follows, so splitting the work does not double it on a board that cannot spare
 the cycles.
+
+### Frames not worth a lookup
+
+A frame the on-device detector finds **no plate in at all**, taken while the
+vehicle is **still moving**, is not sent to the cloud either. The capture
+measures stillness as the difference between a session frame and its
+predecessor (0 is stationary). On 2026-09-10 the frames that decided passages
+sat at 0.001-0.002, a creeping car at 0.009 and a moving one at 0.014-0.034,
+and a vehicle still turning in shows an oblique, smeared plate that neither
+reader has ever read; half of all cloud lookups since 2026-09-08 (111 of 210,
+274 s of waiting) answered "no plate" on frames the device had already found
+nothing in. Such a frame is decided `no_match` on the device's answer,
+journalled `gate_ocr stage=cloud_skipped reason=moving_no_plate stillness=...
+threshold=...`, and nothing is billed. Three things keep the rule narrow: a
+frame the device *read* something in, however weakly, still goes to the
+cloud, because found-and-refused is not nothing-there; a frame with no
+stillness reading (the camera's own FTP still, a hot keyframe) is never
+skipped; and a still frame with no local plate still gets the second opinion.
+`GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` (default `0.005`, `0` disables) is the
+threshold.
 
 `GATE_LOCAL_OCR_CLOUD=always` is the exception and stays exactly as it was -
 its whole purpose is to keep the cloud request on the decision path so every
@@ -278,6 +319,7 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.5` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision *and* admission to the corroboration pool, so it is the floor under `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` too. 0.95 is the shadow-mode measurement threshold and is too high to be the admission gate: it would keep the agreement rule from ever running on the shipped 0.50 agreement bar. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
+| `GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` | `0.005` | A session frame the device found no plate in still goes to the cloud when its stillness is at or below this; one moving more than this is decided `no_match` on the device's answer, unbilled. `0` disables the rule. See "Frames not worth a lookup". |
 
 The confidence bars the shared matching applies - including the ones that
 lower when both readers agree - live with the matching levels, not here. See
