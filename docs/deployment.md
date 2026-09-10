@@ -753,12 +753,89 @@ No pixel, no PCM sample, no resample, no analysis on the device. This is the
 same command measured on the live board on 2026-09-07 for no measurable thermal
 cost (69.2 C before, 69.2 C after).
 
+#### The Pre-Roll Ring — What Makes Issue #106 Measurable
+
+Issue #106 asks one question: **does the camera microphone hear an approaching
+vehicle usefully earlier than the camera's vehicle AI fires?** Clips recorded
+before this change could not answer it, because a camera-event clip started
+*at* the camera event. On 2026-09-10 the 21:52 clip began at the alarm
+(21:52:21.7) and the car had already been on the drive for several seconds —
+the very seconds the question is about.
+
+`GATE_AUDIO_CAPTURE_PREROLL_SECONDS` (default `20`, `0` disables) puts those
+seconds in front of every clip, so the existing free-labelled collection
+becomes the dataset the question needs at no labelling cost: the answer is
+`trigger_offset_seconds` into a clip that already says whether the relay fired.
+
+Audio from before the trigger has to have been recorded before anyone asked for
+it, so one more child runs continuously — and only one:
+
+```
+ffmpeg … -map 0:a:0 -vn -c:a copy \
+  -f segment -segment_time 5 -segment_format adts -segment_wrap N -reset_timestamps 1 \
+  /dev/shm/gate-audio-ring/seg%03d.aac
+```
+
+* **Still nothing decoded.** The same `-vn -c:a copy`; the segment muxer writes
+  the camera's own AAC frames into files.
+* **RAM, not the card.** `GATE_AUDIO_CAPTURE_RING_DIR` (default
+  `/dev/shm/gate-audio-ring`, created `0700`) is tmpfs, so segments rewritten
+  every five seconds cost no SD-card wear, and under the unit's
+  `ProtectSystem=strict` it is writable where `/run` is not. With
+  `PrivateTmp=true` it is the service's own `/dev/shm`, invisible to anything
+  else on the board and gone when the service stops. `-segment_wrap` fixes the
+  number of files, so at ~8 KB/s the whole ring is about 250 KB of the unit's
+  `MemoryMax=1G` however long the child runs.
+* **A clip is assembled, not re-recorded.** On a camera event the newest ring
+  segments covering the pre-roll are read and put in front of the ordinary
+  post-trigger capture. This is sound for **ADTS and only ADTS**: every frame
+  carries its own header and its own length and the format has no file-level
+  index or timestamps, so two streams from one source join with a `+` — which
+  is also why `cat a.aac b.aac` has always worked. What is *not* sound is
+  joining mid-frame, so the ring's bytes are walked header by header (reading
+  the 7-byte headers, never a sample) and any half-written trailing frame is
+  dropped before the join. A segment that does not start with a header
+  contributes nothing at all.
+* **The join is approximate and the sidecar says so.** The capture child still
+  has to connect to RTSP, so there is a fraction of a second between the end of
+  the pre-roll and the first captured packet. Alignment good to about a second
+  is what this is for; it is not a sample-accurate splice and nothing here
+  pretends otherwise.
+* **Stale audio is never spliced on.** Segments older than the pre-roll plus a
+  couple of segments are ignored, and a ring that is not running contributes
+  nothing, so a clip can never be welded onto audio from before a gap. A clip
+  with a short pre-roll is a fact the sidecar states; a clip carrying somebody
+  else's audio would be a corrupted training example.
+
+**The ring is supervised, not fired and forgotten.** The same single thread that
+owns capture spawning owns the ring child: it restarts it with a doubling
+backoff (2 s to 60 s, back to 2 s after a child that stayed up a minute), stops
+it when the governor says so and starts it again when that clears, and empties
+the ring directory on both. It is never a second *capture* — it produces no
+clip and takes no capture slot — and it is the only other child this module has.
+`GATE_AUDIO_CAPTURE_PREROLL_SECONDS=0` starts none of it: no child, no
+directory, and every clip is byte-for-byte what it was before.
+
+**What it costs.** A copy-only child holds one loopback RTSP session all day.
+It demultiplexes the 4K video and throws it away without decoding it, which is
+the same thing the clear-stream recorder already does continuously for about 5%
+of a core. `-allowed_media_types audio` would stop the server sending the video
+at all and is very probably a further trim, for the ring more than for the
+capture; it is deliberately **not** used, for the reason the capture does not
+use it either — nobody has run it on this hardware, and an unmeasured flag is a
+worse default than a measured one. That is the obvious next measurement to take
+on the device.
+
 The same governor as the network probe skips a capture — journalling the reason
 so the gap in the corpus is explicit — when
 
 * `soc_temp_c >= GATE_AUDIO_CAPTURE_MAX_TEMP_C` (default 80.0), or
 * `load_1m >= GATE_AUDIO_CAPTURE_MAX_LOAD` (default 3.0), or
 * available memory is under 300 MB.
+
+The same three ceilings stop the ring child, re-read every five seconds rather
+than on every one-second supervisor tick: a governor that spared the board by
+reading three sysfs files a second would be paying for itself twice over.
 
 One thread owns all spawning, so exactly one capture can exist at a time; a
 second request while one is in flight is coalesced and counted, never queued.
@@ -794,7 +871,41 @@ gate_audio_capture outcome=failed reason=exit_status stderr=error while loading 
 The same tail appears as `last_capture.stderr` in the audio section of status.
 Both trigger points are non-blocking by construction, which matters most for
 the relay one: it runs while the relay is energised, so it does nothing but
-take an uncontended lock and write a few fields.
+take an uncontended lock and write a few fields — the pre-roll is read on the
+owning thread at the top of a capture, never at a trigger.
+
+The ring keeps its own journal prefix and its own status block, so a pre-roll
+that quietly stopped happening is visible rather than inferred:
+
+```
+gate_audio_ring outcome=started seconds=20 segments=6 directory=/dev/shm/gate-audio-ring
+gate_audio_ring outcome=exited stderr=Server returned 404 Not Found
+gate_audio_ring outcome=stopped reason=hot
+gate_audio_capture outcome=captured label=actuated bytes=486912 seconds=40.0 preroll=19.9 trigger=camera_event
+```
+
+`ring` in the audio section of status carries `running`, `starts`, `failures`,
+`stopped_reason` and the last stderr tail; `preroll_absent` counts clips that
+wanted a pre-roll and got none. **A corpus of clips that all begin at their
+trigger is exactly the corpus that could not answer issue #106**, so that
+counter climbing is the thing to watch.
+
+**Reading a clip that starts before its trigger.** `t = 0` is still the
+trigger — the camera event, or the actuation that asked for the clip — and
+every `offset_seconds` is measured from there, unchanged. Four sidecar fields
+locate everything else:
+
+| Field | What it says |
+| --- | --- |
+| `audio.preroll_seconds` | What the pre-roll actually turned out to be. `0.0` means this clip begins at its trigger and cannot speak to what the microphone heard before it. |
+| `audio.preroll_requested_seconds` | What was asked for, so a short pre-roll is visibly short rather than ambiguous. |
+| `audio.trigger_offset_seconds` | Where `t = 0` sits inside the stored bytes. A position in the clip is `trigger_offset_seconds + offset_seconds`. Negative means the clip began *after* the trigger, which is what every clip recorded before this change did. |
+| `clip_started_at` | The wall clock of the clip's first sample. `captured_at` keeps its old meaning: when the capture child ran. |
+
+So the answer to issue #106, per clip, is: listen from the start, note when the
+vehicle becomes audible, and compare with `trigger_offset_seconds`. Audible
+earlier than that offset means the microphone beat the camera's vehicle AI on
+that passage; `label: actuated` says whether the gate was commanded to move.
 
 Clips are written as `<stem>.aac` plus `<stem>.json` with the same stem
 convention and permissions (0700 directory, 0600 files) as the image corpus,
@@ -808,6 +919,14 @@ and the clips are pruned here, by the retention window and cap below.
 30) inside a `GATE_AUDIO_CAPTURE_MAX_TOTAL_BYTES` cap (default 256 MiB),
 whichever bites first, pruned oldest first. They are recordings of the owner's
 own gate on his own premises, held on his own hardware.
+
+A 20 s pre-roll makes a default clip about 485 KB rather than 325 KB, so the
+same cap holds about a third fewer of them and the uploader carries half again
+as many bytes — still small beside the frames, and still behind the same
+backpressure. `GATE_AUDIO_CAPTURE_PREROLL_SECONDS` is the dial if that trade
+is not wanted; the assembled clip is never allowed past
+`GATE_AUDIO_CAPTURE_MAX_CLIP_BYTES` either way, because the pre-roll gives way
+(oldest frames first) rather than the cap quietly becoming cap-plus-a-pre-roll.
 
 The Worker deployment owns evidence retention. Store accepted JPEGs only in a
 private R2 bucket under the verified digest, keep bucket access limited to the
