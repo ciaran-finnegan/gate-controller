@@ -15,7 +15,7 @@ from .backpressure import NULL_GATE
 from .direction import (
     SOURCE_LOCAL_PLATE_BOX, SOURCE_PLATE_BOX, SOURCE_VEHICLE_BOX,
 )
-from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME, box_to_frame
+from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME, STATUS_NO_PLATE, box_to_frame
 from .matching import normalise_plate
 from .plate_region import PlateRegion
 from .models import PlateObservation
@@ -48,6 +48,23 @@ class LocalPass:
     @property
     def decided(self) -> bool:
         return self.observation is not None
+
+    @property
+    def saw_no_plate(self) -> bool:
+        """The on-device detector found nothing at all in this frame.
+
+        Distinct from a read too weak to decide: a candidate that was read and
+        refused still says a plate is there for the cloud to try, and an
+        ``unavailable`` answer (engine not ready, wait exhausted) is no verdict
+        either. Only a completed read that found nothing answers True.
+        """
+        recognition = (self.state or {}).get("recognition")
+        if recognition is None:
+            return False
+        return (
+            getattr(recognition, "status", None) == STATUS_NO_PLATE
+            and not getattr(recognition, "plate", None)
+        )
 
     def abandon(self) -> None:
         """No cloud request will follow. Settle the frame so it is journalled."""
@@ -1045,6 +1062,10 @@ class PlateRecognizerClient:
             recognition = frame.result(wait)
         finally:
             self._local.record_event_wait(trace_id, self._clock() - started)
+        # Kept on the pass so the processor can tell "nothing found" from
+        # "found and refused" before it decides whether the cloud is worth
+        # asking (`LocalPass.saw_no_plate`).
+        state["recognition"] = recognition
         if not self._local.decides(frame, recognition):
             return None
         frame.decided_locally()

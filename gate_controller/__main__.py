@@ -226,11 +226,30 @@ def main() -> None:
         decision_timeout=decision_timeout,
         match_policy=match_policy.get,
         min_cloud_request_seconds=_min_cloud_request_seconds(os.environ),
+        cloud_skip_stillness=_cloud_skip_stillness(os.environ),
     )
+
+    def prepare(paths, received_at=None, decision_started_at=None,
+                processing_started_at=None, *, trigger=None,
+                idempotency_key=None, stillness=None):
+        # The fast lane's half of a decision: identity, trace and the
+        # on-device read, never the network. `process` finishes it.
+        latest_image["path"] = str(paths[0]) if paths else None
+        latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
+        with activity.activity("burst"):
+            return processor.prepare(
+                paths,
+                received_at=received_at,
+                decision_started_at=decision_started_at,
+                processing_started_at=processing_started_at,
+                trigger=trigger,
+                idempotency_key=idempotency_key,
+                stillness=stillness,
+            )
 
     def process(paths, received_at=None, decision_started_at=None,
                 processing_started_at=None, *, trigger=None,
-                idempotency_key=None):
+                idempotency_key=None, prepared=None):
         latest_image["path"] = str(paths[0]) if paths else None
         latest_image["received_at"] = (received_at or datetime.now(timezone.utc)).isoformat()
         # Held for the whole burst: recognition, the decision and the relay
@@ -244,6 +263,7 @@ def main() -> None:
                 processing_started_at=processing_started_at,
                 trigger=trigger,
                 idempotency_key=idempotency_key,
+                prepared=prepared,
             )
         # Counted after the burst has answered and released the gate, from the
         # telemetry the processor already built. The decision path is not
@@ -308,6 +328,7 @@ def main() -> None:
         trigger_resolver=trigger_correlator.correlate,
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
+        prepare=prepare,
     )
 
 
@@ -455,6 +476,25 @@ def _min_cloud_request_seconds(environment):
     except (TypeError, ValueError):
         logging.getLogger(__name__).warning(
             "gate_ocr key=GATE_OCR_MIN_REQUEST_SECONDS status=rejected"
+        )
+        return None
+
+
+def _cloud_skip_stillness(environment):
+    """Above this stillness a frame the device found no plate in skips the cloud.
+
+    Unset keeps the shipped threshold; ``0`` disables the rule. An unreadable
+    value is not worth refusing to start over: the processor validates it
+    again and keeps the shipped threshold.
+    """
+    raw = str(environment.get("GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "gate_ocr key=GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS status=rejected"
         )
         return None
 

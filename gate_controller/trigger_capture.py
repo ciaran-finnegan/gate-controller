@@ -12,6 +12,7 @@ fallback when capture fails.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import select
@@ -471,6 +472,7 @@ class TriggerFrameCapture:
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._queue: Queue = Queue(maxsize=1)
         self._inject = None
+        self._inject_accepts_stillness = False
         self._lock = Lock()
         self._process = None
         self._closed = False
@@ -522,6 +524,11 @@ class TriggerFrameCapture:
     def attach(self, inject) -> None:
         """Receive the burst injector from the worker before capture starts."""
         self._inject = inject
+        # The worker's injector carries the frame's stillness to the processor
+        # (which uses it to decide whether the cloud is worth asking); an
+        # injector without the parameter -- every older fake -- is called
+        # exactly as before.
+        self._inject_accepts_stillness = _accepts_keyword(inject, "stillness")
 
     def on_camera_event(self, event) -> str:
         """Schedule a capture from the webhook thread without blocking it."""
@@ -925,8 +932,13 @@ class TriggerFrameCapture:
                 # The overdue guard is timed from the oldest frame still
                 # outstanding, not from the presence loop first noticing it.
                 self._session_pending_since = self._clock()
+        extra = (
+            {"stillness": self._last_stillness}
+            if self._inject_accepts_stillness and self._last_stillness is not None
+            else {}
+        )
         try:
-            inject((path,), captured_at, trigger)
+            inject((path,), captured_at, trigger, **extra)
         except Exception:
             with self._session_lock:
                 self._session_paths.discard(path)
@@ -1134,6 +1146,18 @@ class TriggerFrameCapture:
         except subprocess.TimeoutExpired:
             return bytes(buffer), "exit_wait"
         return bytes(buffer), None
+
+
+def _accepts_keyword(callable_object, keyword: str) -> bool:
+    """Whether *callable_object* takes this keyword (a ``**kwargs`` counts)."""
+    try:
+        parameters = inspect.signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _is_another_vehicle(decision, bar: float = DEFAULT_CONCLUSIVE_READ_CONFIDENCE) -> bool:
