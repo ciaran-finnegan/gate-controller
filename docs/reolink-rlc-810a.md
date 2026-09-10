@@ -165,6 +165,20 @@ ring falls back to an on-demand grab (`keyframe=unavailable fallback=grab`).
 The journal line for each frame carries `source=keyframe|grab` and
 `frame_age_ms`.
 
+That first keyframe is given up when the camera's own FTP still of the same
+instant has just landed: the alarm uploads the still and posts the webhook
+together, the still first (+0.07 to +1.59 s, median +0.32 s), and on
+2026-09-10 at 21:52 the still landed at 21:52:21.761 while the hot keyframe
+had been decoded at 21:52:21.71 - one instant photographed twice, read twice,
+and charged for a second cloud lookup that answered exactly what the first
+did. A still that landed within
+`GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS` of the webhook (2 s by
+default, either side of it; 0 disables the check) skips that slot and
+journals `outcome=skipped_duplicate_still still_age_ms=...`. The later slots
+are untouched - they are the ones that see the vehicle at rest, and the still
+cannot stand in for them - so with the FTP path slow or disabled nothing
+changes at all.
+
 Decoding and re-encoding 4K HEVC in software costs most of one Pi 5 core and
 about 330 MB, enough to push a fanless Pi 5 into thermal throttling. Set
 `GATE_TRIGGER_CAPTURE_HWACCEL=drm` to decode through the Pi 5's hardware HEVC
@@ -462,6 +476,7 @@ GATE_TRIGGER_CAPTURE_ENABLED=true
 GATE_TRIGGER_CAPTURE_SOURCE=rtsp://127.0.0.1:8554/clear
 GATE_TRIGGER_CAPTURE_TIMEOUT_SECONDS=3
 GATE_TRIGGER_CAPTURE_HOT_KEYFRAMES=true
+GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS=2
 GATE_TRIGGER_CAPTURE_DELAY_SECONDS=1.5
 GATE_TRIGGER_CAPTURE_COUNT=3
 GATE_TRIGGER_CAPTURE_SPACING_SECONDS=1

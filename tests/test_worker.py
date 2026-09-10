@@ -1893,3 +1893,171 @@ class SupersededSessionFrameTests(unittest.TestCase):
         self.capture.note_result((mine,), ProcessingResult(True, "activated"))
 
         self.assertFalse(self.capture.superseded((Path("elsewhere.jpg"),)))
+
+
+class IngressStillNotificationTests(unittest.TestCase):
+    """The FTP still is what tells the capture the alarm's own picture landed.
+
+    The camera's vehicle alarm uploads a 4K still and posts a webhook at
+    almost the same moment, the still first. Ingress is the only place that
+    knows the still arrived, so the hook that already feeds the hot-frame
+    provider has to carry that news to the trigger capture as well.
+    """
+
+    class Provider:
+        """Stand-in for the hot stream: it answers the hook."""
+
+        def __init__(self, output_directory, frames=()):
+            self.output_directory = output_directory
+            self._frames = tuple(frames)
+            self.calls = []
+
+        def select(self, received_at=None):
+            self.calls.append(received_at)
+            return self._frames
+
+    class Capture:
+        """Stand-in for the trigger capture: it only listens."""
+
+        def __init__(self, output_directory, fails=False):
+            self.output_directory = output_directory
+            self.stills = []
+            self._fails = fails
+
+        def attach(self, inject):
+            self.inject = inject
+
+        def note_still(self, received_at):
+            self.stills.append(received_at)
+            if self._fails:
+                raise RuntimeError("capture unavailable")
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.ftp = self.root / "ftp.jpg"
+        self.hot_directory = self.root / ".hot-stream"
+        self.hot = self.hot_directory / "hot.jpg"
+        self.capture_directory = self.root / ".trigger-capture"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _worker_handler(self, **options):
+        """Build the worker exactly as the service does and keep its handler.
+
+        The watch directory is still empty here, so nothing is ingested while
+        the worker runs; the uploads are written afterwards and driven through
+        the handler by hand.
+        """
+        built = []
+
+        class Recording(CompletedImageHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self)
+
+        class WorkerThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+        with patch(
+            "gate_controller.worker.Observer", return_value=PassiveObserver()
+        ), patch(
+            "gate_controller.worker.CompletedImageHandler", Recording
+        ), patch(
+            "gate_controller.worker.Thread", WorkerThread
+        ), patch(
+            "gate_controller.worker.current_thread_is_main", return_value=False
+        ), patch(
+            "gate_controller.worker.sleep", side_effect=KeyboardInterrupt
+        ):
+            run_worker(self.root, lambda *_: None, **options)
+        return built[0]
+
+    def _uploads(self):
+        """Write the frames, always *after* the worker has been built.
+
+        An upload already sitting in the watch tree is ingested by startup
+        reconciliation, which fires the hook before the test can watch it.
+        """
+        Image.new("RGB", (32, 16), color="red").save(self.ftp, format="JPEG")
+        self.hot_directory.mkdir(mode=0o700, exist_ok=True)
+        Image.new("RGB", (32, 16), color="green").save(self.hot, format="JPEG")
+
+    def test_the_still_reaches_the_capture_and_the_hot_frames_still_arrive(self):
+        provider = self.Provider(self.hot_directory, frames=(self.hot,))
+        capture = self.Capture(self.capture_directory)
+        handler = self._worker_handler(
+            hot_frame_provider=provider, trigger_capture=capture,
+        )
+        self._uploads()
+
+        handler.schedule_candidate(self.ftp)
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            self.assertEqual(1, handler.retry_pending())
+
+        self.assertEqual(1, len(capture.stills))
+        self.assertEqual(capture.stills, provider.calls,
+                         "both hear about the same arrival")
+        self.assertIsNotNone(capture.stills[0].tzinfo)
+        self.assertIn("gate_hot_stream added_to_burst=1", "\n".join(logs.output))
+
+    def test_a_capture_that_raises_never_costs_the_burst_its_hot_frames(self):
+        provider = self.Provider(self.hot_directory, frames=(self.hot,))
+        capture = self.Capture(self.capture_directory, fails=True)
+        handler = self._worker_handler(
+            hot_frame_provider=provider, trigger_capture=capture,
+        )
+        self._uploads()
+
+        handler.schedule_candidate(self.ftp)
+        with self.assertLogs("gate_controller.worker", level="INFO") as logs:
+            self.assertEqual(1, handler.retry_pending())
+
+        combined = "\n".join(logs.output)
+        self.assertIn("gate_still_arrival_handler_failed", combined)
+        self.assertIn("gate_hot_stream added_to_burst=1", combined)
+        self.assertEqual(1, len(provider.calls))
+
+    def test_the_capture_is_told_even_with_no_hot_stream_running(self):
+        """The live configuration: GATE_HOT_STREAM_ENABLED=false."""
+        capture = self.Capture(self.capture_directory)
+        handler = self._worker_handler(trigger_capture=capture)
+        self._uploads()
+
+        handler.schedule_candidate(self.ftp)
+        self.assertEqual(1, handler.retry_pending())
+
+        self.assertEqual(1, len(capture.stills))
+
+    def test_neither_a_provider_nor_a_capture_leaves_ingress_untouched(self):
+        handler = self._worker_handler()
+        self._uploads()
+
+        handler.schedule_candidate(self.ftp)
+        with self.assertNoLogs("gate_controller.worker", level="INFO"):
+            self.assertEqual(1, handler.retry_pending())
+
+    def test_both_output_directories_stay_out_of_ingress(self):
+        """Capture writes its frames under the watch tree's own root here, so
+        a frame it wrote must never be ingested as a fresh upload."""
+        provider = self.Provider(self.hot_directory)
+        capture = self.Capture(self.capture_directory)
+        handler = self._worker_handler(
+            hot_frame_provider=provider, trigger_capture=capture,
+        )
+
+        self.assertTrue(handler.ignores(self.hot_directory / "hot.jpg"))
+        self.assertTrue(handler.ignores(self.capture_directory / "frame.jpg"))
+        self.assertFalse(handler.ignores(self.ftp))
+
+        capture_only = self._worker_handler(trigger_capture=capture)
+        self.assertTrue(capture_only.ignores(self.capture_directory / "frame.jpg"))
+        self.assertFalse(capture_only.ignores(self.hot_directory / "hot.jpg"))

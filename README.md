@@ -151,6 +151,9 @@ Frames that show an empty drive are never sent to OCR (`GATE_EMPTY_SCENE_THRESHO
 frames the decoder could not finish - mostly one flat colour - are skipped as
 `outcome=skipped_corrupt` (`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION`),
 blazed frames can be skipped once a limit is chosen (`GATE_MAX_HIGHLIGHT_CLIPPING`),
+the immediate keyframe is given up when the camera's own FTP still of the same
+instant has just landed (`GATE_TRIGGER_CAPTURE_STILL_DUPLICATE_SECONDS`,
+`outcome=skipped_duplicate_still`),
 and a vehicle that was present without the gate opening is journaled as
 `gate_presence stage=unresolved`.
 
