@@ -38,6 +38,43 @@ location ~ "^/gate/whep/[A-Za-z0-9_-]{1,128}$" {
     proxy_pass http://127.0.0.1:8889;
 }
 
+# Push-to-talk publishes into the `talk` path over WHIP. Create and exact
+# teardown only: no candidate trickling, because the browser gathers its ICE
+# candidates before it offers, exactly as the WHEP client does.
+location = /talk/whip {
+    limit_except POST OPTIONS { deny all; }
+    if ($request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin "__GATE_MEDIA_ALLOWED_ORIGIN__" always;
+        add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+        add_header Vary "Origin" always;
+        return 204;
+    }
+    proxy_hide_header Access-Control-Allow-Origin;
+    add_header Access-Control-Allow-Origin "__GATE_MEDIA_ALLOWED_ORIGIN__" always;
+    add_header Vary "Origin" always;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Host $http_host;
+    proxy_pass http://127.0.0.1:8889;
+}
+
+location ~ "^/talk/whip/[A-Za-z0-9_-]{1,128}$" {
+    limit_except DELETE OPTIONS { deny all; }
+    if ($request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin "__GATE_MEDIA_ALLOWED_ORIGIN__" always;
+        add_header Access-Control-Allow-Methods "DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Authorization" always;
+        add_header Vary "Origin" always;
+        return 204;
+    }
+    proxy_hide_header Access-Control-Allow-Origin;
+    add_header Access-Control-Allow-Origin "__GATE_MEDIA_ALLOWED_ORIGIN__" always;
+    add_header Vary "Origin" always;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Host $http_host;
+    proxy_pass http://127.0.0.1:8889;
+}
+
 location / {
     return 404;
 }

@@ -22,6 +22,10 @@ IR_STATES = ("Auto", "Off")
 REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
+TALK_REASONS = (
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
+    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+)
 
 
 def default_state() -> dict:
@@ -36,11 +40,31 @@ def default_state() -> dict:
                 "effective_until": None,
                 "revert_failed": False,
             },
+            "talkback": default_talkback(),
         },
     }
 
 
-def state_document(ir_snapshot, *, now=None) -> dict:
+def default_talkback() -> dict:
+    return {"available": False, "reason": "not_enabled", "active": False}
+
+
+def talkback_document(talk_block) -> dict:
+    """Bound the talk controller's block to the exact nonsecret shape published."""
+    if not isinstance(talk_block, dict):
+        return default_talkback()
+    reason = talk_block.get("reason")
+    if reason not in TALK_REASONS:
+        reason = "camera_error"
+    available = bool(talk_block.get("available")) and reason == "ready"
+    return {
+        "available": available,
+        "reason": reason if available or reason != "ready" else "camera_error",
+        "active": bool(talk_block.get("active")),
+    }
+
+
+def state_document(ir_snapshot, *, now=None, talk_block=None) -> dict:
     """Convert an IR snapshot into the exact nonsecret heartbeat document."""
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
@@ -71,6 +95,7 @@ def state_document(ir_snapshot, *, now=None) -> dict:
                 "effective_until": effective_until,
                 "revert_failed": bool(ir_snapshot.get("revert_failed")),
             },
+            "talkback": talkback_document(talk_block),
         },
     }
 
@@ -93,9 +118,11 @@ class StatePublisher:
     def __init__(self, path, snapshot_provider, *,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
-                 clock=time.time):
+                 clock=time.time, talk_provider=None, talk_refresher=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        self._talk_provider = talk_provider
+        self._talk_refresher = talk_refresher
         self._interval_seconds = float(interval_seconds)
         self._refresher = refresher
         self._refresh_interval_seconds = float(refresh_interval_seconds)
@@ -114,7 +141,8 @@ class StatePublisher:
         self._thread.join(timeout=self._interval_seconds + 1)
 
     def publish_once(self) -> None:
-        write_state(self._path, state_document(self._snapshot_provider()))
+        talk_block = self._talk_provider() if self._talk_provider is not None else None
+        write_state(self._path, state_document(self._snapshot_provider(), talk_block=talk_block))
 
     def refresh_if_due(self) -> bool:
         """Observe the camera at most once per refresh interval. True if it ran."""
@@ -136,6 +164,13 @@ class StatePublisher:
                 # A camera that will not answer is already recorded as the
                 # controller's last error; it must never stop publication.
                 pass
+            if self._talk_refresher is not None:
+                try:
+                    # The talk probe keeps its own slow clock; a failure is its
+                    # own published reason and must never stop publication.
+                    self._talk_refresher()
+                except Exception:
+                    pass
             try:
                 self.publish_once()
             except (OSError, TypeError, ValueError):

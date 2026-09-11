@@ -17,6 +17,10 @@ _REASONS = frozenset({
     "ready", "not_configured", "service_unhealthy", "not_observed",
     "camera_busy", "camera_unreachable", "camera_error",
 })
+_TALK_REASONS = frozenset({
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
+    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+})
 _MAX_STATE_BYTES = 8 * 1024
 _MAX_TIMESTAMP_LENGTH = 40
 
@@ -62,7 +66,9 @@ def read_camera_control_state(path, *, max_age_seconds: float = 30.0, now=None) 
 def validated_camera_control(value) -> dict:
     """Return a canonical bounded camera-control object or a conservative default."""
     try:
-        if not isinstance(value, dict) or set(value) != {"available", "reason", "ir"}:
+        if (not isinstance(value, dict)
+                or not {"available", "reason", "ir"} <= set(value)
+                or not set(value) <= {"available", "reason", "ir", "talkback"}):
             raise ValueError("invalid camera control snapshot")
         available, reason = value["available"], value["reason"]
         if not isinstance(available, bool) or reason not in _REASONS:
@@ -74,7 +80,9 @@ def validated_camera_control(value) -> dict:
             raise ValueError("incoherent camera control availability")
         if available != (reason == "ready"):
             raise ValueError("incoherent camera control reason")
-        return {"available": available, "reason": reason, "ir": infrared}
+        # A service from before talkback publishes no block; that is "not enabled".
+        talkback = _parse_talkback(value.get("talkback", default_talkback()))
+        return {"available": available, "reason": reason, "ir": infrared, "talkback": talkback}
     except (TypeError, ValueError, KeyError):
         return unavailable("service_unhealthy")
 
@@ -89,7 +97,24 @@ def unavailable(reason: str) -> dict:
             "effective_until": None,
             "revert_failed": False,
         },
+        "talkback": default_talkback(),
     }
+
+
+def default_talkback() -> dict:
+    return {"available": False, "reason": "not_enabled", "active": False}
+
+
+def _parse_talkback(value) -> dict:
+    if not isinstance(value, dict) or set(value) != {"available", "reason", "active"}:
+        raise ValueError("invalid talkback snapshot")
+    available, reason, active = value["available"], value["reason"], value["active"]
+    if (not isinstance(available, bool) or not isinstance(active, bool)
+            or reason not in _TALK_REASONS):
+        raise ValueError("invalid talkback snapshot")
+    if available != (reason == "ready"):
+        raise ValueError("incoherent talkback availability")
+    return {"available": available, "reason": reason, "active": active}
 
 
 def _parse_ir(value) -> dict:

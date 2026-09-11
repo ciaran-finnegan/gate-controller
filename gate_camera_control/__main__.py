@@ -24,9 +24,11 @@ from gate_media_config import (
     validate_camera_control_environment,
 )
 
+from .baichuan import BaichuanClient
 from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker
 from .reolink import IR_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient
 from .state import STATE_PATH, StatePublisher
+from .talk import TalkBusySession, TalkController, TalkUnavailable
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -55,9 +57,14 @@ STATE_BURST = 10
 STATE_REFILL_PER_SECOND = 2.0
 IR_BURST = 6
 IR_REFILL_PER_SECOND = 0.5
+# Arming is one Baichuan login; a page cannot usefully do it more than this.
+TALK_BURST = 6
+TALK_REFILL_PER_SECOND = 0.5
 _IR_BODY_FIELDS = frozenset({"state", "lease_minutes", "ttl_seconds", "idempotency_key"})
+_TALK_BODY_FIELDS = frozenset({"max_seconds"})
 _STATE_PATHS = frozenset({"/camera/state", "/camera/ir"})
 _SNAPSHOT_PATHS = frozenset({"/camera/snap", "/camera/snapshot"})
+_TALK_PATH = "/camera/talk"
 
 
 def journal(logger, stage, **fields) -> None:
@@ -84,9 +91,10 @@ class CameraControlService:
 
     def __init__(self, controller, client, *, clock=time.time, logger=None,
                  snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS,
-                 state_rate=None, ir_rate=None):
+                 state_rate=None, ir_rate=None, talk=None, talk_rate=None):
         self._controller = controller
         self._client = client
+        self._talk = talk
         self._clock = clock
         self._logger = logger or logging.getLogger("gate_camera_control")
         self._snapshot_min_interval = float(snapshot_min_interval)
@@ -101,12 +109,59 @@ class CameraControlService:
         self._ir_limiter = ir_rate or _RateLimiter(
             IR_BURST, IR_REFILL_PER_SECOND, clock=clock
         )
+        self._talk_limiter = talk_rate or _RateLimiter(
+            TALK_BURST, TALK_REFILL_PER_SECOND, clock=clock
+        )
         self._idempotency = OrderedDict()
         self._idempotency_lock = threading.Lock()
 
     @property
     def controller(self):
         return self._controller
+
+    @property
+    def talk(self):
+        return self._talk
+
+    def talk_state(self) -> dict:
+        self._admit(self._state_limiter, "state_rate_limited")
+        return self._talk_envelope(self._talk_snapshot())
+
+    def arm_talk(self, payload) -> dict:
+        """Open one bounded talk session; the Worker then hands the browser its token."""
+        request = _parse_talk_request(payload)
+        self._admit(self._talk_limiter, "talk_rate_limited")
+        if self._talk is None:
+            raise TalkUnavailable("not_enabled")
+        snapshot = self._talk.arm(request["max_seconds"])
+        response = self._talk_envelope(snapshot)
+        response["status"] = "armed"
+        return response
+
+    def release_talk(self) -> dict:
+        self._admit(self._talk_limiter, "talk_rate_limited")
+        snapshot = self._talk_snapshot() if self._talk is None else self._talk.release()
+        response = self._talk_envelope(snapshot)
+        response["status"] = "released"
+        return response
+
+    def _talk_snapshot(self) -> dict:
+        if self._talk is None:
+            return {
+                "available": False, "reason": "not_enabled", "active": False,
+                "max_seconds": 0, "state": "idle", "session_id": None, "armed_at": None,
+                "expires_at": None, "seconds_remaining": None, "last_outcome": None,
+                "last_ended_at": None,
+            }
+        return self._talk.snapshot()
+
+    def _talk_envelope(self, talk_snapshot) -> dict:
+        return {
+            "observed_at": datetime.now(timezone.utc).replace(
+                microsecond=0
+            ).isoformat(),
+            "talk": talk_snapshot,
+        }
 
     def state(self) -> dict:
         self._admit(self._state_limiter, "state_rate_limited")
@@ -297,6 +352,18 @@ class SnapshotRateLimited(RateLimited):
     """One snapshot per interval; the caller is told exactly how long to wait."""
 
 
+def _parse_talk_request(payload) -> dict:
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict) or not set(payload) <= _TALK_BODY_FIELDS:
+        raise ValueError("invalid_request")
+    max_seconds = payload.get("max_seconds")
+    if max_seconds is not None and (isinstance(max_seconds, bool)
+                                    or not isinstance(max_seconds, int)):
+        raise ValueError("invalid_request")
+    return {"max_seconds": max_seconds}
+
+
 def _parse_ir_request(payload, max_lease_minutes) -> dict:
     if not isinstance(payload, dict) or not set(payload) <= _IR_BODY_FIELDS:
         raise ValueError("invalid_request")
@@ -357,6 +424,8 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             self._guarded(lambda: self._respond_json(200, self.server.service.state()))
         elif path in _SNAPSHOT_PATHS:
             self._guarded(self._respond_snapshot)
+        elif path == _TALK_PATH:
+            self._guarded(lambda: self._respond_json(200, self.server.service.talk_state()))
         else:
             self._respond_json(404, {"error": "not_found"})
 
@@ -369,6 +438,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             return
         if path in _STATE_PATHS and path != "/camera/ir":
             self._respond_json(405, {"error": "method_not_allowed"})
+            return
+        if path == _TALK_PATH:
+            payload = self._read_json_body(allow_empty=True)
+            if payload is _INVALID:
+                return
+            self._guarded(lambda: self._respond_json(
+                200, self.server.service.arm_talk(payload)
+            ))
             return
         if path != "/camera/ir":
             self._respond_json(404, {"error": "not_found"})
@@ -395,6 +472,10 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             self._guarded(lambda: self._respond_json(
                 200, self.server.service.state(), body_only_headers=True
             ))
+        elif path == _TALK_PATH:
+            self._guarded(lambda: self._respond_json(
+                200, self.server.service.talk_state(), body_only_headers=True
+            ))
         elif path in _SNAPSHOT_PATHS:
             # Deliberately not a snapshot: a HEAD must not spend the camera's
             # one-every-two-seconds budget to report a length nobody reads.
@@ -406,6 +487,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         self._respond_json(405, {"error": "method_not_allowed"})
 
     def do_DELETE(self):  # noqa: N802 - required by BaseHTTPRequestHandler
+        path = self._route()
+        if path is None:
+            return
+        if path == _TALK_PATH:
+            self._guarded(lambda: self._respond_json(
+                200, self.server.service.release_talk()
+            ))
+            return
         self._respond_json(405, {"error": "method_not_allowed"})
 
     def log_message(self, _format, *_arguments):
@@ -433,12 +522,16 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             return None
         return parsed.path
 
-    def _read_json_body(self):
+    def _read_json_body(self, *, allow_empty=False):
         try:
             length = int(self.headers.get("Content-Length", ""))
         except (TypeError, ValueError):
+            if allow_empty and self.headers.get("Content-Length") is None:
+                return None
             self._respond_json(400, {"error": "invalid_request"})
             return _INVALID
+        if length == 0 and allow_empty:
+            return None
         if length < 0:
             self._respond_json(400, {"error": "invalid_request"})
             return _INVALID
@@ -483,6 +576,12 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         except CameraError:
             journal(self.server.logger, "camera_error")
             self._respond_json(502, {"error": "camera_error"})
+        except TalkBusySession:
+            journal(self.server.logger, "talk_busy")
+            self._respond_json(409, {"error": "talk_busy"})
+        except TalkUnavailable as error:
+            journal(self.server.logger, "talk_unavailable", reason=error.reason)
+            self._respond_json(503, {"error": "talk_unavailable", "reason": error.reason})
         except IdempotentCallInFlight:
             # Not `completed`, and not a definite failure either: the first post
             # of this key is still talking to the camera. `502
@@ -547,8 +646,8 @@ def validated_camera_control_environment(environment) -> dict[str, str]:
 
 
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
-                  logger=None, connection_factory=None,
-                  clock=time.time) -> CameraControlService:
+                  logger=None, connection_factory=None, clock=time.time,
+                  talk_client_factory=None, talk_options=None) -> CameraControlService:
     """Wire the client and the IR controller from validated settings.
 
     One clock is threaded through the whole service -- the token bucket, the
@@ -576,7 +675,20 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         clock=clock,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
-    return CameraControlService(controller, client, clock=clock, logger=logger)
+    talk = None
+    if settings.get("GATE_CAMERA_TALK_ENABLED") == "true":
+        talk = TalkController(
+            talk_client_factory or (lambda: BaichuanClient(
+                settings["GATE_CAMERA_HOST"],
+                settings["GATE_CAMERA_USERNAME"],
+                settings["GATE_CAMERA_PASSWORD"],
+            )),
+            max_seconds=int(settings["GATE_CAMERA_TALK_MAX_SECONDS"]),
+            clock=clock,
+            journal=lambda stage, **fields: journal(logger, stage, **fields),
+            **(talk_options or {}),
+        )
+    return CameraControlService(controller, client, clock=clock, logger=logger, talk=talk)
 
 
 def main(argv=None) -> int:
@@ -612,16 +724,21 @@ def main(argv=None) -> int:
     service.controller.restore_default_on_start()
     server = CameraControlServer((arguments.host, arguments.port), service, logger=logger)
     reverts = RevertWorker(service.controller)
+    talk = service.talk
     publisher = StatePublisher(
         arguments.state_path, service.controller.snapshot,
         # One bounded observation behind the publication, so an idle camera is
         # reported as it is rather than as never-observed until someone asks.
         refresher=service.controller.refresh_observation,
+        talk_provider=None if talk is None else talk.state_block,
+        talk_refresher=None if talk is None else talk.refresh_if_due,
     )
     journal(logger, "started", port=arguments.port,
             ir_default=service.controller.default_state,
             lease_default_minutes=service.controller.default_lease_minutes,
-            lease_max_minutes=service.controller.max_lease_minutes)
+            lease_max_minutes=service.controller.max_lease_minutes,
+            talk_enabled=talk is not None,
+            talk_max_seconds=None if talk is None else talk.max_seconds)
     reverts.start()
     publisher.start()
     try:
@@ -629,6 +746,8 @@ def main(argv=None) -> int:
     finally:
         publisher.stop()
         reverts.stop()
+        if talk is not None:
+            talk.stop()
         server.server_close()
     return 0
 

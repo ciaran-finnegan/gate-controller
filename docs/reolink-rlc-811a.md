@@ -24,9 +24,11 @@ Values are from Reolink's specification sheets. The sensors are close in size
 and resolution, so per-pixel image quality is similar rather than identical.
 The gain from the RLC-811A is entirely
 framing: the zoom puts more of the 3840-pixel frame width on the plate. Two-way
-audio is a separate concern; the media stack keeps talkback
-`hardware_unverified` until a physical backchannel acceptance test on the
-RLC-811A is complete.
+audio is a separate concern: the push-to-talk path is designed and implemented
+in [Push-to-talk](talkback.md), but the media stack keeps talkback
+`hardware_unverified` until the supervised acceptance test in that document
+has been done on the fitted RLC-811A. Record the date, firmware and negotiated
+format here when it passes.
 
 ## Single-Camera Controller
 

@@ -1224,8 +1224,10 @@ The only integration is the nonsecret, atomically replaced
 `/run/gate-media/capabilities.json` snapshot. The controller treats a missing,
 stale, or malformed snapshot as unavailable media and continues its normal
 heartbeat. `video`, `listen`, and `talkback` are independent. All default to
-false; talkback remains `hardware_unverified` until a separate physical
-backchannel acceptance test is complete.
+false. Talkback is `ready` only when the camera-control service has proved the
+camera's talk channel (see [Push-to-talk](talkback.md)) and `verified` only
+after the supervised acceptance test in that document sets
+`GATE_MEDIA_TALKBACK_VERIFIED=true`.
 
 Create the two operator-managed root-owned environments before enabling the
 services. Both must remain regular non-symlink `root:root` mode `0600` files
@@ -1253,7 +1255,11 @@ GATE_MEDIA_VIDEO_VERIFIED=false
 GATE_MEDIA_LISTEN_CONFIGURED=false
 GATE_MEDIA_LISTEN_VERIFIED=false
 GATE_MEDIA_TALKBACK_CONFIGURED=false
+GATE_MEDIA_TALKBACK_VERIFIED=false
 ```
+
+`GATE_MEDIA_TALKBACK_VERIFIED` is the one optional key: a file without it
+validates and reads as `false`.
 
 The static gateway environment contains exactly these MediaMTX 1.19.3 overrides.
 `MTX_PATHS_CAMERA_SOURCE` and `MTX_PATHS_CLEAR_SOURCE` must use `rtsp` or
@@ -1492,8 +1498,9 @@ usable from the intended remote network, and verify teardown. Test listen
 separately and confirm the published gate path reports Opus, G722, or G711
 before enabling its configured/verified flags; AAC and AC-3 do not count as
 browser-listen readiness. Restart the auth service only after those checks.
-Talkback remains false and
-`hardware_unverified` until the separate physical backchannel acceptance test.
+Talkback stays `hardware_unverified` until the supervised acceptance test in
+[Push-to-talk](talkback.md#acceptance-test--supervised-at-the-gate) has passed
+on the fitted camera; only then set `GATE_MEDIA_TALKBACK_VERIFIED=true`.
 The sidecar requires every field in the MediaMTX 1.19.3 auth schema, protocol
 `webrtc`, action `read`, controller `primary`, and path `gate`; it does not log
 tokens, camera URLs, passwords, or request bodies.

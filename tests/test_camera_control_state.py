@@ -33,7 +33,7 @@ def _controller_reasons():
     return _REASONS
 
 
-def ready_document(now=None, **overrides):
+def ready_document(now=None, talk_block=None, **overrides):
     snapshot = {
         "state": "Off",
         "default": "Off",
@@ -43,7 +43,9 @@ def ready_document(now=None, **overrides):
         "last_error": None,
     }
     snapshot.update(overrides)
-    return state_document(snapshot, now=time.time() if now is None else now)
+    return state_document(
+        snapshot, now=time.time() if now is None else now, talk_block=talk_block,
+    )
 
 
 class CameraControlStateFileTests(unittest.TestCase):
@@ -77,7 +79,44 @@ class CameraControlStateFileTests(unittest.TestCase):
                 "effective_until": "2026-09-07T21:10:00+00:00",
                 "revert_failed": False,
             },
+            "talkback": {"available": False, "reason": "not_enabled", "active": False},
         }, block)
+
+    def test_the_talkback_block_is_optional_and_held_to_its_own_coherence_rule(self):
+        """A pre-talkback service publishes no block; that reads as not enabled.
+
+        A block that is present must be exactly its three keys, a known reason,
+        and `available` only when the reason is `ready`, so the heartbeat can
+        never claim a talk path the camera-control service did not prove.
+        """
+        legacy = ready_document()["camera_control"]
+        del legacy["talkback"]
+        self.assertEqual(
+            {"available": False, "reason": "not_enabled", "active": False},
+            validated_camera_control(legacy)["talkback"],
+        )
+        ready = ready_document(talk_block={
+            "available": True, "reason": "ready", "active": True,
+        })["camera_control"]
+        self.assertEqual(
+            {"available": True, "reason": "ready", "active": True},
+            validated_camera_control(ready)["talkback"],
+        )
+        for talkback in (
+            {"available": True, "reason": "camera_unreachable", "active": False},
+            {"available": False, "reason": "ready", "active": False},
+            {"available": True, "reason": "ready"},
+            {"available": True, "reason": "ready", "active": False, "extra": 1},
+            {"available": "yes", "reason": "ready", "active": False},
+            {"available": True, "reason": "wonderful", "active": False},
+            "ready",
+        ):
+            block = ready_document()["camera_control"]
+            block["talkback"] = talkback
+            with self.subTest(talkback=talkback):
+                self.assertEqual(
+                    unavailable("service_unhealthy"), validated_camera_control(block)
+                )
 
     def test_a_missing_file_reads_as_not_configured_rather_than_off(self):
         block = read_camera_control_state(self.path)
@@ -463,7 +502,10 @@ class CameraControlDeploymentTests(unittest.TestCase):
         block = document["camera_control"]
 
         self.assertEqual({"observed_at", "camera_control"}, set(document))
-        self.assertEqual({"available", "reason", "ir"}, set(block))
+        # `talkback` is the one addition since #36: the Worker keeps unknown
+        # keys rather than dropping the block, and reads this one for talk.
+        self.assertEqual({"available", "reason", "ir", "talkback"}, set(block))
+        self.assertEqual({"available", "reason", "active"}, set(block["talkback"]))
         self.assertEqual(
             {"state", "default", "effective_until", "revert_failed"}, set(block["ir"])
         )

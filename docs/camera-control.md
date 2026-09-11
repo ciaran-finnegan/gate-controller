@@ -2,9 +2,11 @@
 
 `gate-camera-control` is the only process in the deployment that holds Reolink
 camera API credentials. It exposes a small loopback HTTP surface so the Gate Mate
-Worker can read the IR illuminator state, take a bounded IR lease, and fetch one
-on-demand 4K still — without the browser, the Worker, or the gate controller ever
-holding a camera credential.
+Worker can read the IR illuminator state, take a bounded IR lease, fetch one
+on-demand 4K still, and arm one bounded push-to-talk session — without the
+browser, the Worker, or the gate controller ever holding a camera credential.
+Push-to-talk has its own document, [Push-to-talk](talkback.md); this one covers
+the service, and only names where talkback plugs into it.
 
 Companion issues: gate-controller#92 (this service) and access-gate-ui#33 (the
 Worker routes, the D1 audit, and the Live UI).
@@ -27,9 +29,12 @@ to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
 reboot: the lease record lives on durable storage, and a start that finds no
 usable record reads the camera once and puts it back if it disagrees. The
 service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
-exposure is a measured setting and stays a reviewed, on-Pi operation. The camera
-command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`, `Snap`, and
-no request body can widen it.
+exposure is a measured setting and stays a reviewed, on-Pi operation. The
+`api.cgi` command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`,
+`Snap`, and no request body can widen it. The Baichuan (port 9000) message set
+used for push-to-talk is closed the same way — `Login`, `Logout`,
+`TalkAbility`, `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all
+unless `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
 
 ## Security model
 
@@ -80,6 +85,8 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `GET /camera/state` (and `GET /camera/ir`) | 10 at once, then 2 a second |
 | `POST /camera/ir` | 6 at once, then 1 every 2 s |
 | `GET /camera/snap` | 1 every 2 s, service-wide |
+| `POST /camera/talk` | 6 at once, then 1 every 2 s |
+| `GET /camera/talk` | shares the state budget |
 
 ### `GET /camera/state` — also served at `GET /camera/ir`
 
@@ -181,6 +188,14 @@ camera's `Snap` API (a few hundred KB, about 0.45 s). Rate limited to **one per
 2 s** service-wide. The service stores nothing; retention, if any, is the
 Worker's decision.
 
+### `GET`, `POST`, `DELETE /camera/talk`
+
+Push-to-talk: arm one bounded session, read it, end it. The contract, the
+session states and the two extra errors (`409 talk_busy`, `503
+talk_unavailable`) are in [talkback.md § HTTP contract](talkback.md#http-contract-camera-control-service).
+With talk not enabled, `GET` reports `reason: not_enabled` and `POST` is
+`503 talk_unavailable`.
+
 ### Errors
 
 | Status | Body | When |
@@ -243,6 +258,9 @@ from its cached observation — it never calls the camera to publish:
 `reason` is one of `ready`, `not_observed`, `camera_busy`, `camera_unreachable`,
 `camera_error`. `available` is true exactly when `ir.state` is a real state and
 `reason` is `ready`. The file names no camera, no address, and no credential.
+Since push-to-talk the block also carries
+`"talkback": {"available": false, "reason": "not_enabled", "active": false}`;
+its reasons and its coherence rule are in [talkback.md](talkback.md#capability-flow).
 
 `not_observed` means the service is running and nothing has failed — it simply
 has not called the camera yet. It is deliberately distinct from
@@ -278,6 +296,8 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_DEFAULT` | no | `Off` | exactly `Auto` or `Off` |
 | `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum |
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
+| `GATE_CAMERA_TALK_ENABLED` | no | `false` | exactly `true` or `false`; with `false` the service never opens the camera's port 9000 |
+| `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session |
 
 Validate a file without starting the service:
 
@@ -311,6 +331,9 @@ gate_camera_control stage=snapshot bytes=284119 outcome=completed
 gate_camera_control stage=snapshot_rate_limited retry_after=2
 gate_camera_control stage=state_rate_limited retry_after=1
 gate_camera_control stage=ir_rate_limited retry_after=2
+gate_camera_control stage=talk_probe outcome=ready
+gate_camera_control stage=talk_armed max_seconds=30 session=3f2a9c1d0b7e
+gate_camera_control stage=talk_ended blocks=214 reason=publisher_gone seconds=14.1 session=3f2a9c1d0b7e
 ```
 
 No credential, token, camera address, or camera payload ever appears — the same
@@ -388,7 +411,8 @@ From a git checkout, `--source "$PWD"` does the same thing.
 
 It creates the `gate-camera-control` system user, refuses it if it is in `gpio`
 or shares a group with the media or controller services, publishes
-`/usr/local/lib/gate-camera-control`, installs the unit and the `/32` drop-in
+`/usr/local/lib/gate-camera-control` (every module of the package, the talk
+client included), installs the unit and the `/32` drop-in
 derived from `GATE_CAMERA_HOST`, creates `/run/gate-camera` and the durable
 `/var/lib/gate-camera` (0700) through `/etc/tmpfiles.d/gate-camera.conf` —
 the unit's `StateDirectory=gate-camera` creates the latter too — then enables
