@@ -4,7 +4,8 @@ This document was written for the RLC-810A: fixed 4 mm lens, no optical zoom,
 no two-way audio. That unit was removed on 2026-09-11 and the installed gate
 camera is now an RLC-811A on the same mount; the RLC-810A is the rollback
 unit. The gate has one Ethernet port, so only one camera can be fitted. The
-RLC-811A's zoom framing, exposure, capture point, and cutover are covered in
+RLC-811A's zoom framing, exposure, capture point, cutover, and the settings
+actually applied to the fitted unit are covered in
 [RLC-811A gate camera swap](reolink-rlc-811a.md). Everything below applies to
 whichever camera is fitted unless that document says otherwise.
 
