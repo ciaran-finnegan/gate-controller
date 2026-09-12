@@ -19,6 +19,7 @@ import gate_camera_control.__main__ as camera_control_main
 from gate_camera_control.__main__ import (
     IR_BURST,
     SNAPSHOT_MIN_INTERVAL_SECONDS,
+    SPOTLIGHT_BURST,
     STATE_BURST,
     CameraControlHandler,
     CameraControlServer,
@@ -35,6 +36,7 @@ from gate_camera_control.reolink import (
     ReolinkClient,
     TokenCache,
 )
+from gate_camera_control.spotlight import SpotlightController
 from gate_camera_control.state import StatePublisher, state_document
 from gate_media_config import (
     MediaConfigError,
@@ -61,10 +63,22 @@ def self_signed_certificate(directory):
 
 
 class FakeCamera:
-    """A stand-in for the RLC-810A api.cgi surface, with its 502 login behaviour."""
+    """A stand-in for the Reolink api.cgi surface, with its 502 login behaviour.
+
+    The white-light half is the RLC-811A's, read off the fitted unit on
+    firmware v3.1.0.4695: `GetWhiteLed` answers a `WhiteLed` object carrying a
+    `LightingSchedule` and a `wlAiDetectType` beside `state`, `mode` and
+    `bright`, and `SetWhiteLed` answers `{"rspCode": 200}`.
+    """
 
     def __init__(self, *, certificate=None):
         self.ir_state = "Off"
+        # The camera speaks integers here: 1 lit, 0 dark. `mode` 0 is manual,
+        # 1 is the camera's own "auto on AI detection at night".
+        self.spotlight_state = 0
+        self.spotlight_mode = 1
+        self.spotlight_brightness = 85
+        self.spotlight_writes = []
         self.logins = 0
         self.commands = []
         self.tokens = set()
@@ -133,6 +147,26 @@ class FakeCamera:
             if command == "SetIrLights":
                 self.ir_state = payload[0]["param"]["IrLights"]["state"]
                 return 200, _command_response("SetIrLights", None)
+            if command == "GetWhiteLed":
+                return 200, _command_response("GetWhiteLed", {"WhiteLed": {
+                    "LightingSchedule": {
+                        "EndHour": 6, "EndMin": 0, "StartHour": 18, "StartMin": 0,
+                    },
+                    "bright": self.spotlight_brightness,
+                    "channel": 0,
+                    "mode": self.spotlight_mode,
+                    "state": self.spotlight_state,
+                    "wlAiDetectType": {
+                        "dog_cat": 0, "face": 0, "people": 1, "vehicle": 1,
+                    },
+                }})
+            if command == "SetWhiteLed":
+                white_led = payload[0]["param"]["WhiteLed"]
+                self.spotlight_writes.append(dict(white_led))
+                self.spotlight_state = white_led["state"]
+                self.spotlight_mode = white_led["mode"]
+                self.spotlight_brightness = white_led["bright"]
+                return 200, _command_response("SetWhiteLed", {"rspCode": 200})
             return 200, _authentication_failure(command)
 
     def snapshot(self, token):
@@ -252,6 +286,10 @@ class CameraControlEnvironmentTests(unittest.TestCase):
         self.assertEqual("Off", settings["GATE_CAMERA_IR_DEFAULT"])
         self.assertEqual("10", settings["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"])
         self.assertEqual("60", settings["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
+        # Both lights default to Off, and the spotlight's brightness is the one
+        # setting a request cannot reach: it is installation configuration.
+        self.assertEqual("Off", settings["GATE_CAMERA_SPOTLIGHT_DEFAULT"])
+        self.assertEqual("100", settings["GATE_CAMERA_SPOTLIGHT_BRIGHTNESS"])
 
     def test_invalid_camera_control_environments_fail_closed(self):
         base = {
@@ -271,6 +309,15 @@ class CameraControlEnvironmentTests(unittest.TestCase):
             {**base, "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "30",
              "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "10"},
             {"GATE_CAMERA_HOST": "192.168.0.54", "GATE_CAMERA_USERNAME": "gate"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_DEFAULT": "on"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_DEFAULT": "Auto"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_DEFAULT": ""},
+            {**base, "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "0"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "101"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "100.0"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "bright"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "090"},
+            {**base, "GATE_CAMERA_SPOTLIGHT_LEASE_MAX_MINUTES": "30"},
         ]
 
         for values in rejected:
@@ -908,6 +955,350 @@ class IrLeaseTests(unittest.TestCase):
         self.assertEqual(4, self.journal.stages().count("ir_set"))
 
 
+class SpotlightLeaseTests(unittest.TestCase):
+    """The white spotlight, held to exactly the illuminator's safety model.
+
+    Every rule proved for IR is proved again here rather than assumed from the
+    shared implementation: these are the rules that keep a light from being left
+    burning at the gate, and they are worth asserting on the light that can
+    actually be seen from the road.
+    """
+
+    def setUp(self):
+        self.camera = FakeCamera()
+        self.addCleanup(self.camera.close)
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.clock = ManualClock()
+        self.journal = RecordingJournal()
+
+    def client(self):
+        return ReolinkClient(
+            self.camera.host, "gate", "s3cret",
+            token_path=Path(self.directory.name) / "token.json",
+            clock=self.clock, connection_factory=self.camera.connection_factory,
+        )
+
+    def build(self, client=None, **overrides):
+        settings = {
+            "default_state": "Off",
+            "brightness": 100,
+            "lease_path": Path(self.directory.name) / "spotlight-lease.json",
+            "default_lease_minutes": 10,
+            "max_lease_minutes": 60,
+            "clock": self.clock,
+            "journal": lambda stage, **fields: journal(self.journal, stage, **fields),
+        }
+        settings.update(overrides)
+        return SpotlightController(client or self.client(), **settings)
+
+    def lease_path(self):
+        return Path(self.directory.name) / "spotlight-lease.json"
+
+    def test_a_lease_lights_the_gate_and_reverts_when_it_expires(self):
+        controller = self.build()
+
+        controller.set_state("On", 10)
+        self.assertEqual(1, self.camera.spotlight_state)
+
+        self.clock.advance(599)
+        self.assertFalse(controller.run_due_revert())
+        self.assertEqual(1, self.camera.spotlight_state)
+
+        self.clock.advance(2)
+        self.assertTrue(controller.run_due_revert())
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertIsNone(controller.snapshot()["effective_until"])
+        self.assertIn("spotlight_set", self.journal.stages())
+        self.assertIn("spotlight_revert", self.journal.stages())
+
+    def test_every_write_pins_manual_mode_and_the_configured_brightness(self):
+        """`mode 1` is the camera lighting the gate on its own at night.
+
+        Leaving it set would let the camera re-arm the lamp behind an expired
+        lease, which is precisely the state this module exists to make
+        impossible. The schedule and the AI detection types are the operator's
+        own configuration and are never echoed back, because a copy this
+        service invented would overwrite them.
+        """
+        controller = self.build(brightness=40)
+
+        controller.set_state("On", 5)
+        controller.set_state("Off", 5)
+
+        self.assertEqual(2, len(self.camera.spotlight_writes))
+        for write in self.camera.spotlight_writes:
+            with self.subTest(write=write):
+                self.assertEqual(0, write["mode"])
+                self.assertEqual(40, write["bright"])
+                self.assertEqual(0, write["channel"])
+                self.assertEqual(
+                    {"channel", "state", "mode", "bright"}, set(write)
+                )
+        self.assertEqual([1, 0], [w["state"] for w in self.camera.spotlight_writes])
+
+    def test_setting_the_default_state_clears_the_lease_immediately(self):
+        controller = self.build()
+        controller.set_state("On", 30)
+
+        snapshot = controller.set_state("Off", 30)
+
+        self.assertIsNone(snapshot["effective_until"])
+        self.assertFalse(self.lease_path().exists())
+        self.assertEqual(0, self.camera.spotlight_state)
+
+    def test_a_restart_during_a_lease_reverts_before_the_service_answers(self):
+        controller = self.build()
+        controller.set_state("On", 30)
+        self.assertTrue(self.lease_path().exists())
+
+        restarted = self.build()
+        self.assertEqual(1, self.camera.spotlight_state)
+        restarted.restore_default_on_start()
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertFalse(self.lease_path().exists())
+        self.assertIn("spotlight_startup_revert", self.journal.stages())
+
+    def test_a_lease_record_lost_with_the_reboot_still_ends_the_lease(self):
+        controller = self.build()
+        controller.set_state("On", 60)
+        self.lease_path().unlink()
+
+        restarted = self.build()
+        restarted.restore_default_on_start()
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertIsNone(restarted.snapshot()["effective_until"])
+        self.assertIn("spotlight_startup_reconcile", self.journal.stages())
+
+    def test_a_restart_with_no_outstanding_lease_never_writes_to_the_camera(self):
+        controller = self.build()
+
+        controller.restore_default_on_start()
+
+        self.assertEqual(["GetWhiteLed"], self.camera.commands)
+        self.assertEqual([], self.camera.spotlight_writes)
+
+    def test_an_ir_record_found_in_the_spotlight_path_is_corrupt_not_a_lease(self):
+        """`Auto` is not a state this light can hold.
+
+        A record naming it is not a spotlight lease, whatever wrote it, and
+        reading it as "no lease" would leave the lamp wherever it was.
+        """
+        self.lease_path().write_text(
+            json.dumps({
+                "state": "Auto", "expires_at": self.clock.now + 60,
+                "set_at": self.clock.now,
+            }),
+            encoding="utf-8",
+        )
+        self.camera.spotlight_state = 1
+
+        controller = self.build()
+
+        self.assertIn("spotlight_lease_corrupt", self.journal.stages())
+
+        controller.restore_default_on_start()
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertFalse(self.lease_path().exists())
+
+    def test_lease_bounds_are_enforced_and_the_default_is_used_when_omitted(self):
+        controller = self.build()
+
+        controller.set_state("On")
+        self.assertEqual(600, controller.snapshot()["lease_seconds_remaining"])
+
+        for invalid in (0, -1, 61, 1.5, True, "10"):
+            with self.subTest(lease=invalid):
+                with self.assertRaises(ValueError):
+                    controller.set_state("On", invalid)
+        for invalid in ("Auto", "on", "", None):
+            with self.subTest(state=invalid):
+                with self.assertRaises(ValueError):
+                    controller.set_state(invalid, 5)
+
+    def test_the_published_snapshot_carries_the_configured_brightness(self):
+        controller = self.build(brightness=65)
+
+        controller.set_state("On", 5)
+        snapshot = controller.snapshot()
+
+        self.assertEqual(65, snapshot["brightness"])
+        self.assertEqual("On", snapshot["state"])
+        self.assertEqual("Off", snapshot["default"])
+        self.assertEqual(300, snapshot["lease_seconds_remaining"])
+
+    def test_the_shared_lease_minutes_bound_the_spotlight_as_well(self):
+        """One pair of knobs for both lights, and it is the IR pair.
+
+        `GATE_CAMERA_IR_LEASE_*` is documented as bounding every light; a
+        spotlight that quietly kept its own 60 minutes would be a second answer
+        to a question the operator has already answered once.
+        """
+        service = build_service(
+            {
+                "GATE_CAMERA_HOST": "192.168.0.54",
+                "GATE_CAMERA_USERNAME": "gate",
+                "GATE_CAMERA_PASSWORD": "s3cret",
+                "GATE_CAMERA_IR_DEFAULT": "Off",
+                "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "2",
+                "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "5",
+                "GATE_CAMERA_SPOTLIGHT_DEFAULT": "Off",
+                "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "70",
+            },
+            token_path=Path(self.directory.name) / "built-token.json",
+            lease_path=Path(self.directory.name) / "built-lease.json",
+            spotlight_lease_path=Path(self.directory.name) / "built-spotlight.json",
+            logger=self.journal, clock=self.clock,
+        )
+
+        self.assertEqual(5, service.spotlight.max_lease_minutes)
+        self.assertEqual(2, service.spotlight.default_lease_minutes)
+        self.assertEqual(
+            service.controller.max_lease_minutes, service.spotlight.max_lease_minutes
+        )
+        self.assertEqual(70, service.spotlight.brightness)
+        self.assertEqual("Off", service.spotlight.default_state)
+
+    def test_an_invalid_brightness_is_refused_at_construction(self):
+        for invalid in (0, 101, -1, 1.5, True, "100", None):
+            with self.subTest(brightness=invalid):
+                with self.assertRaises(ValueError):
+                    self.build(brightness=invalid)
+
+    def test_an_indeterminate_set_still_leaves_a_lease_that_will_revert(self):
+        controller = self.build()
+        self.camera.command_status = 502
+
+        with self.assertRaises(CameraError):
+            controller.set_state("On", 5)
+
+        # The camera may have lit the lamp before failing to answer, so a
+        # restart has to find a record and put it out.
+        self.assertTrue(self.lease_path().exists())
+        self.camera.command_status = 200
+        self.camera.spotlight_state = 1
+        self.clock.advance(61)
+
+        restarted = self.build()
+        restarted.restore_default_on_start()
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertFalse(self.lease_path().exists())
+
+    def test_a_refusing_camera_leaves_the_state_unknown_rather_than_off(self):
+        controller = self.build()
+        self.assertTrue(controller.refresh_observation())
+        self.camera.command_status = 500
+
+        with self.assertRaises(CameraError):
+            controller.set_state("On", 10)
+
+        snapshot = controller.snapshot()
+        self.assertEqual("unknown", snapshot["state"])
+        self.assertEqual("camera_error", snapshot["last_error"])
+
+    def test_an_open_breaker_holds_the_reads_off_the_camera_entirely(self):
+        client = self.client()
+        controller = self.build(client)
+        controller.refresh_observation()
+        self.camera.command_status = 502
+
+        with self.assertRaises(CameraBusy):
+            controller.set_state("On", 5)
+
+        self.assertEqual(60, client.breaker_seconds_remaining())
+        reads = self.camera.commands.count("GetWhiteLed")
+        self.assertFalse(controller.refresh_observation())
+        self.assertEqual(reads, self.camera.commands.count("GetWhiteLed"))
+        self.assertEqual("camera_busy", controller.snapshot()["last_error"])
+
+    def test_a_failed_revert_is_retried_with_backoff_and_stays_visible(self):
+        controller = self.build()
+        controller.set_state("On", 1)
+        self.clock.advance(61)
+        self.camera.command_status = 502
+
+        self.assertFalse(controller.run_due_revert())
+        self.assertTrue(controller.snapshot()["revert_failed"])
+
+        self.camera.command_status = 200
+        self.clock.advance(61)
+
+        self.assertTrue(controller.run_due_revert())
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertFalse(controller.snapshot()["revert_failed"])
+
+    def test_the_two_lights_keep_separate_records_and_separate_leases(self):
+        """One file each. A spotlight lease must never revert the illuminator.
+
+        They also expire apart: the light an operator asked for stays on for as
+        long as they asked, whatever the other light happens to be doing.
+        """
+        client = self.client()
+        infrared = IrController(
+            client,
+            default_state="Off",
+            lease_path=Path(self.directory.name) / "lease.json",
+            default_lease_minutes=10, max_lease_minutes=60, clock=self.clock,
+            journal=lambda stage, **fields: journal(self.journal, stage, **fields),
+        )
+        spotlight = self.build(client)
+
+        infrared.set_state("Auto", 30)
+        spotlight.set_state("On", 5)
+
+        ir_lease = Path(self.directory.name) / "lease.json"
+        self.assertTrue(ir_lease.exists())
+        self.assertTrue(self.lease_path().exists())
+        self.assertEqual(
+            "Auto", json.loads(ir_lease.read_text(encoding="utf-8"))["state"]
+        )
+        self.assertEqual(
+            "On", json.loads(self.lease_path().read_text(encoding="utf-8"))["state"]
+        )
+
+        self.clock.advance(301)
+        self.assertTrue(spotlight.run_due_revert())
+
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertEqual("Auto", self.camera.ir_state)
+        self.assertTrue(ir_lease.exists())
+        self.assertFalse(self.lease_path().exists())
+
+    def test_the_revert_worker_thread_fires_both_lights(self):
+        client = self.client()
+        infrared = IrController(
+            client,
+            default_state="Off",
+            lease_path=Path(self.directory.name) / "lease.json",
+            default_lease_minutes=1, max_lease_minutes=60, clock=time.time,
+        )
+        spotlight = self.build(client, clock=time.time, default_lease_minutes=1)
+        for controller, state in ((infrared, "Auto"), (spotlight, "On")):
+            controller._lease = {
+                "state": state, "expires_at": time.time() - 1,
+                "set_at": time.time() - 61,
+            }
+        client.set_ir_state("Auto")
+        client.set_spotlight_state("On", 100)
+        worker = RevertWorker(infrared, spotlight, interval_seconds=0.01)
+        worker.start()
+        self.addCleanup(worker.stop)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (
+            self.camera.ir_state != "Off" or self.camera.spotlight_state != 0
+        ):
+            time.sleep(0.01)
+
+        self.assertEqual("Off", self.camera.ir_state)
+        self.assertEqual(0, self.camera.spotlight_state)
+
+
 class CameraControlHttpTests(unittest.TestCase):
     def setUp(self):
         self.camera = FakeCamera()
@@ -931,9 +1322,12 @@ class CameraControlHttpTests(unittest.TestCase):
                 "GATE_CAMERA_IR_DEFAULT": "Off",
                 "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
                 "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+                "GATE_CAMERA_SPOTLIGHT_DEFAULT": "Off",
+                "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "100",
             },
             token_path=Path(self.directory.name) / "token.json",
             lease_path=Path(self.directory.name) / "lease.json",
+            spotlight_lease_path=Path(self.directory.name) / "spotlight-lease.json",
             logger=self.journal,
             connection_factory=self.camera.connection_factory,
             clock=self.clock,
@@ -970,7 +1364,7 @@ class CameraControlHttpTests(unittest.TestCase):
                 status, payload, _ = self.json_request("GET", path)
 
                 self.assertEqual(200, status)
-                self.assertEqual({"observed_at", "ir"}, set(payload))
+                self.assertEqual({"observed_at", "ir", "spotlight"}, set(payload))
                 self.assertEqual("Off", payload["ir"]["state"])
                 self.assertEqual("Off", payload["ir"]["default"])
                 self.assertIsNone(payload["ir"]["effective_until"])
@@ -1074,7 +1468,7 @@ class CameraControlHttpTests(unittest.TestCase):
         a `503 camera_busy` is `failed`. Neither is true here.
         """
         key = "still-in-flight"
-        call, owned = self.service._reserve(key)
+        call, owned = self.service._reserve("ir", key)
         self.assertTrue(owned)
         self.assertFalse(call.event.is_set())
 
@@ -1089,6 +1483,176 @@ class CameraControlHttpTests(unittest.TestCase):
         self.assertEqual("camera_indeterminate", payload["error"])
         self.assertNotIn("status", payload)
         self.assertEqual(0, self.camera.commands.count("SetIrLights"))
+
+    def test_a_spotlight_lease_is_applied_and_echoed_with_its_expiry(self):
+        status, payload, _ = self.json_request(
+            "POST", "/camera/spotlight", {"state": "On", "lease_minutes": 5}
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual("On", payload["spotlight"]["state"])
+        self.assertEqual(300, payload["spotlight"]["lease_seconds_remaining"])
+        self.assertIsNotNone(payload["spotlight"]["effective_until"])
+        self.assertEqual(100, payload["spotlight"]["brightness"])
+        self.assertEqual(1, self.camera.spotlight_state)
+        self.assertIn("spotlight_set", self.journal.stages())
+        # The illuminator is answered in the same document and is untouched.
+        self.assertIsNone(payload["ir"]["effective_until"])
+        self.assertEqual("Off", self.camera.ir_state)
+
+    def test_the_state_document_carries_both_lights_with_their_own_fields(self):
+        self.json_request("POST", "/camera/spotlight", {"state": "On"})
+
+        _status, payload, _ = self.json_request("GET", "/camera/state")
+
+        self.assertEqual({"observed_at", "ir", "spotlight"}, set(payload))
+        self.assertEqual({
+            "state", "default", "effective_until", "lease_seconds_remaining",
+            "revert_failed", "last_error",
+        }, set(payload["ir"]))
+        self.assertEqual({
+            "state", "default", "brightness", "effective_until",
+            "lease_seconds_remaining", "revert_failed", "last_error",
+        }, set(payload["spotlight"]))
+        self.assertEqual("On", payload["spotlight"]["state"])
+        self.assertEqual("Off", payload["spotlight"]["default"])
+
+    def test_setting_the_spotlight_to_its_default_cancels_the_lease(self):
+        self.json_request("POST", "/camera/spotlight", {"state": "On"})
+
+        _status, payload, _ = self.json_request(
+            "POST", "/camera/spotlight", {"state": "Off"}
+        )
+
+        self.assertEqual("completed", payload["status"])
+        self.assertIsNone(payload["spotlight"]["effective_until"])
+        self.assertIsNone(payload["spotlight"]["lease_seconds_remaining"])
+        self.assertEqual(0, self.camera.spotlight_state)
+        self.assertIn("spotlight_revert", self.journal.stages())
+
+    def test_ttl_seconds_is_accepted_for_the_spotlight_too(self):
+        _status, payload, _ = self.json_request(
+            "POST", "/camera/spotlight", {"state": "On", "ttl_seconds": 1800}
+        )
+
+        self.assertEqual(1800, payload["spotlight"]["lease_seconds_remaining"])
+
+    def test_one_idempotency_key_at_both_lights_is_two_distinct_calls(self):
+        """A key is scoped to the light it was posted at.
+
+        Sharing the map across both lights would let a spotlight post be
+        answered from an illuminator call -- `completed`, with a document
+        saying the lamp is lit, and a dark gate.
+        """
+        key = "one-key-both-lights"
+
+        _status, first, _ = self.json_request(
+            "POST", "/camera/ir", {"state": "Auto", "idempotency_key": key}
+        )
+        _status, second, _ = self.json_request(
+            "POST", "/camera/spotlight", {"state": "On", "idempotency_key": key}
+        )
+
+        self.assertEqual(1, self.camera.commands.count("SetIrLights"))
+        self.assertEqual(1, self.camera.commands.count("SetWhiteLed"))
+        self.assertEqual(key, first["idempotency_key"])
+        self.assertEqual(key, second["idempotency_key"])
+        self.assertEqual("Auto", self.camera.ir_state)
+        self.assertEqual(1, self.camera.spotlight_state)
+
+    def test_a_replayed_spotlight_key_answers_from_the_live_lease(self):
+        body = {"state": "On", "lease_minutes": 5, "idempotency_key": "spot-123"}
+
+        _status, first, _ = self.json_request("POST", "/camera/spotlight", body)
+        writes = self.camera.commands.count("SetWhiteLed")
+        self.service.spotlight._lease["expires_at"] -= 240
+        _status, second, _ = self.json_request("POST", "/camera/spotlight", body)
+
+        self.assertEqual(writes, self.camera.commands.count("SetWhiteLed"))
+        self.assertEqual("completed", second["status"])
+        self.assertEqual("spot-123", second["idempotency_key"])
+        self.assertEqual(300, first["spotlight"]["lease_seconds_remaining"])
+        self.assertEqual(60, second["spotlight"]["lease_seconds_remaining"])
+
+    def test_bad_spotlight_input_is_rejected_without_reaching_the_camera(self):
+        writes = len(self.camera.spotlight_writes)
+        rejected = [
+            {"state": "Auto"},
+            {"state": "on"},
+            {"state": True},
+            {"state": "On", "lease_minutes": 0},
+            {"state": "On", "lease_minutes": 61},
+            {"state": "On", "lease_minutes": 10, "ttl_seconds": 600},
+            {"state": "On", "brightness": 100},
+            {"state": "On", "cmd": "SetWhiteLed"},
+            {"cmd": "SetIsp", "param": {}},
+            [],
+            "On",
+        ]
+
+        for body in rejected:
+            with self.subTest(body=body):
+                status, payload, _ = self.json_request(
+                    "POST", "/camera/spotlight", body
+                )
+                self.assertEqual(400, status)
+                self.assertEqual("invalid_request", payload["error"])
+
+        self.assertEqual(writes, len(self.camera.spotlight_writes))
+        self.assertEqual(0, self.camera.spotlight_state)
+
+    def test_each_light_has_its_own_budget_and_neither_spends_the_others(self):
+        for _ in range(IR_BURST):
+            self.assertEqual(
+                200, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
+            )
+        self.assertEqual(
+            429, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
+        )
+
+        # The illuminator's exhausted bucket says nothing about the spotlight.
+        for _ in range(SPOTLIGHT_BURST):
+            self.assertEqual(
+                200,
+                self.json_request("POST", "/camera/spotlight", {"state": "On"})[0],
+            )
+        writes = len(self.camera.spotlight_writes)
+        status, payload, headers = self.json_request(
+            "POST", "/camera/spotlight", {"state": "On"}
+        )
+
+        self.assertEqual(429, status)
+        self.assertEqual("rate_limited", payload["error"])
+        self.assertEqual(str(payload["retry_after"]), headers["Retry-After"])
+        self.assertEqual(writes, len(self.camera.spotlight_writes))
+        self.assertIn("spotlight_rate_limited", self.journal.stages())
+
+        self.clock.advance(payload["retry_after"])
+        self.assertEqual(
+            200, self.json_request("POST", "/camera/spotlight", {"state": "On"})[0]
+        )
+
+    def test_the_spotlight_path_is_write_only_and_says_so(self):
+        for method in ("GET", "PUT", "DELETE"):
+            with self.subTest(method=method):
+                status, payload, _ = self.json_request(method, "/camera/spotlight")
+
+                self.assertEqual(405, status)
+                self.assertEqual("method_not_allowed", payload["error"])
+
+    def test_a_busy_camera_refuses_the_spotlight_without_echoing_anything(self):
+        self.json_request("GET", "/camera/state")
+        self.camera.command_status = 502
+
+        status, payload, headers = self.json_request(
+            "POST", "/camera/spotlight", {"state": "On"}
+        )
+
+        self.assertEqual(503, status)
+        self.assertEqual({"error": "camera_busy", "retry_after": 60}, payload)
+        self.assertEqual("60", headers["Retry-After"])
+        self.assertNotIn("s3cret", " ".join(self.journal.lines))
 
     def test_a_stalled_connection_is_closed_rather_than_parking_a_thread(self):
         """`TasksMax=64`: twenty half-open connections used to be an outage.
@@ -1392,6 +1956,82 @@ class StateDocumentTests(unittest.TestCase):
             "last_error": "camera_unreachable",
         })["camera_control"]["reason"])
 
+    def test_both_lights_are_published_and_only_ir_decides_availability(self):
+        document = state_document(
+            {
+                "state": "Off", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": False,
+                "last_error": None,
+            },
+            {
+                "state": "unknown", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": True,
+                "brightness": 100, "last_error": "camera_error",
+            },
+            now=1_757_000_000,
+        )
+
+        block = document["camera_control"]
+
+        # The spotlight could not be read; the control as a whole is still
+        # available, because the illuminator was read and answered.
+        self.assertTrue(block["available"])
+        self.assertEqual("ready", block["reason"])
+        self.assertEqual({
+            "state": "unknown",
+            "default": "Off",
+            "effective_until": None,
+            "revert_failed": True,
+        }, block["spotlight"])
+        # Brightness is a control-surface field, not a heartbeat field: the
+        # controller-side key set is frozen and the app reads it from the
+        # service's own document.
+        self.assertNotIn("brightness", block["spotlight"])
+
+    def test_a_published_spotlight_lease_carries_its_expiry(self):
+        document = state_document(
+            {
+                "state": "Off", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": False,
+                "last_error": None,
+            },
+            {
+                "state": "On", "default": "Off",
+                "effective_until": "2026-09-11T21:14:11+00:00",
+                "lease_seconds_remaining": 300, "revert_failed": False,
+                "brightness": 100, "last_error": None,
+            },
+        )
+
+        spotlight = document["camera_control"]["spotlight"]
+
+        self.assertEqual("On", spotlight["state"])
+        self.assertEqual("2026-09-11T21:14:11+00:00", spotlight["effective_until"])
+
+    def test_the_publisher_writes_both_lights_it_is_given(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "state.json"
+        publisher = StatePublisher(
+            path,
+            lambda: {
+                "state": "Off", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": False,
+                "last_error": None,
+            },
+            spotlight_provider=lambda: {
+                "state": "On", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": False,
+                "brightness": 100, "last_error": None,
+            },
+        )
+
+        publisher.publish_once()
+
+        published = json.loads(path.read_text(encoding="utf-8"))["camera_control"]
+        self.assertEqual("On", published["spotlight"]["state"])
+        self.assertEqual("Off", published["ir"]["state"])
+
     def test_the_publisher_observes_the_camera_on_its_own_slow_timer(self):
         clock = ManualClock()
         refreshes = []
@@ -1426,13 +2066,29 @@ class ServiceFacadeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "gate_camera_control"
         text = "\n".join(
             (source / name).read_text(encoding="utf-8")
-            for name in ("__main__.py", "ir.py", "reolink.py", "state.py")
+            for name in (
+                "__main__.py", "ir.py", "lease.py", "reolink.py", "spotlight.py",
+                "state.py",
+            )
         )
 
         self.assertNotIn("SetIsp", text)
+        # The two white-light commands are the only widening this service has
+        # ever taken, and the exposure control is still not on the list: the
+        # deployed Manual `s4 g16` exposure stays a reviewed, on-Pi operation.
         self.assertIn(
-            'ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap"})',
+            "ALLOWED_COMMANDS = frozenset({\n"
+            '    "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed", '
+            '"Snap",\n'
+            "})",
             text,
+        )
+        from gate_camera_control.reolink import ALLOWED_COMMANDS
+
+        self.assertEqual(
+            {"Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed",
+             "Snap"},
+            set(ALLOWED_COMMANDS),
         )
 
     def test_the_snapshot_facade_reports_the_remaining_wait_exactly_once(self):
@@ -1442,7 +2098,8 @@ class ServiceFacadeTests(unittest.TestCase):
             "max_lease_minutes": 60, "snapshot": staticmethod(dict),
         })()
         service = CameraControlService(
-            controller, client, clock=clock, logger=RecordingJournal()
+            controller, client, spotlight=controller, clock=clock,
+            logger=RecordingJournal(),
         )
 
         self.assertEqual(JPEG, service.snapshot())

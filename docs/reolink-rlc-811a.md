@@ -167,6 +167,36 @@ If plates wash out at night, reduce exposure or gain, never add a second light.
 If they are dark, move or re-aim the lamp closer to the camera axis before
 slowing the shutter.
 
+## Fitted Unit, 2026-09-11
+
+Measured on the camera actually on the mount, firmware **v3.1.0.4695**.
+
+**Night mode is forced colour** (`Isp.dayNight=Color`), and a camera in colour
+cannot use infrared. With IR `Auto` under that mode the empty night scene reads
+brightness **0.028** — the same number IR off reads. So on this camera the IR
+control changes nothing anybody can see, and the white spotlight is the only
+light the gate service can add.
+
+The spotlight API, as this firmware answers it:
+
+- **Read** — `GetWhiteLed`, action 1, param `{"channel": 0}`. The `WhiteLed`
+  object carries `state` (1 lit, 0 dark), `mode` (0 off/manual, 1 auto on AI
+  detection at night, others are schedules), `bright` (0–100), and the
+  operator's own `LightingSchedule` and `wlAiDetectType`.
+- **Write** — `SetWhiteLed`, action 0, param
+  `{"WhiteLed": {"channel": 0, "state": 1, "mode": 0, "bright": <1-100>}}`,
+  answered `{"rspCode": 200}`. Always send `mode 0`, or the camera's own auto
+  mode re-arms the lamp behind whatever turned it on. Never send
+  `LightingSchedule` or `wlAiDetectType` back: a copy written by anything but
+  the operator overwrites their configuration.
+- Repeated `Login` calls make this firmware answer **502 for about a minute**,
+  exactly as the RLC-810A does, so a client must cache its token.
+
+`gate-camera-control` holds this light under a bounded, auto-reverting,
+default-`Off` lease — see [Gate Camera Control](camera-control.md). The two-light
+caution in "Night Light" above is why it is a manual, time-limited action and
+not a night default.
+
 ## Cutover And Rollback
 
 Only one camera is on the port at any time, so the swap is a short outage:

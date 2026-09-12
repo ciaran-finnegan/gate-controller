@@ -11,10 +11,10 @@ CAMERA_ENV=/etc/gate-camera-control.env
 CAMERA_LIBRARY=/usr/local/lib/gate-camera-control
 CAMERA_TMPFILES=/etc/tmpfiles.d/gate-camera.conf
 CAMERA_RUNTIME_ROOT=/run/gate-camera
-# Durable, owner-only, and deliberately not under /run: the IR lease record has
-# to survive a reboot, or a power cut during a lease leaves the separately
-# powered camera holding the leased state with nothing left that knows to
-# revert it. systemd's StateDirectory= creates it too; this is the same
+# Durable, owner-only, and deliberately not under /run: the light lease records
+# -- one for IR, one for the spotlight -- have to survive a reboot, or a power
+# cut during a lease leaves the separately powered camera holding the leased
+# state with nothing left that knows to revert it. systemd's StateDirectory= creates it too; this is the same
 # directory, declared where the rest of the layout is.
 CAMERA_STATE_ROOT=/var/lib/gate-camera
 CAMERA_SERVICE=gate-camera-control.service
@@ -165,7 +165,7 @@ publish_library() {
     "$CAMERA_LIBRARY/gate_camera_control"
   install -o root -g root -m 0644 "$SOURCE/gate_media_config.py" \
     "$CAMERA_LIBRARY/gate_media_config.py"
-  for module in __init__ __main__ atomic ir reolink state; do
+  for module in __init__ __main__ atomic ir lease reolink spotlight state; do
     install -o root -g root -m 0644 \
       "$SOURCE/gate_camera_control/$module.py" \
       "$CAMERA_LIBRARY/gate_camera_control/$module.py"
@@ -254,6 +254,7 @@ main() {
       "Populate it as root:root 0600 with GATE_CAMERA_HOST, GATE_CAMERA_USERNAME," \
       "GATE_CAMERA_PASSWORD and optionally GATE_CAMERA_IR_DEFAULT," \
       "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES, GATE_CAMERA_IR_LEASE_MAX_MINUTES," \
+      "GATE_CAMERA_SPOTLIGHT_DEFAULT, GATE_CAMERA_SPOTLIGHT_BRIGHTNESS," \
       "then re-run this installer. See docs/camera-control.md."
     trap - ERR INT TERM
     return 0

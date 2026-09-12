@@ -1414,7 +1414,8 @@ sidecar, WHIP, RTSP serving, or camera administration.
 
 ## Camera Control Service
 
-Camera *settings* (the IR illuminator and the on-demand 4K still) are owned by a
+Camera *settings* (the IR illuminator, the RLC-811A's white spotlight, and the
+on-demand 4K still) are owned by a
 separate isolated service, `gate-camera-control`, installed with
 `bash deployment/install-camera-control.sh --source <release tree>`. It is the only process
 that holds camera API credentials, in its own root-owned mode-0600

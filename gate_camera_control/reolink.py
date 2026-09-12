@@ -21,8 +21,16 @@ from .atomic import atomic_write
 
 
 API_PATH = "/cgi-bin/api.cgi"
-ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap"})
+ALLOWED_COMMANDS = frozenset({
+    "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed", "Snap",
+})
 IR_STATES = ("Auto", "Off")
+SPOTLIGHT_STATES = ("On", "Off")
+# `mode 0` is off/manual: the lamp is exactly what `state` says, and the
+# camera's own "auto on AI detection at night" (`mode 1`) cannot re-arm it.
+# Every write sends it, so nothing lights the gate behind an expiring lease.
+SPOTLIGHT_MANUAL_MODE = 0
+DEFAULT_SPOTLIGHT_BRIGHTNESS = 100
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MIN_LOGIN_INTERVAL_SECONDS = 60.0
 BREAKER_SECONDS = 60.0
@@ -195,6 +203,42 @@ class ReolinkClient:
         if state not in IR_STATES:
             raise ValueError("IR state must be Auto or Off")
         self._command("SetIrLights", 0, {"IrLights": {"state": state}})
+
+    def spotlight_state(self) -> str:
+        """Return the white spotlight's current state as `On` or `Off`.
+
+        The camera answers with an integer `state` (1 lit, 0 dark) beside a
+        `mode`, a `bright`, a `LightingSchedule` and a `wlAiDetectType`. Only
+        `state` is read, and it is mapped to the two words the lease speaks;
+        nothing else in that payload leaves this client.
+        """
+        value = self._command("GetWhiteLed", 1, {"channel": 0})
+        white_led = value.get("WhiteLed") if isinstance(value, dict) else None
+        state = white_led.get("state") if isinstance(white_led, dict) else None
+        if isinstance(state, bool) or state not in (0, 1):
+            raise CameraError("camera reported an unknown spotlight state")
+        return "On" if state == 1 else "Off"
+
+    def set_spotlight_state(
+        self, state: str, brightness: int = DEFAULT_SPOTLIGHT_BRIGHTNESS
+    ) -> None:
+        """Light or extinguish the white spotlight, always in manual mode.
+
+        `LightingSchedule` and `wlAiDetectType` are deliberately absent from the
+        write: they are the operator's own camera configuration, and echoing
+        back a copy this service invented would overwrite it.
+        """
+        if state not in SPOTLIGHT_STATES:
+            raise ValueError("spotlight state must be On or Off")
+        if (isinstance(brightness, bool) or not isinstance(brightness, int)
+                or not 1 <= brightness <= 100):
+            raise ValueError("spotlight brightness must be a whole number 1-100")
+        self._command("SetWhiteLed", 0, {"WhiteLed": {
+            "channel": 0,
+            "state": 1 if state == "On" else 0,
+            "mode": SPOTLIGHT_MANUAL_MODE,
+            "bright": int(brightness),
+        }})
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""

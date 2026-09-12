@@ -56,9 +56,16 @@ _CAMERA_CONTROL_DEFAULTS = {
     "GATE_CAMERA_IR_DEFAULT": "Off",
     "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
     "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+    # The white spotlight of the RLC-811A. The lease minutes above bound both
+    # lights: one operator asking "how long may a light stay changed" gets one
+    # answer, and a second pair of knobs would only be a second thing to get
+    # wrong.
+    "GATE_CAMERA_SPOTLIGHT_DEFAULT": "Off",
+    "GATE_CAMERA_SPOTLIGHT_BRIGHTNESS": "100",
 }
 _CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
 _CAMERA_IR_STATES = frozenset({"Auto", "Off"})
+_CAMERA_SPOTLIGHT_STATES = frozenset({"On", "Off"})
 _CAMERA_CREDENTIAL_KEYS = ("GATE_CAMERA_USERNAME", "GATE_CAMERA_PASSWORD")
 _MAX_CAMERA_LEASE_MINUTES = 60
 
@@ -331,6 +338,9 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
         raise MediaConfigError("camera credentials must be 1 to 256 bytes")
     if selected["GATE_CAMERA_IR_DEFAULT"] not in _CAMERA_IR_STATES:
         raise MediaConfigError("the IR default must be exactly Auto or Off")
+    if selected["GATE_CAMERA_SPOTLIGHT_DEFAULT"] not in _CAMERA_SPOTLIGHT_STATES:
+        raise MediaConfigError("the spotlight default must be exactly On or Off")
+    _bounded_spotlight_brightness(selected["GATE_CAMERA_SPOTLIGHT_BRIGHTNESS"])
     default_minutes = _bounded_lease_minutes(
         selected["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"]
     )
@@ -404,6 +414,15 @@ def _bounded_lease_minutes(value: str) -> int:
     if not 1 <= minutes <= _MAX_CAMERA_LEASE_MINUTES:
         raise MediaConfigError("IR lease minutes must be between 1 and 60")
     return minutes
+
+
+def _bounded_spotlight_brightness(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", value):
+        raise MediaConfigError("spotlight brightness must be a whole number")
+    brightness = int(value)
+    if not 1 <= brightness <= 100:
+        raise MediaConfigError("spotlight brightness must be between 1 and 100")
+    return brightness
 
 
 def relevant_auth_environment(environment: Mapping[str, str]) -> dict[str, str]:

@@ -2,14 +2,25 @@
 
 `gate-camera-control` is the only process in the deployment that holds Reolink
 camera API credentials. It exposes a small loopback HTTP surface so the Gate Mate
-Worker can read the IR illuminator state, take a bounded IR lease, and fetch one
-on-demand 4K still — without the browser, the Worker, or the gate controller ever
-holding a camera credential.
+Worker can read the state of the camera's two lights, take a bounded lease on
+either of them, and fetch one on-demand 4K still — without the browser, the
+Worker, or the gate controller ever holding a camera credential.
+
+The service holds **two bounded light leases**, and they behave identically:
+
+| Lease | Camera light | Endpoint | Default |
+| --- | --- | --- | --- |
+| IR | the infrared illuminator, `Auto` or `Off` | `POST /camera/ir` | `GATE_CAMERA_IR_DEFAULT` |
+| Spotlight | the RLC-811A's white lamp, `On` or `Off` | `POST /camera/spotlight` | `GATE_CAMERA_SPOTLIGHT_DEFAULT` |
+
+Each has its own durable lease record, its own budget, and its own idempotency
+keys; neither can revert or cancel the other. Both are `Off` by default, both
+auto-revert, and both are restored on start.
 
 Companion issues: gate-controller#92 (this service) and access-gate-ui#33 (the
 Worker routes, the D1 audit, and the Live UI).
 
-## Safety: IR is a recognition control, not a brightness control
+## Safety: these are recognition controls, not brightness controls
 
 Read [Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
 before changing anything here.
@@ -21,22 +32,47 @@ before changing anything here.
   the lens (left-third clipping 0.2248), which is what caused the 22:16 denial.
 - `GetIrLights` `range` is exactly `["Auto", "Off"]`. There is no brightness and
   no zone control: it is all or nothing.
+- The spotlight is a real white lamp with a 1–100 brightness, and it is the one
+  light at the gate that a person on the road can see. It is **not** a night
+  default: see the section below.
 
 Therefore every change this service accepts is a **bounded lease** that reverts
-to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
-reboot: the lease record lives on durable storage, and a start that finds no
-usable record reads the camera once and puts it back if it disagrees. The
-service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
-exposure is a measured setting and stays a reviewed, on-Pi operation. The camera
-command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`, `Snap`, and
-no request body can widen it.
+to that light's configured default, and the revert survives a service restart
+and a reboot: each lease record lives on durable storage, and a start that finds
+no usable record reads the camera once and puts the light back if it disagrees.
+The service exposes those two lights and nothing else. It never calls `SetIsp`:
+the deployed Manual `s4 g16` exposure is a measured setting and stays a
+reviewed, on-Pi operation. The camera command allowlist is exactly `Login`,
+`GetIrLights`, `SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, and no
+request body can widen it.
+
+## Why a spotlight and not IR
+
+The fitted camera is an RLC-811A running in **forced colour night mode**
+(`Isp.dayNight=Color`), and a camera in colour cannot use infrared. Measured on
+the fitted unit: with IR `Auto` under colour mode the night scene reads
+brightness **0.028** — identical to IR off. The IR lease is still here and still
+works, but on this camera and in this mode it changes nothing anybody can see.
+The white spotlight is the light that actually reaches the plate, so that is the
+light the operator now needs. See
+[Reolink RLC-811A](reolink-rlc-811a.md#night-light) and its
+[fitted-unit record](reolink-rlc-811a.md#fitted-unit-2026-09-11).
+
+**It stays a manual, time-limited action.** The PIR floodlight already lights
+the stop position, and plates are retroreflective: a second light doubles the
+return and washes the characters out — the 811A document's own instruction is to
+run one light, not two. So the spotlight is `Off` by default, every change is a
+lease that expires on its own, and nothing in this service will ever turn it on
+by schedule or on detection. Every write also pins the camera's `mode` to `0`
+(manual), so the camera's own "auto on at night" cannot re-arm the lamp behind
+an expiring lease.
 
 ## Security model
 
 | Property | How it is enforced |
 | --- | --- |
 | Camera credentials exist in exactly one file | `/etc/gate-camera-control.env`, root:root 0600, read through `gate_media_config._open_trusted_file` |
-| The controller never gains camera credentials | `file-monitor.service` reads no camera env; it learns the IR state only from the nonsecret `/run/gate-camera/state.json` |
+| The controller never gains camera credentials | `file-monitor.service` reads no camera env; it learns both lights' state only from the nonsecret `/run/gate-camera/state.json` |
 | The media gateway secret is not widened | The camera env is a **separate** file. `validate_gateway_static_environment()` pins the gateway key set, so camera-API keys cannot be bolted onto it, and the service is not in group `gate-media` |
 | Its own identity | System user and group `gate-camera-control`; the installer refuses to run if that account shares a group with the media or controller services, or with `gpio` |
 | Its own network reach | `IPAddressDeny=any` plus `IPAddressAllow=localhost` in the unit, and `IPAddressAllow=<camera>/32` in the drop-in `gate-camera-control.service.d/10-camera-address.conf`, which the validator writes itself (`camera-control --write-address-dropin`) so the address never passes through the installer's shell. `GATE_CAMERA_HOST` must be one exact reachable IPv4 address so that pin is one
@@ -79,6 +115,7 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | --- | --- |
 | `GET /camera/state` (and `GET /camera/ir`) | 10 at once, then 2 a second |
 | `POST /camera/ir` | 6 at once, then 1 every 2 s |
+| `POST /camera/spotlight` | 6 at once, then 1 every 2 s, in its **own** bucket |
 | `GET /camera/snap` | 1 every 2 s, service-wide |
 
 ### `GET /camera/state` — also served at `GET /camera/ir`
@@ -91,6 +128,15 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
     "default": "Off",
     "effective_until": "2026-09-07T21:14:11+00:00",
     "lease_seconds_remaining": 600,
+    "revert_failed": false,
+    "last_error": null
+  },
+  "spotlight": {
+    "state": "Off",
+    "default": "Off",
+    "brightness": 100,
+    "effective_until": null,
+    "lease_seconds_remaining": null,
     "revert_failed": false,
     "last_error": null
   }
@@ -106,6 +152,13 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `ir.lease_seconds_remaining` | integer \| `null` | seconds left on the lease, for a countdown |
 | `ir.revert_failed` | boolean | a revert has failed and is being retried with backoff |
 | `ir.last_error` | `"camera_busy"` \| `"camera_unreachable"` \| `"camera_error"` \| `null` | the last camera failure seen |
+| `spotlight.state` | `"On"` \| `"Off"` \| `"unknown"` | as `ir.state`, for the white lamp. **Never** assume `"Off"` from `"unknown"` |
+| `spotlight.default` | `"On"` \| `"Off"` | `GATE_CAMERA_SPOTLIGHT_DEFAULT` |
+| `spotlight.brightness` | integer 1–100 | `GATE_CAMERA_SPOTLIGHT_BRIGHTNESS`, how bright a lease burns it. Read-only: no request can change it |
+| `spotlight.effective_until`, `.lease_seconds_remaining`, `.revert_failed`, `.last_error` | | exactly as the `ir` fields above, for the spotlight's own lease |
+
+The two blocks are independent. A spotlight the camera would not answer about
+reads `"unknown"` and leaves the `ir` block — and the still — entirely alone.
 
 A read refreshes the observation from the camera when it is older than 5 s;
 otherwise it answers from the cached observation. The refresh is subject to the
@@ -122,10 +175,13 @@ thing this service must not do:
 - a queued revert or lease change takes **priority** — a read that finds one
   waiting skips the camera entirely and answers from the last observation.
 
-Separately, the state publisher makes one bounded `GetIrLights` about every 30 s
-on the cached token, behind the breaker. Without it a service that has served no
-request since a restart has never looked at the camera, and would report an
-entirely healthy camera as unavailable.
+A read observes **both** lights, so a `GET /camera/state` costs one `GetIrLights`
+and one `GetWhiteLed` on the cached token — both under the rules above.
+
+Separately, the state publisher makes one bounded read of each light about every
+30 s on the cached token, behind the breaker. Without it a service that has
+served no request since a restart has never looked at the camera, and would
+report an entirely healthy camera as unavailable.
 
 ### `POST /camera/ir`
 
@@ -170,6 +226,37 @@ A key records how its call ended, not merely that it happened:
 
 Setting `state` to the configured default cancels the lease immediately — that
 is the "revert now" action.
+
+### `POST /camera/spotlight`
+
+The white lamp, under exactly the rules above. Request body — unknown fields are
+rejected:
+
+```json
+{"state": "On", "lease_minutes": 5, "idempotency_key": "01J..."}
+```
+
+| Field | Required | Rules |
+| --- | --- | --- |
+| `state` | yes | exactly `"On"` or `"Off"` |
+| `lease_minutes` | no | integer 1–`GATE_CAMERA_IR_LEASE_MAX_MINUTES`. Omitted means `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES`. The lease bounds are **shared with IR**; the spotlight has no minutes of its own |
+| `ttl_seconds` | no | the same compatibility alias, with the same rules. Sending both is a `400` |
+| `idempotency_key` | no | 1–128 characters, **scoped to this light**. The same key posted at `/camera/ir` and at `/camera/spotlight` is two independent calls with two independent outcomes; it can never be answered from the other light's record |
+
+There is no `brightness` field, and sending one is a `400`. How bright the lamp
+burns is `GATE_CAMERA_SPOTLIGHT_BRIGHTNESS`, set once in the environment file
+where it is validated, rather than something whoever holds an app session can
+raise.
+
+Response `200`: the `GET /camera/state` document — **both** lights — plus
+`"status": "completed"`, and `"idempotency_key"` echoed when one was supplied.
+Setting `state` to `GATE_CAMERA_SPOTLIGHT_DEFAULT` cancels the lease
+immediately, exactly as it does for IR. Every other rule in `POST /camera/ir`
+above — the replay from the live lease, the four outcomes a key can record, the
+`429` release, the `502 camera_indeterminate` — applies here unchanged.
+
+The path is write-only: `GET`, `HEAD`, `PUT` and `DELETE` on `/camera/spotlight`
+answer `405`. Both lights are read together on `GET /camera/state`.
 
 ### `GET /camera/snap` — also served at `POST /camera/snap`, and `GET`/`POST /camera/snapshot`
 
@@ -235,6 +322,12 @@ from its cached observation — it never calls the camera to publish:
       "default": "Off",
       "effective_until": null,
       "revert_failed": false
+    },
+    "spotlight": {
+      "state": "Off",
+      "default": "Off",
+      "effective_until": null,
+      "revert_failed": false
     }
   }
 }
@@ -242,7 +335,25 @@ from its cached observation — it never calls the camera to publish:
 
 `reason` is one of `ready`, `not_observed`, `camera_busy`, `camera_unreachable`,
 `camera_error`. `available` is true exactly when `ir.state` is a real state and
-`reason` is `ready`. The file names no camera, no address, and no credential.
+`reason` is `ready` — **the illuminator decides both**, so a spotlight the
+camera would not answer about never takes the camera control away from the app.
+The file names no camera, no address, and no credential. `brightness` is
+deliberately not here: it is a control-surface field the app reads from
+`GET /camera/state`, and the heartbeat block's key set is frozen.
+
+Both shapes of this file are readable, in both directions, because the service
+and the controller are upgraded separately:
+
+- a document **without** `spotlight` is an older service. The controller fills
+  the block with `state: "unknown"` and **`supported: false`**, which is how the
+  app tells "this deployment has no spotlight control" from "the spotlight is
+  there and its state is not currently known";
+- a document **with** `spotlight` gets `supported: true` and the light's real
+  state.
+
+A `spotlight` that is present but malformed fails the whole document closed to
+`service_unhealthy`, exactly as a malformed `ir` block does: guessing which half
+of a document to trust is how an `unknown` becomes a reported `Off`.
 
 `not_observed` means the service is running and nothing has failed — it simply
 has not called the camera yet. It is deliberately distinct from
@@ -276,8 +387,14 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_USERNAME` | yes | — | 1–256 bytes |
 | `GATE_CAMERA_PASSWORD` | yes | — | 1–256 bytes |
 | `GATE_CAMERA_IR_DEFAULT` | no | `Off` | exactly `Auto` or `Off` |
-| `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum |
-| `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
+| `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum. **Applies to both lights** |
+| `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60. **Applies to both lights** |
+| `GATE_CAMERA_SPOTLIGHT_DEFAULT` | no | `Off` | exactly `On` or `Off`. Keep it `Off`: see "Why a spotlight and not IR" |
+| `GATE_CAMERA_SPOTLIGHT_BRIGHTNESS` | no | `100` | integer 1–100. Configuration only; no request field can change it |
+
+The lease minutes are deliberately shared. One operator asking "how long may a
+light stay changed" gets one answer, and a second pair of knobs would only be a
+second thing to get wrong.
 
 Validate a file without starting the service:
 
@@ -292,7 +409,7 @@ stdout, which systemd captures. The prefix is always `gate_camera_control` and
 values are stripped to `[A-Za-z0-9-_.:+]`, so no field can inject another:
 
 ```text
-gate_camera_control stage=started ir_default=Off lease_default_minutes=10 lease_max_minutes=60 port=8767
+gate_camera_control stage=started ir_default=Off lease_default_minutes=10 lease_max_minutes=60 port=8767 spotlight_brightness=100 spotlight_default=Off
 gate_camera_control stage=login lease_seconds=3600
 gate_camera_control stage=login_throttled retry_after=41
 gate_camera_control stage=ir_set lease_seconds=600 outcome=completed state=Auto
@@ -303,6 +420,14 @@ gate_camera_control stage=startup_reconcile observed=Auto state=Off
 gate_camera_control stage=startup_reconcile outcome=not_observed
 gate_camera_control stage=lease_corrupt state=Off
 gate_camera_control stage=ir_idempotent_in_flight
+gate_camera_control stage=spotlight_set brightness=100 lease_seconds=300 outcome=completed state=On
+gate_camera_control stage=spotlight_revert brightness=100 outcome=completed state=Off
+gate_camera_control stage=spotlight_revert attempt=2 brightness=100 outcome=camera_busy retry_after=10 state=Off
+gate_camera_control stage=spotlight_startup_revert state=Off
+gate_camera_control stage=spotlight_startup_reconcile observed=On state=Off
+gate_camera_control stage=spotlight_lease_corrupt state=Off
+gate_camera_control stage=spotlight_idempotent_in_flight
+gate_camera_control stage=spotlight_rate_limited retry_after=2
 gate_camera_control stage=breaker_open retry_after=60
 gate_camera_control stage=camera_busy retry_after=60
 gate_camera_control stage=camera_unreachable
@@ -313,12 +438,16 @@ gate_camera_control stage=state_rate_limited retry_after=1
 gate_camera_control stage=ir_rate_limited retry_after=2
 ```
 
+Each light names itself: the illuminator's stages are the ones the existing
+runbooks already grep for, and every spotlight stage is prefixed `spotlight_`.
+
 No credential, token, camera address, or camera payload ever appears — the same
 rule as the webhook listener.
 
 ```bash
 journalctl -u gate-camera-control -f
 journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
+journalctl -u gate-camera-control --since -1h | grep 'stage=spotlight_'
 ```
 
 ## Failure modes
@@ -329,7 +458,8 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | Camera unreachable | `503 camera_unreachable` and the breaker opens for 60 s, so the retries after it are `503 camera_busy`; `state.json` keeps `last_error` and its own `observed_at`, so the app says "unknown", never "Off" |
 | Nothing has called the camera yet | `state.json` reads `not_observed`, not `camera_unreachable`; the 30 s background refresh clears it without an operator doing anything |
 | A read flood during an expiring lease | reads are single-flighted, skipped while a revert is queued, and rate limited; the revert waits for at most one in-flight call |
-| Service restart mid-lease | the lease is persisted to `/var/lib/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. A lost revert timer can never leave IR in the temporary state |
+| Service restart mid-lease | each lease is persisted **before** the camera is changed — IR to `/var/lib/gate-camera/lease.json`, the spotlight to `/var/lib/gate-camera/spotlight-lease.json`; on start the service restores **both** lights to their configured defaults before it serves a single request, then clears the records. A lost revert timer can never leave a light in the temporary state |
+| One light's lease record lost, or one light refusing | the other light is unaffected: separate records, separate reverts, separate retry backoffs, and one `RevertWorker` that runs both even when one of them is failing. A record naming a state the light cannot hold — an `Auto` in the spotlight's file — is `*_lease_corrupt`, not a lease |
 | Reboot or power cut mid-lease | the record is on durable storage (`StateDirectory=gate-camera`), not in `/run`, which the boot recreates empty — the camera is separately powered, so a lease whose record died with the tmpfs would have been held indefinitely. It is reverted on the next start exactly as a service restart is |
 | The lease record is lost or unreadable anyway | on start, with no usable record, the service **reads** the camera once: a state that is not `GATE_CAMERA_IR_DEFAULT` is put back and journaled `startup_reconcile`; a state that matches it, or a camera that will not answer, is left alone. That read is one `GetIrLights` on the cached token, so a restart loop still cannot become a login storm, and nothing is ever written on the strength of a camera that could not be read. A record that exists but is unusable — bad JSON, or a timestamp outside a year either side of now — is journaled `lease_corrupt` and treated as an expired lease, so the default is restored through the ordinary revert path |
 | A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |
@@ -406,6 +536,9 @@ curl -s http://127.0.0.1:8767/camera/state
 curl -s -X POST http://127.0.0.1:8767/camera/ir \
   -H 'Content-Type: application/json' \
   -d '{"state":"Auto","lease_minutes":5}'
+curl -s -X POST http://127.0.0.1:8767/camera/spotlight \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"On","lease_minutes":1}'
 curl -s -o /tmp/gate-snap.jpg -w '%{http_code} %{content_type}\n' \
   http://127.0.0.1:8767/camera/snap
 ```
@@ -522,15 +655,22 @@ returns the deployment to exactly today's behaviour, except that the app's
 `camera_control` heartbeat block reads `not_configured`.
 
 ```bash
-# 1. Make sure IR is back at the configured default before stopping the service,
-#    because a stopped service cannot run its revert. Setting the state to the
-#    configured default *is* the cancel, so read the default rather than
-#    assuming it: GATE_CAMERA_IR_DEFAULT may be Auto, and posting a hard-coded
-#    "Off" at such a deployment creates a lease instead of ending one.
-default=$(curl -s http://127.0.0.1:8767/camera/state \
+# 1. Make sure BOTH lights are back at their configured defaults before stopping
+#    the service, because a stopped service cannot run its reverts. Setting a
+#    state to that light's configured default *is* the cancel, so read each
+#    default rather than assuming it: GATE_CAMERA_IR_DEFAULT may be Auto, and
+#    posting a hard-coded "Off" at such a deployment creates a lease instead of
+#    ending one. The spotlight is the light a stopped service would leave
+#    burning where the road can see it, so do not skip it.
+state=$(curl -s http://127.0.0.1:8767/camera/state)
+default=$(printf '%s' "$state" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["ir"]["default"])')
+spotlight_default=$(printf '%s' "$state" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["spotlight"]["default"])')
 curl -s -X POST http://127.0.0.1:8767/camera/ir \
   -H 'Content-Type: application/json' -d "{\"state\":\"$default\"}"
+curl -s -X POST http://127.0.0.1:8767/camera/spotlight \
+  -H 'Content-Type: application/json' -d "{\"state\":\"$spotlight_default\"}"
 
 # 2. Stop and disable.
 sudo systemctl disable --now gate-camera-control.service
@@ -544,10 +684,10 @@ sudo rm -f /etc/gate-camera-control.env
 sudo systemctl daemon-reload
 ```
 
-If IR was left `Auto` and the service is already gone, set it back from the Pi
-with the documented rollback in
+If a light was left on and the service is already gone, set it back from the
+camera's web interface, or for IR from the Pi with the documented rollback in
 [Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
-§ rollback, or from the camera web interface.
+§ rollback.
 
 Finally, remove the `gate-camera` ingress hostname from the tunnel config and
 delete its Access application and service token.

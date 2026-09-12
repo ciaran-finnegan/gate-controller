@@ -20,7 +20,7 @@ CPUQuota=20%
 TasksMax=64
 UMask=0077
 ReadWritePaths=/run/gate-camera
-# The IR lease record. /run is tmpfs and is recreated empty at boot, so a lease
+# The light lease records, one per light. /run is tmpfs and is recreated empty at boot, so a lease
 # kept there does not survive the power cut it most needs to survive: the camera
 # is separately powered and would hold the leased state indefinitely. This
 # directory is owner-only; nothing outside this service reads it.

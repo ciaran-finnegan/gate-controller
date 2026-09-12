@@ -19,6 +19,7 @@ PUBLISH_INTERVAL_SECONDS = 5.0
 # an operator's own request ever observed it.
 REFRESH_INTERVAL_SECONDS = 30.0
 IR_STATES = ("Auto", "Off")
+SPOTLIGHT_STATES = ("On", "Off")
 REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
@@ -30,24 +31,27 @@ def default_state() -> dict:
         "camera_control": {
             "available": False,
             "reason": "not_observed",
-            "ir": {
-                "state": "unknown",
-                "default": "Off",
-                "effective_until": None,
-                "revert_failed": False,
-            },
+            "ir": _unknown_light("Off"),
+            "spotlight": _unknown_light("Off"),
         },
     }
 
 
-def state_document(ir_snapshot, *, now=None) -> dict:
-    """Convert an IR snapshot into the exact nonsecret heartbeat document."""
+def state_document(ir_snapshot, spotlight_snapshot=None, *, now=None) -> dict:
+    """Convert the light snapshots into the exact nonsecret heartbeat document.
+
+    `available` and `reason` are the IR light's, exactly as they have always
+    been. The spotlight is reported beside it and never speaks for the service:
+    a spotlight the camera would not answer about leaves the block `unknown`
+    without taking the whole control away from the app.
+
+    With no spotlight snapshot the pre-spotlight document is rendered, which is
+    what an older build of this service published and what the controller must
+    still be able to read.
+    """
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
         state = "unknown"
-    default = ir_snapshot.get("default")
-    if default not in IR_STATES:
-        default = "Off"
     last_error = ir_snapshot.get("last_error")
     if state == "unknown":
         # A camera nobody has looked at yet is not a camera that failed. Saying
@@ -57,21 +61,45 @@ def state_document(ir_snapshot, *, now=None) -> dict:
         reason = last_error if last_error in REASONS else "not_observed"
     else:
         reason = "ready"
-    effective_until = ir_snapshot.get("effective_until")
+    camera_control = {
+        "available": state != "unknown",
+        "reason": reason,
+        "ir": _light_block(ir_snapshot, IR_STATES),
+    }
+    if spotlight_snapshot is not None:
+        camera_control["spotlight"] = _light_block(
+            spotlight_snapshot, SPOTLIGHT_STATES
+        )
+    return {
+        "observed_at": int(time.time() if now is None else now),
+        "camera_control": camera_control,
+    }
+
+
+def _light_block(snapshot, states) -> dict:
+    state = snapshot.get("state")
+    if state not in states:
+        state = "unknown"
+    default = snapshot.get("default")
+    if default not in states:
+        default = "Off"
+    effective_until = snapshot.get("effective_until")
     if not isinstance(effective_until, str):
         effective_until = None
     return {
-        "observed_at": int(time.time() if now is None else now),
-        "camera_control": {
-            "available": state != "unknown",
-            "reason": reason,
-            "ir": {
-                "state": state,
-                "default": default,
-                "effective_until": effective_until,
-                "revert_failed": bool(ir_snapshot.get("revert_failed")),
-            },
-        },
+        "state": state,
+        "default": default,
+        "effective_until": effective_until,
+        "revert_failed": bool(snapshot.get("revert_failed")),
+    }
+
+
+def _unknown_light(default: str) -> dict:
+    return {
+        "state": "unknown",
+        "default": default,
+        "effective_until": None,
+        "revert_failed": False,
     }
 
 
@@ -82,7 +110,7 @@ def write_state(path, document: dict) -> None:
 
 
 class StatePublisher:
-    """Publishes the IR state, and keeps one slow observation behind it.
+    """Publishes both lights' state, and keeps one slow observation behind them.
 
     The snapshot itself never calls the camera.  The optional `refresher` does,
     once every `refresh_interval_seconds`, on the cached login token and behind
@@ -90,12 +118,13 @@ class StatePublisher:
     as `ready` rather than sitting at `not_observed` until a request arrives.
     """
 
-    def __init__(self, path, snapshot_provider, *,
+    def __init__(self, path, snapshot_provider, *, spotlight_provider=None,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
                  clock=time.time):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        self._spotlight_provider = spotlight_provider
         self._interval_seconds = float(interval_seconds)
         self._refresher = refresher
         self._refresh_interval_seconds = float(refresh_interval_seconds)
@@ -114,7 +143,12 @@ class StatePublisher:
         self._thread.join(timeout=self._interval_seconds + 1)
 
     def publish_once(self) -> None:
-        write_state(self._path, state_document(self._snapshot_provider()))
+        spotlight = (
+            None if self._spotlight_provider is None else self._spotlight_provider()
+        )
+        write_state(
+            self._path, state_document(self._snapshot_provider(), spotlight)
+        )
 
     def refresh_if_due(self) -> bool:
         """Observe the camera at most once per refresh interval. True if it ran."""

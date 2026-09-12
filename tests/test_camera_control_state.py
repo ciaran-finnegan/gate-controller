@@ -1,6 +1,7 @@
 import configparser
 import json
 import os
+import re
 import stat
 import subprocess
 import time
@@ -33,7 +34,8 @@ def _controller_reasons():
     return _REASONS
 
 
-def ready_document(now=None, **overrides):
+def ready_document(now=None, spotlight=None, **overrides):
+    """The published document. With no `spotlight`, the pre-spotlight shape."""
     snapshot = {
         "state": "Off",
         "default": "Off",
@@ -43,7 +45,9 @@ def ready_document(now=None, **overrides):
         "last_error": None,
     }
     snapshot.update(overrides)
-    return state_document(snapshot, now=time.time() if now is None else now)
+    return state_document(
+        snapshot, spotlight, now=time.time() if now is None else now
+    )
 
 
 class CameraControlStateFileTests(unittest.TestCase):
@@ -62,6 +66,14 @@ class CameraControlStateFileTests(unittest.TestCase):
         )
 
     def test_a_fresh_ready_file_round_trips_into_the_heartbeat_block(self):
+        """The pre-spotlight file, which an older service is still writing.
+
+        The service and the controller are upgraded separately, so the file
+        without a `spotlight` has to keep working exactly as it did -- and the
+        spotlight the app is then offered must say plainly that this deployment
+        does not have one, rather than reading as a spotlight whose state is
+        merely unknown.
+        """
         write_state(self.path, ready_document(
             state="Auto", effective_until="2026-09-07T21:10:00+00:00",
         ))
@@ -77,7 +89,91 @@ class CameraControlStateFileTests(unittest.TestCase):
                 "effective_until": "2026-09-07T21:10:00+00:00",
                 "revert_failed": False,
             },
+            "spotlight": {
+                "state": "unknown",
+                "default": "Off",
+                "effective_until": None,
+                "revert_failed": False,
+                "supported": False,
+            },
         }, block)
+
+    def test_a_file_carrying_both_lights_round_trips_with_the_spotlight(self):
+        write_state(self.path, ready_document(
+            state="Auto", effective_until="2026-09-07T21:10:00+00:00",
+            spotlight={
+                "state": "On", "default": "Off",
+                "effective_until": "2026-09-07T21:12:00+00:00",
+                "lease_seconds_remaining": 120, "revert_failed": False,
+                "brightness": 100, "last_error": None,
+            },
+        ))
+
+        block = read_camera_control_state(self.path)
+
+        self.assertEqual({
+            "state": "On",
+            "default": "Off",
+            "effective_until": "2026-09-07T21:12:00+00:00",
+            "revert_failed": False,
+            "supported": True,
+        }, block["spotlight"])
+        # The illuminator is untouched by the light beside it.
+        self.assertEqual("Auto", block["ir"]["state"])
+        self.assertTrue(block["available"])
+
+    def test_a_spotlight_the_camera_will_not_answer_about_keeps_the_control(self):
+        """A spotlight failure is not a camera-control failure.
+
+        `available` and `reason` are the illuminator's, as they have always
+        been. A spotlight nobody could read must not take the IR control -- or
+        the still -- away from the app.
+        """
+        write_state(self.path, ready_document(
+            state="Off",
+            spotlight={
+                "state": "unknown", "default": "Off", "effective_until": None,
+                "lease_seconds_remaining": None, "revert_failed": True,
+                "brightness": 100, "last_error": "camera_error",
+            },
+        ))
+
+        block = read_camera_control_state(self.path)
+
+        self.assertTrue(block["available"])
+        self.assertEqual("ready", block["reason"])
+        self.assertEqual("unknown", block["spotlight"]["state"])
+        self.assertTrue(block["spotlight"]["supported"])
+        self.assertTrue(block["spotlight"]["revert_failed"])
+
+    def test_an_unreadable_spotlight_block_fails_the_whole_document_closed(self):
+        """Half a document is not a document: the reader is exact or it is out.
+
+        A `spotlight` that is present but malformed says the writer is not the
+        service this reader understands, and guessing which half to trust is
+        how an `unknown` state becomes a reported `Off`.
+        """
+        malformed = [
+            {"state": "Auto", "default": "Off",
+             "effective_until": None, "revert_failed": False},
+            {"state": "On", "default": "Auto",
+             "effective_until": None, "revert_failed": False},
+            {"state": "On", "default": "Off", "revert_failed": False},
+            {"state": "On", "default": "Off", "effective_until": None,
+             "revert_failed": False, "brightness": 100},
+            "On",
+        ]
+
+        for spotlight in malformed:
+            with self.subTest(spotlight=spotlight):
+                self.assertEqual(unavailable("service_unhealthy"),
+                                 validated_camera_control({
+                                     "available": True, "reason": "ready",
+                                     "ir": {"state": "Off", "default": "Off",
+                                            "effective_until": None,
+                                            "revert_failed": False},
+                                     "spotlight": spotlight,
+                                 }))
 
     def test_a_missing_file_reads_as_not_configured_rather_than_off(self):
         block = read_camera_control_state(self.path)
@@ -371,7 +467,71 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertIn("GATE_CAMERA_USERNAME=", template)
         self.assertIn("GATE_CAMERA_PASSWORD=", template)
         self.assertIn("GATE_CAMERA_IR_DEFAULT=Off", template)
+        self.assertIn("GATE_CAMERA_SPOTLIGHT_DEFAULT=Off", template)
+        self.assertIn("GATE_CAMERA_SPOTLIGHT_BRIGHTNESS=100", template)
         self.assertNotIn("MTX_", template)
+
+    def test_the_installer_publishes_every_module_the_service_imports(self):
+        """A module left out of the list is an ImportError on the Pi only.
+
+        The published library is an explicit file list, not a directory copy,
+        so adding a module to the package is not enough: a release that misses
+        one starts the service against half a package and `Restart=always`
+        turns that into a crash loop with camera credentials on disk.
+        """
+        installer = (
+            REPOSITORY_ROOT / "deployment/install-camera-control.sh"
+        ).read_text(encoding="utf-8")
+        package = REPOSITORY_ROOT / "gate_camera_control"
+        modules = sorted(path.stem for path in package.glob("*.py"))
+
+        listed = re.search(r"for module in ([^;]+); do", installer)
+
+        self.assertIsNotNone(listed)
+        self.assertEqual(modules, sorted(listed.group(1).split()))
+
+    def test_the_spotlight_lease_is_kept_beside_the_ir_one_and_apart_from_it(self):
+        from gate_camera_control.__main__ import (
+            LEASE_PATH, SPOTLIGHT_LEASE_PATH, STATE_ROOT,
+        )
+
+        self.assertEqual("/var/lib/gate-camera/spotlight-lease.json",
+                         SPOTLIGHT_LEASE_PATH)
+        self.assertNotEqual(LEASE_PATH, SPOTLIGHT_LEASE_PATH)
+        self.assertTrue(SPOTLIGHT_LEASE_PATH.startswith(f"{STATE_ROOT}/"))
+        self.assertFalse(SPOTLIGHT_LEASE_PATH.startswith("/run/"))
+
+    def test_the_documented_rollback_restores_both_lights_before_stopping(self):
+        """A stopped service cannot run either revert.
+
+        The spotlight is the one a passer-by can see, so a rollback that put
+        only IR back would leave the gate lit until somebody noticed.
+        """
+        text = (REPOSITORY_ROOT / "docs/camera-control.md").read_text(encoding="utf-8")
+        rollback = text.split("## Rollback", 1)[1]
+
+        self.assertIn('["spotlight"]["default"]', rollback)
+        self.assertIn("/camera/spotlight", rollback)
+        self.assertNotIn('-d \'{"state":"On"}\'', rollback)
+
+    def test_the_documented_spotlight_contract_matches_the_served_routes(self):
+        from gate_camera_control.__main__ import _SPOTLIGHT_PATH
+
+        text = (REPOSITORY_ROOT / "docs/camera-control.md").read_text(encoding="utf-8")
+
+        self.assertEqual("/camera/spotlight", _SPOTLIGHT_PATH)
+        self.assertIn("### `POST /camera/spotlight`", text)
+        self.assertIn("GATE_CAMERA_SPOTLIGHT_DEFAULT", text)
+        self.assertIn("GATE_CAMERA_SPOTLIGHT_BRIGHTNESS", text)
+        self.assertIn("## Why a spotlight and not IR", text)
+        # The measurement the decision rests on, and where it is recorded.
+        self.assertIn("0.028", text)
+        self.assertIn("reolink-rlc-811a.md", text)
+        camera = (REPOSITORY_ROOT / "docs/reolink-rlc-811a.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("## Fitted Unit, 2026-09-11", camera)
+        self.assertIn("## Night Light", camera)
 
     def test_the_docs_send_the_installer_at_the_managed_release_tree(self):
         """`/opt/gate-controller/releases/<sha>` does not exist, and the
@@ -457,7 +617,7 @@ class CameraControlDeploymentTests(unittest.TestCase):
         disappears from the app. Nothing in this service may widen or rename
         them without the Worker changing first.
         """
-        from gate_camera_control.state import IR_STATES, REASONS
+        from gate_camera_control.state import IR_STATES, REASONS, SPOTLIGHT_STATES
 
         document = ready_document(state="Auto", effective_until="2026-09-08T21:14:11+00:00")
         block = document["camera_control"]
@@ -467,6 +627,19 @@ class CameraControlDeploymentTests(unittest.TestCase):
         self.assertEqual(
             {"state", "default", "effective_until", "revert_failed"}, set(block["ir"])
         )
+        # The published shape the service writes today: the same block with one
+        # sibling, and the sibling has exactly the illuminator's four fields.
+        published = ready_document(state="Auto", spotlight={
+            "state": "On", "default": "Off", "effective_until": None,
+            "lease_seconds_remaining": None, "revert_failed": False,
+            "brightness": 100, "last_error": None,
+        })["camera_control"]
+        self.assertEqual({"available", "reason", "ir", "spotlight"}, set(published))
+        self.assertEqual(
+            {"state", "default", "effective_until", "revert_failed"},
+            set(published["spotlight"]),
+        )
+        self.assertEqual(("On", "Off"), SPOTLIGHT_STATES)
         self.assertEqual(
             ("ready", "not_observed", "camera_busy", "camera_unreachable",
              "camera_error"),
