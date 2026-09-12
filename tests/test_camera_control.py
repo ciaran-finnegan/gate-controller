@@ -252,6 +252,10 @@ class CameraControlEnvironmentTests(unittest.TestCase):
         self.assertEqual("Off", settings["GATE_CAMERA_IR_DEFAULT"])
         self.assertEqual("10", settings["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"])
         self.assertEqual("60", settings["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
+        # Talk-back is off until an operator turns it on; with it off the
+        # service never opens the camera's Baichuan port.
+        self.assertEqual("false", settings["GATE_CAMERA_TALK_ENABLED"])
+        self.assertEqual("30", settings["GATE_CAMERA_TALK_MAX_SECONDS"])
 
     def test_invalid_camera_control_environments_fail_closed(self):
         base = {
@@ -271,6 +275,12 @@ class CameraControlEnvironmentTests(unittest.TestCase):
             {**base, "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "30",
              "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "10"},
             {"GATE_CAMERA_HOST": "192.168.0.54", "GATE_CAMERA_USERNAME": "gate"},
+            {**base, "GATE_CAMERA_TALK_ENABLED": "yes"},
+            {**base, "GATE_CAMERA_TALK_ENABLED": "True"},
+            {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "4"},
+            {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "61"},
+            {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "030"},
+            {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "30.0"},
         ]
 
         for values in rejected:
@@ -1351,6 +1361,7 @@ class StateDocumentTests(unittest.TestCase):
                     "effective_until": "2026-09-07T21:00:00+00:00",
                     "revert_failed": False,
                 },
+                "talkback": {"available": False, "reason": "not_enabled", "active": False},
             },
         }, document)
 

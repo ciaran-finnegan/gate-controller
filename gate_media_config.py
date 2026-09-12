@@ -20,7 +20,7 @@ _TURN_URL = re.compile(
     r"(?:\?transport=(udp|tcp))?$"
 )
 _TURN_KEY_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_AUTH_KEYS = frozenset({
+_AUTH_REQUIRED_KEYS = frozenset({
     "GATE_MEDIA_HMAC_SECRET",
     "GATE_MEDIA_VIDEO_CONFIGURED",
     "GATE_MEDIA_VIDEO_VERIFIED",
@@ -28,6 +28,10 @@ _AUTH_KEYS = frozenset({
     "GATE_MEDIA_LISTEN_VERIFIED",
     "GATE_MEDIA_TALKBACK_CONFIGURED",
 })
+# Optional so an auth file written before talkback existed keeps validating;
+# absent means false, exactly as the physical acceptance test requires.
+_AUTH_OPTIONAL_DEFAULTS = {"GATE_MEDIA_TALKBACK_VERIFIED": "false"}
+_AUTH_KEYS = _AUTH_REQUIRED_KEYS | frozenset(_AUTH_OPTIONAL_DEFAULTS)
 _GATEWAY_STATIC_KEY_ORDER = (
     "MTX_PATHS_CAMERA_SOURCE",
     "MTX_PATHS_CLEAR_SOURCE",
@@ -56,11 +60,17 @@ _CAMERA_CONTROL_DEFAULTS = {
     "GATE_CAMERA_IR_DEFAULT": "Off",
     "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
     "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+    # Talk-back over the camera's Baichuan port. Off until the operator turns it
+    # on: with it off the service never opens port 9000 on the camera.
+    "GATE_CAMERA_TALK_ENABLED": "false",
+    "GATE_CAMERA_TALK_MAX_SECONDS": "30",
 }
 _CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
 _CAMERA_IR_STATES = frozenset({"Auto", "Off"})
 _CAMERA_CREDENTIAL_KEYS = ("GATE_CAMERA_USERNAME", "GATE_CAMERA_PASSWORD")
 _MAX_CAMERA_LEASE_MINUTES = 60
+_MIN_CAMERA_TALK_SECONDS = 5
+_MAX_CAMERA_TALK_SECONDS = 60
 
 
 class MediaConfigError(ValueError):
@@ -143,8 +153,10 @@ def parse_trusted_environment(path) -> dict[str, str]:
 def validate_auth_environment(values: Mapping[str, str]) -> dict[str, str]:
     selected = dict(values)
     _validate_effective_values(selected)
-    if set(selected) != _AUTH_KEYS:
+    if not _AUTH_REQUIRED_KEYS <= set(selected) <= _AUTH_KEYS:
         raise MediaConfigError("auth environment has missing or forbidden keys")
+    for key, default in _AUTH_OPTIONAL_DEFAULTS.items():
+        selected.setdefault(key, default)
     secret = selected["GATE_MEDIA_HMAC_SECRET"]
     if not 32 <= len(secret.encode("utf-8")) <= 256:
         raise MediaConfigError("HMAC secret must be 32 to 256 bytes")
@@ -156,6 +168,9 @@ def validate_auth_environment(values: Mapping[str, str]) -> dict[str, str]:
     if (selected["GATE_MEDIA_LISTEN_VERIFIED"] == "true"
             and selected["GATE_MEDIA_LISTEN_CONFIGURED"] != "true"):
         raise MediaConfigError("verified listen must be configured")
+    if (selected["GATE_MEDIA_TALKBACK_VERIFIED"] == "true"
+            and selected["GATE_MEDIA_TALKBACK_CONFIGURED"] != "true"):
+        raise MediaConfigError("verified talkback must be configured")
     return selected
 
 
@@ -337,6 +352,9 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
     max_minutes = _bounded_lease_minutes(selected["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
     if default_minutes > max_minutes:
         raise MediaConfigError("the default IR lease must not exceed the maximum")
+    if selected["GATE_CAMERA_TALK_ENABLED"] not in {"true", "false"}:
+        raise MediaConfigError("the talk flag must be exactly true or false")
+    _bounded_talk_seconds(selected["GATE_CAMERA_TALK_MAX_SECONDS"])
     return selected
 
 
@@ -404,6 +422,15 @@ def _bounded_lease_minutes(value: str) -> int:
     if not 1 <= minutes <= _MAX_CAMERA_LEASE_MINUTES:
         raise MediaConfigError("IR lease minutes must be between 1 and 60")
     return minutes
+
+
+def _bounded_talk_seconds(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", value):
+        raise MediaConfigError("talk seconds must be a whole number of seconds")
+    seconds = int(value)
+    if not _MIN_CAMERA_TALK_SECONDS <= seconds <= _MAX_CAMERA_TALK_SECONDS:
+        raise MediaConfigError("talk seconds must be between 5 and 60")
+    return seconds
 
 
 def relevant_auth_environment(environment: Mapping[str, str]) -> dict[str, str]:

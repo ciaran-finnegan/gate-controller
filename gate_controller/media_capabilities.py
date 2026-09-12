@@ -56,12 +56,6 @@ def validated_media_capabilities(value) -> dict:
         parsed = {feature: _parse_capability(feature, value[feature]) for feature in _FEATURES}
     except (TypeError, ValueError, KeyError):
         return _unavailable("gateway_unhealthy")
-    parsed["talkback"] = {
-        "configured": parsed["talkback"]["configured"],
-        "ready": False,
-        "verified": False,
-        "reason": "hardware_unverified",
-    }
     return parsed
 
 
@@ -84,15 +78,18 @@ def _parse_capability(feature: str, value) -> dict:
         raise ValueError("incoherent media capability")
     if reason == "ready" and not (configured and ready and verified):
         raise ValueError("incoherent media capability")
-    if feature != "talkback":
-        expected_reason = (
-            "not_configured" if not configured
-            else "gateway_unhealthy" if not ready
-            else "ready" if verified
-            else "hardware_unverified"
-        )
-        if reason != expected_reason:
-            raise ValueError("noncanonical media capability")
+    # Every feature, talkback included, is canonical: the sidecar claims ready
+    # only from a fresh camera-control probe and verified only from the flag the
+    # physical acceptance test sets, so the reader no longer forces it false.
+    expected_reason = (
+        "not_configured" if not configured
+        else "gateway_unhealthy" if not ready
+        else "ready" if verified
+        else "hardware_unverified"
+    )
+    if reason != expected_reason:
+        raise ValueError("noncanonical media capability")
+    del feature
     return {"configured": configured, "ready": ready, "verified": verified, "reason": reason}
 
 
@@ -100,7 +97,7 @@ def _unavailable(reason: str) -> dict:
     return {
         "video": _false_capability(reason),
         "listen": _false_capability(reason),
-        "talkback": _false_capability("hardware_unverified"),
+        "talkback": _false_capability(reason),
     }
 
 

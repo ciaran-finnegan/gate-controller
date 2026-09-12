@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -11,6 +12,11 @@ from pathlib import Path
 
 
 _GATEWAY_API = "http://127.0.0.1:9997/v3/paths/list"
+# The camera-control service's nonsecret state; its talkback block says whether
+# the camera has answered a TalkAbility probe and ffmpeg is present.
+_CAMERA_STATE_PATH = Path("/run/gate-camera/state.json")
+_MAX_CAMERA_STATE_BYTES = 8 * 1024
+_CAMERA_STATE_MAX_AGE_SECONDS = 30.0
 _MAX_GATEWAY_API_BYTES = 64 * 1024
 _MAX_GATEWAY_PATHS = 64
 _MAX_TRACKS = 16
@@ -31,21 +37,32 @@ def default_capabilities() -> dict:
         "media": {
             "video": _capability(False, False, False, "not_configured"),
             "listen": _capability(False, False, False, "not_configured"),
-            "talkback": _capability(False, False, False, "hardware_unverified"),
+            "talkback": _capability(False, False, False, "not_configured"),
         }
     }
 
 
-def capability_snapshot(environment, gateway_readiness) -> dict:
-    """Build a conservative, nonsecret snapshot from explicit operator settings."""
+def capability_snapshot(environment, gateway_readiness, talk_readiness=False) -> dict:
+    """Build a conservative, nonsecret snapshot from explicit operator settings.
+
+    ``talk_readiness`` is what the camera-control service published: the
+    camera answered a ``TalkAbility`` probe and the forwarder can run. Talkback
+    is ready only when that is true *and* the gateway that will carry the
+    browser's WHIP publish is up, and verified only after the physical
+    acceptance test sets ``GATE_MEDIA_TALKBACK_VERIFIED``.
+    """
     gateway_readiness = _validated_gateway_readiness(gateway_readiness)
     video_configured = _enabled(environment.get("GATE_MEDIA_VIDEO_CONFIGURED"))
     listen_configured = _enabled(environment.get("GATE_MEDIA_LISTEN_CONFIGURED"))
     talkback_configured = _enabled(environment.get("GATE_MEDIA_TALKBACK_CONFIGURED"))
     video_ready = video_configured and gateway_readiness["video"]
     listen_ready = listen_configured and gateway_readiness["listen"]
+    talkback_ready = (talkback_configured and gateway_readiness["video"]
+                      and talk_readiness is True)
     video_verified = video_ready and _enabled(environment.get("GATE_MEDIA_VIDEO_VERIFIED"))
     listen_verified = listen_ready and _enabled(environment.get("GATE_MEDIA_LISTEN_VERIFIED"))
+    talkback_verified = (talkback_ready
+                         and _enabled(environment.get("GATE_MEDIA_TALKBACK_VERIFIED")))
     return {
         "observed_at": int(time.time()),
         "media": {
@@ -53,8 +70,9 @@ def capability_snapshot(environment, gateway_readiness) -> dict:
                                   _reason(video_configured, video_ready, video_verified)),
             "listen": _capability(listen_configured, listen_ready, listen_verified,
                                    _reason(listen_configured, listen_ready, listen_verified)),
-            # Backchannel support is intentionally never claimed until separately verified.
-            "talkback": _capability(talkback_configured, False, False, "hardware_unverified"),
+            "talkback": _capability(talkback_configured, talkback_ready, talkback_verified,
+                                     _reason(talkback_configured, talkback_ready,
+                                             talkback_verified)),
         }
     }
 
@@ -102,7 +120,8 @@ class MediaHealthPublisher:
 
     def publish_once(self) -> None:
         write_capabilities(
-            self._path, capability_snapshot(self._environment, _gateway_is_ready())
+            self._path,
+            capability_snapshot(self._environment, _gateway_is_ready(), _camera_talk_is_ready()),
         )
 
     def _run(self) -> None:
@@ -156,6 +175,44 @@ def gateway_status_readiness(body: bytes) -> dict:
         "video": any(track in _VIDEO_TRACKS for track in tracks),
         "listen": any(track in _WEBRTC_AUDIO_TRACKS for track in tracks),
     }
+
+
+def _camera_talk_is_ready(path=_CAMERA_STATE_PATH, *, now=None) -> bool:
+    """True only when a fresh camera-control snapshot says talkback is available."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0
+                or metadata.st_size > _MAX_CAMERA_STATE_BYTES):
+            return False
+        body = os.read(descriptor, metadata.st_size)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    return camera_talk_readiness(body, now=time.time() if now is None else now)
+
+
+def camera_talk_readiness(body: bytes, *, now) -> bool:
+    try:
+        decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    observed_at = decoded.get("observed_at")
+    if (not isinstance(observed_at, int) or isinstance(observed_at, bool)
+            or observed_at > now or observed_at < now - _CAMERA_STATE_MAX_AGE_SECONDS):
+        return False
+    control = decoded.get("camera_control")
+    talkback = control.get("talkback") if isinstance(control, dict) else None
+    if not isinstance(talkback, dict):
+        return False
+    return talkback.get("available") is True and talkback.get("reason") == "ready"
 
 
 def _validated_gateway_readiness(value) -> dict:

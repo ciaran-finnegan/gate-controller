@@ -11,7 +11,9 @@ import time
 import unittest
 from pathlib import Path
 
-from gate_controller.media_capabilities import read_media_capabilities
+from gate_controller.media_capabilities import (
+    read_media_capabilities, validated_media_capabilities,
+)
 import gate_media_auth.capabilities as media_health
 from gate_media_auth.capabilities import (
     _gateway_is_ready, capability_snapshot, default_capabilities, write_capabilities,
@@ -292,7 +294,16 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         self.assertRegex(proxy, r"location\s+/\s*\{\s*return 404;")
         self.assertIn("limit_except POST OPTIONS", proxy)
         self.assertIn("limit_except DELETE OPTIONS", proxy)
-        self.assertEqual(2, proxy.count("proxy_set_header Host $http_host;"))
+        # Push-to-talk adds exactly one WHIP create and one exact teardown for
+        # the talk path; no PATCH (the browser gathers ICE before it offers).
+        self.assertIn("location = /talk/whip", proxy)
+        self.assertIn('location ~ "^/talk/whip/[A-Za-z0-9_-]{1,128}$" {', proxy)
+        self.assertNotIn("PATCH", proxy)
+        self.assertEqual(2, proxy.count("limit_except POST OPTIONS"))
+        self.assertEqual(2, proxy.count("limit_except DELETE OPTIONS"))
+        self.assertEqual(4, proxy.count("proxy_set_header Host $http_host;"))
+        self.assertNotIn("/gate/whip", proxy)
+        self.assertNotIn("/talk/whep", proxy)
 
     def test_services_receive_disjoint_root_owned_environment_files(self):
         auth = read_unit("deployment/systemd/gate-media-auth.service")
@@ -2384,7 +2395,7 @@ class MediaCapabilityTests(unittest.TestCase):
             "listen": {"configured": False, "ready": False, "verified": False,
                        "reason": "not_configured"},
             "talkback": {"configured": False, "ready": False, "verified": False,
-                         "reason": "hardware_unverified"},
+                         "reason": "not_configured"},
         }
         before = int(__import__("time").time())
         expected = default_capabilities()
@@ -2401,7 +2412,7 @@ class MediaCapabilityTests(unittest.TestCase):
                 "listen": {"configured": False, "ready": False, "verified": False,
                            "reason": "not_configured"},
                 "talkback": {"configured": False, "ready": False, "verified": False,
-                             "reason": "hardware_unverified"},
+                             "reason": "not_configured"},
             }
         }
         self.assertEqual(expected_shape, expected)
@@ -2423,7 +2434,7 @@ class MediaCapabilityTests(unittest.TestCase):
                     "listen": {"configured": True, "ready": True, "verified": False,
                                "reason": "hardware_unverified"},
                     "talkback": {"configured": False, "ready": False, "verified": False,
-                                 "reason": "hardware_unverified"},
+                                 "reason": "not_configured"},
                 }
             }
             write_capabilities(target, healthy)
@@ -2511,24 +2522,109 @@ class MediaCapabilityTests(unittest.TestCase):
             unavailable = read_media_capabilities(target, max_age_seconds=60, now=100)
             self.assertEqual("gateway_unhealthy", unavailable["video"]["reason"])
 
-    def test_reader_forces_talkback_to_hardware_unverified(self):
+    def test_reader_passes_canonical_talkback_through_and_rejects_the_rest(self):
+        """Talkback is held to the same canonical rule as video and listen.
+
+        The sidecar claims `ready` only from a fresh camera-control probe and
+        `verified` only from the flag the physical acceptance test sets, so the
+        reader no longer forces the feature false; it refuses anything that
+        does not match the sidecar's own reason for its flags.
+        """
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "capabilities.json"
+            for talkback in (
+                {"configured": True, "ready": True, "verified": True, "reason": "ready"},
+                {"configured": True, "ready": True, "verified": False,
+                 "reason": "hardware_unverified"},
+                {"configured": True, "ready": False, "verified": False,
+                 "reason": "gateway_unhealthy"},
+            ):
+                snapshot = default_capabilities()
+                snapshot["observed_at"] = 100
+                snapshot["media"]["talkback"] = talkback
+                write_capabilities(target, snapshot)
+                with self.subTest(talkback=talkback):
+                    media = read_media_capabilities(target, max_age_seconds=60, now=100)
+                    self.assertEqual(talkback, media["talkback"])
+            # The pre-talkback sidecar's "unconfigured but hardware_unverified"
+            # shape is now noncanonical and reads as unavailable, like any
+            # other incoherent capability.
             snapshot = default_capabilities()
             snapshot["observed_at"] = 100
             snapshot["media"]["talkback"] = {
-                "configured": True, "ready": True, "verified": True, "reason": "ready",
+                "configured": False, "ready": False, "verified": False,
+                "reason": "hardware_unverified",
             }
             write_capabilities(target, snapshot)
-
             media = read_media_capabilities(target, max_age_seconds=60, now=100)
+            self.assertEqual("gateway_unhealthy", media["talkback"]["reason"])
+            self.assertFalse(media["video"]["ready"])
 
-            self.assertEqual(media["talkback"], {
-                "configured": True,
-                "ready": False,
-                "verified": False,
-                "reason": "hardware_unverified",
-            })
+    def test_talkback_is_ready_only_from_flags_gateway_and_a_fresh_camera_probe(self):
+        environment = {
+            "GATE_MEDIA_VIDEO_CONFIGURED": "true",
+            "GATE_MEDIA_VIDEO_VERIFIED": "true",
+            "GATE_MEDIA_LISTEN_CONFIGURED": "false",
+            "GATE_MEDIA_TALKBACK_CONFIGURED": "true",
+            "GATE_MEDIA_TALKBACK_VERIFIED": "true",
+        }
+        gateway_up = {"video": True, "listen": False}
+        gateway_down = {"video": False, "listen": False}
+
+        cases = (
+            (environment, gateway_up, True, (True, True, True, "ready")),
+            (environment, gateway_up, False, (True, False, False, "gateway_unhealthy")),
+            (environment, gateway_down, True, (True, False, False, "gateway_unhealthy")),
+            ({**environment, "GATE_MEDIA_TALKBACK_VERIFIED": "false"}, gateway_up, True,
+             (True, True, False, "hardware_unverified")),
+            ({**environment, "GATE_MEDIA_TALKBACK_CONFIGURED": "false"}, gateway_up, True,
+             (False, False, False, "not_configured")),
+            # Anything but the literal True from the camera-state reader is unready.
+            (environment, gateway_up, "true", (True, False, False, "gateway_unhealthy")),
+        )
+        for values, gateway, talk, expected in cases:
+            with self.subTest(values=values, gateway=gateway, talk=talk):
+                talkback = capability_snapshot(values, gateway, talk)["media"]["talkback"]
+                self.assertEqual(expected, (
+                    talkback["configured"], talkback["ready"], talkback["verified"],
+                    talkback["reason"],
+                ))
+                # Every published shape must survive the controller's reader.
+                self.assertEqual(talkback, validated_media_capabilities(
+                    capability_snapshot(values, gateway, talk)["media"]
+                )["talkback"])
+
+    def test_camera_talk_readiness_reads_only_a_fresh_ready_block(self):
+        ready = {"observed_at": 100, "camera_control": {
+            "available": True, "reason": "ready",
+            "ir": {"state": "Off", "default": "Off", "effective_until": None,
+                   "revert_failed": False},
+            "talkback": {"available": True, "reason": "ready", "active": False},
+        }}
+        self.assertTrue(media_health.camera_talk_readiness(
+            json.dumps(ready).encode("utf-8"), now=100,
+        ))
+        stale = json.loads(json.dumps(ready))
+        stale["observed_at"] = 60
+        future = json.loads(json.dumps(ready))
+        future["observed_at"] = 101
+        unavailable = json.loads(json.dumps(ready))
+        unavailable["camera_control"]["talkback"]["available"] = False
+        wrong_reason = json.loads(json.dumps(ready))
+        wrong_reason["camera_control"]["talkback"]["reason"] = "not_probed"
+        missing = json.loads(json.dumps(ready))
+        del missing["camera_control"]["talkback"]
+        for body in (stale, future, unavailable, wrong_reason, missing, [], "x"):
+            with self.subTest(body=body):
+                self.assertFalse(media_health.camera_talk_readiness(
+                    json.dumps(body).encode("utf-8"), now=100,
+                ))
+        self.assertFalse(media_health.camera_talk_readiness(b"{", now=100))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "state.json"
+            self.assertFalse(media_health._camera_talk_is_ready(path, now=100))
+            path.write_text(json.dumps(ready), encoding="utf-8")
+            self.assertTrue(media_health._camera_talk_is_ready(path, now=100))
 
     def test_publisher_uses_nonsecret_configuration_flags(self):
         snapshot = capability_snapshot({

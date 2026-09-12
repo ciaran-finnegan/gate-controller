@@ -1,5 +1,5 @@
 [Unit]
-Description=Isolated gate camera control service (IR lease and 4K still)
+Description=Isolated gate camera control service (IR lease, 4K still, talk-back)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -15,8 +15,9 @@ ExecStart=/usr/bin/python3 -m gate_camera_control
 Restart=always
 RestartSec=5s
 TimeoutStopSec=10s
-MemoryMax=64M
-CPUQuota=20%
+# ffmpeg decoding the talk path adds roughly 30 MB while a talk session runs.
+MemoryMax=128M
+CPUQuota=30%
 TasksMax=64
 UMask=0077
 ReadWritePaths=/run/gate-camera
