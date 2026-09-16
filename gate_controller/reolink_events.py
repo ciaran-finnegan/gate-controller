@@ -35,6 +35,15 @@ MAX_REOLINK_WEBHOOK_SECRET_LENGTH = 128
 MAX_REOLINK_EVENTS = 64
 MAX_REOLINK_EVENT_TTL_SECONDS = 60.0
 MAX_REOLINK_CORRELATION_WINDOW_SECONDS = 15.0
+# How far the camera's own alarm timestamp may sit from the Pi clock before the
+# event is refused as stale. 0 keeps the historical rule (15 s behind, 5 s
+# ahead). Receipt-time freshness and event de-duplication are unchanged either
+# way: this only decides whether a camera with a wrong clock is trusted to say
+# *when* it fired, and the skew is journalled and reported regardless.
+MAX_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS = 86400.0
+# Skews beyond this are journalled on accepted events as well, so a drifting
+# camera is visible before it starts being rejected.
+NOTABLE_CLOCK_SKEW_SECONDS = 2.0
 REOLINK_CONNECTION_TIMEOUT_SECONDS = 1.0
 REOLINK_REQUEST_DEADLINE_SECONDS = 1.0
 REOLINK_BODY_DEADLINE_SECONDS = 1.0
@@ -71,6 +80,26 @@ class SanitizedCameraEvent:
 @dataclass(frozen=True)
 class WebhookResponse:
     status: int
+
+
+def load_clock_skew_tolerance(environment: Mapping[str, str]) -> float:
+    """``GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS``: 0 keeps the historical rule."""
+    raw = str(environment.get("GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS", "0") or "0").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS must be a number") from error
+    if not 0 <= value <= MAX_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS or value != value:
+        raise ValueError(
+            "GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS must be between 0 and 86400"
+        )
+    return value
+
+
+def build_reolink_correlator(environment: Mapping[str, str]) -> "ReolinkEventCorrelator":
+    return ReolinkEventCorrelator(
+        clock_skew_tolerance_seconds=load_clock_skew_tolerance(environment),
+    )
 
 
 def load_reolink_webhook_config(environment: Mapping[str, str]) -> ReolinkWebhookConfig:
@@ -119,9 +148,12 @@ class ReolinkEventCorrelator:
         correlation_window_seconds: float = 5.0,
         max_events: int = MAX_REOLINK_EVENTS,
         clock: Callable[[], datetime] | None = None,
+        clock_skew_tolerance_seconds: float = 0.0,
     ) -> None:
         if not 0 < ttl_seconds <= MAX_REOLINK_EVENT_TTL_SECONDS:
             raise ValueError("event TTL exceeds the safe range")
+        if not 0 <= clock_skew_tolerance_seconds <= MAX_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS:
+            raise ValueError("clock skew tolerance exceeds the safe range")
         if not 0 < correlation_window_seconds <= min(
             ttl_seconds, MAX_REOLINK_CORRELATION_WINDOW_SECONDS
         ):
@@ -133,9 +165,44 @@ class ReolinkEventCorrelator:
         self._max_events = max_events
         self._max_seen = max_events * 2
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._skew_tolerance = timedelta(seconds=clock_skew_tolerance_seconds)
         self._events: deque[SanitizedCameraEvent] = deque()
         self._seen: OrderedDict[str, datetime] = OrderedDict()
         self._lock = Lock()
+        self._accepted = 0
+        self._duplicates = 0
+        self._rejected_stale = 0
+        self._last_skew_seconds: float | None = None
+        self._last_stale_at: datetime | None = None
+        self._last_accepted_at: datetime | None = None
+
+    @property
+    def last_skew_seconds(self) -> float | None:
+        """Camera alarm time minus Pi time on the last timestamped event."""
+        with self._lock:
+            return self._last_skew_seconds
+
+    def status(self) -> dict:
+        """Bounded, nonsecret counters for the heartbeat."""
+        with self._lock:
+            return {
+                "accepted": self._accepted,
+                "duplicates": self._duplicates,
+                "rejected_stale": self._rejected_stale,
+                "last_skew_seconds": (
+                    None if self._last_skew_seconds is None
+                    else round(self._last_skew_seconds, 1)
+                ),
+                "last_accepted_at": (
+                    None if self._last_accepted_at is None
+                    else self._last_accepted_at.isoformat()
+                ),
+                "last_stale_at": (
+                    None if self._last_stale_at is None
+                    else self._last_stale_at.isoformat()
+                ),
+                "clock_skew_tolerance_seconds": self._skew_tolerance.total_seconds(),
+            }
 
     @property
     def pending_count(self) -> int:
@@ -157,13 +224,26 @@ class ReolinkEventCorrelator:
             self._prune(now)
             age = now - received_at
             if age > self._ttl or age < -self._window:
+                self._rejected_stale += 1
+                self._last_stale_at = now
                 return "stale"
             if event_at is not None:
-                event_age = now - event_at
-                if event_age > self._ttl or event_age < -self._window:
+                # Positive when the camera's clock runs ahead of the Pi's.
+                skew = event_at - now
+                self._last_skew_seconds = skew.total_seconds()
+                if self._skew_tolerance > self._ttl:
+                    stale = abs(skew) > self._skew_tolerance
+                else:
+                    stale = -skew > self._ttl or skew > self._window
+                if stale:
+                    self._rejected_stale += 1
+                    self._last_stale_at = now
                     return "stale"
             if event.event_id in self._seen:
+                self._duplicates += 1
                 return "duplicate"
+            self._accepted += 1
+            self._last_accepted_at = now
             self._seen[event.event_id] = received_at
             while len(self._seen) > self._max_seen:
                 self._seen.popitem(last=False)
@@ -269,12 +349,21 @@ class ReolinkWebhookEndpoint:
         except InvalidReolinkWebhook:
             return self._reject(400, "payload")
         outcome = self._correlator.record(event, now=received_at)
+        skew = _skew_field(self._correlator, event)
         if outcome == "accepted":
+            if skew is not None and abs(skew) > NOTABLE_CLOCK_SKEW_SECONDS:
+                LOGGER.warning(
+                    "reolink_webhook status=accepted event_skew_seconds=%+.1f", skew,
+                )
             self._notify_accepted(event)
             return WebhookResponse(202)
         if outcome == "duplicate":
             return WebhookResponse(200)
-        return self._reject(422, "stale")
+        LOGGER.warning(
+            "reolink_webhook status=rejected reason=stale event_skew_seconds=%s",
+            "unknown" if skew is None else f"{skew:+.1f}",
+        )
+        return WebhookResponse(422)
 
     def _notify_accepted(self, event: SanitizedCameraEvent) -> None:
         # The callback only schedules a bounded frame capture; it must never
@@ -525,6 +614,18 @@ def _sanitize_event(
         received_at=received_at,
         event_at=event_at,
     )
+
+
+def _skew_field(correlator, event) -> float | None:
+    """The camera clock skew of ``event`` as the correlator measured it."""
+    if getattr(event, "event_at", None) is None:
+        return None
+    reader = getattr(correlator, "last_skew_seconds", None)
+    try:
+        value = reader() if callable(reader) else reader
+    except Exception:
+        return None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _bounded_string(value: object, *, required: bool) -> str | None:

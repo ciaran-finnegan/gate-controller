@@ -56,6 +56,9 @@ _CAMERA_CONTROL_DEFAULTS = {
     "GATE_CAMERA_IR_DEFAULT": "Off",
     "GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES": "10",
     "GATE_CAMERA_IR_LEASE_MAX_MINUTES": "60",
+    # Keep the camera's clock on the Pi's, hourly, so its alarm timestamps are
+    # trusted by the controller. "false" leaves the camera clock alone.
+    "GATE_CAMERA_CLOCK_SYNC": "true",
 }
 _CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
 _CAMERA_IR_STATES = frozenset({"Auto", "Off"})
@@ -337,6 +340,8 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
     max_minutes = _bounded_lease_minutes(selected["GATE_CAMERA_IR_LEASE_MAX_MINUTES"])
     if default_minutes > max_minutes:
         raise MediaConfigError("the default IR lease must not exceed the maximum")
+    if selected["GATE_CAMERA_CLOCK_SYNC"] not in ("true", "false"):
+        raise MediaConfigError("GATE_CAMERA_CLOCK_SYNC must be exactly true or false")
     return selected
 
 

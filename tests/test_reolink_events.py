@@ -105,6 +105,39 @@ class ReolinkWebhookTests(unittest.TestCase):
         self.assertEqual(response.status, 422)
         self.assertEqual(correlator.pending_count, 0)
 
+    def test_a_stale_rejection_journals_the_camera_clock_skew(self):
+        correlator = ReolinkEventCorrelator()
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+        two_hours_ahead = self.payload(alarmTime="2026-08-20T12:00:00.000+0000")
+        with self.assertLogs("gate_controller.reolink_events", level="WARNING") as logs:
+            response = self.request(endpoint, two_hours_ahead)
+        self.assertEqual(response.status, 422)
+        self.assertIn("reolink_webhook status=rejected reason=stale event_skew_seconds=+7200.0", logs.output[0])
+        status = correlator.status()
+        self.assertEqual((status["accepted"], status["rejected_stale"], status["last_skew_seconds"]), (0, 1, 7200.0))
+
+    def test_a_configured_tolerance_accepts_a_skewed_clock_and_still_journals_it(self):
+        correlator = ReolinkEventCorrelator(clock_skew_tolerance_seconds=3 * 3600)
+        endpoint = ReolinkWebhookEndpoint(self.secret, correlator)
+        with self.assertLogs("gate_controller.reolink_events", level="WARNING") as logs:
+            response = self.request(endpoint, self.payload(alarmTime="2026-08-20T12:00:00.000+0000"))
+        self.assertEqual(response.status, 202)
+        self.assertIn("reolink_webhook status=accepted event_skew_seconds=+7200.0", logs.output[0])
+        self.assertEqual(correlator.status()["accepted"], 1)
+        beyond = ReolinkEventCorrelator(clock_skew_tolerance_seconds=60)
+        endpoint = ReolinkWebhookEndpoint(self.secret, beyond)
+        self.assertEqual(self.request(endpoint, self.payload(alarmTime="2026-08-20T12:00:00.000+0000")).status, 422)
+
+    def test_the_tolerance_is_read_from_the_environment_and_bounded(self):
+        from gate_controller.reolink_events import build_reolink_correlator, load_clock_skew_tolerance
+        self.assertEqual(load_clock_skew_tolerance({}), 0.0)
+        self.assertEqual(load_clock_skew_tolerance({"GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS": "7300"}), 7300.0)
+        self.assertEqual(build_reolink_correlator({"GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS": "10"}).status()["clock_skew_tolerance_seconds"], 10.0)
+        for value in ("-1", "86401", "nan", "later"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    load_clock_skew_tolerance({"GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS": value})
+
     def test_rejects_non_index_channel_values(self):
         for channel in (True, -1, 256, 1.5, ["0"]):
             with self.subTest(channel=channel):

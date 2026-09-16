@@ -75,6 +75,9 @@ class FakeCamera:
         self.login_502_after = None
         self.expire_next_token = False
         self.snapshot_body = JPEG
+        self.clock_fields = {"year": 2026, "mon": 9, "day": 16, "hour": 14, "min": 0, "sec": 0,
+                             "hourFmt": 1, "timeFmt": "DD/MM/YYYY", "timeZone": 0, "isDst": 0}
+        self.dst_fields = {"enable": 0, "offset": 1}
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCameraHandler)
         self._server.camera = self
@@ -133,6 +136,14 @@ class FakeCamera:
             if command == "SetIrLights":
                 self.ir_state = payload[0]["param"]["IrLights"]["state"]
                 return 200, _command_response("SetIrLights", None)
+            if command == "GetTime":
+                return 200, _command_response("GetTime", {
+                    "Time": dict(self.clock_fields), "Dst": dict(self.dst_fields),
+                })
+            if command == "SetTime":
+                self.clock_fields = dict(payload[0]["param"]["Time"])
+                self.dst_fields = dict(payload[0]["param"]["Dst"])
+                return 200, _command_response("SetTime", None)
             return 200, _authentication_failure(command)
 
     def snapshot(self, token):
@@ -1426,12 +1437,14 @@ class ServiceFacadeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "gate_camera_control"
         text = "\n".join(
             (source / name).read_text(encoding="utf-8")
-            for name in ("__main__.py", "ir.py", "reolink.py", "state.py")
+            for name in ("__main__.py", "ir.py", "reolink.py", "state.py", "clock.py")
         )
 
         self.assertNotIn("SetIsp", text)
+        # The clock reconcile adds exactly GetTime and SetTime: the camera's
+        # displayed time and DST block, nothing that touches the picture.
         self.assertIn(
-            'ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap"})',
+            'ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap", "GetTime", "SetTime"})',
             text,
         )
 

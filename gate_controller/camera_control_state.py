@@ -62,7 +62,9 @@ def read_camera_control_state(path, *, max_age_seconds: float = 30.0, now=None) 
 def validated_camera_control(value) -> dict:
     """Return a canonical bounded camera-control object or a conservative default."""
     try:
-        if not isinstance(value, dict) or set(value) != {"available", "reason", "ir"}:
+        if not isinstance(value, dict) or not (
+            {"available", "reason", "ir"} <= set(value) <= {"available", "reason", "ir", "clock"}
+        ):
             raise ValueError("invalid camera control snapshot")
         available, reason = value["available"], value["reason"]
         if not isinstance(available, bool) or reason not in _REASONS:
@@ -74,7 +76,10 @@ def validated_camera_control(value) -> dict:
             raise ValueError("incoherent camera control availability")
         if available != (reason == "ready"):
             raise ValueError("incoherent camera control reason")
-        return {"available": available, "reason": reason, "ir": infrared}
+        block = {"available": available, "reason": reason, "ir": infrared}
+        if "clock" in value:
+            block["clock"] = _parse_clock(value["clock"])
+        return block
     except (TypeError, ValueError, KeyError):
         return unavailable("service_unhealthy")
 
@@ -112,6 +117,41 @@ def _parse_ir(value) -> dict:
         "default": default,
         "effective_until": effective_until,
         "revert_failed": revert_failed,
+    }
+
+
+_CLOCK_OUTCOMES = frozenset({
+    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
+    "camera_unreachable", "camera_error", "disabled",
+})
+_MAX_CLOCK_SKEW_SECONDS = 10_000_000
+
+
+def _parse_clock(value) -> dict:
+    """The camera clock block: skew against the Pi and the last reconcile outcome."""
+    if (not isinstance(value, dict)
+            or set(value) != {"synced", "outcome", "skew_seconds", "checked_at", "corrections"}):
+        raise ValueError("invalid camera clock block")
+    synced, outcome = value["synced"], value["outcome"]
+    skew, checked_at, corrections = value["skew_seconds"], value["checked_at"], value["corrections"]
+    if not isinstance(synced, bool) or outcome not in _CLOCK_OUTCOMES:
+        raise ValueError("invalid camera clock block")
+    if skew is not None and (
+        isinstance(skew, bool) or not isinstance(skew, int)
+        or abs(skew) > _MAX_CLOCK_SKEW_SECONDS
+    ):
+        raise ValueError("invalid camera clock skew")
+    if checked_at is not None and (
+        not isinstance(checked_at, str) or not 0 < len(checked_at) <= _MAX_TIMESTAMP_LENGTH
+    ):
+        raise ValueError("invalid camera clock timestamp")
+    if isinstance(corrections, bool) or not isinstance(corrections, int) or corrections < 0:
+        raise ValueError("invalid camera clock corrections")
+    if synced != (outcome in {"ok", "corrected"}):
+        raise ValueError("incoherent camera clock block")
+    return {
+        "synced": synced, "outcome": outcome, "skew_seconds": skew,
+        "checked_at": checked_at, "corrections": corrections,
     }
 
 
