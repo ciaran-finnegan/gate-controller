@@ -1,10 +1,10 @@
 # Reolink RLC-810A Deployment and Night Calibration
 
-The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
-two-way audio. Earlier issues that call the installed unit an RLC-811A are
-mislabelled. The gate has one Ethernet port, so only one camera can be fitted.
-The RLC-811A replaces the RLC-810A at the same mount; its zoom framing,
-exposure, capture point, and cutover are covered in
+This document was written for the RLC-810A: fixed 4 mm lens, no optical zoom,
+no two-way audio. That unit was removed on 2026-09-11 and the installed gate
+camera is now an RLC-811A on the same mount; the RLC-810A is the rollback
+unit. The gate has one Ethernet port, so only one camera can be fitted. The
+RLC-811A's zoom framing, exposure, capture point, and cutover are covered in
 [RLC-811A gate camera swap](reolink-rlc-811a.md). Everything below applies to
 whichever camera is fitted unless that document says otherwise.
 
@@ -264,6 +264,45 @@ frame, 0..1). The session stops when the presence session ends. The scene
 baseline is refreshed from one on-demand keyframe decode every 30 s while
 idle. `GATE_CLEAR_STREAM_MODE=decoded` restores the continuously decoding
 keyframe ring.
+
+### Local Sweep
+
+With `GATE_LOCAL_OCR_MODE=active` the on-device reader answers in about
+175 ms, so the session decoder's 5 fps output can be read frame by frame
+instead of three frames seconds apart. `GATE_LOCAL_SWEEP_ENABLED=true`
+replaces the capture series with a *sweep*: for `GATE_LOCAL_SWEEP_SECONDS`
+(default 10) after an accepted webhook, every new session frame (newest
+first, never one twice, at most `GATE_LOCAL_SWEEP_MAX_FPS`, default 5) is
+cropped to `GATE_PLATE_REGION` and read locally under the same plate list and
+policy band the processor uses. Nothing is injected, so nothing reaches the
+cloud, until the reader's own answer is an authorised plate; that frame is
+then handed to the ordinary burst pipeline, which re-reads it through its
+normal local pass and applies every existing safeguard (freshness, the
+authorisation re-check under the relay lock, cooldown, idempotency) before
+the relay moves. The sweep decides nothing itself, and stops on an open.
+
+If the window ends with no authorised read, `GATE_LOCAL_SWEEP_FALLBACK_FRAMES`
+(default 1, 0 to 3) of the best frames seen -- highest local score, else the
+newest -- go through the ordinary path, cloud fallback included, so the
+passage is still recorded and the cloud gets a last-resort read; 0 keeps
+every sweep frame off the cloud. The presence session then runs as before
+for whatever remains of its window. The sweep is skipped, and the series runs
+unchanged, whenever the local reader is off, in shadow mode, or not loaded.
+
+Journal: `gate_local_sweep stage=read plate=… score=… authorised=… read_ms=…`
+for every frame that read characters, and one
+`gate_local_sweep outcome=ended reason=opened|window|new_event|stopping|plate_denied|final_…
+frames=N reads=N busy=N authorised=N injected=N fallback=N best_plate=… best_score=…`
+per event (a warning when nothing was injected). Injected frames log the
+usual `gate_trigger_capture outcome=captured` with `source=sweep` or
+`source=sweep_fallback`. `busy` counts frames the reader declined because the
+FTP still's own local pass held it; they are simply skipped. The heartbeat's
+`recognition.trigger_capture.sweep` block carries the same counters.
+
+Cost: the session decoder at 5 fps is about 60% of one core and the reader
+about 90% of another for the length of the window, on a Pi 5. Expect a
+local decision roughly 0.5 to 0.8 s after the webhook for a readable plate,
+against 2 s on the FTP path, and no cloud lookups for authorised vehicles.
 
 ### Presence Session
 

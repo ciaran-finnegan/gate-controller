@@ -25,6 +25,7 @@ from .direction import DirectionTracker, load_direction_config
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
+from .local_sweep import LocalSweepReader
 from .net_probe import NetProbeWorker, load_net_probe_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
 from .plate_region import parse_plate_region
@@ -152,10 +153,21 @@ def main() -> None:
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
     clear_keyframes = _clear_stream_source(trigger_capture_config)
+    # The sweep reads session frames with the same recogniser, plate list and
+    # policy band the processor uses, so what it admits is what the processor
+    # will re-check. Built only when configured; None leaves capture as it was.
+    sweep_reader = (
+        LocalSweepReader(
+            local_recognizer, authorised=authorised.get, match_policy=match_policy.get,
+            plate_region=plate_region,
+        )
+        if trigger_capture_config.sweep_enabled and local_recognizer is not None
+        else None
+    )
     trigger_capture = (
         TriggerFrameCapture(
             trigger_capture_config, frame_source=clear_keyframes,
-            activity=activity,
+            activity=activity, sweep=sweep_reader,
         )
         if trigger_capture_config.enabled else None
     )
