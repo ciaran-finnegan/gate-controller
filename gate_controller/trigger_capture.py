@@ -47,6 +47,14 @@ MAX_CAPTURE_COUNT = 3
 MIN_CAPTURE_SPACING_SECONDS = 0.5
 MAX_CAPTURE_SPACING_SECONDS = 3.0
 SKIPPED_EVENT_TYPES = frozenset({"manual_test"})
+DEFAULT_SWEEP_SECONDS = 10.0
+MIN_SWEEP_SECONDS, MAX_SWEEP_SECONDS = 1.0, 30.0
+DEFAULT_SWEEP_MAX_FPS = 5.0
+MIN_SWEEP_FPS, MAX_SWEEP_FPS = 1.0, 10.0
+DEFAULT_SWEEP_FALLBACK_FRAMES = 1
+MAX_SWEEP_FALLBACK_FRAMES = 3
+# How long the sweep polls for a fresh session frame before asking again.
+SWEEP_POLL_SECONDS = 0.05
 # One keyframe per second at the camera's 1x interval; the ring only has to
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
@@ -200,6 +208,16 @@ class TriggerCaptureConfig:
     # looking at a different vehicle and stops offering frames. It gates no
     # actuation: see DEFAULT_CONCLUSIVE_READ_CONFIDENCE.
     conclusive_read_confidence: float = DEFAULT_CONCLUSIVE_READ_CONFIDENCE
+    # Local sweep: instead of the spaced series, read every live session frame
+    # on the device for a bounded window and inject only a frame whose local
+    # read already authorises. Off by default; needs GATE_LOCAL_OCR_MODE=active.
+    sweep_enabled: bool = False
+    sweep_seconds: float = DEFAULT_SWEEP_SECONDS
+    sweep_max_fps: float = DEFAULT_SWEEP_MAX_FPS
+    # Frames handed to the ordinary pipeline (cloud fallback included) when
+    # the sweep window ends with no authorised read: the audit trail and the
+    # last-resort cloud read. 0 keeps every sweep frame off the cloud.
+    sweep_fallback_frames: int = DEFAULT_SWEEP_FALLBACK_FRAMES
 
 
 def load_trigger_capture_config(
@@ -301,6 +319,21 @@ def load_trigger_capture_config(
         ),
         MIN_CONCLUSIVE_READ_CONFIDENCE, 1.0, DEFAULT_CONCLUSIVE_READ_CONFIDENCE,
     )
+    sweep_enabled = _boolean(environment.get("GATE_LOCAL_SWEEP_ENABLED", "false"))
+    sweep_seconds = _number(
+        environment.get("GATE_LOCAL_SWEEP_SECONDS", str(DEFAULT_SWEEP_SECONDS)),
+        MIN_SWEEP_SECONDS, MAX_SWEEP_SECONDS,
+    )
+    sweep_max_fps = _number(
+        environment.get("GATE_LOCAL_SWEEP_MAX_FPS", str(DEFAULT_SWEEP_MAX_FPS)),
+        MIN_SWEEP_FPS, MAX_SWEEP_FPS,
+    )
+    sweep_fallback_frames = _integer(
+        environment.get(
+            "GATE_LOCAL_SWEEP_FALLBACK_FRAMES", str(DEFAULT_SWEEP_FALLBACK_FRAMES),
+        ),
+        0, MAX_SWEEP_FALLBACK_FRAMES,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -328,6 +361,10 @@ def load_trigger_capture_config(
         session_seconds=session_seconds,
         source_fps=source_fps,
         conclusive_read_confidence=conclusive_confidence,
+        sweep_enabled=sweep_enabled,
+        sweep_seconds=sweep_seconds,
+        sweep_max_fps=sweep_max_fps,
+        sweep_fallback_frames=sweep_fallback_frames,
     )
 
 
@@ -456,11 +493,21 @@ class TriggerFrameCapture:
 
     def __init__(self, config: TriggerCaptureConfig, *, popen=subprocess.Popen,
                  clock=monotonic, wall_clock=None, frame_source=None,
-                 activity=NULL_GATE):
+                 activity=NULL_GATE, sweep=None):
         self.config = config
         # A camera event owns the uplink from the first frame to the end of
         # the presence session. The corpus asks this gate before it sends.
         self._activity = activity or NULL_GATE
+        # A LocalSweepReader when the sweep is configured; None otherwise.
+        self._sweep = sweep
+        self._sweep_runs = 0
+        self._sweep_frames = 0
+        self._sweep_reads = 0
+        self._sweep_busy = 0
+        self._sweep_authorised = 0
+        self._sweep_injected = 0
+        self._sweep_fallbacks = 0
+        self._sweep_last_read_ms: float | None = None
         self.output_directory = config.output_directory
         self._popen = popen
         # An object with latest(after=...) -> (jpeg_bytes, captured_at) or
@@ -568,8 +615,223 @@ class TriggerFrameCapture:
             # One span over both halves: a vehicle is at the gate for the
             # whole of it, including the quiet gaps between frames.
             with self._activity.activity("camera_event"):
-                self.capture_series(event, scheduled_at, stop_event)
+                if self._sweep_ready():
+                    self.local_sweep(event, scheduled_at, stop_event)
+                else:
+                    self.capture_series(event, scheduled_at, stop_event)
                 self.presence_session(event, scheduled_at, stop_event)
+
+    def _sweep_ready(self) -> bool:
+        """Sweep only when configured *and* the local reader can decide.
+
+        A reader that is off, in shadow mode, or not loaded means the sweep
+        would read nothing, so the spaced series runs exactly as before.
+        """
+        if not self.config.sweep_enabled or self._sweep is None:
+            return False
+        try:
+            return bool(self._sweep.available())
+        except Exception:
+            return False
+
+    def _reset_session(self) -> None:
+        with self._session_lock:
+            self._session_paths.clear()
+            self._session_pending_paths.clear()
+            self._session_pending = 0
+            self._session_pending_since = None
+            self._session_settled = None
+            self._session_read_a_plate = False
+            self._session_changed.clear()
+
+    def local_sweep(self, event, scheduled_at, stop_event) -> int:
+        """Read live session frames on the device until one authorises.
+
+        Every new session frame (newest first, never one twice) goes to the
+        local reader. Nothing is injected, and so nothing reaches the cloud,
+        until the reader's own answer is an authorised plate under the band
+        in force; that frame is then injected into the ordinary pipeline,
+        which re-reads it and applies every existing safeguard before the
+        relay moves. The sweep waits for that verdict and stops on an open.
+
+        When the window ends without an authorised read, up to
+        ``sweep_fallback_frames`` of the best frames seen (highest local
+        score, else the newest) are injected so the passage is still recorded
+        and the cloud gets its last-resort read. Returns the frames injected.
+        """
+        config = self.config
+        self._reset_session()
+        self._sweep_runs += 1
+        self._start_live_session()
+        deadline = scheduled_at + config.sweep_seconds
+        min_gap = 1.0 / config.sweep_max_fps if config.sweep_max_fps > 0 else 0.0
+        trace_id = f"sweep-{self._sweep_runs}-{int(scheduled_at * 1000) & 0xFFFFFFFF:x}"
+        after = None
+        frames = reads = busy = authorised = injected = 0
+        last_read_at: float | None = None
+        best: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
+        newest: tuple[bytes, float] | None = None
+        best_plate: str | None = None
+        reason = "window"
+        batch: list[tuple[bytes, float]] = []
+
+        def halted() -> str | None:
+            """Why the sweep must stop now, or None to keep going."""
+            if stop_event.is_set():
+                return "stopping"
+            if not self._queue.empty():
+                return "new_event"
+            with self._session_lock:
+                settled = self._session_settled
+            if settled is not None:
+                return settled
+            if self._clock() >= deadline:
+                return "window"
+            return None
+
+        while True:
+            reason = halted()
+            if reason is not None:
+                break
+            with self._session_lock:
+                pending = self._session_pending
+            if pending > 0:
+                # A frame is with the processor; its verdict decides whether
+                # the sweep is over. Keep the window ticking meanwhile.
+                self._session_changed.clear()
+                self._session_changed.wait(SWEEP_POLL_SECONDS * 5)
+                continue
+            if not batch:
+                batch = self._unread_frames(after)
+                if not batch:
+                    if self._pause(stop_event, SWEEP_POLL_SECONDS):
+                        reason = "stopping"
+                        break
+                    continue
+            frame, captured_at = batch.pop(0)
+            after = captured_at
+            if last_read_at is not None and self._clock() - last_read_at < min_gap:
+                if self._pause(stop_event, min_gap - (self._clock() - last_read_at)):
+                    reason = "stopping"
+                    break
+            frames += 1
+            flat_fraction = self._flat_fraction(frame)
+            if (
+                flat_fraction is not None
+                and config.max_flat_fraction > 0
+                and flat_fraction > config.max_flat_fraction
+            ):
+                self._skipped_corrupt += 1
+                continue
+            scene_difference = self._scene_difference(frame)
+            if (
+                scene_difference is not None
+                and config.empty_scene_threshold > 0
+                and scene_difference < config.empty_scene_threshold
+            ):
+                self._skipped_empty += 1
+                continue
+            newest = (frame, captured_at)
+            last_read_at = self._clock()
+            read = self._sweep.read(frame, trace_id=trace_id)
+            reads += 1
+            self._sweep_last_read_ms = read.read_ms
+            if read.status == "unavailable":
+                busy += 1
+                continue
+            if read.recognised:
+                LOGGER.info(
+                    "gate_local_sweep stage=read plate=%s score=%.3f authorised=%s "
+                    "read_ms=%d frame=%d",
+                    read.plate, read.score, read.authorised, round(read.read_ms), frames,
+                )
+                if best is None or read.score > best[0]:
+                    best = (read.score, frame, captured_at)
+                    best_plate = read.plate
+            if not read.authorised:
+                continue
+            authorised += 1
+            if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep"):
+                injected += 1
+                # The rest of this clump is older than the frame just sent.
+                batch = []
+        fallback = 0
+        if injected == 0 and reason in ("window", "new_event") and config.sweep_fallback_frames > 0:
+            candidates = []
+            if best is not None:
+                candidates.append((best[1], best[2]))
+            if newest is not None and (best is None or newest[1] != best[2]):
+                candidates.append(newest)
+            for frame, captured_at in candidates[:config.sweep_fallback_frames]:
+                if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep_fallback"):
+                    fallback += 1
+        self._sweep_frames += frames
+        self._sweep_reads += reads
+        self._sweep_busy += busy
+        self._sweep_authorised += authorised
+        self._sweep_injected += injected
+        self._sweep_fallbacks += fallback
+        LOGGER.log(
+            logging.INFO if injected or fallback else logging.WARNING,
+            "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
+            "busy=%d authorised=%d injected=%d fallback=%d best_plate=%s best_score=%s "
+            "elapsed_ms=%d",
+            reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
+            authorised, injected, fallback, best_plate or "-",
+            "-" if best is None else f"{best[0]:.3f}",
+            round(max(0.0, self._clock() - scheduled_at) * 1000),
+        )
+        return injected + fallback
+
+    def _unread_frames(self, after: float | None) -> list[tuple[bytes, float]]:
+        """Fresh session frames newer than ``after``, oldest first.
+
+        A source that can hand over a clump (`frames_since`) does; otherwise
+        the newest frame stands alone (a keyframe before the session warms).
+        """
+        source = self._frame_source
+        if source is None:
+            return []
+        frames_since = getattr(source, "frames_since", None)
+        try:
+            if callable(frames_since):
+                picked = list(frames_since(after))
+            else:
+                latest = source.latest(after=after)
+                picked = [] if latest is None else [latest]
+        except Exception:
+            return []
+        if picked:
+            self._last_captured_at = picked[-1][1]
+        return picked
+
+    def _inject_bytes(self, frame: bytes, captured_at: float, event, scheduled_at,
+                      *, source: str) -> bool:
+        """Write ``frame`` privately and hand it to the burst pipeline."""
+        started = self._clock()
+        try:
+            path = write_private_frame(
+                _ensure_private_directory(self.output_directory), frame,
+            )
+        except Exception:
+            self._failure_count += 1
+            LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
+            return False
+        try:
+            injected = self._inject_path(path, event, scheduled_at, started)
+        except Exception:
+            self._failure_count += 1
+            LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
+            return False
+        if injected:
+            LOGGER.info(
+                "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
+                "source=%s frame_age_ms=%d",
+                getattr(event, "event_type", "unknown"),
+                round((self._clock() - started) * 1000), source,
+                max(0, round((self._clock() - captured_at) * 1000)),
+            )
+        return injected
 
     def note_result(self, paths, result) -> bool:
         """Learn how a frame this capture injected was decided.
@@ -804,14 +1066,7 @@ class TriggerFrameCapture:
         injected = 0
         after = None
         slots = self.config.capture_count
-        with self._session_lock:
-            self._session_paths.clear()
-            self._session_pending_paths.clear()
-            self._session_pending = 0
-            self._session_pending_since = None
-            self._session_settled = None
-            self._session_read_a_plate = False
-            self._session_changed.clear()
+        self._reset_session()
         self._start_live_session()
         if self._frame_source is not None:
             after, count = self._capture_slot(event, scheduled_at, after=after)
@@ -901,6 +1156,28 @@ class TriggerFrameCapture:
                 event.event_type, source, clipping,
             )
             return ()
+        if not self._inject_path(path, event, scheduled_at, started):
+            return ()
+        LOGGER.info(
+            "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
+            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s flat_fraction=%s "
+            "stillness=%s",
+            event.event_type, round((self._clock() - started) * 1000),
+            source, max(0, round((self._clock() - frame_captured_at) * 1000)),
+            "unavailable" if scene_difference is None else f"{scene_difference:.3f}",
+            "unavailable" if clipping is None else f"{clipping:.2f}",
+            "unavailable" if flat_fraction is None else f"{flat_fraction:.3f}",
+            "unavailable" if self._last_stillness is None else f"{self._last_stillness:.3f}",
+        )
+        return (path,)
+
+    def _inject_path(self, path: Path, event, scheduled_at, started) -> bool:
+        """Hand a written frame to the burst pipeline with its trigger telemetry.
+
+        Returns False, having removed the file, when no injector is attached.
+        Session bookkeeping is updated before the call and rolled back if the
+        injector raises, so a failed hand-off never leaves a frame pending.
+        """
         captured_at = self._wall_clock()
         origin = started if scheduled_at is None else scheduled_at
         delta_ms = max(0.0, (self._clock() - origin) * 1000.0)
@@ -916,7 +1193,7 @@ class TriggerFrameCapture:
         if inject is None:
             path.unlink(missing_ok=True)
             LOGGER.warning("gate_trigger_capture outcome=unattached")
-            return ()
+            return False
         with self._session_lock:
             self._session_paths.add(path)
             self._session_pending_paths.add(path)
@@ -937,18 +1214,7 @@ class TriggerFrameCapture:
             path.unlink(missing_ok=True)
             raise
         self._capture_count += 1
-        LOGGER.info(
-            "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
-            "source=%s frame_age_ms=%d scene_difference=%s clipping=%s flat_fraction=%s "
-            "stillness=%s",
-            event.event_type, round((self._clock() - started) * 1000),
-            source, max(0, round((self._clock() - frame_captured_at) * 1000)),
-            "unavailable" if scene_difference is None else f"{scene_difference:.3f}",
-            "unavailable" if clipping is None else f"{clipping:.2f}",
-            "unavailable" if flat_fraction is None else f"{flat_fraction:.3f}",
-            "unavailable" if self._last_stillness is None else f"{self._last_stillness:.3f}",
-        )
-        return (path,)
+        return True
 
     def _scene_difference(self, frame: bytes) -> float | None:
         difference = getattr(self._frame_source, "scene_difference", None)
@@ -1051,6 +1317,24 @@ class TriggerFrameCapture:
                 "empty_scene_threshold": self.config.empty_scene_threshold,
                 "max_highlight_clipping": self.config.max_highlight_clipping,
                 "max_flat_fraction": self.config.max_flat_fraction,
+            },
+            "sweep": {
+                "enabled": self.config.sweep_enabled,
+                "ready": self._sweep_ready(),
+                "seconds": self.config.sweep_seconds,
+                "max_fps": self.config.sweep_max_fps,
+                "fallback_frames": self.config.sweep_fallback_frames,
+                "runs": self._sweep_runs,
+                "frames": self._sweep_frames,
+                "reads": self._sweep_reads,
+                "busy": self._sweep_busy,
+                "authorised": self._sweep_authorised,
+                "injected": self._sweep_injected,
+                "fallbacks": self._sweep_fallbacks,
+                "last_read_ms": (
+                    None if self._sweep_last_read_ms is None
+                    else round(self._sweep_last_read_ms)
+                ),
             },
         }
 

@@ -1211,6 +1211,79 @@ updater, the application service, release health checks, or rollback. A broken
 or logged-out Tailscale client therefore cannot stop the gate or block automatic
 updates.
 
+### Remote Diagnostics From The Developer Mac
+
+This is the path an agent or engineer working from the owner's Mac should use
+to read the Pi journal and the live environment. Everything here was verified
+on 2026-09-16 and is the reason an earlier diagnosis had to stop at the
+dashboard.
+
+- The Pi is the Tailscale peer `raspberrypi`, address `100.90.85.12`. Tailscale
+  is normally **stopped** on the Mac; ask the owner to start it, then check with
+  `tailscale status` (the CLI lives at
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale` when it is not on the
+  `PATH`). The Pi is not on the Mac's LAN and does not answer `.local` names.
+- The SSH login user is `pi`. The dedicated diagnostics key is
+  `~/.ssh/gate_pi_claude` (ed25519, comment `claude-code-gate-diagnostics`,
+  generated 2026-08-24, authorised on the Pi by the owner on 2026-09-16). The
+  Pi's own password and login details are in the owner's 1Password vault
+  (item `gyn5vckzrm5tousoakfbpn2aku`); an agent never needs them once the key
+  is authorised. If a fresh Mac needs the key installed again, the owner runs
+  once, from a terminal, with the Pi password:
+
+  ```sh
+  ssh-copy-id -i ~/.ssh/gate_pi_claude.pub -o IdentitiesOnly=yes pi@100.90.85.12
+  ```
+
+  Connect with the key pinned, so the 1Password agent's other keys are not
+  offered first:
+
+  ```sh
+  ssh -i ~/.ssh/gate_pi_claude -o IdentitiesOnly=yes pi@100.90.85.12
+  ```
+
+- The Pi's LAN address is `192.168.0.33` and the camera's is `192.168.0.54`.
+  Read-only camera API reads work from the Pi with
+  `sudo /root/camtool.py get GetTime GetNtp GetEnc GetWebHook GetIsp GetZoomFocus GetFtpV20 GetPushV20`;
+  each invocation logs in once, so keep to one call with several commands.
+  Redact `password`, `userName`, `hookUrl` secrets and `server` before pasting
+  output anywhere.
+
+- Do not rely on the default agent. `~/.ssh/config` routes every host through
+  the 1Password SSH agent, which holds ten unrelated keys; without
+  `IdentitiesOnly=yes` the Pi's `sshd` disconnects with
+  `Too many authentication failures` before the right key is tried. None of
+  the agent keys is the Pi login key.
+- Once connected, the first lines to read for a recognition failure are in
+  [RLC-810A deployment](reolink-rlc-810a.md#stage-timing) and the review at
+  [reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md):
+  `sudo journalctl -u file-monitor.service --since '-2 days' -o cat | grep -E 'gate_presence stage=|reolink_webhook|gate_trigger_capture|upload_downscale'`,
+  and `sudo grep -E 'GATE_PLATE_REGION|GATE_TRIGGER|GATE_LOCAL_OCR|GATE_HOT_STREAM' /etc/gate-controller.env`.
+  A run of `reolink_webhook status=rejected reason=stale` with no
+  `gate_trigger_capture` lines means the camera clock is wrong; compare
+  `GetTime` and `GetNtp` with `date -u` before anything else. The correct
+  `GetTime` display for `timeZone 0` with DST is UTC plus 60 minutes. Saving
+  the camera's NTP dialog or Date and Time page from the web UI can disable
+  NTP and shift the clock; the API fix is in
+  [reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md).
+
+Without SSH, the Gate Mate Worker still exposes everything the Pi reports.
+Sign in to `https://gate-mate.ciaran-8d2.workers.dev` (Cloudflare Access,
+e-mail login code) and read, as JSON:
+
+- `/api/access-logs?limit=100&offset=0&from=YYYY-MM-DD` for events;
+- `/api/access-logs/<id>/reviews` for one event's stage timing, per-frame OCR
+  attempts, trigger provenance, local-reader summary, match policy, and
+  actuation claim;
+- `/api/access-logs/<id>/image` for the evidence frame;
+- `/api/controller-status` for the latest 15 s heartbeat, including the
+  release SHA, `recognition.trigger_capture` counters, `camera_control`, host,
+  and network probes.
+
+Wrangler on the Mac is not logged in, so D1 and R2 cannot be queried directly.
+The dashboard renders times in the browser's zone, which may not be
+`Europe/Dublin`; the JSON timestamps are UTC.
+
 ## Isolated Live Media Gateway
 
 Live media is an optional, separate MediaMTX service. It has dedicated

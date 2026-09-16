@@ -93,12 +93,16 @@ class CloudflareDocumentationTests(unittest.TestCase):
         )
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("The installed gate camera is an RLC-810A", installed)
+        # The RLC-811A was fitted on 2026-09-11; the docs must say so and
+        # must still point at the review that records what the swap missed.
+        self.assertIn("installed gate\ncamera is now an RLC-811A", installed)
         self.assertIn("reolink-rlc-811a.md", installed)
-        self.assertIn("The installed camera is an RLC-810A", readme)
+        self.assertIn("The installed camera is an RLC-811A", readme)
         self.assertIn("docs/reolink-rlc-811a.md", readme)
-        self.assertIn("RLC-810A (installed)", plate_camera)
-        self.assertIn("RLC-811A (replacement)", plate_camera)
+        self.assertIn("2026-09-16-rlc-811a-first-week.md", readme)
+        self.assertIn("RLC-810A (removed, rollback unit)", plate_camera)
+        self.assertIn("RLC-811A (installed)", plate_camera)
+        self.assertIn("fitted on 2026-09-11", plate_camera)
         self.assertIn("one Ethernet port", plate_camera)
         self.assertIn("The controller assumes one camera", plate_camera)
         self.assertIn("MTX_PATHS_CAMERA_SOURCE", plate_camera)

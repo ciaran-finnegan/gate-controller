@@ -255,6 +255,32 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertIsNotNone(fallback)
         self.assertIsNone(fallback[2])
 
+    def test_frames_since_drains_a_clump_oldest_first_capped_at_the_newest_three(self):
+        frames = [jpeg((10 * index, 10 * index, 10 * index)) for index in range(1, 6)]
+        done = Event()
+        factory, _source_process, _decoder_process = self._session_factory(
+            frames, [MID_GOP, STREAM], done,
+        )
+        source, _popen = self.source(factory)
+        self.assertTrue(source.start_session())
+        for _ in range(100):
+            if source.status()["session"]["frames"] >= 5:
+                break
+            import time
+            time.sleep(0.02)
+        self.assertEqual(source.status()["session"]["frames"], 5)
+        clump = source.frames_since(None, max_age=60.0)
+        self.assertEqual([frame for frame, _at in clump], frames[2:], "newest three, oldest first")
+        self.assertTrue(all(earlier <= later for (_a, earlier), (_b, later) in zip(clump, clump[1:])))
+        last_at = clump[-1][1]
+        self.assertEqual(source.frames_since(last_at, max_age=60.0), [], "nothing newer than the last one seen")
+        source.stop_session("test")
+        done.set()
+        # Without a session the newest keyframe stands in, as a one-item clump.
+        source.ring.feed(STREAM)
+        fallback = source.frames_since(None)
+        self.assertEqual(len(fallback), 1)
+
     def test_the_session_decoder_is_only_ever_fed_from_a_keyframe(self):
         """The defect: the decoder used to be handed the middle of a GOP.
 
