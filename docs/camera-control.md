@@ -365,6 +365,13 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 
 ## Install
 
+Once bootstrapped, the service follows the controller release: the updater
+re-runs this installer from each newly active release whenever the files the
+service is built from changed, so a merged change to `gate_camera_control/`
+reaches the Pi without anyone logging in (see
+[deployment.md](deployment.md#what-an-automatic-release-covers)). The steps
+below are the first-time bootstrap.
+
 The service is installed separately from the media stack; it shares no state, no
 user, and no environment file with it. **Run these steps in this order.** The
 ordering is not cosmetic: the Access application must exist before any DNS name
