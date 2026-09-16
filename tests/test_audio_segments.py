@@ -1,0 +1,350 @@
+"""The continuous recorder: what it writes, what it keeps, and what it cuts."""
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+
+from gate_controller.audio_segments import (
+    DEFAULT_MIN_FREE_BYTES, SegmentRecorder, SegmentStore, extract_window,
+    iter_adts_frames, load_segment_config, segment_command, segment_started_at,
+)
+
+
+def adts_frame(payload_bytes: int = 57, *, rate_index: int = 8) -> bytes:
+    """One ADTS frame with a real header: AAC-LC, MPEG-4, no CRC.
+
+    ``rate_index`` 8 is 16 kHz, the camera's rate, so one frame is 64 ms.
+    """
+    length = 7 + payload_bytes
+    header = bytearray(7)
+    header[0] = 0xFF
+    header[1] = 0xF1
+    header[2] = 0x40 | (rate_index << 2)
+    header[3] = 0x40 | ((length >> 11) & 0x03)
+    header[4] = (length >> 3) & 0xFF
+    header[5] = ((length & 0x07) << 5) | 0x1F
+    header[6] = 0xFC
+    return bytes(header) + b"\x00" * payload_bytes
+
+
+def stream(frames: int) -> bytes:
+    return b"".join(adts_frame() for _ in range(frames))
+
+
+class FakeProcess:
+    def __init__(self, *, runs_for: int = 2, stderr: bytes = b""):
+        self._polls = 0
+        self._runs_for = runs_for
+        self._stderr = stderr
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        self._polls += 1
+        return None if self._polls <= self._runs_for else 1
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def communicate(self, timeout=None):
+        return b"", self._stderr
+
+
+class AdtsParsingTests(unittest.TestCase):
+    def test_a_frame_reports_its_own_length_and_duration(self):
+        frames = list(iter_adts_frames(adts_frame()))
+        self.assertEqual(len(frames), 1)
+        offset, length, seconds = frames[0]
+        self.assertEqual((offset, length), (0, 64))
+        self.assertAlmostEqual(seconds, 1024 / 16000, places=6)
+
+    def test_frames_are_walked_in_order_without_a_decoder(self):
+        frames = list(iter_adts_frames(stream(5)))
+        self.assertEqual([offset for offset, _, _ in frames], [0, 64, 128, 192, 256])
+
+    def test_a_truncated_tail_ends_the_walk_rather_than_raising(self):
+        # A segment interrupted mid-write ends in a partial frame. The frames
+        # before it are still good and are still offered.
+        data = stream(3)[:-20]
+        self.assertEqual(len(list(iter_adts_frames(data))), 2)
+
+    def test_bytes_that_are_not_a_frame_header_stop_the_walk(self):
+        self.assertEqual(list(iter_adts_frames(b"not audio at all")), [])
+
+
+class SegmentNamingTests(unittest.TestCase):
+    def test_the_name_carries_the_start_instant_in_utc(self):
+        moment = segment_started_at(Path("gate-20260916T123000Z.aac"))
+        self.assertEqual(moment, datetime(2026, 9, 16, 12, 30, tzinfo=timezone.utc))
+
+    def test_a_name_from_anything_else_is_not_a_segment(self):
+        for name in ("notes.txt", "gate-nonsense.aac", "gate-20260916T993000Z.aac"):
+            self.assertIsNone(segment_started_at(Path(name)), name)
+
+    def test_the_command_never_decodes_and_cuts_on_the_clock(self):
+        command = segment_command("rtsp://127.0.0.1:8554/clear", Path("/tmp/seg"), seconds=1800)
+        self.assertIn("-vn", command)
+        self.assertIn("copy", command)
+        self.assertNotIn("-c:a", command[command.index("copy"):][1:])
+        self.assertIn("-segment_atclocktime", command)
+        self.assertIn("-strftime", command)
+        self.assertTrue(command[-1].endswith("gate-%Y%m%dT%H%M%SZ.aac"))
+
+
+class SegmentStoreTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.now = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+
+    def store(self, **overrides) -> SegmentStore:
+        settings = {"retention_hours": 48, "clock": lambda: self.now}
+        settings.update(overrides)
+        return SegmentStore(self.directory, **settings)
+
+    def write(self, started_at: datetime, frames: int = 10) -> Path:
+        path = self.directory / f"gate-{started_at.strftime('%Y%m%dT%H%M%S')}Z.aac"
+        path.write_bytes(stream(frames))
+        return path
+
+    def test_segments_are_listed_oldest_first(self):
+        self.write(self.now - timedelta(hours=1))
+        self.write(self.now - timedelta(hours=3))
+        self.write(self.now - timedelta(hours=2))
+        started = [segment.started_at for segment in self.store().segments()]
+        self.assertEqual(started, sorted(started))
+
+    def test_a_file_this_does_not_recognise_is_ignored_not_deleted(self):
+        stray = self.directory / "somebody-elses-file.aac"
+        stray.write_bytes(b"leave me alone")
+        self.write(self.now - timedelta(hours=1))
+        self.assertEqual(len(self.store().segments()), 1)
+        self.store().prune()
+        self.assertTrue(stray.exists())
+
+    def test_segments_past_the_horizon_are_pruned(self):
+        old = self.write(self.now - timedelta(hours=50))
+        kept = self.write(self.now - timedelta(hours=10))
+        report = self.store().prune()
+        self.assertEqual(report["expired"], 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(kept.exists())
+
+    def test_the_floor_takes_the_oldest_first_when_space_is_short(self):
+        oldest = self.write(self.now - timedelta(hours=3))
+        middle = self.write(self.now - timedelta(hours=2))
+        newest = self.write(self.now - timedelta(hours=1))
+        store = self.store()
+        # Never enough room, so the floor takes everything it is allowed to.
+        store.free_bytes = lambda: 0
+        report = store.prune()
+        self.assertEqual(report["for_space"], 2)
+        self.assertFalse(oldest.exists())
+        self.assertFalse(middle.exists())
+        # The newest is the one being written; deleting it frees nothing the
+        # recorder is not about to use again.
+        self.assertTrue(newest.exists())
+
+    def test_a_healthy_disk_prunes_nothing_for_space(self):
+        self.write(self.now - timedelta(hours=1))
+        store = self.store()
+        store.free_bytes = lambda: DEFAULT_MIN_FREE_BYTES * 2
+        self.assertEqual(store.prune()["for_space"], 0)
+
+    def test_covering_finds_only_the_segments_that_overlap(self):
+        # Each segment here is 10 frames, so 0.64 s of audio.
+        first = self.write(self.now - timedelta(seconds=10))
+        second = self.write(self.now - timedelta(seconds=5))
+        self.write(self.now - timedelta(seconds=100))
+        covering = self.store().covering(
+            self.now - timedelta(seconds=10), self.now - timedelta(seconds=4))
+        self.assertEqual([segment.path for segment in covering], [first, second])
+
+    def test_a_segment_span_is_measured_from_its_frames_not_assumed(self):
+        # A short segment -- the one before a restart -- must not be treated as
+        # a full one, or a window after it would claim audio that is not there.
+        short = self.write(self.now - timedelta(seconds=30), frames=2)
+        segment = next(s for s in self.store().segments() if s.path == short)
+        self.assertAlmostEqual(segment.duration(), 2 * 1024 / 16000, places=6)
+
+
+class ExtractionTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.now = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+        self.store = SegmentStore(self.directory, clock=lambda: self.now)
+
+    def write(self, started_at: datetime, frames: int) -> Path:
+        path = self.directory / f"gate-{started_at.strftime('%Y%m%dT%H%M%S')}Z.aac"
+        path.write_bytes(stream(frames))
+        return path
+
+    def test_a_window_is_cut_on_frame_boundaries_and_stays_playable(self):
+        start = self.now - timedelta(seconds=60)
+        self.write(start, 100)  # 6.4 s of audio
+        cut = extract_window(self.store, start + timedelta(seconds=1),
+                             start + timedelta(seconds=2))
+        self.assertGreater(len(cut), 0)
+        # Every byte kept is whole frames: walking the result consumes it all.
+        walked = sum(length for _, length, _ in iter_adts_frames(cut))
+        self.assertEqual(walked, len(cut))
+
+    def test_a_window_spanning_two_segments_is_joined(self):
+        start = self.now - timedelta(seconds=20)
+        self.write(start, 100)
+        self.write(start + timedelta(seconds=6.4), 100)
+        cut = extract_window(self.store, start + timedelta(seconds=5),
+                             start + timedelta(seconds=8))
+        frames = list(iter_adts_frames(cut))
+        self.assertGreater(len(frames), 20)
+        self.assertEqual(sum(length for _, length, _ in frames), len(cut))
+
+    def test_a_gap_in_the_recording_yields_a_shorter_clip_not_silence(self):
+        # The recorder was down between these two, so the window cannot be
+        # filled. Padding it would put silence the microphone never heard into
+        # a training set.
+        start = self.now - timedelta(seconds=60)
+        self.write(start, 50)
+        self.write(start + timedelta(seconds=30), 50)
+        cut = extract_window(self.store, start, start + timedelta(seconds=40))
+        seconds = sum(seconds for _, _, seconds in iter_adts_frames(cut))
+        self.assertAlmostEqual(seconds, 100 * 1024 / 16000, places=3)
+
+    def test_an_empty_or_backwards_window_returns_nothing(self):
+        self.write(self.now - timedelta(seconds=10), 50)
+        self.assertEqual(extract_window(self.store, self.now, self.now), b"")
+        self.assertEqual(
+            extract_window(self.store, self.now, self.now - timedelta(seconds=5)), b"")
+
+    def test_a_window_no_segment_covers_returns_nothing(self):
+        self.write(self.now - timedelta(hours=5), 50)
+        self.assertEqual(extract_window(self.store, self.now - timedelta(minutes=1),
+                                        self.now), b"")
+
+
+class RecorderTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.store = SegmentStore(self.directory)
+
+    def test_the_child_is_told_to_name_its_files_in_utc(self):
+        recorder = SegmentRecorder(self.store)
+        self.assertEqual(recorder.child_environment["TZ"], "UTC")
+
+    def test_the_child_is_spawned_without_a_shell_and_keeps_its_stderr(self):
+        seen = {}
+
+        def popen(command, **kwargs):
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            return FakeProcess(runs_for=0)
+
+        recorder = SegmentRecorder(self.store, popen=popen,
+                                   waiter=lambda _event, _seconds: None)
+        stop = threading.Event()
+        recorder._run_once(stop)
+        self.assertIsInstance(seen["command"], tuple)
+        self.assertNotIn("shell", seen["kwargs"])
+        self.assertIsNotNone(seen["kwargs"]["stderr"])
+
+    def test_run_forever_returns_when_the_stop_event_is_set(self):
+        stop = threading.Event()
+        stop.set()
+        recorder = SegmentRecorder(self.store, popen=lambda *a, **k: FakeProcess())
+        recorder.run_forever(stop)
+        self.assertEqual(recorder.status()["starts"], 0)
+
+    def test_a_child_that_dies_is_restarted_and_counted(self):
+        stop = threading.Event()
+        attempts = []
+
+        def popen(command, **kwargs):
+            attempts.append(command)
+            if len(attempts) >= 3:
+                stop.set()
+            return FakeProcess(runs_for=0, stderr=b"connection refused")
+
+        recorder = SegmentRecorder(self.store, popen=popen, monotonic=lambda: 0.0,
+                                   waiter=lambda _event, _seconds: None)
+        recorder.run_forever(stop)
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertGreaterEqual(recorder.status()["restarts"], 1)
+        self.assertIn("connection refused", recorder.status()["last_error"])
+
+    def test_recording_stops_rather_than_taking_the_last_of_the_card(self):
+        stop = threading.Event()
+        spawned = []
+        self.store.free_bytes = lambda: 0
+
+        def popen(command, **kwargs):
+            spawned.append(command)
+            return FakeProcess(runs_for=0)
+
+        class OneShot(threading.Event):
+            def wait(self, timeout=None):
+                self.set()
+                return True
+
+        recorder = SegmentRecorder(self.store, popen=popen, monotonic=lambda: 0.0)
+        recorder.run_forever(OneShot())
+        self.assertEqual(spawned, [])
+        self.assertEqual(recorder.status()["low_disk_refusals"], 1)
+
+    def test_status_reports_what_is_on_the_card(self):
+        started = datetime(2026, 9, 16, 11, 30, tzinfo=timezone.utc)
+        (self.directory / "gate-20260916T113000Z.aac").write_bytes(stream(10))
+        recorder = SegmentRecorder(self.store)
+        status = recorder.status()
+        self.assertEqual(status["segments"], 1)
+        self.assertEqual(status["oldest"], started.isoformat())
+        self.assertGreater(status["bytes"], 0)
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_is_off_unless_switched_on(self):
+        self.assertFalse(load_segment_config({})["enabled"])
+
+    def test_enabling_without_anywhere_to_write_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_segment_config({"GATE_AUDIO_SEGMENTS_ENABLED": "true"})
+
+    def test_a_relative_directory_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_segment_config({"GATE_AUDIO_SEGMENTS_ENABLED": "true",
+                                 "GATE_AUDIO_SEGMENTS_DIR": "segments"})
+
+    def test_a_non_loopback_source_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_segment_config({"GATE_AUDIO_SEGMENTS_SOURCE": "rtsp://192.168.0.54:554/h264"})
+
+    def test_credentials_in_the_source_are_refused(self):
+        with self.assertRaises(ValueError):
+            load_segment_config(
+                {"GATE_AUDIO_SEGMENTS_SOURCE": "rtsp://user:pass@127.0.0.1:8554/clear"})
+
+    def test_settings_outside_their_bounds_are_refused(self):
+        for name, value in (("GATE_AUDIO_SEGMENTS_SECONDS", "4"),
+                            ("GATE_AUDIO_SEGMENTS_SECONDS", "99999"),
+                            ("GATE_AUDIO_SEGMENTS_RETENTION_HOURS", "0"),
+                            ("GATE_AUDIO_SEGMENTS_MIN_FREE_BYTES", "1024")):
+            with self.assertRaises(ValueError, msg=f"{name}={value}"):
+                load_segment_config({name: value})
+
+    def test_the_defaults_are_the_measured_ones(self):
+        config = load_segment_config({})
+        self.assertEqual(config["segment_seconds"], 1800)
+        self.assertEqual(config["retention_hours"], 48)
+        self.assertEqual(config["source_url"], "rtsp://127.0.0.1:8554/clear")
+
+
+if __name__ == "__main__":
+    unittest.main()
