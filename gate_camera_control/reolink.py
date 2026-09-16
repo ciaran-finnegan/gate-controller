@@ -21,7 +21,7 @@ from .atomic import atomic_write
 
 
 API_PATH = "/cgi-bin/api.cgi"
-ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap"})
+ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap", "GetTime", "SetTime"})
 IR_STATES = ("Auto", "Off")
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MIN_LOGIN_INTERVAL_SECONDS = 60.0
@@ -195,6 +195,19 @@ class ReolinkClient:
         if state not in IR_STATES:
             raise ValueError("IR state must be Auto or Off")
         self._command("SetIrLights", 0, {"IrLights": {"state": state}})
+
+    def clock_state(self) -> dict:
+        """The camera's clock as it displays it, with its DST block."""
+        value = self._command("GetTime", 1, {"channel": 0})
+        if not isinstance(value, dict) or not isinstance(value.get("Time"), dict):
+            raise CameraError("camera reported an unusable clock")
+        return {"Time": dict(value["Time"]), "Dst": dict(value.get("Dst") or {})}
+
+    def set_clock(self, time_fields: dict, dst: dict) -> None:
+        """Write the displayed time and the DST block back in one call."""
+        if not isinstance(time_fields, dict) or not isinstance(dst, dict):
+            raise ValueError("clock fields must be objects")
+        self._command("SetTime", 0, {"Time": dict(time_fields), "Dst": dict(dst)})
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""

@@ -40,7 +40,38 @@ def default_state() -> dict:
     }
 
 
-def state_document(ir_snapshot, *, now=None) -> dict:
+CLOCK_OUTCOMES = (
+    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
+    "camera_unreachable", "camera_error", "disabled",
+)
+
+
+def clock_block(clock_snapshot) -> dict | None:
+    """The bounded clock block, or None when the reconciler is not wired."""
+    if not isinstance(clock_snapshot, dict):
+        return None
+    outcome = clock_snapshot.get("outcome")
+    if outcome not in CLOCK_OUTCOMES:
+        outcome = "camera_error"
+    skew = clock_snapshot.get("skew_seconds")
+    if isinstance(skew, bool) or not isinstance(skew, int):
+        skew = None
+    checked_at = clock_snapshot.get("checked_at")
+    if not isinstance(checked_at, str) or not 0 < len(checked_at) <= 40:
+        checked_at = None
+    corrections = clock_snapshot.get("corrections")
+    if isinstance(corrections, bool) or not isinstance(corrections, int) or corrections < 0:
+        corrections = 0
+    return {
+        "synced": outcome in ("ok", "corrected"),
+        "outcome": outcome,
+        "skew_seconds": skew,
+        "checked_at": checked_at,
+        "corrections": corrections,
+    }
+
+
+def state_document(ir_snapshot, *, now=None, clock_snapshot=None) -> dict:
     """Convert an IR snapshot into the exact nonsecret heartbeat document."""
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
@@ -60,7 +91,7 @@ def state_document(ir_snapshot, *, now=None) -> dict:
     effective_until = ir_snapshot.get("effective_until")
     if not isinstance(effective_until, str):
         effective_until = None
-    return {
+    document = {
         "observed_at": int(time.time() if now is None else now),
         "camera_control": {
             "available": state != "unknown",
@@ -73,6 +104,10 @@ def state_document(ir_snapshot, *, now=None) -> dict:
             },
         },
     }
+    clock = clock_block(clock_snapshot)
+    if clock is not None:
+        document["camera_control"]["clock"] = clock
+    return document
 
 
 def write_state(path, document: dict) -> None:
@@ -93,9 +128,11 @@ class StatePublisher:
     def __init__(self, path, snapshot_provider, *,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
-                 clock=time.time):
+                 clock=time.time, clock_provider=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        # The clock reconciler's own snapshot; None when it is not wired.
+        self._clock_provider = clock_provider
         self._interval_seconds = float(interval_seconds)
         self._refresher = refresher
         self._refresh_interval_seconds = float(refresh_interval_seconds)
@@ -114,7 +151,15 @@ class StatePublisher:
         self._thread.join(timeout=self._interval_seconds + 1)
 
     def publish_once(self) -> None:
-        write_state(self._path, state_document(self._snapshot_provider()))
+        clock_snapshot = None
+        if self._clock_provider is not None:
+            try:
+                clock_snapshot = self._clock_provider()
+            except Exception:
+                clock_snapshot = None
+        write_state(self._path, state_document(
+            self._snapshot_provider(), clock_snapshot=clock_snapshot,
+        ))
 
     def refresh_if_due(self) -> bool:
         """Observe the camera at most once per refresh interval. True if it ran."""
