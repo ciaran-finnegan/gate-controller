@@ -112,6 +112,10 @@ def main() -> None:
     # nothing recorded. Built before the coordinator because the coordinator is
     # the sole owner of the relay, and the relay is what labels the clips.
     audio_capture = _audio_capture_recorder(os.environ)
+    # The continuous recorder is independent of the per-event one: it holds no
+    # lock the pipeline takes, observes no actuation, and is never consulted by
+    # a gate decision. It only writes segments a later job cuts windows from.
+    audio_segments = _audio_segment_recorder(os.environ)
     coordinator = ActuationCoordinator(
         store, relay, timedelta(seconds=20), activation_observer=audio_capture,
     )
@@ -219,6 +223,8 @@ def main() -> None:
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if audio_capture is not None:
         background_workers += (audio_capture,)
+    if audio_segments is not None:
+        background_workers += (audio_segments,)
     if hot_stream is not None:
         background_workers += (hot_stream,)
     if clear_keyframes is not None:
@@ -423,6 +429,30 @@ def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
         return None
 
     return handle
+
+
+def _audio_segment_recorder(environment):
+    """A continuous recorder of the gate's sound, or None when off.
+
+    Off unless ``GATE_AUDIO_SEGMENTS_ENABLED`` is set: no thread, no child,
+    nothing written. A configuration error raises here, before the relay is
+    claimed, rather than leaving a half-configured recorder running.
+    """
+    from .audio_segments import SegmentRecorder, SegmentStore, load_segment_config
+
+    config = load_segment_config(environment)
+    if not config["enabled"] or config["directory"] is None:
+        return None
+    store = SegmentStore(
+        config["directory"],
+        retention_hours=config["retention_hours"],
+        min_free_bytes=config["min_free_bytes"],
+    )
+    return SegmentRecorder(
+        store,
+        source_url=config["source_url"],
+        segment_seconds=config["segment_seconds"],
+    )
 
 
 def _audio_capture_recorder(environment):

@@ -348,3 +348,78 @@ class ConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WiringTests(unittest.TestCase):
+    """That the recorder is actually reachable from the controller.
+
+    The first version of this work shipped with the module, the tests and the
+    documentation all present and the four lines that construct the recorder
+    missing from ``__main__``. Everything passed, the release deployed, and
+    nothing recorded: there was no test that the wiring existed, because every
+    test addressed the module directly. These are those tests.
+    """
+
+    #: Importing the entry point pulls in the controller's whole dependency
+    #: tree. Where that is not installed the import-based checks skip, but the
+    #: source check below does not: it is the one that catches the regression
+    #: and it must run everywhere, including on a bare checkout.
+    ENTRY_POINT = Path(__file__).resolve().parent.parent / "gate_controller" / "__main__.py"
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+
+    @staticmethod
+    def _entry_point():
+        try:
+            from gate_controller.__main__ import _audio_segment_recorder
+        except Exception as error:      # dependency missing in this environment
+            raise unittest.SkipTest(f"controller entry point not importable: {error}")
+        return _audio_segment_recorder
+
+    def _environment(self, **overrides):
+        settings = {
+            "GATE_AUDIO_SEGMENTS_ENABLED": "true",
+            "GATE_AUDIO_SEGMENTS_DIR": str(self.directory),
+        }
+        settings.update(overrides)
+        return settings
+
+    def test_the_controller_builds_a_recorder_when_it_is_switched_on(self):
+        recorder = self._entry_point()(self._environment())
+        self.assertIsInstance(recorder, SegmentRecorder)
+        self.assertEqual(recorder.store.directory, self.directory)
+
+    def test_the_controller_builds_nothing_when_it_is_off(self):
+        self.assertIsNone(self._entry_point()({}))
+
+    def test_the_recorder_carries_the_configured_bounds(self):
+        recorder = self._entry_point()(self._environment(
+            GATE_AUDIO_SEGMENTS_SECONDS="600",
+            GATE_AUDIO_SEGMENTS_RETENTION_HOURS="12",
+        ))
+        self.assertEqual(recorder.segment_seconds, 600)
+        self.assertEqual(recorder.store.retention_hours, 12)
+
+    def test_a_bad_setting_is_refused_before_the_relay_is_claimed(self):
+        build = self._entry_point()
+        with self.assertRaises(ValueError):
+            build(self._environment(GATE_AUDIO_SEGMENTS_DIR="relative/path"))
+
+    def test_the_recorder_satisfies_the_background_worker_protocol(self):
+        # `run_worker` starts each background worker as
+        # `Thread(target=..., args=(worker.run_forever, (stop_event,)))`.
+        # A recorder missing that method would be built, added, and then fail
+        # in a supervised thread rather than at startup.
+        recorder = self._entry_point()(self._environment())
+        self.assertTrue(callable(getattr(recorder, "run_forever", None)))
+        self.assertTrue(callable(getattr(recorder, "status", None)))
+
+    def test_the_wiring_is_present_in_the_controller_entry_point(self):
+        # The one assertion that would have caught the shipped regression:
+        # the construction and the append both have to be there.
+        source = self.ENTRY_POINT.read_text(encoding="utf-8")
+        self.assertIn("audio_segments = _audio_segment_recorder(", source)
+        self.assertIn("background_workers += (audio_segments,)", source)
