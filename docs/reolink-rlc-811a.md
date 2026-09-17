@@ -205,6 +205,32 @@ lower frame rate lets the shutter stretch towards 1/6 s, which would brighten
 the picture and smear every moving plate. Read `Isp.exposure` back after any
 frame-rate change.
 
+
+### It still under-delivers, by about a quarter
+
+Measured again on 2026-09-17 in daylight, with `frameRate 6`, `bitRate 6144`,
+`gop 1` and `constantFrameRate 1` all confirmed in place:
+
+| Sample | Frames | Over | Delivered |
+| --- | --- | --- | --- |
+| 10 s | 41 | 10.0 s | 4.1 fps |
+| 20 s | 92 | 19.8 s | 4.6 fps |
+
+So about **4.5 fps against a configured 6**, or 75%. Setting `constantFrameRate`
+to 1 recovered the worst of it -- it was 2.9 before -- but not all of it.
+
+This caps everything downstream. The session decoder is asked for
+`GATE_SESSION_FPS=5`, which is *above* what arrives, so its `fps` filter has
+nothing to thin and repeats frames instead to make the rate up. A repeated
+frame costs the on-device reader its full ~200 ms for an answer already known,
+which is why the sweep now skips a frame identical to the one before it and
+reports `duplicates=` and `read_fps=` when the window ends.
+
+Do not chase this with a higher frame rate. At a fixed 6144 kbit/s more frames
+means fewer bits each, and the binding constraint on recognition at this site
+is plate size -- measured at 135-170 px at the stopping position on
+2026-09-17, against the 300 px the lens could give after re-aiming.
+
 ## Webhook Capture And Keyframes
 
 The delayed capture series above grabs frames from the clear stream on
