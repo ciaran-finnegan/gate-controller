@@ -442,6 +442,87 @@ segment ships to R2 and is discarded, `propose` reports `no audio` for
 anything inside it — four of eight actuations on the first real run. Either
 propose often, or teach it to fetch from R2.
 
+## 2c. The Detector, Running
+
+Built 2026-09-17. `gate_controller.gate_sound_scan`, driven by
+`scripts/scan_gate_sound.py` on a quarter-hourly timer, reads finished
+segments and writes what the gate did into `gate_movements`.
+
+Nothing here is in the path of opening a gate. It runs after the fact, over
+recordings, niced to the back of the queue, and if it never runs at all
+recognition is unaffected.
+
+### What it found on the first real scan
+
+Forty-eight segments, four hours of recorded audio:
+
+| | |
+| --- | --- |
+| Movements | 13 |
+| Ending shut (a clang) | 5 |
+| Ending open | 8 |
+| **Openings nobody commanded** | **1** |
+
+The four commanded cycles are all there with their travel times -- 24.0 s,
+25.4 s, 28.3 s, 32.2 s against a measured 15-27 s -- and the clangs land at
+-21.9 to -28.1 dBFS with 54-79% of their energy above 3 kHz, which is the band
+profile measured by hand in section 2.
+
+The uncommanded opening is **2026-09-17 11:47:16, twelve seconds**, with no
+relay firing anywhere near it. Somebody used a fob or the keypad, and until
+this table nothing in the system would ever have known.
+
+### Two numbers that had to be measured, not guessed
+
+**The minimum run is eight seconds.** At three it found 88 openings against 7
+closings over the same audio -- and a gate that opens 88 times shuts 88 times,
+so eighty of those were transients the classifier fired on for a frame or two.
+Eight is well under the shortest real travel and well over anything that is
+not the motor; the count fell to 13, and open and shut came into balance.
+
+**A relay firing claims a run from 12 s before it to 75 s after.** Late,
+because the auto-close follows about forty seconds behind. Early, because the
+detector hears the motor start *before* the relay row is written: at 11:08 the
+run was timed 3.2 s ahead of the firing. Erring wide is the safe direction --
+a commanded opening mistaken for a fob inflates the one number this exists to
+produce, and the opposite error only understates it.
+
+### What it costs
+
+Fifty-nine seconds for twenty minutes of audio, measured on the board. It was
+six and a half minutes before the band analysis was restricted to the few
+seconds around each motor run: YAMNet is a MobileNet and cheap, but
+`analyse_frames` is a pure-Python FFT over 9,375 windows per segment. A clang
+is only ever *interpreted* beside the end of a motor run, so that is the only
+place it is looked for now.
+
+### What is not yet true of it
+
+* **A vehicle's engine reads much like the motor.** It is what put the 11:08
+  run 3.2 s early, and it is unresolved: separating them needs labelled engine
+  audio, which the retention fix has only just started collecting.
+* **The alternation is only as good as its first run.** A movement means
+  "shut" because the gate was open, and a false positive early in a scan
+  inverts every outcome after it.
+* **One travel can still be reported as two.** A dropout longer than 1.5 s
+  splits a run; the 14:20 closing came out as 15.4 s plus 9.6 s.
+* **The gate-motor classifier is trained on four cycles** from one afternoon.
+  It is the starting point the corpus exists to improve.
+
+### Installing it on a board
+
+The classifier ships in this repository as JSON. YAMNet does not -- it is
+16 MB and never changes:
+
+```sh
+sudo install -o gate-controller -g gate-controller -m 644 \
+  yamnet.onnx /var/lib/gate-controller/models/yamnet.onnx
+sudo systemctl enable --now gate-sound-scan.timer
+```
+
+Without it the detector reports itself unavailable and does nothing, which is
+the correct behaviour for an analysis model on a gate controller.
+
 ## 3. What Is Proposed
 
 The detector above exists and is tested. What does **not** exist yet is the
