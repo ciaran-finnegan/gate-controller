@@ -111,3 +111,68 @@ class Recording(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateStateForTheHeartbeat(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        from gate_controller.gate_sound_scan import gate_state
+
+        self.gate_state = gate_state
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        store = LocalStore(Path(self.directory.name) / "gate.db")
+        self.connection = sqlite3.connect(store.path)
+        self.addCleanup(self.connection.close)
+        self.now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+
+    def movement(self, *, seconds_ago: int, seconds: int, commanded: bool, shut: bool):
+        start = self.now - timedelta(seconds=seconds_ago)
+        end = start + timedelta(seconds=seconds)
+        return movements_from(
+            [MotorRun(start=start, end=end)],
+            [Clang(at=end - timedelta(seconds=1), high_share=0.7, peak_dbfs=-24.0)] if shut else [],
+            commanded_at=(start,) if commanded else (),
+            initial_state="open" if shut else "shut",
+        )
+
+    def test_nothing_scanned_is_unknown_rather_than_a_shut_gate(self):
+        """A dashboard that showed "shut" here would be reassuring and wrong."""
+        self.assertIsNone(self.gate_state(self.connection, now=self.now))
+
+    def test_a_gate_left_open_reports_how_long_it_has_been(self):
+        # The only moment the property is not secured, and until this table
+        # nobody could know it from anywhere but the driveway.
+        record(self.connection, self.movement(
+            seconds_ago=300, seconds=20, commanded=True, shut=False,
+        ), [("a.aac", 10)], now=self.now)
+
+        state = self.gate_state(self.connection, now=self.now)
+
+        self.assertEqual(state["state"], "open")
+        self.assertEqual(state["open_for_seconds"], 280)
+
+    def test_a_gate_that_shut_reports_no_open_time(self):
+        record(self.connection, self.movement(
+            seconds_ago=300, seconds=20, commanded=True, shut=True,
+        ), [("a.aac", 10)], now=self.now)
+
+        state = self.gate_state(self.connection, now=self.now)
+
+        self.assertEqual(state["state"], "shut")
+        self.assertEqual(state["open_for_seconds"], 0)
+
+    def test_openings_nobody_commanded_are_counted_over_the_window(self):
+        """The denominator: 84% of passages here never fire the relay."""
+        record(self.connection, self.movement(
+            seconds_ago=600, seconds=20, commanded=False, shut=False,
+        ), [("a.aac", 10)], now=self.now)
+
+        state = self.gate_state(self.connection, now=self.now)
+
+        self.assertEqual(state["uncommanded_24h"], 1)
+        self.assertEqual(state["movements_24h"], 1)
+
+    def test_a_database_without_the_tables_says_nothing(self):
+        self.assertIsNone(self.gate_state(sqlite3.connect(":memory:"), now=self.now))
