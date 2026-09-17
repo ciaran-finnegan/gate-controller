@@ -159,6 +159,52 @@ Set it up as:
 7. Save JPEGs of a car stopped at the mark, and of one stopped half a metre
    short and half a metre long, before enabling the alarm FTP schedule.
 
+## Frame Rate, And The Setting That Decides Whether You Get It
+
+Measured on 2026-09-17, after the swap: the camera was configured for 10 fps
+and delivering about 5, and at 6 fps it delivered 2.9. `Isp.constantFrameRate`
+was **2**; the RLC-810A ran at **1**, and the swap did not carry it over. At 2
+the encoder drops frames on a quiet scene, which an empty driveway always is,
+so the controller saw roughly half the pictures it was configured for and the
+`GATE_CLEAR_STREAM_SOURCE_FPS` it was told about was fiction.
+
+```sh
+sudo /root/camtool.py raw '[{"cmd":"SetIsp","action":0,"param":{"Isp":{<GetIsp.value.Isp with constantFrameRate: 1>}}}]'
+```
+
+With `constantFrameRate: 1` the same 6 fps configuration delivered 5.9 fps over
+ten seconds. Check it by measuring rather than by reading the setting back:
+
+```sh
+ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/clear -t 10 -an -f null -
+```
+
+Sixty video frames in ten stream-seconds is 6 fps; thirty is the encoder
+quietly deciding the scene was dull.
+
+**Rate against bitrate.** The stream is CBR, so the bitrate is spent whatever
+the frame rate: halving the rate doubles the data in each picture. At 4K the
+site now runs **6 fps at 6144 kbit/s**, which is 1024 kbit a frame against 614
+at the previous 10 fps, and costs the NVR nothing because the bitrate is
+unchanged. The camera offers 25/22/20/18/16/15/12/10/8/6/4/2 fps and bitrates
+to 8192; 8192 was measured and rejected as diminishing returns for a third
+more recording storage, since plate pixel width and night exposure dominate,
+not compression. Six is deliberately just above the five frames a second the
+on-device reader can consume.
+
+Two things must move with the frame rate, every time:
+
+- `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi. The session decoder reads an
+  Annex-B pipe with no timestamps, so a stated rate that is not the real one
+  silently changes how many pictures it keeps.
+- The I-frame interval, at 1x the frame rate, so there is still a keyframe
+  every second for an on-demand grab to start from.
+
+Exposure is **not** one of them, as long as it stays `Manual`. On `Auto` a
+lower frame rate lets the shutter stretch towards 1/6 s, which would brighten
+the picture and smear every moving plate. Read `Isp.exposure` back after any
+frame-rate change.
+
 ## Webhook Capture And Keyframes
 
 The delayed capture series above grabs frames from the clear stream on
