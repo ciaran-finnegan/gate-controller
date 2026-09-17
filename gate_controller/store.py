@@ -1109,6 +1109,36 @@ class LocalStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_per_event ON outbox (event_id);
                 CREATE INDEX IF NOT EXISTS event_telemetry_created_at
                     ON event_telemetry (created_at);
+                -- What the microphone heard the gate do, which is not the same
+                -- as what the controller asked it to do. At this site 84% of
+                -- passages never fire the relay: people use key fobs, and until
+                -- this table those openings were invisible to everything.
+                --
+                -- `started_at` is the primary key because a movement is
+                -- identified by when it began: re-scanning the same segment
+                -- after a restart must update the row rather than record the
+                -- gate opening twice.
+                CREATE TABLE IF NOT EXISTS gate_movements (
+                    started_at TEXT PRIMARY KEY,
+                    ended_at TEXT NOT NULL,
+                    seconds REAL NOT NULL,
+                    outcome TEXT NOT NULL,
+                    uncommanded INTEGER NOT NULL DEFAULT 0,
+                    clang_at TEXT,
+                    clang_peak_dbfs REAL,
+                    detector TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS gate_movements_started_at
+                    ON gate_movements (started_at DESC);
+                -- Which recorded segments have been looked at, so a scan that
+                -- is interrupted resumes instead of starting the night again.
+                CREATE TABLE IF NOT EXISTS gate_sound_scans (
+                    segment TEXT PRIMARY KEY,
+                    scanned_at TEXT NOT NULL,
+                    frames INTEGER NOT NULL,
+                    movements INTEGER NOT NULL
+                );
             """)
             event_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(events)")

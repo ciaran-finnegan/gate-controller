@@ -88,6 +88,21 @@ CLANG_CLUSTER_SECONDS = 1.5
 #: generous in both directions.
 CLANG_ATTRIBUTION_SECONDS = 4.0
 
+#: How far either side of a relay firing a motor run still counts as ours.
+#:
+#: Wider than it looks like it needs to be, in both directions. Late, because
+#: the measured gap from the relay to the motor starting is one to two seconds
+#: and the auto-close follows forty seconds later. Early, because the detector
+#: hears the motor start *before* the relay row is written: on 2026-09-17 at
+#: 11:08 the run was timed 3.2 s ahead of the firing, partly onset error and
+#: partly the arriving car's own engine, which reads much like the motor.
+#:
+#: Erring wide is the safe direction. A commanded opening mistaken for a fob
+#: inflates the one number this exists to produce -- how often people give up
+#: on recognition -- and a fob mistaken for ours only understates it.
+COMMAND_BEFORE_SECONDS = 12.0
+COMMAND_AFTER_SECONDS = 75.0
+
 
 @dataclass(frozen=True)
 class MotorRun:
@@ -238,8 +253,26 @@ def movements(frames, *, commanded_at=(), initial_state: str = "shut") -> list[G
     the window -- ``shut`` by default, since that is where a gate rests.
     """
     frames = list(frames)
-    runs = find_motor_runs(frames)
-    clangs = find_clangs(frames)
+    return movements_from(
+        find_motor_runs(frames), find_clangs(frames),
+        commanded_at=commanded_at, initial_state=initial_state,
+    )
+
+
+def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut") -> list[GateMovement]:
+    """The same state machine, over runs and clangs found however you like.
+
+    The band-ratio rule above finds both, and on a quiet night it saturates and
+    calls 62% of an empty half hour a gate moving -- which is why the motor is
+    now found by a classifier over pretrained embeddings instead. The clang is
+    not affected: it is a transient in a band that is empty the rest of the
+    time, and share has nothing to saturate against over 32 ms.
+
+    What neither of them can do is decide what a run *meant*. That needs the
+    gate's alternation, and it lives here, once.
+    """
+    runs = sorted(runs, key=lambda run: run.start)
+    clangs = list(clangs)
     commands = sorted(commanded_at)
     state = initial_state if initial_state in {"shut", "open"} else "shut"
     out: list[GateMovement] = []
@@ -261,7 +294,7 @@ def movements(frames, *, commanded_at=(), initial_state: str = "shut") -> list[G
         else:
             outcome = "open"
         uncommanded = (not closing) and not any(
-            -MOTOR_GAP_SECONDS <= (run.start - moment).total_seconds() <= 30.0
+            -COMMAND_BEFORE_SECONDS <= (run.start - moment).total_seconds() <= COMMAND_AFTER_SECONDS
             for moment in commands
         )
         out.append(GateMovement(

@@ -1,0 +1,14 @@
+[Unit]
+Description=Read the gate's own sound every quarter of an hour
+
+[Timer]
+# Quarter-hourly rather than nightly: a gate left standing open is worth
+# knowing about within minutes, not at breakfast. Each run reads only what it
+# has not read before, so the usual pass is three segments.
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
