@@ -1203,6 +1203,36 @@ Add `GITHUB_TOKEN=` followed by the token value. Never put the token in this
 repository, the application environment file, a systemd unit, or a command-line
 argument.
 
+## What An Automatic Release Covers
+
+Every five minutes the updater compares the active release with the exact
+`master` commit that has a successful `Gate Controller CI` run. A new release
+is staged, verified, symlinked and the controller restarted as described
+above. Since 2026-09-16 the same run then reconciles the **managed
+components** that live outside the release tree, on activation and on every
+later run until each one matches:
+
+| Component | Built from | Refreshed by | Marker |
+| --- | --- | --- | --- |
+| `gate-camera-control` | `gate_camera_control/`, `gate_media_config.py`, its installer and unit | `bash deployment/install-camera-control.sh --source <release>` (idempotent; restarts the service) | `/usr/local/lib/gate-camera-control/.gate-release-digest` |
+| media stack | `gate_media_auth/`, `gate_media_gateway/`, `gate_media_transcoder/`, `gate_media_config.py`, the TURN refresh helper, `mediamtx.yml`, the WHEP template and the five media units | files copied with the installer's owners and modes, `systemctl daemon-reload`, `systemctl try-restart` of the three media services and the TURN-refresh timer | `/usr/local/lib/gate-media/.gate-release-digest` |
+
+A component is skipped when it was never bootstrapped on the host (no
+library directory, or for camera-control no environment file). A refresh
+failure never touches the controller release: it is logged, the marker is
+left stale so the next cycle retries, and the updater run exits non-zero so
+`systemctl status gate-controller-updater.service` shows it. Look for
+`Refreshing component`, `now matches release` and `was not refreshed` in
+`journalctl -u gate-controller-updater.service`.
+
+Still bootstrap-owned, because they need arguments only the operator's
+install command carries: the updater's own systemd unit and timer, the
+MediaMTX binary, the rendered WHEP proxy configuration and the TURN
+credentials. Changing those still means `deployment/install.sh`. The WHEP
+proxy *template* is refreshed, and when it changes the updater warns that
+`/etc/gate-media/nginx-whep-locations.conf` is still rendered from the
+previous release and needs `install-media.sh --allowed-origin` to catch up.
+
 ## Tailscale
 
 Tailscale can remain installed for break-glass SSH diagnostics, log inspection,
@@ -1541,13 +1571,18 @@ an unauthenticated camera control on the public internet.
 7. **Store the service token in the Worker**, exactly as the `gate-command`
    token is stored. The token never goes near the Pi.
 
-Re-run the installer on **every** controller release. Activation deliberately
-does not republish `/usr/local/lib/gate-camera-control` — that path sits outside
-the managed release tree so an auto-update cannot silently change the one process
-holding camera credentials — so a release that changes `gate_camera_control/` or
-`gate_media_config.py` does not reach the running service until
+After this bootstrap the updater re-runs the installer from each newly active
+release whenever `gate_camera_control/`, `gate_media_config.py`, the installer
+or the unit changed (see
+[What An Automatic Release Covers](#what-an-automatic-release-covers)). Until
+2026-09-16 activation deliberately left `/usr/local/lib/gate-camera-control`
+alone so an auto-update could not change the one process holding camera
+credentials; that protection now rests on what it always did in practice, the
+CI gate on `master` and the release verification, and the installer still
+validates the environment file before it publishes anything and never reads
+the credentials into the updater. A manual re-run remains
 `sudo bash /opt/gate-controller-deploy/releases/<sha>/deployment/install-camera-control.sh --source /opt/gate-controller-deploy/releases/<sha>`
-is run (through `bash`, for the reason in step 3).
+(through `bash`, for the reason in step 3).
 
 The full HTTP contract, environment keys, journal lines, failure modes, and
 rollback are in [Gate camera control](camera-control.md).

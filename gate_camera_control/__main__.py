@@ -24,6 +24,7 @@ from gate_media_config import (
     validate_camera_control_environment,
 )
 
+from .clock import ClockReconciler, ClockWorker
 from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker
 from .reolink import IR_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient
 from .state import STATE_PATH, StatePublisher
@@ -579,6 +580,17 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
     return CameraControlService(controller, client, clock=clock, logger=logger)
 
 
+def build_clock_reconciler(settings, client, *, logger=None, clock=time.time) -> ClockReconciler:
+    """The hourly camera clock reconcile; disabled leaves the camera clock alone."""
+    logger = logger or logging.getLogger("gate_camera_control")
+    return ClockReconciler(
+        client,
+        enabled=settings.get("GATE_CAMERA_CLOCK_SYNC", "true") == "true",
+        clock=clock,
+        journal=lambda stage, **fields: journal(logger, stage, **fields),
+    )
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Loopback gate camera-control service")
     parser.add_argument("--host", default=LOOPBACK_HOST)
@@ -612,22 +624,28 @@ def main(argv=None) -> int:
     service.controller.restore_default_on_start()
     server = CameraControlServer((arguments.host, arguments.port), service, logger=logger)
     reverts = RevertWorker(service.controller)
+    clock_reconciler = build_clock_reconciler(settings, service._client, logger=logger)
+    clock_worker = ClockWorker(clock_reconciler)
     publisher = StatePublisher(
         arguments.state_path, service.controller.snapshot,
         # One bounded observation behind the publication, so an idle camera is
         # reported as it is rather than as never-observed until someone asks.
         refresher=service.controller.refresh_observation,
+        clock_provider=clock_reconciler.snapshot,
     )
     journal(logger, "started", port=arguments.port,
+            clock_sync=clock_reconciler.enabled,
             ir_default=service.controller.default_state,
             lease_default_minutes=service.controller.default_lease_minutes,
             lease_max_minutes=service.controller.max_lease_minutes)
     reverts.start()
+    clock_worker.start()
     publisher.start()
     try:
         server.serve_forever()
     finally:
         publisher.stop()
+        clock_worker.stop()
         reverts.stop()
         server.server_close()
     return 0

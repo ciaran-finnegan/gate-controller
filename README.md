@@ -84,10 +84,18 @@ the Pi as well; the suite refuses to run any command against a live stream, so
 doing that can no longer starve the board the way it did on 2026-09-07.
 Network, GitHub, rate-limit,
 dependency, staging, or verification failures leave the running release
-untouched; activation failures restore the previous managed symlink. The root
-updater helper and all systemd units are fixed copies installed only by explicit
-bootstrap, so changes to them require a deliberate bootstrap refresh rather
-than an automatic release.
+untouched; activation failures restore the previous managed symlink. After a
+release is active the updater also brings the services published outside the
+release tree up to it: `gate-camera-control` is re-published through its own
+installer, and the media library, its MediaMTX configuration and its units are
+copied and the media services restarted, each only when the files it is built
+from actually changed (a digest marker beside each installed copy). A component
+that fails to refresh leaves the controller release active, marks the run
+failed, and is retried every cycle. The root updater helper itself is refreshed
+from each verified release; only the updater's own systemd unit and timer, the
+MediaMTX binary, the rendered WHEP proxy configuration and the TURN credentials
+remain bootstrap-owned, because they depend on arguments only the operator's
+install command carries.
 Tailscale is optional break-glass administration only and is not required for
 gate operation or updates. See [Raspberry Pi deployment](docs/deployment.md)
 for migration, logs, retention, manual rollback, and optional private-token

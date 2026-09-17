@@ -165,7 +165,7 @@ publish_library() {
     "$CAMERA_LIBRARY/gate_camera_control"
   install -o root -g root -m 0644 "$SOURCE/gate_media_config.py" \
     "$CAMERA_LIBRARY/gate_media_config.py"
-  for module in __init__ __main__ atomic ir reolink state; do
+  for module in __init__ __main__ atomic clock ir reolink state; do
     install -o root -g root -m 0644 \
       "$SOURCE/gate_camera_control/$module.py" \
       "$CAMERA_LIBRARY/gate_camera_control/$module.py"

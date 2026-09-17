@@ -53,6 +53,7 @@ from .settings import (
     CloudflareSettingsFetcher, MatchPolicyCache, SettingsRefreshWorker,
 )
 from .reolink_events import (
+    build_reolink_correlator,
     ReolinkEventCorrelator, ReolinkWebhookWorker,
     load_reolink_webhook_config,
 )
@@ -183,12 +184,15 @@ def main() -> None:
     metrics = build_metrics_ring(
         os.environ, state_directory=Path(arguments.database).resolve().parent,
     )
+    # Built before the workers so the heartbeat can report webhook acceptance
+    # and the camera's clock skew; the listener itself is wired further down.
+    trigger_correlator = build_reolink_correlator(os.environ)
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
-        trigger_capture=trigger_capture,
+        trigger_capture=trigger_capture, webhook=trigger_correlator,
         corpus=corpus, activity=activity, metrics=metrics,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
@@ -216,9 +220,12 @@ def main() -> None:
             and trigger_capture_config.crop_capture else None
         ),
     )
+    # The pipeline hands back the correlator it was given, so the listener,
+    # the burst resolver and the heartbeat all share one set of counters.
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
         os.environ,
         on_accepted=_camera_event_handler(trigger_capture, recognizer, audio_capture),
+        correlator=trigger_correlator,
     )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if audio_capture is not None:
@@ -471,9 +478,9 @@ def _audio_capture_recorder(environment):
 
 
 
-def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None):
+def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None, correlator=None):
     environment = os.environ if environment is None else environment
-    correlator = ReolinkEventCorrelator()
+    correlator = correlator if correlator is not None else build_reolink_correlator(environment)
     config = load_reolink_webhook_config(environment)
     workers = (
         (ReolinkWebhookWorker(config, correlator, on_accepted=on_accepted),)
@@ -625,7 +632,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
-                             corpus=None, activity=None, metrics=None):
+                             corpus=None, activity=None, metrics=None, webhook=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -685,7 +692,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             camera_stale_seconds=camera_stale_seconds,
             hot_stream=hot_stream, match_policy=match_policy,
             local_recognizer=local_recognizer,
-            trigger_capture=trigger_capture,
+            trigger_capture=trigger_capture, webhook=webhook,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
             metrics=metrics,
@@ -735,7 +742,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
         hot_stream=hot_stream, local_recognizer=local_recognizer,
-        trigger_capture=trigger_capture, net_probe=net_probe,
+        trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity,
     )
 
@@ -787,7 +794,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
                        hot_stream=None, match_policy=None, local_recognizer=None,
-                       trigger_capture=None, net_probe=None,
+                       trigger_capture=None, webhook=None, net_probe=None,
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
@@ -829,6 +836,9 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     trigger_capture_status = _trigger_capture_status(trigger_capture)
     if trigger_capture_status is not None:
         status["recognition"]["trigger_capture"] = trigger_capture_status
+    webhook_status = _webhook_status(webhook)
+    if webhook_status is not None:
+        status["recognition"]["webhook"] = webhook_status
     host = _host_status(host_metrics, net_probe)
     if host:
         status["host"] = host
@@ -849,6 +859,20 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if match_policy is not None:
         status["match_policy"] = match_policy.status()
     return status
+
+
+def _webhook_status(webhook) -> dict | None:
+    """Webhook acceptance counters and the camera's clock skew, when wired."""
+    if webhook is None:
+        return None
+    reader = getattr(webhook, "status", None)
+    if not callable(reader):
+        return None
+    try:
+        measured = reader()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
 
 
 def _corpus_status(corpus, corpus_upload, activity) -> dict | None:

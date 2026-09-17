@@ -546,6 +546,21 @@ Keep that baseline fixed while collecting matched and unverified events; change
 one camera variable at a time only after comparing missed entries and false
 positives across day, night, rain, and headlights.
 
+### Camera Clock Skew
+
+Every timestamped webhook is compared with the Pi clock. Since 2026-09-16 the
+skew (camera minus Pi) is journalled on rejection
+(`reolink_webhook status=rejected reason=stale event_skew_seconds=+7198.0`)
+and, when it exceeds 2 s, on acceptance too, and the heartbeat's
+`recognition.webhook` block carries `accepted`, `duplicates`,
+`rejected_stale`, `last_skew_seconds`, `last_accepted_at` and
+`last_stale_at`. A run of stale rejections with a large constant skew is a
+wrong camera clock, not a network fault; `gate-camera-control` reconciles it
+hourly ([camera-control.md](camera-control.md#camera-clock-reconcile)).
+`GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS` can widen what is accepted
+(receipt-time freshness and de-duplication still apply), but fix the clock
+first.
+
 ## Continuously Hot Recognition Stream
 
 MediaMTX continuously pulls both camera profiles: `camera` is Fluent and

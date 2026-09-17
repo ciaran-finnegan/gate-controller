@@ -263,6 +263,30 @@ Worst-case heartbeat staleness is Pi heartbeat 15 s plus UI poll 15 s ≈ **30 s
 so the app must confirm a toggle with a direct read rather than waiting for a
 heartbeat.
 
+## Camera clock reconcile
+
+The controller refuses a webhook whose alarm time sits more than 15 s from
+its own clock, and on 2026-09-16 every webhook was refused for four days
+because the NVR that records the camera pushed it a clock two hours out (see
+[reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md)).
+The Pi is NTP-synced and already holds the only camera credentials, so this
+service owns the camera clock: with `GATE_CAMERA_CLOCK_SYNC=true` (the
+default) it reads `GetTime` once an hour and, when the displayed time is more
+than 5 s from UTC, writes `SetTime` with UTC. `GetTime` and `SetTime` are the
+only additions to the command allowlist.
+
+It only corrects a camera configured to *display* UTC: `timeZone 0` with DST
+disabled. `SetTime` takes the displayed time and the firmware shifts it by
+the DST hour when that flag changes in the same write, so any other
+configuration is reported as skew and left alone. A camera that would not
+answer is asked again after 5 min rather than an hour.
+
+State (`camera_control.clock`): `synced`, `outcome` (`not_checked`, `ok`,
+`corrected`, `skipped_config`, `camera_busy`, `camera_unreachable`,
+`camera_error`, `disabled`), `skew_seconds` (camera minus Pi, integer, null
+when unknown), `checked_at`, `corrections`. Journal:
+`gate_camera_control stage=clock_reconcile outcome=… skew_seconds=+N`.
+
 ## Environment
 
 `/etc/gate-camera-control.env`, root:root 0600, validated by
@@ -278,6 +302,7 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_DEFAULT` | no | `Off` | exactly `Auto` or `Off` |
 | `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum |
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
+| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; hourly `GetTime`/`SetTime` reconcile of the camera clock to UTC |
 
 Validate a file without starting the service:
 
@@ -339,6 +364,13 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | Camera push interval | the firmware minimum webhook interval is **20 s**, so "did the change help the trigger?" cannot be answered faster than that. Do not imply instant confirmation |
 
 ## Install
+
+Once bootstrapped, the service follows the controller release: the updater
+re-runs this installer from each newly active release whenever the files the
+service is built from changed, so a merged change to `gate_camera_control/`
+reaches the Pi without anyone logging in (see
+[deployment.md](deployment.md#what-an-automatic-release-covers)). The steps
+below are the first-time bootstrap.
 
 The service is installed separately from the media stack; it shares no state, no
 user, and no environment file with it. **Run these steps in this order.** The

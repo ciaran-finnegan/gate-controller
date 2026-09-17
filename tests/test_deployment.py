@@ -556,11 +556,90 @@ install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
                     (REPOSITORY_ROOT / "gate_media_transcoder" / name).read_bytes(),
                     (bootstrap / "gate_media_transcoder" / name).read_bytes(),
                 )
-            updater = (
-                REPOSITORY_ROOT / "deployment/gate_controller_updater.py"
-            ).read_text(encoding="utf-8")
-            self.assertNotIn("gate-media-transcoder", updater)
-            self.assertNotIn("gate_media_transcoder", updater)
+            # Until 2026-09-16 the updater was asserted to mention no media
+            # artifact at all. It now republishes these same files from each
+            # active release, so the invariant that matters is that the two
+            # publish the *same* files, which the anti-drift test below checks.
+
+    def test_the_updater_publishes_exactly_what_the_media_installer_does(self):
+        """The release-follow refresh must not drift from the bootstrap installer.
+
+        `install_fixed_media_files` in install-media.sh is the definition of
+        what the media stack is made of. The updater republishes those files
+        from each active release, so a file added to one and not the other
+        would leave the Pi running a mixture of two releases.
+        """
+        from deployment.gate_controller_updater import (
+            MEDIA_PUBLISHED_FILES, MEDIA_SOURCES,
+        )
+
+        script = (REPOSITORY_ROOT / "deployment/install-media.sh").read_text(encoding="utf-8")
+        body = script[script.index("install_fixed_media_files() {"):]
+        body = body[:body.index("\n}\n")].replace("\\\n", " ")
+        variables = dict(re.findall(r"^([A-Z_]+)=(\S+)$", script, flags=re.MULTILINE))
+        variables.update(
+            source="", source_auth="/gate_media_auth",
+            source_gateway="/gate_media_gateway",
+            source_transcoder="/gate_media_transcoder",
+        )
+
+        def expand(text):
+            # Script variables are defined in terms of each other
+            # (MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml), so expand to a
+            # fixed point rather than in one pass.
+            for _pass in range(8):
+                expanded = text
+                for name in sorted(variables, key=len, reverse=True):
+                    expanded = expanded.replace(f"${name}", variables[name])
+                if expanded == text:
+                    return text
+                text = expanded
+            raise AssertionError(f"install-media.sh variables do not resolve: {text}")
+
+        installed = {}
+        for group, mode, source, destination in re.findall(
+            r'install\s+-o\s+root\s+-g\s+(\S+)\s+-m\s+(\d+)\s+"([^"]+)"\s+"([^"]+)"',
+            body,
+        ):
+            installed[expand(destination)] = (expand(source).lstrip("/"), int(mode, 8), group)
+
+        roots = {
+            "lib": "/usr/local/lib/gate-media",
+            "config": "/etc/gate-media",
+            "unit": "/etc/systemd/system",
+        }
+        refreshed = {}
+        for relative, destination, mode in MEDIA_PUBLISHED_FILES:
+            kind, _separator, name = destination.partition("/")
+            refreshed[f"{roots[kind]}/{name}"] = (relative, mode, "root")
+        refreshed["/etc/gate-media/mediamtx.yml"] = (
+            "deployment/media/mediamtx.yml", 0o640, "gate-media",
+        )
+
+        self.assertEqual(
+            installed, refreshed,
+            "install-media.sh and the updater's media refresh publish different files",
+        )
+        for relative, _destination, _mode in MEDIA_PUBLISHED_FILES:
+            self.assertTrue((REPOSITORY_ROOT / relative).is_file(), relative)
+        for relative in MEDIA_SOURCES:
+            self.assertTrue((REPOSITORY_ROOT / relative).exists(), relative)
+
+    def test_the_updater_refreshes_camera_control_through_its_own_installer(self):
+        from deployment.gate_controller_updater import (
+            CAMERA_CONTROL_SOURCES, MANAGED_COMPONENTS,
+        )
+
+        self.assertEqual(
+            {component.name for component in MANAGED_COMPONENTS},
+            {"camera-control", "media"},
+        )
+        for relative in CAMERA_CONTROL_SOURCES:
+            self.assertTrue((REPOSITORY_ROOT / relative).exists(), relative)
+        # The installer is the only thing that may publish the credentialed
+        # service: it validates the environment file before it publishes, and
+        # no credential is ever read into the updater.
+        self.assertIn("deployment/install-camera-control.sh", CAMERA_CONTROL_SOURCES)
 
     def test_fixed_media_bootstrap_is_installed_from_immutable_handoff(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
