@@ -8,8 +8,11 @@ design that measurement makes possible.
 Three things are deliberately kept apart here, because conflating them is how
 a prototype gets mistaken for a system:
 
-1. **Built and running** — the continuous recorder and the window extractor.
-2. **Measured** — four commanded gate cycles, analysed. Real numbers.
+1. **Built and running** — the continuous recorder, keeping every segment, and
+   the window extractor.
+2. **Measured** — four commanded gate cycles, one overnight recording, and a
+   pretrained-embedding probe. Real numbers, including the ones that killed
+   the first approach.
 3. **Proposed** — the gate state machine and occupancy counting. Not built.
 
 ## 1. What Is Built
@@ -216,6 +219,57 @@ neighbouring cycle overlapping its window) reads exactly right:
 A closing run that ends with **no** clang is reported as `open`, not as shut:
 the gate is stuck, was reversed, or the recorder missed it, and the safe
 reading is the one that does not claim the property is secured.
+
+## 2b. Why The Rule Was Abandoned
+
+The rule above was written from four cycles recorded within ten minutes of
+each other, in one weather, with no vehicle present. Run against the first
+overnight recording it reported a **629-second motor run** and called 62% of a
+quiet half hour a gate moving.
+
+The cause is that it uses band *share*, and share has a denominator. In
+daylight, low-frequency wind dominated the total and held the ratio down.
+Overnight that wind is gone, and the ratio saturates on whatever is left.
+
+Two further objections are not fixable by tuning it:
+
+* **Weather is not two conditions.** Ireland does not divide into "day" and
+  "night"; it varies continuously, and a threshold set against two samples of
+  it is set against nothing.
+* **A tractor is a motor.** Agricultural traffic on the road, or a diesel
+  idling at the gate waiting for it to open, is loud, sustained and harmonic
+  in 1.2-3 kHz — which is exactly how the rule defines the gate. It has no
+  defence against the single most likely thing to be happening at the moment
+  it matters.
+
+### What replaced it: pretrained embeddings
+
+Measured on 2026-09-17. YAMNet — a MobileNet trained on AudioSet — was run
+over the four cycles and the overnight audio with **no training at all**.
+
+Its *class* outputs are weak here, which is expected: this audio is
+band-limited to 16 kHz, quiet, and recorded at distance, where AudioSet is
+mostly loud full-band YouTube. The gate motor reads as "Silence, Animal,
+Snake". What is useful is the 1024-dimensional **embedding**, and a linear
+classifier on top of it, trained on three cycles and tested on the fourth:
+
+| Held-out cycle | Motor recall | False positives on night + ambient |
+| --- | --- | --- |
+| 2927 | 80.0% | 0.15% |
+| 2928 | 100.0% | 0.29% |
+| 2929 | 91.1% | 0.29% |
+| 2930 | 82.0% | 0.44% |
+
+Against the same overnight audio where the threshold rule flagged **62%** of
+frames, the learned classifier flags **under half a percent** — on a cycle it
+had never seen, from roughly 250 labelled positive frames.
+
+Cost on the live board: **0.68% of one core** run continuously, about ten
+core-minutes a day, using the `onnxruntime` already installed for the plate
+reader. Decoding adds 0.04%.
+
+That settles the approach. The remaining work is not a better threshold, it is
+labelled variety — which is what keeping every segment now collects.
 
 ## 3. What Is Proposed
 
