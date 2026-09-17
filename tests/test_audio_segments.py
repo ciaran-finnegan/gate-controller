@@ -341,7 +341,9 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_the_defaults_are_the_measured_ones(self):
         config = load_segment_config({})
-        self.assertEqual(config["segment_seconds"], 1800)
+        # Five minutes, set by the corpus contract's 4 MiB payload cap rather
+        # than by taste -- see KeepEverythingTests.
+        self.assertEqual(config["segment_seconds"], 300)
         self.assertEqual(config["retention_hours"], 48)
         self.assertEqual(config["source_url"], "rtsp://127.0.0.1:8554/clear")
 
@@ -423,3 +425,112 @@ class WiringTests(unittest.TestCase):
         source = self.ENTRY_POINT.read_text(encoding="utf-8")
         self.assertIn("audio_segments = _audio_segment_recorder(", source)
         self.assertIn("background_workers += (audio_segments,)", source)
+
+
+class KeepEverythingTests(unittest.TestCase):
+    """Releasing finished segments to the corpus uploader.
+
+    "Keep everything" is not a new uploader. ``TrainingCorpus.pending`` offers
+    only complete pairs, so a segment with no sidecar is invisible to the one
+    that already exists; writing the sidecar *is* the release.
+    """
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+        self.store = SegmentStore(self.directory, clock=lambda: self.now)
+
+    def write(self, minutes_ago: int, frames: int = 100) -> Path:
+        started = self.now - timedelta(minutes=minutes_ago)
+        path = self.directory / f"gate-{started.strftime('%Y%m%dT%H%M%S')}Z.aac"
+        path.write_bytes(stream(frames))
+        return path
+
+    def test_a_finished_segment_is_released_to_the_uploader(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        finished = self.write(10)
+        self.write(5)
+        self.assertEqual(write_ready_sidecars(self.store, source_url="rtsp://x"), 1)
+        sidecar = finished.with_suffix(".json")
+        self.assertTrue(sidecar.exists())
+        self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+
+    def test_the_segment_still_being_written_is_never_released(self):
+        # ffmpeg still has it open; shipping it would upload a truncated file
+        # and then delete the local copy that was about to grow.
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        self.write(10)
+        newest = self.write(1)
+        write_ready_sidecars(self.store, source_url="rtsp://x")
+        self.assertFalse(newest.with_suffix(".json").exists())
+
+    def test_a_lone_segment_is_never_released(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        only = self.write(2)
+        self.assertEqual(write_ready_sidecars(self.store, source_url="rtsp://x"), 0)
+        self.assertFalse(only.with_suffix(".json").exists())
+
+    def test_a_segment_is_not_released_twice(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        self.write(10)
+        self.write(5)
+        write_ready_sidecars(self.store, source_url="rtsp://x")
+        # The uploader deletes both halves on success; offering the pair again
+        # would re-upload bytes R2 already holds.
+        self.assertEqual(write_ready_sidecars(self.store, source_url="rtsp://x"), 0)
+
+    def test_an_undecodable_segment_is_left_for_the_pruner(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        broken = self.directory / "gate-20260917T114000Z.aac"
+        broken.write_bytes(b"not audio")
+        self.write(1)
+        self.assertEqual(write_ready_sidecars(self.store, source_url="rtsp://x"), 0)
+        self.assertFalse(broken.with_suffix(".json").exists())
+
+    def test_the_sidecar_routes_the_segment_through_the_existing_uploader(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+        import json as _json
+
+        finished = self.write(10)
+        self.write(5)
+        write_ready_sidecars(self.store, source_url="rtsp://127.0.0.1:8554/clear")
+        document = _json.loads(finished.with_suffix(".json").read_text())
+        # `.aac` already maps to kind=audio in the uploader's media-type table.
+        self.assertEqual(document["artefact"], {"kind": "audio", "media_type": "audio/aac"})
+        self.assertTrue(document["segment"]["continuous"])
+        self.assertFalse(document["audio"]["decoded"])
+
+    def test_a_whole_segment_fits_the_corpus_payload_cap(self):
+        # The contract caps an artefact payload at 4 MiB. At the measured
+        # 8.1 KB/s the default segment length has to stay under that, or every
+        # upload is refused and the card fills with audio nobody can ship.
+        from gate_controller.audio_segments import DEFAULT_SEGMENT_SECONDS
+
+        measured_bytes_per_second = 8095
+        self.assertLess(DEFAULT_SEGMENT_SECONDS * measured_bytes_per_second,
+                        4 * 1024 * 1024)
+
+    def test_pruning_a_segment_that_never_shipped_is_reported_as_loss(self):
+        from gate_controller.audio_segments import write_ready_sidecars
+
+        stale = self.write(minutes_ago=60 * 60)      # far past the horizon
+        self.write(5)
+        write_ready_sidecars(self.store, source_url="rtsp://x")
+        self.assertTrue(stale.with_suffix(".json").exists())
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING") as logs:
+            self.store.prune()
+        self.assertTrue(any("pruned_unshipped" in line for line in logs.output))
+        self.assertFalse(stale.exists())
+        self.assertFalse(stale.with_suffix(".json").exists())
+
+    def test_keep_everything_is_off_unless_asked_for(self):
+        self.assertFalse(load_segment_config({})["keep_everything"])
+        self.assertTrue(load_segment_config(
+            {"GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING": "true"})["keep_everything"])

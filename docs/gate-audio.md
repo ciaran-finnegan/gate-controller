@@ -25,8 +25,9 @@ the camera's own AAC untouched.
 GATE_AUDIO_SEGMENTS_ENABLED=true
 GATE_AUDIO_SEGMENTS_DIR=/var/lib/gate-controller/audio-segments
 GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/clear
-GATE_AUDIO_SEGMENTS_SECONDS=1800
+GATE_AUDIO_SEGMENTS_SECONDS=300
 GATE_AUDIO_SEGMENTS_RETENTION_HOURS=48
+GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING=true
 GATE_AUDIO_SEGMENTS_MIN_FREE_BYTES=1610612736
 ```
 
@@ -36,8 +37,31 @@ than a manifest that could disagree with what is on the card. The child is
 given `TZ=UTC` explicitly, or `-strftime` would name files in host local time
 and be an hour out for half the year.
 
+Segments are **five minutes**, and that number is set by the corpus contract
+rather than by taste: an artefact payload is capped at 4 MiB and a half-hour
+segment is 13.9 MiB.
+
 Cost, measured on the live board rather than estimated: **8.1 KB/s**, so
-665 MiB a day and 1.3 GiB at the 48-hour horizon. For comparison the journal
+665 MiB a day and 1.3 GiB at the 48-hour horizon.
+
+### Keeping everything
+
+With `GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING`, every *finished* segment is given a
+sidecar, which is the whole mechanism: `TrainingCorpus.pending` offers only
+complete pairs, so a segment without one is invisible to the uploader that
+already exists. Nothing moves, copies or locks. The segment ffmpeg still has
+open is deliberately skipped.
+
+This exists because a threshold rule written from four cycles in one afternoon
+broke on the first different condition it met. What the corpus needs is
+weather, tractors, road traffic and night — none of which produce a camera
+event to cut a window around, and all of which the 48-hour horizon was quietly
+discarding.
+
+Pruning a segment that still carries its sidecar means it was queued and never
+shipped, which is permanent loss of audio. Filling the card would be worse, so
+it still goes — but it is journalled as `stage=pruned_unshipped` and never
+happens quietly. For comparison the journal
 on the same card writes about 550 MB/day.
 
 Three bounds keep it from ever being the reason something else fails:

@@ -60,19 +60,24 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
+import json
 import re
 import shutil
 import subprocess
+import tempfile
 
 LOGGER = logging.getLogger(__name__)
 
 FFMPEG_BINARY = "ffmpeg"
 DEFAULT_SOURCE = "rtsp://127.0.0.1:8554/clear"
 
-#: Half an hour: long enough that the per-file overhead is nothing and the
-#: write pattern stays sequential, short enough that the segment still being
-#: written holds at most half an hour nobody can cut from yet.
-DEFAULT_SEGMENT_SECONDS = 1800
+#: Five minutes, and the number is set by the corpus contract rather than by
+#: taste: an artefact payload is capped at 4 MiB, and at the measured 8.1 KB/s
+#: a half-hour segment is 13.9 MiB -- three and a half times over. Five minutes
+#: is 2.3 MiB, which leaves room for a bitrate excursion. It also shortens the
+#: window nobody can read yet, because the segment being written is the one
+#: segment that is not shippable.
+DEFAULT_SEGMENT_SECONDS = 300
 MIN_SEGMENT_SECONDS = 60
 MAX_SEGMENT_SECONDS = 3600
 
@@ -99,6 +104,8 @@ MAX_RESTART_SECONDS = 60.0
 #: there is no manifest that could disagree with what is on the card.
 SEGMENT_PREFIX = "gate-"
 SEGMENT_SUFFIX = ".aac"
+SIDECAR_SUFFIX = ".json"
+SIDECAR_SCHEMA_VERSION = 2
 SEGMENT_TEMPLATE = f"{SEGMENT_PREFIX}%Y%m%dT%H%M%SZ{SEGMENT_SUFFIX}"
 SEGMENT_PATTERN = re.compile(
     rf"^{re.escape(SEGMENT_PREFIX)}(\d{{8}}T\d{{6}})Z{re.escape(SEGMENT_SUFFIX)}$"
@@ -292,6 +299,16 @@ class SegmentStore:
 
     def _remove(self, segment: Segment) -> bool:
         try:
+            # A sidecar beside it means the uploader had been offered this
+            # segment and had not yet shipped it, so deleting it now loses
+            # audio permanently. Filling the card would be worse, so it still
+            # goes -- but never quietly.
+            sidecar = segment.path.with_suffix(SIDECAR_SUFFIX)
+            if sidecar.exists():
+                LOGGER.warning(
+                    "gate_audio_segments stage=pruned_unshipped path=%s bytes=%d "
+                    "detail=audio_lost_before_upload", segment.path.name, segment.size)
+                sidecar.unlink(missing_ok=True)
             segment.path.unlink(missing_ok=True)
             return True
         except OSError:
@@ -347,6 +364,93 @@ def extract_window(store: SegmentStore, start: datetime, end: datetime) -> bytes
     return bytes(kept)
 
 
+def sidecar_for(segment: "Segment", *, source_url: str, seconds: float) -> dict:
+    """What this segment is, in the shape the corpus uploader already ships.
+
+    Deliberately free of the events database. Correlating a segment with the
+    passages inside it is a join on time that the cloud can do against the
+    access log it already holds, and the recorder has no business opening the
+    controller's database to do it.
+    """
+    return {
+        "schema_version": SIDECAR_SCHEMA_VERSION,
+        "kind": "gate_audio_segment",
+        "captured_at": segment.started_at.isoformat(),
+        "source": "audio_segments",
+        "artefact": {"kind": "audio", "media_type": "audio/aac"},
+        "ocr": None,
+        "segment": {
+            "started_at": segment.started_at.isoformat(),
+            "seconds": round(seconds, 2),
+            "bytes": segment.size,
+            "continuous": True,
+        },
+        "audio": {
+            "container": "adts",
+            "codec": "aac_lc",
+            "sample_rate_hz": 16000,
+            "channels": 1,
+            "raw_copy": True,
+            "decoded": False,
+            "source": source_url,
+        },
+    }
+
+
+def write_ready_sidecars(store: "SegmentStore", *, source_url: str) -> int:
+    """Give every finished segment its sidecar, so the uploader ships it.
+
+    This is the whole of "keep everything": ``TrainingCorpus.pending`` offers
+    only *complete pairs*, so a segment with no sidecar is invisible to the
+    uploader. Writing the sidecar is therefore the act of releasing a segment,
+    and the newest segment -- the one ffmpeg still has open -- is deliberately
+    skipped. Nothing has to lock, move or copy anything.
+
+    A segment already carrying a sidecar is left alone: the uploader deletes
+    both halves when the cloud confirms them, so the pair reappearing would
+    mean re-uploading bytes R2 already has.
+    """
+    segments = store.segments()
+    if len(segments) < 2:
+        return 0
+    written = 0
+    for segment in segments[:-1]:
+        sidecar_path = segment.path.with_suffix(SIDECAR_SUFFIX)
+        if sidecar_path.exists():
+            continue
+        seconds = segment.duration()
+        if seconds <= 0:
+            # Nothing decodable in it. Left for the pruner rather than shipped
+            # as an artefact that is not audio.
+            continue
+        document = sidecar_for(segment, source_url=source_url, seconds=seconds)
+        try:
+            _write_private(sidecar_path,
+                           json.dumps(document, separators=(",", ":")).encode("utf-8"))
+        except OSError:
+            LOGGER.warning("gate_audio_segments stage=sidecar_failed path=%s",
+                           segment.path.name, exc_info=True)
+            continue
+        written += 1
+    if written:
+        LOGGER.info("gate_audio_segments stage=released segments=%d", written)
+    return written
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 class SegmentRecorder:
     """One long-lived ffmpeg writing segments, restarted when it dies."""
 
@@ -354,9 +458,14 @@ class SegmentRecorder:
                  segment_seconds: int = DEFAULT_SEGMENT_SECONDS,
                  ffmpeg: str = FFMPEG_BINARY, popen=subprocess.Popen,
                  prune_every_seconds: float = 300.0, monotonic=None, sleep=None,
-                 waiter=None):
+                 waiter=None, keep_everything: bool = False):
         self.store = store
         self.source_url = source_url
+        #: When set, every finished segment is given a sidecar and so becomes
+        #: an artefact the existing corpus uploader ships to R2. Weather,
+        #: tractors and everything else that was never going to be an event
+        #: is then kept rather than pruned unheard.
+        self.keep_everything = keep_everything
         self.segment_seconds = max(MIN_SEGMENT_SECONDS,
                                    min(MAX_SEGMENT_SECONDS, int(segment_seconds)))
         self.command = segment_command(source_url, store.directory,
@@ -385,6 +494,14 @@ class SegmentRecorder:
             now = self._monotonic()
             if now - last_prune >= self._prune_every:
                 last_prune = now
+                if self.keep_everything:
+                    # Before pruning, not after: a segment that has just been
+                    # released is one the uploader can still save.
+                    try:
+                        write_ready_sidecars(self.store, source_url=self.source_url)
+                    except Exception:
+                        LOGGER.warning("gate_audio_segments stage=release_failed",
+                                       exc_info=True)
                 try:
                     self.store.prune()
                 except Exception:
@@ -468,6 +585,9 @@ class SegmentRecorder:
             "newest": segments[-1].started_at.isoformat() if segments else None,
             "starts": self._starts,
             "restarts": self._restarts,
+            "keep_everything": self.keep_everything,
+            "released": sum(1 for segment in self.store.segments()
+                            if segment.path.with_suffix(SIDECAR_SUFFIX).exists()),
             "low_disk_refusals": self._refusals,
             "free_bytes": self.store.free_bytes(),
             "last_error": self._last_error,
@@ -489,6 +609,9 @@ def load_segment_config(environment=None) -> dict:
     _require_loopback(source)
     return {
         "enabled": enabled,
+        "keep_everything": str(
+            environment.get("GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"},
         "directory": Path(directory) if directory else None,
         "source_url": source,
         "segment_seconds": _bounded_int(

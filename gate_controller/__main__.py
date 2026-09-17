@@ -459,6 +459,7 @@ def _audio_segment_recorder(environment):
         store,
         source_url=config["source_url"],
         segment_seconds=config["segment_seconds"],
+        keep_everything=config["keep_everything"],
     )
 
 
