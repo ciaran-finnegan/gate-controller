@@ -1228,7 +1228,10 @@ left stale so the next cycle retries, and the updater run exits non-zero so
 Still bootstrap-owned, because they need arguments only the operator's
 install command carries: the updater's own systemd unit and timer, the
 MediaMTX binary, the rendered WHEP proxy configuration and the TURN
-credentials. Changing those still means `deployment/install.sh`.
+credentials. Changing those still means `deployment/install.sh`. The WHEP
+proxy *template* is refreshed, and when it changes the updater warns that
+`/etc/gate-media/nginx-whep-locations.conf` is still rendered from the
+previous release and needs `install-media.sh --allowed-origin` to catch up.
 
 ## Tailscale
 

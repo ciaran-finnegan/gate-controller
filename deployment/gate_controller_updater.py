@@ -1228,6 +1228,31 @@ def _install_file(source: Path, destination: Path, mode: int, group: str = "root
         raise
 
 
+def _warn_if_proxy_template_changed(release: Path) -> bool:
+    """Say so when the WHEP proxy template moved, since the render cannot follow.
+
+    `nginx-whep-locations.conf` is rendered from this template with the
+    `--allowed-origin` only the operator's install command carries, so the
+    template is republished but the rendered file it feeds is not. Silence
+    here would leave a Pi serving a proxy configuration from an older release
+    with nothing saying so.
+    """
+    source = release / "deployment" / "media" / "nginx-whep-locations.conf.template"
+    installed = MEDIA_CONFIG_ROOT / "nginx-whep-locations.conf.template"
+    try:
+        if not installed.is_file() or installed.read_bytes() == source.read_bytes():
+            return False
+    except OSError:
+        return False
+    LOGGER.warning(
+        "The WHEP proxy template changed in this release; %s is still rendered "
+        "from the previous one. Re-run deployment/install-media.sh with "
+        "--allowed-origin to regenerate it.",
+        MEDIA_CONFIG_ROOT / "nginx-whep-locations.conf",
+    )
+    return True
+
+
 def _refresh_media(release: Path, config: UpdateConfig) -> None:
     """Publish the media library, config template and units, then restart.
 
@@ -1239,6 +1264,7 @@ def _refresh_media(release: Path, config: UpdateConfig) -> None:
     targets = {
         "lib": MEDIA_LIBRARY, "config": MEDIA_CONFIG_ROOT, "unit": SYSTEMD_UNIT_ROOT,
     }
+    _warn_if_proxy_template_changed(release)
     for relative, published, mode in MEDIA_PUBLISHED_FILES:
         kind, _separator, name = published.partition("/")
         _install_file(release / relative, targets[kind] / name, mode)

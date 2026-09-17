@@ -161,6 +161,32 @@ class MediaRefreshTests(unittest.TestCase):
             self.assertEqual(set(recorded[1][2:]), set(updater.MEDIA_SERVICES))
 
 
+class ProxyTemplateTests(unittest.TestCase):
+    def test_a_changed_whep_template_is_reported_because_the_render_cannot_follow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            template = release / "deployment" / "media" / "nginx-whep-locations.conf.template"
+            template.parent.mkdir(parents=True)
+            template.write_text("location /whep { origin ORIGIN; }\n")
+            installed = root / "etc"
+            installed.mkdir()
+            with patch("deployment.gate_controller_updater.MEDIA_CONFIG_ROOT", installed):
+                self.assertFalse(
+                    updater._warn_if_proxy_template_changed(release),
+                    "nothing installed yet is a bootstrap question, not a drift warning",
+                )
+                (installed / "nginx-whep-locations.conf.template").write_text(
+                    "location /whep { origin ORIGIN; }\n"
+                )
+                self.assertFalse(updater._warn_if_proxy_template_changed(release))
+                (installed / "nginx-whep-locations.conf.template").write_text("older\n")
+                with self.assertLogs(updater.LOGGER, level="WARNING") as logs:
+                    self.assertTrue(updater._warn_if_proxy_template_changed(release))
+                self.assertIn("still rendered", logs.output[0])
+                self.assertIn("--allowed-origin", logs.output[0])
+
+
 class RunOnceIntegrationTests(unittest.TestCase):
     def test_an_already_active_release_still_reconciles_components(self):
         with tempfile.TemporaryDirectory() as directory:
