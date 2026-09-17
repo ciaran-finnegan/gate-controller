@@ -270,14 +270,41 @@ every passage now depends on that one slow call.
 6. Verify the floodlight covers the stop and holds for 1 to 2 minutes; keep
    IR and the camera spotlight off.
 
-## Controller follow-ups worth doing regardless
+## What shipped out of this investigation
+
+- **Local sweep** (#143): with the on-device reader active, an accepted webhook
+  reads every live clear-stream frame on the Pi instead of three frames seconds
+  apart, and hands the pipeline only a frame the reader already authorises, so
+  no sweep frame reaches the cloud. `GATE_LOCAL_SWEEP_ENABLED`, off by default.
+  See [Local Sweep](../reolink-rlc-810a.md#local-sweep).
+- **Camera clock reconcile and webhook skew telemetry** (#147): the Pi owns the
+  camera clock hourly, and every stale rejection now journals the camera-minus-Pi
+  skew and counts it in the heartbeat's `recognition.webhook` block. Four silent
+  days is the failure this closes.
+- **Automatic releases cover every managed service** (#147): the updater
+  republishes `gate-camera-control` and the media stack from each active
+  release, so a merged fix to the credentialed camera service no longer waits
+  for someone to log in and re-run an installer. See
+  [What An Automatic Release Covers](../deployment.md#what-an-automatic-release-covers).
+- **Dashboard timing help** (access-gate-ui#63): the OCR stage says whether it
+  measured the on-device reader or a cloud upload, and the first stage no longer
+  claims the image had already reached the controller.
+
+## Controller follow-ups still open
 
 - Alert in the dashboard when webhooks are being rejected, and when
-  `trigger_capture.captures` has not advanced for hours; this failure was
-  silent for four days.
+  `trigger_capture.captures` has not advanced for hours. The controller now
+  reports both (`recognition.webhook`, `recognition.trigger_capture.sweep`);
+  nothing yet turns them into an alert.
 - Record the OCR crop box in event telemetry so the dashboard shows whether the
   plate was inside the upload.
 - Age-bound the clear-stream keyframe ring so a stale keyframe cannot match the
   idle baseline and be discarded as an empty scene.
 - Publish `ClearStreamSource.status()` in the heartbeat; it is built and never
   called.
+- Two timing-sensitive tests flake on a loaded CI runner and blocked this
+  release for a cycle: `test_timed_out_ocr_keeps_later_requests_out_of_the_shared_session`
+  (expects `ocr_busy`, gets `decision_timeout`) and
+  `test_concurrent_snapshot_export_does_not_delay_an_actuation_claim`
+  (asserts a wall-clock bound of 0.25 s). Both pass locally; a flake on
+  `master` stops the Pi adopting anything until it is re-run.
