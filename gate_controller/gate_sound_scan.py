@@ -235,3 +235,61 @@ def already_scanned(connection) -> set[str]:
         # A database without the table is one the migration has not touched
         # yet; scanning everything again is correct and merely slow.
         return set()
+
+
+def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
+    """What the microphone says the gate is doing, for the heartbeat.
+
+    ``state`` is what the last movement left behind, and ``open_for_seconds``
+    is how long it has been that way. A gate standing open is the only moment
+    the property is not secured, and until this it was a thing nobody could
+    know from anywhere but the driveway.
+
+    ``uncommanded`` over the window is the denominator recognition has never
+    had: the rate is relay openings over *all* openings, and 84% of passages
+    at this site never fire the relay.
+
+    Returns None when nothing has been scanned, which the dashboard must show
+    as "unknown" rather than as a shut gate.
+    """
+    moment = now or datetime.now(timezone.utc)
+    try:
+        last = connection.execute(
+            "SELECT started_at, ended_at, outcome FROM gate_movements"
+            " ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        since = (moment - _seconds(recent_hours * 3600)).isoformat()
+        counts = dict(connection.execute(
+            "SELECT outcome, COUNT(*) FROM gate_movements WHERE started_at >= ?"
+            " GROUP BY outcome", (since,),
+        ))
+        uncommanded = connection.execute(
+            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ? AND uncommanded = 1",
+            (since,),
+        ).fetchone()[0]
+        scanned = connection.execute(
+            "SELECT COUNT(*), MAX(scanned_at) FROM gate_sound_scans"
+        ).fetchone()
+    except Exception:
+        # An older database, or one mid-migration. The heartbeat says nothing
+        # rather than reporting a gate state it cannot support.
+        return None
+    if not last:
+        return None
+
+    state = "shut" if last[2] == "shut" else "open"
+    try:
+        ended = datetime.fromisoformat(last[1])
+    except (TypeError, ValueError):
+        ended = moment
+    return {
+        "state": state,
+        "since": last[1],
+        "open_for_seconds": round((moment - ended).total_seconds()) if state == "open" else 0,
+        "movements_24h": sum(counts.values()),
+        "closed_24h": counts.get("shut", 0),
+        "uncommanded_24h": uncommanded,
+        "segments_scanned": scanned[0] if scanned else 0,
+        "last_scan_at": scanned[1] if scanned else None,
+        "detector": DETECTOR,
+    }

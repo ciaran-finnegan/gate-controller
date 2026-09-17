@@ -853,6 +853,9 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     webhook_status = _webhook_status(webhook)
     if webhook_status is not None:
         status["recognition"]["webhook"] = webhook_status
+    gate = _gate_sound_status(store)
+    if gate is not None:
+        status["gate"] = gate
     host = _host_status(host_metrics, net_probe)
     if host:
         status["host"] = host
@@ -943,6 +946,24 @@ def _age_seconds(timestamp: str | None, now: datetime) -> float | None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     age = (now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc))
     return round(max(0.0, age.total_seconds()), 1)
+
+
+def _gate_sound_status(store) -> dict | None:
+    """What the microphone says the gate did, or None when nothing has scanned.
+
+    Read-only and best-effort: the heartbeat must go out whether or not the
+    sound scanner has ever run, and a board without the model never will.
+    """
+    import sqlite3
+    from contextlib import closing
+
+    from .gate_sound_scan import gate_state
+
+    try:
+        with closing(sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)) as connection:
+            return gate_state(connection)
+    except Exception:
+        return None
 
 
 def _trigger_capture_status(trigger_capture) -> dict | None:
