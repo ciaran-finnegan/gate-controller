@@ -1077,6 +1077,7 @@ CAMERA_CONTROL_ENVIRONMENT = Path("/etc/gate-camera-control.env")
 MEDIA_LIBRARY = Path("/usr/local/lib/gate-media")
 MEDIA_CONFIG_ROOT = Path("/etc/gate-media")
 SYSTEMD_UNIT_ROOT = Path("/etc/systemd/system")
+TMPFILES_ROOT = Path("/etc/tmpfiles.d")
 # try-restart, so a unit the operator has stopped stays stopped. The
 # turn-refresh *timer* is here because a reload re-reads a changed timer file
 # without re-arming it, so a new schedule would not take effect until reboot;
@@ -1142,6 +1143,9 @@ class ManagedComponent:
     configured: Callable[[], bool]
     # Publish the component from ``release``; raises UpdateError on failure.
     refresh: Callable[[Path, UpdateConfig], None]
+    # Directories the refresh must be able to write. A host whose updater unit
+    # predates release-following has them read-only under ProtectSystem=strict.
+    writable: tuple[Path, ...] = ()
 
 
 def component_digest(release: Path, sources: Sequence[str]) -> str:
@@ -1170,6 +1174,30 @@ def component_digest(release: Path, sources: Sequence[str]) -> str:
             digest.update(entry.read_bytes())
             digest.update(b"\n")
     return digest.hexdigest()
+
+
+def unwritable_path(paths: Sequence[Path]) -> Path | None:
+    """The first path this process cannot actually write, or None.
+
+    `ProtectSystem=strict` makes the filesystem read-only outside the unit's
+    own `ReadWritePaths`, and root's permission bits say nothing about that,
+    so the only honest test is to try. The probe file is created and removed
+    inside the directory itself.
+    """
+    for path in paths:
+        if not path.is_dir():
+            continue
+        probe = path / f".gate-updater-probe-{os.getpid()}"
+        try:
+            probe.touch()
+        except OSError:
+            return path
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    return None
 
 
 def _read_marker(marker: Path) -> str | None:
@@ -1291,6 +1319,7 @@ MANAGED_COMPONENTS: tuple[ManagedComponent, ...] = (
         marker=CAMERA_CONTROL_LIBRARY / COMPONENT_MARKER_NAME,
         configured=_camera_control_configured,
         refresh=_refresh_camera_control,
+        writable=(CAMERA_CONTROL_LIBRARY, SYSTEMD_UNIT_ROOT, TMPFILES_ROOT),
     ),
     ManagedComponent(
         name="media",
@@ -1298,6 +1327,7 @@ MANAGED_COMPONENTS: tuple[ManagedComponent, ...] = (
         marker=MEDIA_LIBRARY / COMPONENT_MARKER_NAME,
         configured=_media_configured,
         refresh=_refresh_media,
+        writable=(MEDIA_LIBRARY, MEDIA_CONFIG_ROOT, SYSTEMD_UNIT_ROOT),
     ),
 )
 
@@ -1320,6 +1350,19 @@ def reconcile_components(
                 continue
             digest = component_digest(release, component.sources)
             if _read_marker(component.marker) == digest:
+                continue
+            blocked = unwritable_path(component.writable)
+            if blocked is not None:
+                # Not a failure this release can fix: the running updater unit
+                # predates release-following and confines the updater to the
+                # release tree. One bootstrap re-run installs the unit that
+                # allows it, and every release after that follows by itself.
+                LOGGER.warning(
+                    "Component %s cannot follow releases yet: %s is read-only for "
+                    "this updater. Re-run deployment/install.sh once to install the "
+                    "current gate-controller-updater.service, which grants it.",
+                    component.name, blocked,
+                )
                 continue
             LOGGER.info("Refreshing component %s from release %s", component.name, release.name)
             component.refresh(release, config)

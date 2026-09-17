@@ -335,13 +335,28 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertEqual("gate-controller-updater", service.get("RuntimeDirectory"))
         self.assertEqual("yes", service.get("RuntimeDirectoryPreserve"))
         # The helper directory is writable so that an activated release can
-        # refresh the updater itself; ProtectSystem=strict keeps the rest of
-        # /usr read-only. The leading "-" only means "ignore it if absent".
+        # refresh the updater itself, and since 2026-09-17 so are the install
+        # roots of the managed components the updater republishes from each
+        # release; ProtectSystem=strict keeps the rest of the system read-only.
+        # The leading "-" only means "ignore it if absent".
+        #
+        # This is enumerated, never a wholesale grant, and it does not widen
+        # what the updater can ultimately cause to run: it already publishes
+        # the code the controller executes and the helper systemd runs here.
+        # test_the_updater_unit_may_write_every_path_its_components_publish_into
+        # is the other half -- a component may not publish anywhere this list
+        # does not name.
         self.assertEqual(
             {
                 "/opt/gate-controller-deploy",
                 "/run/gate-controller-updater",
                 "-/usr/local/libexec/gate-controller",
+                "-/usr/local/lib/gate-camera-control",
+                "-/usr/local/lib/gate-media",
+                "-/etc/gate-media",
+                "-/etc/systemd/system",
+                "-/etc/tmpfiles.d",
+                "-/run/gate-camera",
             },
             set(shlex.split(service.get("ReadWritePaths", ""))),
         )
@@ -624,6 +639,34 @@ install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
             self.assertTrue((REPOSITORY_ROOT / relative).is_file(), relative)
         for relative in MEDIA_SOURCES:
             self.assertTrue((REPOSITORY_ROOT / relative).exists(), relative)
+
+    def test_the_updater_unit_may_write_every_path_its_components_publish_into(self):
+        """ProtectSystem=strict makes anything outside ReadWritePaths read-only.
+
+        A component whose install root is missing from the unit cannot be
+        published at all, and the failure is a read-only filesystem on a live
+        Pi rather than anything CI would catch.
+        """
+        from deployment.gate_controller_updater import MANAGED_COMPONENTS
+
+        unit = (
+            REPOSITORY_ROOT / "deployment/systemd/gate-controller-updater.service"
+        ).read_text(encoding="utf-8")
+        line = next(
+            value for value in unit.splitlines()
+            if value.startswith("ReadWritePaths=")
+        )
+        granted = {
+            entry.lstrip("-") for entry in line.split("=", 1)[1].split()
+        }
+
+        for component in MANAGED_COMPONENTS:
+            for path in component.writable:
+                self.assertIn(
+                    str(path), granted,
+                    f"{component.name} publishes into {path}, which the updater "
+                    "unit does not grant",
+                )
 
     def test_the_updater_refreshes_camera_control_through_its_own_installer(self):
         from deployment.gate_controller_updater import (
