@@ -53,6 +53,14 @@ DEFAULT_SWEEP_MAX_FPS = 5.0
 MIN_SWEEP_FPS, MAX_SWEEP_FPS = 1.0, 10.0
 DEFAULT_SWEEP_FALLBACK_FRAMES = 1
 MAX_SWEEP_FALLBACK_FRAMES = 3
+# Frames of one passage the sweep may hand to the ordinary pipeline purely so
+# the cloud reader sees them, while the local reader keeps sweeping. Each is a
+# billed lookup, and the service permits one request a second, so this is a
+# spend ceiling per passage rather than a rate.
+DEFAULT_SWEEP_CLOUD_FRAMES = 5
+MAX_SWEEP_CLOUD_FRAMES = 10
+DEFAULT_SWEEP_CLOUD_SPACING_SECONDS = 1.0
+MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
 # One keyframe per second at the camera's 1x interval; the ring only has to
@@ -218,6 +226,12 @@ class TriggerCaptureConfig:
     # the sweep window ends with no authorised read: the audit trail and the
     # last-resort cloud read. 0 keeps every sweep frame off the cloud.
     sweep_fallback_frames: int = DEFAULT_SWEEP_FALLBACK_FRAMES
+    # The cloud reader runs beside the local one rather than behind it: while
+    # the sweep reads frames on the device, it also hands the pipeline a frame
+    # at a time for the cloud to read, and whichever answers first opens the
+    # gate. 0 keeps the cloud out of the window entirely.
+    sweep_cloud_frames: int = DEFAULT_SWEEP_CLOUD_FRAMES
+    sweep_cloud_spacing_seconds: float = DEFAULT_SWEEP_CLOUD_SPACING_SECONDS
 
 
 def load_trigger_capture_config(
@@ -334,6 +348,19 @@ def load_trigger_capture_config(
         ),
         0, MAX_SWEEP_FALLBACK_FRAMES,
     )
+    sweep_cloud_frames = _integer(
+        environment.get(
+            "GATE_LOCAL_SWEEP_CLOUD_FRAMES", str(DEFAULT_SWEEP_CLOUD_FRAMES),
+        ),
+        0, MAX_SWEEP_CLOUD_FRAMES,
+    )
+    sweep_cloud_spacing = _number(
+        environment.get(
+            "GATE_LOCAL_SWEEP_CLOUD_SPACING_SECONDS",
+            str(DEFAULT_SWEEP_CLOUD_SPACING_SECONDS),
+        ),
+        MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -365,6 +392,8 @@ def load_trigger_capture_config(
         sweep_seconds=sweep_seconds,
         sweep_max_fps=sweep_max_fps,
         sweep_fallback_frames=sweep_fallback_frames,
+        sweep_cloud_frames=sweep_cloud_frames,
+        sweep_cloud_spacing_seconds=sweep_cloud_spacing,
     )
 
 
@@ -507,6 +536,7 @@ class TriggerFrameCapture:
         self._sweep_authorised = 0
         self._sweep_injected = 0
         self._sweep_fallbacks = 0
+        self._sweep_cloud_handovers = 0
         self._sweep_last_read_ms: float | None = None
         self.output_directory = config.output_directory
         self._popen = popen
@@ -645,19 +675,32 @@ class TriggerFrameCapture:
             self._session_changed.clear()
 
     def local_sweep(self, event, scheduled_at, stop_event) -> int:
-        """Read live session frames on the device until one authorises.
+        """Read live session frames, locally and in the cloud at the same time.
 
-        Every new session frame (newest first, never one twice) goes to the
-        local reader. Nothing is injected, and so nothing reaches the cloud,
-        until the reader's own answer is an authorised plate under the band
-        in force; that frame is then injected into the ordinary pipeline,
-        which re-reads it and applies every existing safeguard before the
-        relay moves. The sweep waits for that verdict and stops on an open.
+        Two readers work the same passage in parallel and the gate opens on
+        whichever answers first:
 
-        When the window ends without an authorised read, up to
+        **On the device.** Every new session frame (newest first, never one
+        twice) goes to the local reader at up to ``sweep_max_fps``. When its
+        own answer is an authorised plate under the band in force, that frame
+        is injected into the ordinary pipeline, which re-reads it and applies
+        every existing safeguard before the relay moves. The sweep then waits
+        for that verdict and stops on an open.
+
+        **In the cloud.** Every ``sweep_cloud_spacing_seconds``, up to
+        ``sweep_cloud_frames`` times, the newest frame the local reader could
+        not authorise is handed to the same pipeline. Its local pass fails
+        again and the frame goes to the cloud reader, which is exactly where
+        a frame the on-device model cannot read -- a plate inside a headlight
+        blaze, say -- gets its second opinion. The sweep does not wait for
+        these: it keeps reading while they are in flight. The cap is a spend
+        ceiling, because every cloud lookup is billed and the service permits
+        one request a second.
+
+        When the window ends with nothing authorised, up to
         ``sweep_fallback_frames`` of the best frames seen (highest local
-        score, else the newest) are injected so the passage is still recorded
-        and the cloud gets its last-resort read. Returns the frames injected.
+        score, else the newest) are injected so the passage is still
+        recorded. Returns the frames injected.
         """
         config = self.config
         self._reset_session()
@@ -667,12 +710,15 @@ class TriggerFrameCapture:
         min_gap = 1.0 / config.sweep_max_fps if config.sweep_max_fps > 0 else 0.0
         trace_id = f"sweep-{self._sweep_runs}-{int(scheduled_at * 1000) & 0xFFFFFFFF:x}"
         after = None
-        frames = reads = busy = authorised = injected = 0
+        frames = reads = busy = authorised = injected = handovers = 0
         last_read_at: float | None = None
+        last_handover_at: float | None = None
         best: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
         newest: tuple[bytes, float] | None = None
+        unread: tuple[bytes, float] | None = None  # newest the local reader could not authorise
         best_plate: str | None = None
         reason = "window"
+        awaiting_local_verdict = False
         batch: list[tuple[bytes, float]] = []
 
         def halted() -> str | None:
@@ -693,14 +739,38 @@ class TriggerFrameCapture:
             reason = halted()
             if reason is not None:
                 break
-            with self._session_lock:
-                pending = self._session_pending
-            if pending > 0:
-                # A frame is with the processor; its verdict decides whether
-                # the sweep is over. Keep the window ticking meanwhile.
-                self._session_changed.clear()
-                self._session_changed.wait(SWEEP_POLL_SECONDS * 5)
-                continue
+            if awaiting_local_verdict:
+                # Only a frame the local reader authorised is worth waiting
+                # on: its verdict is the open. A frame handed over for the
+                # cloud is deliberately not waited for -- that is what makes
+                # the two readers parallel rather than one behind the other.
+                with self._session_lock:
+                    pending = self._session_pending
+                if pending > 0:
+                    self._session_changed.clear()
+                    self._session_changed.wait(SWEEP_POLL_SECONDS * 5)
+                    continue
+                awaiting_local_verdict = False
+            if (
+                config.sweep_cloud_frames > 0
+                and handovers < config.sweep_cloud_frames
+                and unread is not None
+                and (
+                    last_handover_at is None
+                    or self._clock() - last_handover_at >= config.sweep_cloud_spacing_seconds
+                )
+            ):
+                frame, captured_at = unread
+                unread = None
+                last_handover_at = self._clock()
+                if self._inject_bytes(
+                    frame, captured_at, event, scheduled_at, source="sweep_cloud",
+                ):
+                    handovers += 1
+                    LOGGER.info(
+                        "gate_local_sweep stage=cloud_handover frame=%d of=%d",
+                        handovers, config.sweep_cloud_frames,
+                    )
             if not batch:
                 batch = self._unread_frames(after)
                 if not batch:
@@ -749,10 +819,14 @@ class TriggerFrameCapture:
                     best = (read.score, frame, captured_at)
                     best_plate = read.plate
             if not read.authorised:
+                # The freshest view the on-device reader could not settle, and
+                # so the one worth a paid second opinion.
+                unread = (frame, captured_at)
                 continue
             authorised += 1
             if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep"):
                 injected += 1
+                awaiting_local_verdict = True
                 # The rest of this clump is older than the frame just sent.
                 batch = []
         fallback = 0
@@ -771,17 +845,18 @@ class TriggerFrameCapture:
         self._sweep_authorised += authorised
         self._sweep_injected += injected
         self._sweep_fallbacks += fallback
+        self._sweep_cloud_handovers += handovers
         LOGGER.log(
             logging.INFO if injected or fallback else logging.WARNING,
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
-            "busy=%d authorised=%d injected=%d fallback=%d best_plate=%s best_score=%s "
-            "elapsed_ms=%d",
+            "busy=%d authorised=%d injected=%d cloud_handovers=%d fallback=%d "
+            "best_plate=%s best_score=%s elapsed_ms=%d",
             reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
-            authorised, injected, fallback, best_plate or "-",
+            authorised, injected, handovers, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",
             round(max(0.0, self._clock() - scheduled_at) * 1000),
         )
-        return injected + fallback
+        return injected + fallback + handovers
 
     def _unread_frames(self, after: float | None) -> list[tuple[bytes, float]]:
         """Fresh session frames newer than ``after``, oldest first.
@@ -1331,6 +1406,8 @@ class TriggerFrameCapture:
                 "authorised": self._sweep_authorised,
                 "injected": self._sweep_injected,
                 "fallbacks": self._sweep_fallbacks,
+                "cloud_frames": self.config.sweep_cloud_frames,
+                "cloud_handovers": self._sweep_cloud_handovers,
                 "last_read_ms": (
                     None if self._sweep_last_read_ms is None
                     else round(self._sweep_last_read_ms)
