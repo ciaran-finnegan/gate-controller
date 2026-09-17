@@ -1077,9 +1077,14 @@ CAMERA_CONTROL_ENVIRONMENT = Path("/etc/gate-camera-control.env")
 MEDIA_LIBRARY = Path("/usr/local/lib/gate-media")
 MEDIA_CONFIG_ROOT = Path("/etc/gate-media")
 SYSTEMD_UNIT_ROOT = Path("/etc/systemd/system")
+# try-restart, so a unit the operator has stopped stays stopped. The
+# turn-refresh *timer* is here because a reload re-reads a changed timer file
+# without re-arming it, so a new schedule would not take effect until reboot;
+# its oneshot service is deliberately absent, since restarting that would
+# refresh TURN credentials on every release rather than on its schedule.
 MEDIA_SERVICES = (
     "gate-media-auth.service", "gate-media-gateway.service",
-    "gate-media-transcoder.service",
+    "gate-media-transcoder.service", "gate-media-turn-refresh.timer",
 )
 # What each component is built from, relative to the release. The digest of
 # these is what decides whether the installed copy is stale.
