@@ -116,6 +116,8 @@ class SweepConfigTests(unittest.TestCase):
         self.assertEqual(config.sweep_seconds, 10.0)
         self.assertEqual(config.sweep_max_fps, 5.0)
         self.assertEqual(config.sweep_fallback_frames, 1)
+        self.assertEqual(config.sweep_cloud_frames, 5)
+        self.assertEqual(config.sweep_cloud_spacing_seconds, 1.0)
 
     def test_environment_bounds_are_enforced(self):
         environment = {
@@ -124,14 +126,20 @@ class SweepConfigTests(unittest.TestCase):
             "GATE_LOCAL_SWEEP_MAX_FPS": "4",
             "GATE_LOCAL_SWEEP_FALLBACK_FRAMES": "0",
         }
+        environment["GATE_LOCAL_SWEEP_CLOUD_FRAMES"] = "3"
+        environment["GATE_LOCAL_SWEEP_CLOUD_SPACING_SECONDS"] = "2"
         config = load_trigger_capture_config(environment, Path("/tmp"), webhook_enabled=True)
         self.assertTrue(config.sweep_enabled)
         self.assertEqual((config.sweep_seconds, config.sweep_max_fps, config.sweep_fallback_frames), (12.5, 4.0, 0))
+        self.assertEqual((config.sweep_cloud_frames, config.sweep_cloud_spacing_seconds), (3, 2.0))
         for key, value in (
             ("GATE_LOCAL_SWEEP_SECONDS", "0"),
             ("GATE_LOCAL_SWEEP_SECONDS", "31"),
             ("GATE_LOCAL_SWEEP_MAX_FPS", "11"),
             ("GATE_LOCAL_SWEEP_FALLBACK_FRAMES", "4"),
+            ("GATE_LOCAL_SWEEP_CLOUD_FRAMES", "11"),
+            ("GATE_LOCAL_SWEEP_CLOUD_SPACING_SECONDS", "0.4"),
+            ("GATE_LOCAL_SWEEP_CLOUD_SPACING_SECONDS", "6"),
             ("GATE_LOCAL_SWEEP_ENABLED", "yes"),
         ):
             with self.subTest(key=key, value=value):
@@ -227,12 +235,15 @@ class LocalSweepTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _capture(self, source, sweep, *, seconds=10.0, fallback=1, presence_frames=0,
-                 inject=None, max_fps=5.0):
+                 inject=None, max_fps=5.0, cloud=0, cloud_spacing=1.0):
+        # cloud=0 by default so each test says for itself whether the paid
+        # reader takes part; the shipped default is 5.
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
             sweep_enabled=True, sweep_seconds=seconds, sweep_max_fps=max_fps,
             sweep_fallback_frames=fallback, presence_max_frames=presence_frames,
             empty_scene_threshold=0.0, max_flat_fraction=0.0,
+            sweep_cloud_frames=cloud, sweep_cloud_spacing_seconds=cloud_spacing,
         )
         capture = TriggerFrameCapture(
             config, popen=lambda *a, **k: None, clock=self.clock,
@@ -270,7 +281,7 @@ class LocalSweepTests(unittest.TestCase):
         self.assertEqual([frame for frame, _ in sweep.reads], [plain, winner])
         output = "\n".join(logs.output)
         self.assertIn("gate_local_sweep outcome=ended reason=opened", output)
-        self.assertIn("authorised=1 injected=1 fallback=0", output)
+        self.assertIn("authorised=1 injected=1 cloud_handovers=0 fallback=0", output)
         self.assertIn("source=sweep", output)
         self.assertLess(self.clock.now, 110.0, "an open ends the sweep before its window")
 
@@ -290,7 +301,7 @@ class LocalSweepTests(unittest.TestCase):
         ended = [line for line in logs.output if "gate_local_sweep outcome=ended" in line]
         self.assertEqual(len(ended), 1)
         self.assertIn("reason=window", ended[0])
-        self.assertIn("injected=0 fallback=1 best_plate=11WH257 best_score=0.700", ended[0])
+        self.assertIn("injected=0 cloud_handovers=0 fallback=1 best_plate=11WH257 best_score=0.700", ended[0])
         self.assertIn("source=sweep_fallback", "\n".join(logs.output))
         self.assertGreaterEqual(self.clock.now, 103.0)
 
@@ -363,6 +374,66 @@ class LocalSweepTests(unittest.TestCase):
         capture.local_sweep(event(), 100.0, Stop(self.clock))
         self.assertEqual([frame for frame, _ in sweep.reads], [winner])
         self.assertEqual(len(self.injected), 1)
+
+    def test_the_cloud_reads_in_parallel_without_the_sweep_waiting_for_it(self):
+        # Frames keep arriving for the whole window, as a live stream does.
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(20)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({})  # nothing reads locally: the blaze case
+        handed = []
+
+        def inject(paths, received_at, trigger):
+            handed.append(paths[0].read_bytes())
+            # Deliberately no verdict: a cloud handover must not block the sweep.
+
+        capture = self._capture(
+            source, sweep, seconds=3.0, fallback=0, inject=inject,
+            cloud=2, cloud_spacing=1.0, max_fps=5.0,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+
+        output = "\n".join(logs.output)
+        self.assertEqual(len(handed), 2, "capped at sweep_cloud_frames")
+        self.assertIn("stage=cloud_handover frame=1 of=2", output)
+        self.assertIn("stage=cloud_handover frame=2 of=2", output)
+        self.assertIn("source=sweep_cloud", output)
+        self.assertIn("cloud_handovers=2", output)
+        self.assertGreater(len(sweep.reads), 2, "the local reader kept going meanwhile")
+        status = capture.status()["sweep"]
+        self.assertEqual((status["cloud_frames"], status["cloud_handovers"]), (2, 2))
+
+    def test_a_local_match_still_stops_the_sweep_and_is_waited_for(self):
+        plain, winner = jpeg(seed=1), jpeg(seed=2)
+        source = FrameSource(self.clock, [(100.0, plain), (100.4, winner)])
+        sweep = ScriptedSweep({
+            winner: SweepRead(status="recognized", plate="131D2696", score=1.0, authorised=True),
+        })
+        capture = None
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            # Only the locally authorised frame opens the gate; a cloud
+            # handover of an unreadable frame gets no verdict at all.
+            if paths[0].read_bytes() == winner:
+                capture.note_result(paths, ProcessingResult(True, "exact_match"))
+
+        capture = self._capture(source, sweep, seconds=5.0, fallback=0, inject=inject, cloud=5)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("reason=opened", output)
+        self.assertIn("injected=1", output)
+        self.assertLess(self.clock.now, 105.0, "the open ends the window early")
+
+    def test_zero_cloud_frames_keeps_the_paid_reader_out_of_the_window(self):
+        frames = [(100.0 + i * 0.2, jpeg(seed=i)) for i in range(4)]
+        source = FrameSource(self.clock, frames)
+        capture = self._capture(source, ScriptedSweep({}), seconds=2.0, fallback=0, cloud=0)
+        self.clock.now = 100.8
+        capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertEqual(self.injected, [])
+        self.assertEqual(capture.status()["sweep"]["cloud_handovers"], 0)
 
     def test_run_forever_prefers_the_sweep_only_when_the_reader_is_ready(self):
         frame = jpeg(seed=1)

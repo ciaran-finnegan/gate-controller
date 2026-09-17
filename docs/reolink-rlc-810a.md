@@ -267,6 +267,52 @@ keyframe ring.
 
 ### Local Sweep
 
+Two readers work the same passage at once and the gate opens on whichever
+answers first.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cam as Camera
+    participant Pi as Controller
+    participant Local as On-device reader
+    participant Cloud as Cloud reader
+    participant Relay as Gate relay
+
+    Note over Pi: compressed video is already<br/>in memory (~2% of a core)
+    Cam->>Pi: webhook "vehicle detected" (t=0)
+    Pi->>Pi: decode the live stream at 5 frames/s
+    par On the device, every ~200 ms
+        loop up to GATE_LOCAL_SWEEP_SECONDS
+            Pi->>Local: next frame
+            Local-->>Pi: plate, or nothing
+        end
+    and In the cloud, every ~1 s
+        loop up to GATE_LOCAL_SWEEP_CLOUD_FRAMES
+            Pi->>Cloud: newest frame the device could not place
+            Cloud-->>Pi: plate, or nothing
+        end
+    end
+    Note over Pi: first authorised plate wins;<br/>freshness and authorisation<br/>re-checked under the relay lock
+    Pi->>Relay: pulse (2 s)
+    Cam--)Pi: 4K photo by FTP (t≈1.5 s, backstop)
+```
+
+| | On the device | In the cloud |
+| --- | --- | --- |
+| Rate | 5 frames a second | 1 frame a second |
+| Cost per frame | ~200 ms of one core | a billed lookup |
+| Frames per passage | every frame in the window | `GATE_LOCAL_SWEEP_CLOUD_FRAMES` (5) |
+| Which frames | all of them, newest first | the newest the device could not place |
+| Good at | a clean plate, instantly | a plate the device cannot read at all, such as one inside a headlight blaze |
+
+Neither waits for the other. A frame the device authorises is injected and
+the sweep waits for that verdict, because it is about to open the gate. A
+frame handed to the cloud is *not* waited for: the sweep keeps reading while
+it is in flight, which is what makes the two parallel rather than one behind
+the other. Set `GATE_LOCAL_SWEEP_CLOUD_FRAMES=0` to keep the paid reader out
+of the window entirely and make the sweep local-only.
+
 With `GATE_LOCAL_OCR_MODE=active` the on-device reader answers in about
 175 ms, so the session decoder's 5 fps output can be read frame by frame
 instead of three frames seconds apart. `GATE_LOCAL_SWEEP_ENABLED=true`
