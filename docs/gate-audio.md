@@ -15,6 +15,43 @@ a prototype gets mistaken for a system:
    the first approach.
 3. **Proposed** — the gate state machine and occupancy counting. Not built.
 
+## Where each part runs
+
+Three machines, and each does the one thing it is suited to.
+
+```
+   the gate                      Cloudflare                   a laptop
+   ---------                     ----------                   --------
+   record the sound      ---->   keep all of it       <----   fetch a day of it
+   run the finished              (R2, the archive)            try things out
+   detector, live                                             train a model
+        |                                                          |
+        +---------------- deploy the finished model <--------------+
+                              (a few kilobytes)
+```
+
+**The gate controller records and detects. It does not store or learn.** It
+keeps a short rolling window on the card -- enough to survive a broken
+internet connection, nothing more -- and ships everything to R2. The only
+model it runs is one that has already been shown to work.
+
+**R2 keeps everything.** Storage is cheap and the recording is 8 KB/s, so a
+year of continuous audio is about 250 GB and no decision has to be made in
+advance about which hour might turn out to matter.
+
+**The laptop does the thinking.** Fetching a day of audio, listening to it,
+labelling it, training a classifier and testing it against a season of weather
+are all things to do somewhere with a screen, a fast disk and no gate
+depending on it.
+
+**What gets deployed is tiny.** The gate-motor classifier trained above is a
+list of 1024 numbers: 4 KB. Deploying it is copying a file. The heavy part --
+YAMNet, which turns sound into those numbers -- is 16 MB and never changes.
+
+This is why the archive needed a way to be read (see below): without it the
+laptop had nothing to work from, and the only copy of anything was a rolling
+window on an SD card in a cabinet.
+
 ## 1. What Is Built
 
 ### The recorder
@@ -465,6 +502,13 @@ outside the crop band.
 # Is the recorder running, and what has it got?
 systemctl is-active gate-audio-segments.service
 sudo du -sh /var/lib/gate-controller/audio-segments
+
+# Pull a day of recorded audio down to this machine, from R2
+export GATE_CLOUDFLARE_API_URL=https://gate-mate.example.workers.dev
+export GATE_CLOUDFLARE_ACCESS_CLIENT_ID=...      # the controller's service token
+export GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET=...
+python3 scripts/fetch_corpus.py list  --kind audio --since 2026-09-16
+python3 scripts/fetch_corpus.py fetch --kind audio --since 2026-09-16 --out ./audio
 
 # Cut yesterday's windows into the corpus
 sudo python3 scripts/extract_audio_windows.py --hours 24
