@@ -1217,6 +1217,21 @@ later run until each one matches:
 | `gate-camera-control` | `gate_camera_control/`, `gate_media_config.py`, its installer and unit | `bash deployment/install-camera-control.sh --source <release>` (idempotent; restarts the service) | `/usr/local/lib/gate-camera-control/.gate-release-digest` |
 | media stack | `gate_media_auth/`, `gate_media_gateway/`, `gate_media_transcoder/`, `gate_media_config.py`, the TURN refresh helper, `mediamtx.yml`, the WHEP template and the five media units | files copied with the installer's owners and modes, `systemctl daemon-reload`, `systemctl try-restart` of the three media services and the TURN-refresh timer | `/usr/local/lib/gate-media/.gate-release-digest` |
 
+**Enabling it once.** The updater runs under `ProtectSystem=strict`, so it
+can only write what its own unit's `ReadWritePaths` names. A Pi whose
+`gate-controller-updater.service` predates release-following has every
+component install root read-only, and says so once per cycle:
+
+```text
+Component camera-control cannot follow releases yet: /usr/local/lib/gate-camera-control
+is read-only for this updater. Re-run deployment/install.sh once to install the
+current gate-controller-updater.service, which grants it.
+```
+
+That single bootstrap re-run installs the unit that allows it; every release
+after it follows on its own. Until then nothing is published and nothing
+fails — the controller release still activates normally.
+
 A component is skipped when it was never bootstrapped on the host (no
 library directory, or for camera-control no environment file). A refresh
 failure never touches the controller release: it is logged, the marker is

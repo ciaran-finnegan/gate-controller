@@ -91,7 +91,10 @@ installer, and the media library, its MediaMTX configuration and its units are
 copied and the media services restarted, each only when the files it is built
 from actually changed (a digest marker beside each installed copy). A component
 that fails to refresh leaves the controller release active, marks the run
-failed, and is retried every cycle. The root updater helper itself is refreshed
+failed, and is retried every cycle. Because the updater runs under
+`ProtectSystem=strict`, a Pi whose updater unit predates this needs one
+`deployment/install.sh` re-run to grant those paths; the updater names the
+blocked path and that command until it happens. The root updater helper itself is refreshed
 from each verified release; only the updater's own systemd unit and timer, the
 MediaMTX binary, the rendered WHEP proxy configuration and the TURN credentials
 remain bootstrap-owned, because they depend on arguments only the operator's

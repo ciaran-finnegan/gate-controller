@@ -1,4 +1,5 @@
 import os
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +112,48 @@ class ReconcileComponentsTests(unittest.TestCase):
         component = self.component()
         reconcile_components(self.release, config(), [component])
         self.assertEqual(len(self.refreshes), 1)
+
+
+class WritablePathTests(unittest.TestCase):
+    def test_a_read_only_component_root_is_reported_and_never_refreshed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = make_release(root)
+            blocked = root / "blocked"
+            blocked.mkdir(mode=0o555)
+            refreshes = []
+            component = ManagedComponent(
+                name="camera-control",
+                sources=("gate_camera_control",),
+                marker=root / "marker",
+                configured=lambda: True,
+                refresh=lambda release, config: refreshes.append(release),
+                writable=(blocked,),
+            )
+            if os.geteuid() == 0:
+                blocked.chmod(0o755)
+                self.skipTest("root ignores the permission bits this probes")
+            try:
+                with self.assertLogs(updater.LOGGER, level="WARNING") as logs:
+                    self.assertEqual(reconcile_components(release, config(), [component]), [])
+                self.assertEqual(refreshes, [], "nothing is published into a read-only root")
+                self.assertFalse((root / "marker").exists(), "and the marker stays stale")
+                self.assertIn("cannot follow releases yet", logs.output[0])
+                self.assertIn("deployment/install.sh", logs.output[0])
+            finally:
+                # Restored here, not in addCleanup: the temporary directory is
+                # already gone by the time cleanups run.
+                blocked.chmod(0o755)
+
+    def test_a_writable_root_probes_clean_and_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertIsNone(updater.unwritable_path([root]))
+            self.assertEqual(list(root.iterdir()), [], "the probe file is removed")
+
+    def test_a_missing_root_is_not_treated_as_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(updater.unwritable_path([Path(directory) / "absent"]))
 
 
 class CameraControlRefreshTests(unittest.TestCase):
