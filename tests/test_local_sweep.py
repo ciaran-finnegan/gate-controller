@@ -281,7 +281,7 @@ class LocalSweepTests(unittest.TestCase):
         self.assertEqual([frame for frame, _ in sweep.reads], [plain, winner])
         output = "\n".join(logs.output)
         self.assertIn("gate_local_sweep outcome=ended reason=opened", output)
-        self.assertIn("authorised=1 injected=1 cloud_handovers=0 fallback=0", output)
+        self.assertIn("authorised=1 injected=1 cloud_handovers=0 blind_handovers=0 fallback=0", output)
         self.assertIn("source=sweep", output)
         self.assertLess(self.clock.now, 110.0, "an open ends the sweep before its window")
 
@@ -301,7 +301,7 @@ class LocalSweepTests(unittest.TestCase):
         ended = [line for line in logs.output if "gate_local_sweep outcome=ended" in line]
         self.assertEqual(len(ended), 1)
         self.assertIn("reason=window", ended[0])
-        self.assertIn("injected=0 cloud_handovers=0 fallback=1 best_plate=11WH257 best_score=0.700", ended[0])
+        self.assertIn("injected=0 cloud_handovers=0 blind_handovers=0 fallback=1 best_plate=11WH257 best_score=0.700", ended[0])
         self.assertIn("source=sweep_fallback", "\n".join(logs.output))
         self.assertGreaterEqual(self.clock.now, 103.0)
 
@@ -374,6 +374,77 @@ class LocalSweepTests(unittest.TestCase):
         capture.local_sweep(event(), 100.0, Stop(self.clock))
         self.assertEqual([frame for frame, _ in sweep.reads], [winner])
         self.assertEqual(len(self.injected), 1)
+
+    def test_once_a_plate_has_been_seen_the_paid_lookup_goes_to_that_frame(self):
+        """Not simply the newest frame, which is what this used to send.
+
+        A frame the on-device detector found no plate in is a picture problem,
+        and the cloud answering "no plate found" still costs a lookup and,
+        at one request a second with answers taking five or six, still delays
+        every later answer -- including the one that opens the gate.
+
+        The *first* handover still goes out blind and at once: with nothing
+        read yet there is nothing better to send, and making the cloud wait
+        for the on-device reader is the serial design this replaced.
+        """
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(20)]
+        source = FrameSource(self.clock, frames)
+        seen = frames[2][1]
+        # Only the third frame has a plate in it; every other one is blank.
+        sweep = ScriptedSweep({
+            seen: SweepRead(status="recognized", plate="131D2696", score=0.42, authorised=False),
+        })
+        handed = []
+
+        capture = self._capture(
+            source, sweep, seconds=3.0, fallback=0,
+            inject=lambda paths, received_at, trigger: handed.append(paths[0].read_bytes()),
+            cloud=2, cloud_spacing=1.0, max_fps=5.0,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+
+        output = "\n".join(logs.output)
+        self.assertEqual(len(handed), 2)
+        self.assertNotEqual(handed[0], seen, "the first handover goes out before anything is read")
+        self.assertEqual(handed[1], seen, "the second lookup ignored the frame with a plate in it")
+        self.assertIn("stage=cloud_handover frame=1 of=2 plate_seen=False", output)
+        self.assertIn("stage=cloud_handover frame=2 of=2 plate_seen=True", output)
+        self.assertIn("blind_handovers=1", output)
+
+    def test_with_no_plate_anywhere_the_freshest_frame_is_still_sent(self):
+        """The detector missing what the cloud would find is the case being paid for."""
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(10)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({})
+        handed = []
+
+        capture = self._capture(
+            source, sweep, seconds=3.0, fallback=0,
+            inject=lambda paths, received_at, trigger: handed.append(paths[0].read_bytes()),
+            cloud=1, cloud_spacing=1.0, max_fps=5.0,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+
+        self.assertEqual(len(handed), 1)
+        self.assertIn("plate_seen=False", "\n".join(logs.output))
+
+    def test_a_repeated_frame_never_costs_a_second_read(self):
+        """The session decoder repeats frames when the camera delivers under its rate."""
+        same = jpeg(seed=7)
+        frames = [(100.0, same), (100.2, same), (100.4, jpeg(seed=8)), (100.6, same)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({})
+
+        capture = self._capture(source, sweep, seconds=2.0, fallback=0, cloud=0, max_fps=5.0)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+
+        read_bytes = [frame for frame, _ in sweep.reads]
+        self.assertEqual(read_bytes, [same, jpeg(seed=8), same],
+                         "the consecutive repeat should not have been read again")
+        self.assertIn("duplicates=1", "\n".join(logs.output))
 
     def test_the_cloud_reads_in_parallel_without_the_sweep_waiting_for_it(self):
         # Frames keep arriving for the whole window, as a live stream does.

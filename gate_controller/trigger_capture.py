@@ -16,6 +16,7 @@ import logging
 import os
 import select
 import subprocess
+from hashlib import sha256
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
@@ -716,7 +717,17 @@ class TriggerFrameCapture:
         best: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
         newest: tuple[bytes, float] | None = None
         unread: tuple[bytes, float] | None = None  # newest the local reader could not authorise
+        # The best frame to spend a paid lookup on: one the on-device detector
+        # actually found a plate in. A frame it found none in is a picture
+        # problem rather than a reading problem, and the cloud is very likely
+        # to answer "no plate found" -- which still costs a lookup and, at one
+        # request a second with answers taking five or six, still delays every
+        # later answer including the one that opens the gate.
+        candidate: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
+        handover_blind = 0
         best_plate: str | None = None
+        last_frame_digest: bytes | None = None
+        duplicates = 0
         reason = "window"
         awaiting_local_verdict = False
         batch: list[tuple[bytes, float]] = []
@@ -754,22 +765,34 @@ class TriggerFrameCapture:
             if (
                 config.sweep_cloud_frames > 0
                 and handovers < config.sweep_cloud_frames
-                and unread is not None
+                and (candidate is not None or unread is not None)
                 and (
                     last_handover_at is None
                     or self._clock() - last_handover_at >= config.sweep_cloud_spacing_seconds
                 )
             ):
-                frame, captured_at = unread
+                # A frame with a plate in it, best read first; otherwise the
+                # freshest view there is, which is what this always sent. The
+                # fallback stays because the on-device detector missing a plate
+                # the cloud would have found is exactly the case a second
+                # opinion is being paid for.
+                if candidate is not None:
+                    _score, frame, captured_at = candidate
+                    candidate = None
+                    blind = False
+                else:
+                    frame, captured_at = unread
+                    blind = True
                 unread = None
                 last_handover_at = self._clock()
                 if self._inject_bytes(
                     frame, captured_at, event, scheduled_at, source="sweep_cloud",
                 ):
                     handovers += 1
+                    handover_blind += 1 if blind else 0
                     LOGGER.info(
-                        "gate_local_sweep stage=cloud_handover frame=%d of=%d",
-                        handovers, config.sweep_cloud_frames,
+                        "gate_local_sweep stage=cloud_handover frame=%d of=%d plate_seen=%s",
+                        handovers, config.sweep_cloud_frames, not blind,
                     )
             if not batch:
                 batch = self._unread_frames(after)
@@ -801,6 +824,16 @@ class TriggerFrameCapture:
             ):
                 self._skipped_empty += 1
                 continue
+            # The session decoder resamples to a fixed rate. When the camera is
+            # delivering less than that -- measured at 4.5 fps against a
+            # configured 6 -- the resampler makes the difference up by
+            # repeating frames, and reading the same picture twice spends the
+            # reader's ~200 ms on an answer already known.
+            digest = sha256(frame).digest()
+            if digest == last_frame_digest:
+                duplicates += 1
+                continue
+            last_frame_digest = digest
             newest = (frame, captured_at)
             last_read_at = self._clock()
             read = self._sweep.read(frame, trace_id=trace_id)
@@ -822,6 +855,8 @@ class TriggerFrameCapture:
                 # The freshest view the on-device reader could not settle, and
                 # so the one worth a paid second opinion.
                 unread = (frame, captured_at)
+                if read.recognised and (candidate is None or read.score > candidate[0]):
+                    candidate = (read.score, frame, captured_at)
                 continue
             authorised += 1
             if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep"):
@@ -849,10 +884,12 @@ class TriggerFrameCapture:
         LOGGER.log(
             logging.INFO if injected or fallback else logging.WARNING,
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
-            "busy=%d authorised=%d injected=%d cloud_handovers=%d fallback=%d "
+            "busy=%d duplicates=%d read_fps=%.1f authorised=%d injected=%d "
+            "cloud_handovers=%d blind_handovers=%d fallback=%d "
             "best_plate=%s best_score=%s elapsed_ms=%d",
             reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
-            authorised, injected, handovers, fallback, best_plate or "-",
+            duplicates, reads / max(1e-6, self._clock() - scheduled_at),
+            authorised, injected, handovers, handover_blind, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",
             round(max(0.0, self._clock() - scheduled_at) * 1000),
         )
