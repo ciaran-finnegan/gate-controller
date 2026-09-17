@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -1446,6 +1447,29 @@ class ServiceFacadeTests(unittest.TestCase):
         self.assertIn(
             'ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap", "GetTime", "SetTime"})',
             text,
+        )
+
+    def test_the_installer_publishes_every_module_in_the_package(self):
+        """A module missing from the installer's list is an import error on the Pi.
+
+        The list is explicit rather than a glob, so the service publishes
+        exactly what it means to. That only holds while the two agree: a new
+        module added to the package and not to the list would be published
+        nowhere and crash-loop the service on its next restart.
+        """
+        source = Path(__file__).resolve().parents[1]
+        script = (source / "deployment/install-camera-control.sh").read_text(encoding="utf-8")
+        match = re.search(r"for module in ([^;]+); do", script)
+        self.assertIsNotNone(match, "the installer's module loop changed shape")
+        published = set(match.group(1).split())
+        package = {
+            path.stem for path in (source / "gate_camera_control").glob("*.py")
+        }
+
+        self.assertEqual(
+            package, published,
+            "deployment/install-camera-control.sh does not publish every "
+            "gate_camera_control module",
         )
 
     def test_the_snapshot_facade_reports_the_remaining_wait_exactly_once(self):
