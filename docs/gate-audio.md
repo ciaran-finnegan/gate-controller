@@ -271,6 +271,51 @@ reader. Decoding adds 0.04%.
 That settles the approach. The remaining work is not a better threshold, it is
 labelled variety — which is what keeping every segment now collects.
 
+### The labelling loop
+
+`gate_controller.audio_labels`, driven by `scripts/label_audio.py`. It exists
+because the classifier above was trained on four spans typed into a dictionary
+by hand, and when that session ended the labels went with it. Eight weeks of
+recording without this is eight weeks of *unlabelled* audio.
+
+```sh
+# build a queue and cut the audio for each candidate
+sudo python3 scripts/label_audio.py propose --detections detections.json
+
+# say what one is
+sudo python3 scripts/label_audio.py record <clip_id> gate_motor_opening --by ciaran
+
+# what the corpus holds, and the set to train on
+sudo python3 scripts/label_audio.py status
+sudo python3 scripts/label_audio.py export --out training.json
+```
+
+Candidates come from three places in descending order of cost: the **relay**,
+which labels its own actuations for free; a **detector** run, which proposes
+and is often wrong; and a **person** who heard something. Only a person's
+verdict clears a clip from the queue — the detector proposing it is why it is
+there, so its own opinion cannot be what removes it.
+
+Three decisions worth stating:
+
+* **Append-only.** A label is an observation, not a setting. Somebody deciding
+  in November that a September `gate_motor` was really a `tractor` is new
+  information *about both*, and overwriting would destroy the evidence that
+  the two are confusable — the most useful thing that disagreement could say.
+  Latest verdict stands; a machine never overturns a person.
+* **A fixed vocabulary.** Free text would fill with `gate`, `Gate`,
+  `gate motor` and `motor?` inside a week. `tractor` is its own label because
+  it is the confusion most likely to matter, and `nothing` is a label rather
+  than an absence, because a confirmed negative is worth as much as a positive.
+* **Human verdicts only, by default.** A model trained on its own detector's
+  proposals learns to agree with itself, which is the failure this loop exists
+  to prevent. Including the cheap sources has to be a deliberate argument.
+
+**Known limitation:** clips are cut from segments still on the card. Once a
+segment ships to R2 and is discarded, `propose` reports `no audio` for
+anything inside it — four of eight actuations on the first real run. Either
+propose often, or teach it to fetch from R2.
+
 ## 3. What Is Proposed
 
 The detector above exists and is tested. What does **not** exist yet is the
