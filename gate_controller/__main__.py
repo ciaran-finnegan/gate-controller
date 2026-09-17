@@ -378,7 +378,20 @@ def _training_corpus(environment):
         max_bytes = int(raw) if raw else DEFAULT_MAX_BYTES
     except ValueError as error:
         raise ValueError("GATE_TRAINING_CORPUS_MAX_BYTES must be an integer") from error
-    return TrainingCorpus(path, max_bytes=max_bytes)
+    # The recorder owns its own segments: it keeps a rolling window on the card
+    # for the window cutter and the labeller to read, and prunes it against its
+    # retention and free-space floor. Shipping one must not empty that window.
+    from .audio_segments import load_segment_config
+    retained = []
+    try:
+        segments = load_segment_config(environment)
+    except Exception:
+        segments = None
+    # Only while the recorder is running: with nothing pruning that directory,
+    # keeping shipped payloads there would grow without a bound.
+    if segments and segments.get("enabled") and segments.get("directory"):
+        retained.append(Path(segments["directory"]))
+    return TrainingCorpus(path, max_bytes=max_bytes, retained_directories=retained)
 
 
 

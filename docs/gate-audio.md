@@ -271,6 +271,95 @@ reader. Decoding adds 0.04%.
 That settles the approach. The remaining work is not a better threshold, it is
 labelled variety — which is what keeping every segment now collects.
 
+### Is a *vehicle* audible? Measured 2026-09-17
+
+Everything above is about the gate. The question this answers is the other
+one: can the microphone hear a vehicle, early enough and distinctly enough to
+be worth acting on. Method: YAMNet run over **6.74 hours** of recorded segments
+(2026-09-16 14:08 to 2026-09-17 04:23 UTC), no training, scoring every 0.48 s
+frame against the fourteen AudioSet classes that describe a road vehicle.
+
+**A vehicle passing the gate is unmistakable, and it lasts about thirteen
+seconds.** The clearest example, 2026-09-16 14:57:
+
+| Time | Level | `Vehicle` | `Motor vehicle (road)` | `Car` |
+| --- | --- | --- | --- | --- |
+| 14:57:22 | −50.2 dBFS | 0.00 | 0.00 | 0.00 |
+| 14:57:24 | −44.6 | 0.05 | 0.01 | 0.01 |
+| 14:57:26 | **−30.4** | 0.09 | 0.04 | 0.04 |
+| 14:57:28 | −33.6 | **0.30** | **0.24** | **0.21** |
+| 14:57:29 | −41.1 | 0.40 | 0.19 | 0.18 |
+| 14:57:34 | −46.9 | 0.29 | 0.15 | 0.17 |
+| 14:57:37 | −55.5 | 0.01 | 0.00 | 0.00 |
+
+The level leaves the −50 dBFS floor about **six seconds** before closest
+approach and the class score is up about **four**. The camera's detection zone
+covers the last few metres of that approach; the sound covers all of it. There
+is real lead time here, and it is not a rounding error.
+
+**A single-frame threshold is useless, and duration is what fixes it.** The
+class head fires weakly and often on nothing: 38 episodes over 0.15 in under
+seven hours, most of them one 0.48 s frame at a level indistinguishable from
+ambient. Requiring the score to *hold*:
+
+| Score over | Held for | Episodes | Per day |
+| --- | --- | --- | --- |
+| 0.10 | 0.5 s | 67 | 239 |
+| 0.10 | 2 s | 13 | 46 |
+| **0.10** | **3 s** | **5** | **18** |
+| 0.15 | 3 s | 1 | 3.6 |
+
+Eighteen a day is the right order for a site that sees ten passages plus road
+traffic. Four of those five episodes carry `Motor vehicle (road)` and `Car`
+together — a coherent read, not a spike.
+
+**It is not merely responding to loudness.** The ten loudest moments in the
+whole recording — wind, birds, a voice, −7 to −10 dBFS, far louder than any
+vehicle here — score 0.00 to 0.02. Level alone would have flagged every one.
+
+**The gate motor reads as a vehicle, on single frames.** The four commanded
+cycles peak at 0.35–0.57 on the vehicle family. None survives the three-second
+gate, so duration separates them — but a detector that ignored this would call
+every gate cycle a car.
+
+**What is still unknown, and why.** Whether an episode is an arrival, a
+departure or a pass-by is unmeasured, and it is the question that matters. The
+site had five real passages in the recorded span — 17:42, 18:59, 19:15, 19:19
+and 19:23 on 2026-09-16, two of which opened the gate — and **the audio for
+every one of them had already been deleted** (see below). So the lead time
+above is measured against a vehicle's own closest approach, not against a
+camera event, and nothing here yet says which direction anything was going.
+
+Finally, this is the *untrained* class head. On the gate motor the same head
+was near-useless where a linear classifier on the embeddings reached 80–100%
+recall at under 0.5% false positives. The vehicle numbers above should be read
+as a floor, not a ceiling.
+
+### The corpus was deleting the evidence
+
+Found while gathering the audio for the experiment above. Of the 14.1 hours the
+recorder had covered, **6.89 hours remained on the card**, and the gaps were not
+outages: `TrainingCorpus.discard` deletes each segment the moment R2 confirms
+it, by design -- "this is the step that turns the card from an archive into a
+buffer".
+
+The buffer is sound. The archive is not readable. The worker exposes
+`POST /api/controller/corpus` and **no GET of any kind**, so an artefact in R2
+cannot be listed or fetched back by anything. Every consumer of recorded audio
+-- `extract_audio_windows`, `label_audio propose`, this experiment -- reads the
+card, and the card is emptied within minutes of each upload. That is the
+"Known limitation" above, and it is not a limitation of `propose`: it is the
+whole corpus being write-only.
+
+Two further faults in the same area:
+
+* **78 `unshippable` refusals.** Segments written under the old 1800 s setting
+  are 3.7–4.1 MB, over the 4 MiB payload cap, so they are refused, kept, and
+  re-offered on every poll for ever.
+* **Every controller restart loses the in-flight segment**, and the controller
+  restarted eleven times between 01:05 and 03:28 on 2026-09-17. At the old
+  30-minute setting that cost up to half an hour each time.
+
 ### The labelling loop
 
 `gate_controller.audio_labels`, driven by `scripts/label_audio.py`. It exists
