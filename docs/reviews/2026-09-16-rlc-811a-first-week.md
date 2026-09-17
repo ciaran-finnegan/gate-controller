@@ -290,6 +290,22 @@ every passage now depends on that one slow call.
   measured the on-device reader or a cloud upload, and the first stage no longer
   claims the image had already reached the controller.
 
+## Camera settings the swap did not carry over
+
+Measured 2026-09-17, each verified from the camera API rather than the UI:
+
+| | RLC-810A | RLC-811A as fitted | Now |
+| --- | --- | --- | --- |
+| `Isp.constantFrameRate` | 1 (constant) | 2 (drops frames on a quiet scene) | 1 |
+| Main stream | 3840x2160 h265 10 fps, 6144 kbit/s | same | 6 fps, 6144 kbit/s |
+| Delivered frames | ~10 fps | **~5 fps at 10, 2.9 at 6** | 5.9 fps |
+| Bits per frame | 614 kbit | 614 kbit | 1024 kbit |
+
+The frame-rate mode is the one that mattered: at 2 the controller saw about
+half the pictures it was configured for, and nothing detected it, because the
+setting reads back exactly as asked. The measurement is
+`ffmpeg -i rtsp://127.0.0.1:8554/clear -t 10 -an -f null -` and counting.
+
 ## Controller follow-ups still open
 
 - Alert in the dashboard when webhooks are being rejected, and when
