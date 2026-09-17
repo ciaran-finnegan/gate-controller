@@ -66,6 +66,8 @@ import shutil
 import subprocess
 import tempfile
 
+from .corpus import SHIPPED_SUFFIX
+
 LOGGER = logging.getLogger(__name__)
 
 FFMPEG_BINARY = "ffmpeg"
@@ -309,6 +311,10 @@ class SegmentStore:
                     "gate_audio_segments stage=pruned_unshipped path=%s bytes=%d "
                     "detail=audio_lost_before_upload", segment.path.name, segment.size)
                 sidecar.unlink(missing_ok=True)
+            # A marker instead means R2 has it and this copy was being kept
+            # only to be read locally. Reaching the horizon is what is supposed
+            # to happen to it, so it goes without a word.
+            segment.path.with_suffix(SHIPPED_SUFFIX).unlink(missing_ok=True)
             segment.path.unlink(missing_ok=True)
             return True
         except OSError:
@@ -406,9 +412,11 @@ def write_ready_sidecars(store: "SegmentStore", *, source_url: str) -> int:
     and the newest segment -- the one ffmpeg still has open -- is deliberately
     skipped. Nothing has to lock, move or copy anything.
 
-    A segment already carrying a sidecar is left alone: the uploader deletes
-    both halves when the cloud confirms them, so the pair reappearing would
-    mean re-uploading bytes R2 already has.
+    A segment already carrying a sidecar is left alone: the uploader takes the
+    sidecar when the cloud confirms the pair, so writing another would mean
+    re-uploading bytes R2 already has. So is one carrying a ``.shipped``
+    marker, which is that same statement about a segment whose audio is kept
+    on the card afterwards for the window cutter and the labeller to read.
     """
     segments = store.segments()
     if len(segments) < 2:
@@ -417,6 +425,8 @@ def write_ready_sidecars(store: "SegmentStore", *, source_url: str) -> int:
     for segment in segments[:-1]:
         sidecar_path = segment.path.with_suffix(SIDECAR_SUFFIX)
         if sidecar_path.exists():
+            continue
+        if segment.path.with_suffix(SHIPPED_SUFFIX).exists():
             continue
         seconds = segment.duration()
         if seconds <= 0:

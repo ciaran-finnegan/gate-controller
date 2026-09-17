@@ -19,6 +19,13 @@ cloud has confirmed it, so what remains on the SD card is only what has not
 shipped yet. The size bound stays as a backstop for a long outage: past the
 cap the oldest pairs are removed first, and that is a permanent loss, which is
 exactly why the upload exists.
+
+The exception is a **retained** directory, given at construction. Its payloads
+are somebody else's to delete -- the audio recorder keeps a rolling window and
+prunes it on its own timer -- so ``discard`` leaves the payload and marks it
+shipped. Without that the recorder's 48-hour window emptied within minutes of
+each upload, and every reader of recorded audio reads the card: there is no
+route that reads an artefact back out of R2.
 """
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +52,10 @@ FRAME_KIND = "frame"
 FRAME_MEDIA_TYPE = "image/jpeg"
 FRAME_SUFFIX = ".jpg"
 SIDECAR_SUFFIX = ".json"
+#: Left where a payload's sidecar was, for artefacts under a *retained*
+#: directory. It says "the cloud has this one" without deleting the payload,
+#: which is what stops the releaser from offering it all over again.
+SHIPPED_SUFFIX = ".shipped"
 #: How far under the corpus root :meth:`TrainingCorpus.pending` looks. The root
 #: is depth 0 and the gate's audio clips are at depth 1, in the ``audio``
 #: directory ``load_audio_capture_config`` puts beside the corpus. It is a
@@ -75,10 +86,22 @@ class CorpusArtefact:
 
 
 class TrainingCorpus:
-    def __init__(self, directory: Path, *, max_bytes: int = DEFAULT_MAX_BYTES, clock=None):
+    def __init__(self, directory: Path, *, max_bytes: int = DEFAULT_MAX_BYTES, clock=None,
+                 retained_directories=()):
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < MIN_MAX_BYTES:
             raise ValueError("training corpus max_bytes must be at least 16 MiB")
         self.directory = Path(directory)
+        #: Directories whose payloads somebody else owns the lifetime of.
+        #:
+        #: The audio recorder keeps a rolling window on the card and prunes it
+        #: on its own timer against its own retention and free-space floor.
+        #: Discarding a segment the moment R2 confirmed it would leave that
+        #: window empty however long the retention says, and everything that
+        #: reads recorded audio -- cutting a window around a passage, proposing
+        #: a clip to label -- reads the card, because R2 has no way to read an
+        #: artefact back. So here ``discard`` marks instead of deleting, and
+        #: the owner still takes the file at its own horizon.
+        self._retained = frozenset(Path(path).resolve() for path in retained_directories)
         self._max_bytes = max_bytes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
@@ -252,8 +275,13 @@ class TrainingCorpus:
         this is the step that turns the card from an archive into a buffer.
         Accounting happens under the same lock ``record`` uses: a stale byte
         total would make the backstop prune live pairs it does not need to.
+
+        Under a *retained* directory the payload stays and only the sidecar
+        goes, replaced by a marker. See :attr:`_retained`.
         """
         directory, stem = self._locate(artefact)
+        if directory.resolve() in self._retained:
+            return self._mark_shipped(directory, stem)
         freed = 0
         removed = False
         with self._lock:
@@ -275,6 +303,29 @@ class TrainingCorpus:
                 if self._total_bytes is not None and directory == self.directory:
                     self._total_bytes = max(0, self._total_bytes - freed)
         return removed
+
+    def _mark_shipped(self, directory: Path, stem: str) -> bool:
+        """Retire the sidecar, keep the payload, remember that R2 has it.
+
+        The marker is written *before* the sidecar is removed. Crashing between
+        the two leaves both, and a pair whose payload is already in R2 is
+        offered once more -- a duplicate object, which costs a few kilobytes.
+        The other order would lose the record that it shipped at all and leave
+        the releaser re-offering the same segment for as long as it is kept.
+        """
+        marker = directory / (stem + SHIPPED_SUFFIX)
+        try:
+            marker.write_bytes(b"")
+            os.chmod(marker, 0o600)
+        except OSError:
+            # Nowhere to record it, so leave the pair alone rather than delete
+            # a sidecar whose payload would then never be offered again.
+            LOGGER.warning("gate_corpus stage=mark_failed stem=%s", stem, exc_info=False)
+            return False
+        (directory / (stem + SIDECAR_SUFFIX)).unlink(missing_ok=True)
+        with self._lock:
+            self._discarded += 1
+        return True
 
     def _locate(self, artefact) -> tuple[Path, str]:
         """The directory and stem of an artefact, however it was named."""
