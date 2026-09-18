@@ -632,3 +632,24 @@ If `GetEnc` shows no such profile, live selection reduces to "Fluent live plus t
 on-demand 4K still", and the app should not render a `Clearer` option at all
 (access-gate-ui#33 §4 hides it unless the controller reports the second path
 ready).
+
+## When only the DST flag moves
+
+The reconciler will not touch a camera showing a zone somebody chose: the skew
+it measures then includes their offset, and "correcting" it would be wrong.
+
+`timeZone 0` with DST **on** is not that. It is the state this camera keeps
+being put back into by something outside the controller -- fixed on
+2026-09-16, back by 12:43 on the 17th -- and the firmware then counts the
+one-hour offset twice and sits two hours ahead of UTC. That is what rejected
+every webhook as `stale` and stopped recognition entirely in September.
+
+Refusing to act on it was the worst of both: the reconciler logged
+`skipped_config skew_seconds=+7200` every hour for sixteen hours, seeing the
+fault clearly and declining to do anything about it. It now corrects that one
+case, turning DST off with the same write it already made.
+
+It does not manage NTP. Enabling NTP is what pulled the clock back to within a
+second in under a minute on 2026-09-18, and it was found disabled at the same
+time DST was re-enabled, so both are worth checking after anyone has been in
+the camera's web interface.
