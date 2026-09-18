@@ -452,18 +452,37 @@ def passage_key(trigger) -> str | None:
 class _PassageDirection:
     """One passage's samples, one list per box source, plus how dark it was."""
 
-    __slots__ = ("series", "brightest", "touched_at")
+    __slots__ = ("series", "tracks", "brightest", "touched_at")
 
     def __init__(self, touched_at: float) -> None:
         self.series: dict[str, list[tuple[float, float]]] = {}
+        self.tracks: dict[str, list[tuple[float, float]]] = {}
         self.brightest: float | None = None
         self.touched_at = touched_at
 
-    def add(self, source: str, at: float, width: float) -> None:
+    def add(self, source: str, at: float, width: float, x: float | None = None) -> None:
         samples = self.series.setdefault(source, [])
         samples.append((at, width))
         if len(samples) > MAX_SAMPLES:
             del samples[0]
+        # The box's horizontal position, kept beside the width.
+        #
+        # `observe` is handed the whole box and kept only the width, so nothing
+        # that ever reached this module could be re-fitted afterwards -- and
+        # the width slope is the one measurement that stopped working when the
+        # camera was changed. Where the car crosses the frame did not: an
+        # arrival comes from the road side and a departure from the property
+        # side, whichever way the boxes happen to grow.
+        #
+        # Recorded only. Which side is which is a fact about this mount that
+        # nobody has measured yet, and a sign guessed here would be a second
+        # rule fitted to no data.
+        if x is None:
+            return
+        track = self.tracks.setdefault(source, [])
+        track.append((at, float(x)))
+        if len(track) > MAX_SAMPLES:
+            del track[0]
 
     def note_brightness(self, brightness: float) -> None:
         if self.brightest is None or brightness > self.brightest:
@@ -542,6 +561,7 @@ class DirectionTracker:
         if width is None and box is None:
             return
         try:
+            x = None if box is None else box[0]
             if width is None:
                 width = box[2]
             width = float(width)
@@ -552,7 +572,7 @@ class DirectionTracker:
                 return
             with self._lock:
                 passage = self._passage(trace_id, at)
-                passage.add(source, at, width)
+                passage.add(source, at, width, x)
             self._count("samples")
             LOGGER.debug(
                 "gate_direction stage=sample trace_id=%s source=%s width=%.6f at=%.3f",
@@ -573,6 +593,24 @@ class DirectionTracker:
                 self._passage(trace_id, self._clock()).note_brightness(brightness)
         except Exception:
             return
+
+    def track(self, trace_id, source: str = SOURCE_VEHICLE_BOX) -> list[tuple[float, float]]:
+        """This passage's box positions across the frame, oldest first.
+
+        Where a car crosses the frame is the measurement this module was not
+        keeping, and the one most likely to survive a change of camera: an
+        arrival comes from the road side and a departure from inside, whichever
+        way their boxes happen to grow. Exposed so it can be recorded against
+        labelled passages and fitted once, rather than guessed at now.
+        """
+        if not self._config.enabled or not trace_id:
+            return []
+        try:
+            with self._lock:
+                passage = self._passages.get(self._key(trace_id))
+                return list(passage.tracks.get(source, ())) if passage else []
+        except Exception:
+            return []
 
     def estimate(self, trace_id) -> DirectionEstimate:
         """This trace's verdict. ``unknown``/``none`` whenever in doubt."""
