@@ -125,10 +125,20 @@ class ClockReconciler:
         displayed = _displayed(fields)
         now = self._utc_now()
         skew = (displayed - now.replace(tzinfo=None)).total_seconds()
-        if int(fields.get("timeZone", -1)) != 0 or int(dst.get("enable", 1)) != 0:
-            # The display is not UTC, so the skew above includes an offset the
-            # operator chose. Report it; do not touch it.
+        if int(fields.get("timeZone", -1)) != 0:
+            # A zone somebody chose. The skew above includes their offset, so
+            # it is not an error and this must not "correct" it away.
             return "skipped_config", skew
+        # timeZone is already UTC and only the DST flag has moved, which is not
+        # a choice anybody makes: it is the state this camera keeps being put
+        # back into, and the firmware then counts the offset twice and lands
+        # two hours out. Seen on 2026-09-16, fixed, and back by 12:43 on the
+        # 17th -- after which the reconciler logged `skipped_config +7200`
+        # every hour for sixteen hours and corrected nothing, which is the
+        # worst of both: it could see the fault and had decided not to act.
+        #
+        # The correction below already writes `enable=0`, so this needs no new
+        # behaviour, only permission to run.
         if abs(skew) <= self._tolerance:
             return "ok", skew
         corrected = {

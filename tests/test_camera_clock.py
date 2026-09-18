@@ -65,17 +65,38 @@ class ClockReconcilerTests(unittest.TestCase):
         self.assertEqual((snapshot["outcome"], snapshot["skew_seconds"], snapshot["corrections"]), ("corrected", 0, 1))
         self.assertEqual(journal[-1][1]["outcome"], "corrected")
 
-    def test_a_camera_not_configured_to_display_utc_is_reported_but_never_written(self):
-        for state in (
-            camera_time(self.NOW.replace(hour=14), dst_enabled=1, is_dst=1),
-            camera_time(self.NOW.replace(hour=14), time_zone=-3600),
-        ):
-            with self.subTest(state=state["Time"]):
-                client = FakeClient(state)
-                reconciler, _journal = self._reconciler(client)
-                snapshot = reconciler.reconcile()
-                self.assertEqual(client.writes, [])
-                self.assertEqual((snapshot["outcome"], snapshot["synced"], snapshot["skew_seconds"]), ("skipped_config", False, 7200))
+    def test_a_zone_somebody_chose_is_reported_but_never_written(self):
+        """The skew includes their offset, so "correcting" it would be wrong."""
+        client = FakeClient(camera_time(self.NOW.replace(hour=14), time_zone=-3600))
+        reconciler, _journal = self._reconciler(client)
+
+        snapshot = reconciler.reconcile()
+
+        self.assertEqual(client.writes, [])
+        self.assertEqual(
+            (snapshot["outcome"], snapshot["synced"], snapshot["skew_seconds"]),
+            ("skipped_config", False, 7200),
+        )
+
+    def test_utc_with_the_dst_flag_flipped_back_on_is_corrected(self):
+        """Not a choice anybody makes.
+
+        This camera keeps being put back into `timeZone 0` with DST on, and the
+        firmware then counts the offset twice and lands two hours out -- which
+        is what rejected every webhook as stale in September. Refusing to touch
+        it left the reconciler logging `skipped_config +7200` hourly for
+        sixteen hours: able to see the fault, and declining to act on it.
+        """
+        client = FakeClient(camera_time(self.NOW.replace(hour=14), dst_enabled=1, is_dst=1))
+        reconciler, _journal = self._reconciler(client)
+
+        snapshot = reconciler.reconcile()
+
+        self.assertEqual(len(client.writes), 1)
+        fields, dst = client.writes[0]
+        self.assertEqual(fields["timeZone"], 0)
+        self.assertEqual(dst["enable"], 0, "the double-count is turned off with the same write")
+        self.assertEqual(snapshot["outcome"], "corrected")
 
     def test_camera_errors_are_recorded_and_retried_sooner_than_the_hourly_pass(self):
         for error, outcome in (
