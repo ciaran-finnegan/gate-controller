@@ -28,11 +28,16 @@ Values are from Reolink's specification sheets. The sensors are close in size
 and resolution, so per-pixel image quality is similar rather than identical.
 The gain from the RLC-811A is entirely
 framing: the zoom puts more of the 3840-pixel frame width on the plate. Two-way
-audio is a separate concern: the push-to-talk path is designed and implemented
-in [Push-to-talk](talkback.md), but the media stack keeps talkback
-`hardware_unverified` until the supervised acceptance test in that document
-has been done on the fitted RLC-811A. Record the date, firmware and negotiated
-format here when it passes.
+audio is a separate concern, covered in [Push-to-talk](talkback.md). On the
+fitted camera (firmware `v3.1.0.4695_2504301440`, hardware `IPC_560B158MP`)
+the talk channel negotiates `adpcm16000x1024`: 16 kHz mono DVI ADPCM in 516-byte
+blocks, full duplex. It passed the remote check (`scripts/talk_tone_check.py`)
+on 2026-09-19, and two of that check's measurements shape the service:
+- the speaker plays into the camera's own microphone at about -8 dBFS
+- the camera holds about 0.5 s of talk audio, which `TalkReset` throws away
+
+The supervised acceptance test at the gate has not been done yet, so talkback
+still reports `hardware_unverified`.
 
 ## Single-Camera Controller
 
