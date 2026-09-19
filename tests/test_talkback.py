@@ -430,6 +430,7 @@ class TalkControllerTests(unittest.TestCase):
             "ffmpeg_binary": sys.executable,
             "publisher_wait": 2.0,
             "poll_interval": 0.05,
+            "drain_seconds": 0.0,
             "spawn": fake_spawn(ffmpeg_seconds),
             "opener": gateway or FakeGateway(),
             "journal": lambda stage, **fields: self.journal.append((stage, fields)),
@@ -683,6 +684,26 @@ class TalkControllerTests(unittest.TestCase):
         self.assertEqual("publisher_gone", ended["last_outcome"])
         self.assertEqual(armed["session_id"], ended["session_id"])
 
+    def test_the_camera_plays_out_what_it_holds_before_the_channel_is_reset(self):
+        controller = self.controller(ffmpeg_seconds=0.5, drain_seconds=0.4)
+        controller.probe()
+        controller.arm()
+        self.assertEqual("publisher_gone", self.wait_until_ended(controller)["last_outcome"])
+        talks = [at for message, at in self.camera.message_times if message == baichuan.MSG_TALK]
+        resets = [at for message, at in self.camera.message_times
+                  if message == baichuan.MSG_TALK_RESET]
+        self.assertTrue(talks and resets)
+        self.assertGreaterEqual(resets[-1] - talks[-1], 0.35)
+
+    def test_a_session_that_sent_nothing_resets_without_waiting(self):
+        controller = self.controller(drain_seconds=5.0)
+        controller.probe()
+        self.camera.busy_count = 10
+        started = time.monotonic()
+        controller.arm()
+        self.assertEqual("talk_busy", self.wait_until_ended(controller)["last_outcome"])
+        self.assertLess(time.monotonic() - started, 4.0)
+
     def test_the_ffmpeg_command_is_fixed_loopback_and_credential_free(self):
         command = ffmpeg_command("/usr/bin/ffmpeg", "rtsp://127.0.0.1:8554/talk", 16000)
         self.assertEqual("/usr/bin/ffmpeg", command[0])
@@ -735,7 +756,7 @@ class TalkHttpTests(unittest.TestCase):
             ),
             talk_options={
                 "ffmpeg_binary": sys.executable, "publisher_wait": 0.5, "poll_interval": 0.05,
-                "spawn": fake_spawn(0.5), "opener": self.gateway,
+                "drain_seconds": 0.0, "spawn": fake_spawn(0.5), "opener": self.gateway,
             },
         )
 

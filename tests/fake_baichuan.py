@@ -9,6 +9,7 @@ audio the "camera" would have played.
 import hashlib
 import socket
 import threading
+import time
 from xml.etree import ElementTree
 
 from gate_camera_control.aes import Aes128
@@ -51,6 +52,7 @@ class FakeBaichuanCamera:
         self.frames = []
         self.blocks = []
         self.messages = []
+        self.message_times = []
         self.logins = 0
         self.logouts = 0
         self.resets = 0
@@ -106,6 +108,7 @@ class FakeBaichuanCamera:
                 return
             msg_id, channel, msg_num, response_code, message_class, offset, body = message
             self.messages.append(msg_id)
+            self.message_times.append((msg_id, time.monotonic()))
             if msg_id == MSG_LOGIN and message_class == CLASS_LEGACY:
                 reply = (
                     '<?xml version="1.0" encoding="UTF-8" ?>\n<body>\n'

@@ -51,6 +51,12 @@ PROBE_SPACING_SECONDS = 15.0
 # them: retrying those on every press is how a camera locks the account out.
 _REPROBE_ON_ARM = frozenset({"not_probed", "camera_unreachable", "camera_busy", "camera_error"})
 FFMPEG_STOP_GRACE_SECONDS = 2.0
+# TalkReset discards whatever the camera has not yet played. The RLC-811A holds
+# about half a second (measured 2026-09-19: a reset sent with the last block cut
+# 0.55 s off a 1.5 s tone; one sent 1.5 s later cut nothing), so without this
+# wait the last words of every press were lost.
+TALK_DRAIN_SECONDS = 0.8
+_PLAYED_OUT = frozenset({"publisher_gone", "released", "time_limit"})
 _MAX_API_BYTES = 64 * 1024
 _SESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 REASONS = (
@@ -93,6 +99,7 @@ class _Session:
         self.ended_at = None
         self.outcome = None
         self.blocks = 0
+        self.last_block_at = None
         self.release = threading.Event()
         self.process = None
         self.lock = threading.Lock()
@@ -105,7 +112,8 @@ class TalkController:
                  max_seconds: int = DEFAULT_MAX_SECONDS, gateway_api: str = GATEWAY_API,
                  ffmpeg_binary: str = FFMPEG_BINARY, rtsp_url: str = TALK_RTSP_URL,
                  publisher_wait: float = PUBLISHER_WAIT_SECONDS,
-                 poll_interval: float = POLL_INTERVAL_SECONDS, clock=time.time,
+                 poll_interval: float = POLL_INTERVAL_SECONDS,
+                 drain_seconds: float = TALK_DRAIN_SECONDS, clock=time.time,
                  monotonic=time.monotonic, spawn=subprocess.Popen,
                  opener=urllib.request.urlopen, journal=None):
         self._client_factory = client_factory
@@ -116,6 +124,7 @@ class TalkController:
         self._rtsp_url = rtsp_url
         self._publisher_wait = float(publisher_wait)
         self._poll_interval = float(poll_interval)
+        self._drain_seconds = max(0.0, float(drain_seconds))
         self._clock = clock
         self._monotonic = monotonic
         self._spawn = spawn
@@ -321,6 +330,12 @@ class TalkController:
                     pass
             if client is not None:
                 if client.logged_in:
+                    if outcome in _PLAYED_OUT and session.last_block_at is not None:
+                        # Let the camera finish what it holds before the reset
+                        # throws it away. Nothing new is read or sent meanwhile.
+                        wait = session.last_block_at + self._drain_seconds - self._monotonic()
+                        if wait > 0:
+                            time.sleep(wait)
                     try:
                         client.talk_reset()
                     except (BaichuanError, OSError):
@@ -386,6 +401,7 @@ class TalkController:
                 block = encoder.encode_block(pcm16_to_samples(pcm))
                 client.talk_send(block)
                 session.blocks += 1
+                session.last_block_at = self._monotonic()
         except BaichuanRefused as error:
             if isinstance(error, TalkBusy):
                 raise

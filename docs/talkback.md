@@ -66,7 +66,11 @@ Worker /api/media/whip  ──►  Cloudflare Tunnel  ──►  nginx /talk/whi
    browser deletes its WHIP resource and MediaMTX drops the path, so ffmpeg
    sees EOF); the Worker's `DELETE /camera/talk`; the **hard limit**; a camera
    error. At every exit the service sends `TalkReset`, logs out, and kicks the
-   WHIP publisher from the gateway so the app sees the end.
+   WHIP publisher from the gateway so the app sees the end. `TalkReset`
+   discards whatever the camera has not played yet, and the RLC-811A holds
+   about half a second. So after a session that sent audio and ended normally
+   (released, publisher gone or time limit), the reset waits until 0.8 s after
+   the last block. Nothing new is read or sent in that wait.
 
 ## Security model
 
