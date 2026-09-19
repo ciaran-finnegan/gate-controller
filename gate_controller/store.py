@@ -1133,6 +1133,23 @@ class LocalStore:
                     ON gate_movements (started_at DESC);
                 -- Which recorded segments have been looked at, so a scan that
                 -- is interrupted resumes instead of starting the night again.
+                -- Which way each event's vehicle was going, judged from its photo
+                -- after the passage: front of the vehicle is arriving, rear is
+                -- leaving. `status` separates "no photo" from "no opinion", and
+                -- `shipped_at` is what lets an unreachable dashboard be retried
+                -- rather than a verdict silently lost.
+                CREATE TABLE IF NOT EXISTS event_directions (
+                    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    score REAL NOT NULL DEFAULT 0,
+                    front REAL,
+                    rear REAL,
+                    top TEXT,
+                    method TEXT NOT NULL,
+                    classified_at TEXT NOT NULL,
+                    shipped_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS gate_sound_scans (
                     segment TEXT PRIMARY KEY,
                     scanned_at TEXT NOT NULL,

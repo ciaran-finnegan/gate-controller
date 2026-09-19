@@ -1,0 +1,13 @@
+[Unit]
+Description=Judge which way recent vehicles were going, every ten minutes
+
+[Timer]
+# Soon enough that a departure drops out of the access log while someone is
+# still looking at it; each pass only judges events it has not judged before.
+OnBootSec=12min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

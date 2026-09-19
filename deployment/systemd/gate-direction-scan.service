@@ -1,0 +1,29 @@
+[Unit]
+Description=Judge which way each vehicle was going, from its photo
+After=file-monitor.service
+# Nothing here is in the path of opening a gate. It reads finished segments
+# off the card, scores them, and writes rows; if it never runs, recognition is
+# unaffected and the only loss is the record of what the gate did.
+
+[Service]
+Type=oneshot
+User=gate-controller
+Group=gate-controller
+EnvironmentFile=/etc/gate-controller.env
+Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/gate-controller-deploy/current
+WorkingDirectory=/var/lib/gate-controller
+ExecStart=/opt/gate-controller-deploy/current/.venv/bin/python \
+  /opt/gate-controller-deploy/current/scripts/scan_direction.py
+# One core at the back of the queue: plate recognition is answering in about
+# 200 ms on this board and must never wait behind a night of audio.
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=60%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/gate-controller
+
+[Install]
+WantedBy=multi-user.target
