@@ -28,13 +28,14 @@ Therefore every change this service accepts is a **bounded lease** that reverts
 to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
 reboot: the lease record lives on durable storage, and a start that finds no
 usable record reads the camera once and puts it back if it disagrees. The
-service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
-exposure is a measured setting and stays a reviewed, on-Pi operation. The
-`api.cgi` command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`,
-`Snap`, and no request body can widen it. The Baichuan (port 9000) message set
-used for push-to-talk is closed the same way — `Login`, `Logout`,
-`TalkAbility`, `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all
-unless `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
+service exposes IR and the spotlight only. It never calls `SetIsp`: the deployed
+Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
+operation. The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
+`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime` and `SetTime`, and
+no request body can widen it. The Baichuan (port 9000) message set used for
+push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
+`TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
+`GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
 
 ## Security model
 
@@ -82,8 +83,9 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 
 | Endpoint | Budget |
 | --- | --- |
-| `GET /camera/state` (and `GET /camera/ir`) | 10 at once, then 2 a second |
+| `GET /camera/state` (and `GET /camera/ir`, `GET /camera/spotlight`) | 10 at once, then 2 a second |
 | `POST /camera/ir` | 6 at once, then 1 every 2 s |
+| `POST /camera/spotlight` | 6 at once, then 1 every 2 s, its own bucket |
 | `GET /camera/snap` | 1 every 2 s, service-wide |
 | `POST /camera/talk` | 6 at once, then 1 every 2 s |
 | `GET /camera/talk` | shares the state budget |
@@ -177,6 +179,33 @@ A key records how its call ended, not merely that it happened:
 
 Setting `state` to the configured default cancels the lease immediately — that
 is the "revert now" action.
+
+### `POST /camera/spotlight`
+
+The RLC-811A's white spotlight, on exactly the IR lease: `{"state": "On" | "Off",
+"lease_minutes": 1-60, "idempotency_key": "..."}` (or `ttl_seconds`), the same
+bounds as IR, persisted before the camera is touched, reverted on expiry and on
+restart, reconciled at startup. `Off` ends a lease early. Its default is always
+`Off` -- it is only ever lit on a lease -- because a second light on a
+retroreflective plate washes it out ([Night Light](reolink-rlc-811a.md#night-light)).
+
+It sets only `WhiteLed.state` (1 lit, 0 dark). The camera's own automation
+`mode` and its brightness are the installer's settings and are never sent. The
+firmware applies a change a moment after acknowledging it, so a confirmed write
+is recorded as the observation rather than re-read.
+
+The response is the state envelope with the spotlight's lease beside IR's:
+
+```json
+{"observed_at": "...", "status": "completed",
+ "ir": {...},
+ "spotlight": {"state": "On", "default": "Off", "effective_until": "...", "lease_seconds_remaining": 600, "revert_failed": false}}
+```
+
+Idempotency keys are namespaced per light: one key sent to both is two changes.
+The lease record is `/var/lib/gate-camera/spotlight-lease.json`, independent of
+IR's. On a camera without a spotlight (the RLC-810A rollback unit) its reads fail
+and it is published as `unknown`; IR is unaffected.
 
 ### `GET /camera/snap` — also served at `POST /camera/snap`, and `GET`/`POST /camera/snapshot`
 
@@ -281,6 +310,30 @@ Worst-case heartbeat staleness is Pi heartbeat 15 s plus UI poll 15 s ≈ **30 s
 so the app must confirm a toggle with a direct read rather than waiting for a
 heartbeat.
 
+## Camera clock reconcile
+
+The controller refuses a webhook whose alarm time sits more than 15 s from
+its own clock, and on 2026-09-16 every webhook was refused for four days
+because the NVR that records the camera pushed it a clock two hours out (see
+[reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md)).
+The Pi is NTP-synced and already holds the only camera credentials, so this
+service owns the camera clock: with `GATE_CAMERA_CLOCK_SYNC=true` (the
+default) it reads `GetTime` once an hour and, when the displayed time is more
+than 5 s from UTC, writes `SetTime` with UTC. `GetTime` and `SetTime` are the
+only additions to the command allowlist.
+
+It only corrects a camera configured to *display* UTC: `timeZone 0` with DST
+disabled. `SetTime` takes the displayed time and the firmware shifts it by
+the DST hour when that flag changes in the same write, so any other
+configuration is reported as skew and left alone. A camera that would not
+answer is asked again after 5 min rather than an hour.
+
+State (`camera_control.clock`): `synced`, `outcome` (`not_checked`, `ok`,
+`corrected`, `skipped_config`, `camera_busy`, `camera_unreachable`,
+`camera_error`, `disabled`), `skew_seconds` (camera minus Pi, integer, null
+when unknown), `checked_at`, `corrections`. Journal:
+`gate_camera_control stage=clock_reconcile outcome=… skew_seconds=+N`.
+
 ## Environment
 
 `/etc/gate-camera-control.env`, root:root 0600, validated by
@@ -298,6 +351,7 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
 | `GATE_CAMERA_TALK_ENABLED` | no | `false` | exactly `true` or `false`; with `false` the service never opens the camera's port 9000 |
 | `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session |
+| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; hourly `GetTime`/`SetTime` reconcile of the camera clock to UTC |
 
 Validate a file without starting the service:
 
@@ -362,6 +416,13 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | Camera push interval | the firmware minimum webhook interval is **20 s**, so "did the change help the trigger?" cannot be answered faster than that. Do not imply instant confirmation |
 
 ## Install
+
+Once bootstrapped, the service follows the controller release: the updater
+re-runs this installer from each newly active release whenever the files the
+service is built from changed, so a merged change to `gate_camera_control/`
+reaches the Pi without anyone logging in (see
+[deployment.md](deployment.md#what-an-automatic-release-covers)). The steps
+below are the first-time bootstrap.
 
 The service is installed separately from the media stack; it shares no state, no
 user, and no environment file with it. **Run these steps in this order.** The
@@ -624,3 +685,24 @@ If `GetEnc` shows no such profile, live selection reduces to "Fluent live plus t
 on-demand 4K still", and the app should not render a `Clearer` option at all
 (access-gate-ui#33 §4 hides it unless the controller reports the second path
 ready).
+
+## When only the DST flag moves
+
+The reconciler will not touch a camera showing a zone somebody chose: the skew
+it measures then includes their offset, and "correcting" it would be wrong.
+
+`timeZone 0` with DST **on** is not that. It is the state this camera keeps
+being put back into by something outside the controller -- fixed on
+2026-09-16, back by 12:43 on the 17th -- and the firmware then counts the
+one-hour offset twice and sits two hours ahead of UTC. That is what rejected
+every webhook as `stale` and stopped recognition entirely in September.
+
+Refusing to act on it was the worst of both: the reconciler logged
+`skipped_config skew_seconds=+7200` every hour for sixteen hours, seeing the
+fault clearly and declining to do anything about it. It now corrects that one
+case, turning DST off with the same write it already made.
+
+It does not manage NTP. Enabling NTP is what pulled the clock back to within a
+second in under a minute on 2026-09-18, and it was found disabled at the same
+time DST was re-enabled, so both are worth checking after anyone has been in
+the camera's web interface.

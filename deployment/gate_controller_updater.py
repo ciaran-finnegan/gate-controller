@@ -7,6 +7,7 @@ import base64
 import http.client
 import json
 import logging
+import hashlib
 import os
 import py_compile
 import re
@@ -21,7 +22,7 @@ import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
@@ -81,6 +82,9 @@ OPTIONAL_SHELL_SYNTAX_CHECKS: tuple[tuple[str, str], ...] = (
     ("/bin/bash", "deployment/install.sh"),
     ("/bin/bash", "deployment/install-camera-control.sh"),
 )
+
+
+SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class UpdateError(RuntimeError):
@@ -1062,6 +1066,314 @@ def prune_releases(config: UpdateConfig, current_sha: str) -> None:
         shutil.rmtree(release)
 
 
+# Managed components that live outside the release tree. The controller is
+# activated by the symlink switch above; these are published from the active
+# release afterwards, and again on every later run until their marker matches,
+# so a release that changes any of them reaches the Pi without a bootstrap.
+COMPONENT_MARKER_NAME = ".gate-release-digest"
+COMPONENT_INSTALL_TIMEOUT_SECONDS = 300
+CAMERA_CONTROL_LIBRARY = Path("/usr/local/lib/gate-camera-control")
+CAMERA_CONTROL_ENVIRONMENT = Path("/etc/gate-camera-control.env")
+MEDIA_LIBRARY = Path("/usr/local/lib/gate-media")
+MEDIA_CONFIG_ROOT = Path("/etc/gate-media")
+SYSTEMD_UNIT_ROOT = Path("/etc/systemd/system")
+TMPFILES_ROOT = Path("/etc/tmpfiles.d")
+# try-restart, so a unit the operator has stopped stays stopped. The
+# turn-refresh *timer* is here because a reload re-reads a changed timer file
+# without re-arming it, so a new schedule would not take effect until reboot;
+# its oneshot service is deliberately absent, since restarting that would
+# refresh TURN credentials on every release rather than on its schedule.
+MEDIA_SERVICES = (
+    "gate-media-auth.service", "gate-media-gateway.service",
+    "gate-media-transcoder.service", "gate-media-turn-refresh.timer",
+)
+# What each component is built from, relative to the release. The digest of
+# these is what decides whether the installed copy is stale.
+CAMERA_CONTROL_SOURCES = (
+    "gate_camera_control", "gate_media_config.py",
+    "deployment/install-camera-control.sh",
+    "deployment/systemd/gate-camera-control.service",
+)
+MEDIA_SOURCES = (
+    "gate_media_auth", "gate_media_gateway", "gate_media_transcoder",
+    "gate_media_config.py", "deployment/gate_media_turn_refresh.py",
+    "deployment/media/mediamtx.yml",
+    "deployment/media/nginx-whep-locations.conf.template",
+    "deployment/systemd/gate-media-auth.service",
+    "deployment/systemd/gate-media-gateway.service",
+    "deployment/systemd/gate-media-transcoder.service",
+    "deployment/systemd/gate-media-turn-refresh.service",
+    "deployment/systemd/gate-media-turn-refresh.timer",
+)
+# Exactly the files install-media.sh publishes into the library and unit
+# directory, with the same owners and modes, so a refresh and a bootstrap
+# leave identical trees. (source relative to the release, destination, mode)
+MEDIA_PUBLISHED_FILES: tuple[tuple[str, str, int], ...] = (
+    ("gate_media_auth/__init__.py", "lib/gate_media_auth/__init__.py", 0o644),
+    ("gate_media_auth/__main__.py", "lib/gate_media_auth/__main__.py", 0o644),
+    ("gate_media_auth/token.py", "lib/gate_media_auth/token.py", 0o644),
+    ("gate_media_auth/capabilities.py", "lib/gate_media_auth/capabilities.py", 0o644),
+    ("gate_media_config.py", "lib/gate_media_config.py", 0o644),
+    ("gate_media_gateway/__init__.py", "lib/gate_media_gateway/__init__.py", 0o644),
+    ("gate_media_gateway/__main__.py", "lib/gate_media_gateway/__main__.py", 0o644),
+    ("gate_media_transcoder/__init__.py", "lib/gate_media_transcoder/__init__.py", 0o644),
+    ("gate_media_transcoder/__main__.py", "lib/gate_media_transcoder/__main__.py", 0o644),
+    ("deployment/gate_media_turn_refresh.py", "lib/gate_media_turn_refresh.py", 0o700),
+    ("deployment/media/nginx-whep-locations.conf.template",
+     "config/nginx-whep-locations.conf.template", 0o640),
+    ("deployment/systemd/gate-media-auth.service", "unit/gate-media-auth.service", 0o644),
+    ("deployment/systemd/gate-media-gateway.service", "unit/gate-media-gateway.service", 0o644),
+    ("deployment/systemd/gate-media-transcoder.service",
+     "unit/gate-media-transcoder.service", 0o644),
+    ("deployment/systemd/gate-media-turn-refresh.service",
+     "unit/gate-media-turn-refresh.service", 0o644),
+    ("deployment/systemd/gate-media-turn-refresh.timer",
+     "unit/gate-media-turn-refresh.timer", 0o644),
+)
+
+
+@dataclass(frozen=True)
+class ManagedComponent:
+    """A service published outside the release tree that follows the release."""
+
+    name: str
+    sources: tuple[str, ...]
+    marker: Path
+    # True when the component was bootstrapped on this host and may be refreshed.
+    configured: Callable[[], bool]
+    # Publish the component from ``release``; raises UpdateError on failure.
+    refresh: Callable[[Path, UpdateConfig], None]
+    # Directories the refresh must be able to write. A host whose updater unit
+    # predates release-following has them read-only under ProtectSystem=strict.
+    writable: tuple[Path, ...] = ()
+
+
+def component_digest(release: Path, sources: Sequence[str]) -> str:
+    """One digest over every file the component is built from, in a fixed order.
+
+    Missing sources contribute their name only, so a release that drops a file
+    still gets a different digest from one that has it.
+    """
+    digest = hashlib.sha256()
+    for relative in sources:
+        path = release / relative
+        entries: list[Path]
+        if path.is_dir() and not path.is_symlink():
+            entries = sorted(
+                candidate for candidate in path.rglob("*")
+                if candidate.is_file() and not candidate.is_symlink()
+                and "__pycache__" not in candidate.parts
+            )
+        elif path.is_file() and not path.is_symlink():
+            entries = [path]
+        else:
+            digest.update(f"missing:{relative}\n".encode("utf-8"))
+            continue
+        for entry in entries:
+            digest.update(f"{entry.relative_to(release).as_posix()}\n".encode("utf-8"))
+            digest.update(entry.read_bytes())
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def unwritable_path(paths: Sequence[Path]) -> Path | None:
+    """The first path this process cannot actually write, or None.
+
+    `ProtectSystem=strict` makes the filesystem read-only outside the unit's
+    own `ReadWritePaths`, and root's permission bits say nothing about that,
+    so the only honest test is to try. The probe file is created and removed
+    inside the directory itself.
+    """
+    for path in paths:
+        if not path.is_dir():
+            continue
+        probe = path / f".gate-updater-probe-{os.getpid()}"
+        try:
+            probe.touch()
+        except OSError:
+            return path
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def _read_marker(marker: Path) -> str | None:
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        text = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text if SHA256_HEX_PATTERN.fullmatch(text) else None
+
+
+def _write_marker(marker: Path, digest: str) -> None:
+    _atomic_write(marker, (digest + "\n").encode("utf-8"), 0o644)
+
+
+def _camera_control_configured() -> bool:
+    try:
+        return (
+            CAMERA_CONTROL_LIBRARY.is_dir()
+            and CAMERA_CONTROL_ENVIRONMENT.is_file()
+            and CAMERA_CONTROL_ENVIRONMENT.stat().st_size > 0
+        )
+    except OSError:
+        return False
+
+
+def _refresh_camera_control(release: Path, config: UpdateConfig) -> None:
+    installer = release / "deployment" / "install-camera-control.sh"
+    if installer.is_symlink() or not installer.is_file():
+        raise UpdateError("release does not contain deployment/install-camera-control.sh")
+    _run_command(
+        ["/bin/bash", installer, "--source", release],
+        config=config, cwd=release, timeout=COMPONENT_INSTALL_TIMEOUT_SECONDS,
+    )
+
+
+def _media_configured() -> bool:
+    try:
+        return MEDIA_LIBRARY.is_dir() and MEDIA_CONFIG_ROOT.is_dir()
+    except OSError:
+        return False
+
+
+def _install_file(source: Path, destination: Path, mode: int, group: str = "root") -> None:
+    """Publish one file the way install(1) does: atomic replace, root-owned, exact mode."""
+    if source.is_symlink() or not source.is_file():
+        raise UpdateError(f"release file is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.updater-{os.getpid()}")
+    try:
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, mode)
+        try:
+            shutil.chown(temporary, "root", group)
+        except (LookupError, PermissionError, OSError) as error:
+            raise UpdateError(f"could not set ownership on {destination}: {error}") from error
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _warn_if_proxy_template_changed(release: Path) -> bool:
+    """Say so when the WHEP proxy template moved, since the render cannot follow.
+
+    `nginx-whep-locations.conf` is rendered from this template with the
+    `--allowed-origin` only the operator's install command carries, so the
+    template is republished but the rendered file it feeds is not. Silence
+    here would leave a Pi serving a proxy configuration from an older release
+    with nothing saying so.
+    """
+    source = release / "deployment" / "media" / "nginx-whep-locations.conf.template"
+    installed = MEDIA_CONFIG_ROOT / "nginx-whep-locations.conf.template"
+    try:
+        if not installed.is_file() or installed.read_bytes() == source.read_bytes():
+            return False
+    except OSError:
+        return False
+    LOGGER.warning(
+        "The WHEP proxy template changed in this release; %s is still rendered "
+        "from the previous one. Re-run deployment/install-media.sh with "
+        "--allowed-origin to regenerate it.",
+        MEDIA_CONFIG_ROOT / "nginx-whep-locations.conf",
+    )
+    return True
+
+
+def _refresh_media(release: Path, config: UpdateConfig) -> None:
+    """Publish the media library, config template and units, then restart.
+
+    The MediaMTX binary, the rendered WHEP proxy configuration and the TURN
+    credentials are bootstrap-owned: they depend on arguments only the
+    operator's install command carries. Everything install-media.sh copies
+    verbatim from the release is refreshed here, in the same layout.
+    """
+    targets = {
+        "lib": MEDIA_LIBRARY, "config": MEDIA_CONFIG_ROOT, "unit": SYSTEMD_UNIT_ROOT,
+    }
+    _warn_if_proxy_template_changed(release)
+    for relative, published, mode in MEDIA_PUBLISHED_FILES:
+        kind, _separator, name = published.partition("/")
+        _install_file(release / relative, targets[kind] / name, mode)
+    _install_file(
+        release / "deployment" / "media" / "mediamtx.yml",
+        MEDIA_CONFIG_ROOT / "mediamtx.yml", 0o640, group="gate-media",
+    )
+    _run_command(["systemctl", "daemon-reload"], config=config, timeout=60)
+    # try-restart: a service the operator has disabled stays down.
+    _run_command(
+        ["systemctl", "try-restart", *MEDIA_SERVICES], config=config, timeout=120,
+    )
+
+
+MANAGED_COMPONENTS: tuple[ManagedComponent, ...] = (
+    ManagedComponent(
+        name="camera-control",
+        sources=CAMERA_CONTROL_SOURCES,
+        marker=CAMERA_CONTROL_LIBRARY / COMPONENT_MARKER_NAME,
+        configured=_camera_control_configured,
+        refresh=_refresh_camera_control,
+        writable=(CAMERA_CONTROL_LIBRARY, SYSTEMD_UNIT_ROOT, TMPFILES_ROOT),
+    ),
+    ManagedComponent(
+        name="media",
+        sources=MEDIA_SOURCES,
+        marker=MEDIA_LIBRARY / COMPONENT_MARKER_NAME,
+        configured=_media_configured,
+        refresh=_refresh_media,
+        writable=(MEDIA_LIBRARY, MEDIA_CONFIG_ROOT, SYSTEMD_UNIT_ROOT),
+    ),
+)
+
+
+def reconcile_components(
+    release: Path, config: UpdateConfig,
+    components: Sequence[ManagedComponent] = MANAGED_COMPONENTS,
+) -> list[str]:
+    """Bring every bootstrapped component up to the active release.
+
+    Returns the names of components that failed to refresh. A failure never
+    touches the controller release: it is logged, the marker is left stale,
+    and the next run tries again.
+    """
+    failed: list[str] = []
+    for component in components:
+        try:
+            if not component.configured():
+                LOGGER.info("Component %s is not bootstrapped on this host; skipped", component.name)
+                continue
+            digest = component_digest(release, component.sources)
+            if _read_marker(component.marker) == digest:
+                continue
+            blocked = unwritable_path(component.writable)
+            if blocked is not None:
+                # Not a failure this release can fix: the running updater unit
+                # predates release-following and confines the updater to the
+                # release tree. One bootstrap re-run installs the unit that
+                # allows it, and every release after that follows by itself.
+                LOGGER.warning(
+                    "Component %s cannot follow releases yet: %s is read-only for "
+                    "this updater. Re-run deployment/install.sh once to install the "
+                    "current gate-controller-updater.service, which grants it.",
+                    component.name, blocked,
+                )
+                continue
+            LOGGER.info("Refreshing component %s from release %s", component.name, release.name)
+            component.refresh(release, config)
+            _write_marker(component.marker, digest)
+            LOGGER.info("Component %s now matches release %s", component.name, release.name)
+        except (UpdateError, OSError, ValueError) as error:
+            LOGGER.error("Component %s was not refreshed: %s", component.name, error)
+            failed.append(component.name)
+    return failed
+
+
 def run_once(config: UpdateConfig) -> int:
     try:
         current_sha = reconcile_pending_activation(config)
@@ -1077,7 +1389,8 @@ def run_once(config: UpdateConfig) -> int:
         candidate_sha = read_main_sha(main_payload)
         if candidate_sha == current_sha:
             LOGGER.info("Release %s is already active", current_sha)
-            return 0
+            failed = reconcile_components(config.current_link.resolve(strict=True), config)
+            return 1 if failed else 0
         runs_payload = _workflow_runs_payload(config, candidate_sha)
         decision = decide_update(current_sha, main_payload, runs_payload, config.branch)
         if decision is UpdateDecision.DEFER:
@@ -1104,6 +1417,15 @@ def run_once(config: UpdateConfig) -> int:
         except (UpdateError, OSError) as error:
             LOGGER.warning("Release activated but old-release pruning failed: %s", error)
         LOGGER.info("Activated gate controller release %s", candidate_sha)
+        # The controller is active; the components published outside the
+        # release tree follow it now, and again next run if any of them fail.
+        failed = reconcile_components(candidate, config)
+        if failed:
+            LOGGER.error(
+                "Release %s is active but these components are stale: %s",
+                candidate_sha, ", ".join(failed),
+            )
+            return 1
         return 0
     except ActivationError as error:
         LOGGER.critical("%s", error)

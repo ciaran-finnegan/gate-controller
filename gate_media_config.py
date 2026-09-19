@@ -64,6 +64,9 @@ _CAMERA_CONTROL_DEFAULTS = {
     # on: with it off the service never opens port 9000 on the camera.
     "GATE_CAMERA_TALK_ENABLED": "false",
     "GATE_CAMERA_TALK_MAX_SECONDS": "30",
+    # Keep the camera's clock on the Pi's, hourly, so its alarm timestamps are
+    # trusted by the controller. "false" leaves the camera clock alone.
+    "GATE_CAMERA_CLOCK_SYNC": "true",
 }
 _CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
 _CAMERA_IR_STATES = frozenset({"Auto", "Off"})
@@ -355,6 +358,8 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
     if selected["GATE_CAMERA_TALK_ENABLED"] not in {"true", "false"}:
         raise MediaConfigError("the talk flag must be exactly true or false")
     _bounded_talk_seconds(selected["GATE_CAMERA_TALK_MAX_SECONDS"])
+    if selected["GATE_CAMERA_CLOCK_SYNC"] not in ("true", "false"):
+        raise MediaConfigError("GATE_CAMERA_CLOCK_SYNC must be exactly true or false")
     return selected
 
 

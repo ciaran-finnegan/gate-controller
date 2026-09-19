@@ -197,6 +197,64 @@ class CameraControlStateFileTests(unittest.TestCase):
                     unavailable("service_unhealthy"), validated_camera_control(block)
                 )
 
+    def test_the_clock_block_round_trips_and_a_bad_one_fails_closed(self):
+        from gate_controller.camera_control_state import validated_camera_control
+        ready = {
+            "available": True, "reason": "ready",
+            "ir": {"state": "Off", "default": "Off", "effective_until": None, "revert_failed": False},
+        }
+        clock = {"synced": True, "outcome": "corrected", "skew_seconds": 7198, "checked_at": "2026-09-16T12:00:00+00:00", "corrections": 1}
+        parsed = validated_camera_control({**ready, "clock": clock})
+        self.assertEqual(parsed["clock"], clock)
+        self.assertNotIn("clock", validated_camera_control(ready))
+        for bad in (
+            {**clock, "outcome": "made_up"},
+            {**clock, "synced": False},
+            {**clock, "skew_seconds": "7198"},
+            {**clock, "corrections": -1},
+            {**clock, "extra": 1},
+        ):
+            with self.subTest(bad=bad):
+                self.assertEqual(validated_camera_control({**ready, "clock": bad})["reason"], "service_unhealthy")
+
+    def test_the_spotlight_block_round_trips_and_a_bad_one_fails_closed(self):
+        ready = {
+            "available": True, "reason": "ready",
+            "ir": {"state": "Off", "default": "Off", "effective_until": None, "revert_failed": False},
+        }
+        spotlight = {
+            "state": "On", "default": "Off",
+            "effective_until": "2026-09-19T21:00:00+00:00", "revert_failed": False,
+        }
+        parsed = validated_camera_control({**ready, "spotlight": spotlight})
+        self.assertEqual(spotlight, parsed["spotlight"])
+        # It rides alongside IR: availability is still IR's to decide.
+        self.assertTrue(parsed["available"])
+        self.assertNotIn("spotlight", validated_camera_control(ready))
+        # A camera nobody has read yet is unknown, and that is a valid block.
+        unknown = {**spotlight, "state": "unknown", "effective_until": None}
+        self.assertEqual("unknown", validated_camera_control({**ready, "spotlight": unknown})["spotlight"]["state"])
+        for bad in (
+            {**spotlight, "state": "Auto"},
+            {**spotlight, "default": "On"},
+            {**spotlight, "revert_failed": "no"},
+            {**spotlight, "extra": 1},
+        ):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    "service_unhealthy",
+                    validated_camera_control({**ready, "spotlight": bad})["reason"],
+                )
+
+    def test_the_published_document_with_a_spotlight_passes_the_reader(self):
+        document = state_document(
+            {"state": "Off", "default": "Off", "effective_until": None, "revert_failed": False},
+            spotlight_snapshot={"state": "Off", "default": "Off", "effective_until": None, "revert_failed": False},
+        )
+        parsed = validated_camera_control(document["camera_control"])
+        self.assertEqual("ready", parsed["reason"])
+        self.assertEqual("Off", parsed["spotlight"]["state"])
+
     def test_the_default_document_claims_nothing(self):
         block = default_state()["camera_control"]
 

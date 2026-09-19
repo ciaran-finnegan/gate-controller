@@ -1,10 +1,10 @@
 # Reolink RLC-810A Deployment and Night Calibration
 
-The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
-two-way audio. Earlier issues that call the installed unit an RLC-811A are
-mislabelled. The gate has one Ethernet port, so only one camera can be fitted.
-The RLC-811A replaces the RLC-810A at the same mount; its zoom framing,
-exposure, capture point, and cutover are covered in
+This document was written for the RLC-810A: fixed 4 mm lens, no optical zoom,
+no two-way audio. That unit was removed on 2026-09-11 and the installed gate
+camera is now an RLC-811A on the same mount; the RLC-810A is the rollback
+unit. The gate has one Ethernet port, so only one camera can be fitted. The
+RLC-811A's zoom framing, exposure, capture point, and cutover are covered in
 [RLC-811A gate camera swap](reolink-rlc-811a.md). Everything below applies to
 whichever camera is fitted unless that document says otherwise.
 
@@ -265,6 +265,91 @@ baseline is refreshed from one on-demand keyframe decode every 30 s while
 idle. `GATE_CLEAR_STREAM_MODE=decoded` restores the continuously decoding
 keyframe ring.
 
+### Local Sweep
+
+Two readers work the same passage at once and the gate opens on whichever
+answers first.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cam as Camera
+    participant Pi as Controller
+    participant Local as On-device reader
+    participant Cloud as Cloud reader
+    participant Relay as Gate relay
+
+    Note over Pi: compressed video is already<br/>in memory (~2% of a core)
+    Cam->>Pi: webhook "vehicle detected" (t=0)
+    Pi->>Pi: decode the live stream at 5 frames/s
+    par On the device, every ~200 ms
+        loop up to GATE_LOCAL_SWEEP_SECONDS
+            Pi->>Local: next frame
+            Local-->>Pi: plate, or nothing
+        end
+    and In the cloud, every ~1 s
+        loop up to GATE_LOCAL_SWEEP_CLOUD_FRAMES
+            Pi->>Cloud: newest frame the device could not place
+            Cloud-->>Pi: plate, or nothing
+        end
+    end
+    Note over Pi: first authorised plate wins;<br/>freshness and authorisation<br/>re-checked under the relay lock
+    Pi->>Relay: pulse (2 s)
+    Cam--)Pi: 4K photo by FTP (t≈1.5 s, backstop)
+```
+
+| | On the device | In the cloud |
+| --- | --- | --- |
+| Rate | 5 frames a second | 1 frame a second |
+| Cost per frame | ~200 ms of one core | a billed lookup |
+| Frames per passage | every frame in the window | `GATE_LOCAL_SWEEP_CLOUD_FRAMES` (5) |
+| Which frames | all of them, newest first | the newest the device could not place |
+| Good at | a clean plate, instantly | a plate the device cannot read at all, such as one inside a headlight blaze |
+
+Neither waits for the other. A frame the device authorises is injected and
+the sweep waits for that verdict, because it is about to open the gate. A
+frame handed to the cloud is *not* waited for: the sweep keeps reading while
+it is in flight, which is what makes the two parallel rather than one behind
+the other. Set `GATE_LOCAL_SWEEP_CLOUD_FRAMES=0` to keep the paid reader out
+of the window entirely and make the sweep local-only.
+
+With `GATE_LOCAL_OCR_MODE=active` the on-device reader answers in about
+175 ms, so the session decoder's 5 fps output can be read frame by frame
+instead of three frames seconds apart. `GATE_LOCAL_SWEEP_ENABLED=true`
+replaces the capture series with a *sweep*: for `GATE_LOCAL_SWEEP_SECONDS`
+(default 10) after an accepted webhook, every new session frame (newest
+first, never one twice, at most `GATE_LOCAL_SWEEP_MAX_FPS`, default 5) is
+cropped to `GATE_PLATE_REGION` and read locally under the same plate list and
+policy band the processor uses. Nothing is injected, so nothing reaches the
+cloud, until the reader's own answer is an authorised plate; that frame is
+then handed to the ordinary burst pipeline, which re-reads it through its
+normal local pass and applies every existing safeguard (freshness, the
+authorisation re-check under the relay lock, cooldown, idempotency) before
+the relay moves. The sweep decides nothing itself, and stops on an open.
+
+If the window ends with no authorised read, `GATE_LOCAL_SWEEP_FALLBACK_FRAMES`
+(default 1, 0 to 3) of the best frames seen -- highest local score, else the
+newest -- go through the ordinary path, cloud fallback included, so the
+passage is still recorded and the cloud gets a last-resort read; 0 keeps
+every sweep frame off the cloud. The presence session then runs as before
+for whatever remains of its window. The sweep is skipped, and the series runs
+unchanged, whenever the local reader is off, in shadow mode, or not loaded.
+
+Journal: `gate_local_sweep stage=read plate=… score=… authorised=… read_ms=…`
+for every frame that read characters, and one
+`gate_local_sweep outcome=ended reason=opened|window|new_event|stopping|plate_denied|final_…
+frames=N reads=N busy=N authorised=N injected=N fallback=N best_plate=… best_score=…`
+per event (a warning when nothing was injected). Injected frames log the
+usual `gate_trigger_capture outcome=captured` with `source=sweep` or
+`source=sweep_fallback`. `busy` counts frames the reader declined because the
+FTP still's own local pass held it; they are simply skipped. The heartbeat's
+`recognition.trigger_capture.sweep` block carries the same counters.
+
+Cost: the session decoder at 5 fps is about 60% of one core and the reader
+about 90% of another for the length of the window, on a Pi 5. Expect a
+local decision roughly 0.5 to 0.8 s after the webhook for a readable plate,
+against 2 s on the FTP path, and no cloud lookups for authorised vehicles.
+
 ### Presence Session
 
 A vehicle that triggered the camera is still sitting at the gate after the
@@ -506,6 +591,21 @@ with the line spanning the driveway at the configured inbound capture point.
 Keep that baseline fixed while collecting matched and unverified events; change
 one camera variable at a time only after comparing missed entries and false
 positives across day, night, rain, and headlights.
+
+### Camera Clock Skew
+
+Every timestamped webhook is compared with the Pi clock. Since 2026-09-16 the
+skew (camera minus Pi) is journalled on rejection
+(`reolink_webhook status=rejected reason=stale event_skew_seconds=+7198.0`)
+and, when it exceeds 2 s, on acceptance too, and the heartbeat's
+`recognition.webhook` block carries `accepted`, `duplicates`,
+`rejected_stale`, `last_skew_seconds`, `last_accepted_at` and
+`last_stale_at`. A run of stale rejections with a large constant skew is a
+wrong camera clock, not a network fault; `gate-camera-control` reconciles it
+hourly ([camera-control.md](camera-control.md#camera-clock-reconcile)).
+`GATE_REOLINK_CLOCK_SKEW_TOLERANCE_SECONDS` can widen what is accepted
+(receipt-time freshness and de-duplication still apply), but fix the clock
+first.
 
 ## Continuously Hot Recognition Stream
 

@@ -93,12 +93,16 @@ class CloudflareDocumentationTests(unittest.TestCase):
         )
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("The installed gate camera is an RLC-810A", installed)
+        # The RLC-811A was fitted on 2026-09-11; the docs must say so and
+        # must still point at the review that records what the swap missed.
+        self.assertIn("installed gate\ncamera is now an RLC-811A", installed)
         self.assertIn("reolink-rlc-811a.md", installed)
-        self.assertIn("The installed camera is an RLC-810A", readme)
+        self.assertIn("The installed camera is an RLC-811A", readme)
         self.assertIn("docs/reolink-rlc-811a.md", readme)
-        self.assertIn("RLC-810A (installed)", plate_camera)
-        self.assertIn("RLC-811A (replacement)", plate_camera)
+        self.assertIn("2026-09-16-rlc-811a-first-week.md", readme)
+        self.assertIn("RLC-810A (removed, rollback unit)", plate_camera)
+        self.assertIn("RLC-811A (installed)", plate_camera)
+        self.assertIn("fitted on 2026-09-11", plate_camera)
         self.assertIn("one Ethernet port", plate_camera)
         self.assertIn("The controller assumes one camera", plate_camera)
         self.assertIn("MTX_PATHS_CAMERA_SOURCE", plate_camera)
@@ -331,13 +335,28 @@ class SystemdTrustBoundaryTests(unittest.TestCase):
         self.assertEqual("gate-controller-updater", service.get("RuntimeDirectory"))
         self.assertEqual("yes", service.get("RuntimeDirectoryPreserve"))
         # The helper directory is writable so that an activated release can
-        # refresh the updater itself; ProtectSystem=strict keeps the rest of
-        # /usr read-only. The leading "-" only means "ignore it if absent".
+        # refresh the updater itself, and since 2026-09-17 so are the install
+        # roots of the managed components the updater republishes from each
+        # release; ProtectSystem=strict keeps the rest of the system read-only.
+        # The leading "-" only means "ignore it if absent".
+        #
+        # This is enumerated, never a wholesale grant, and it does not widen
+        # what the updater can ultimately cause to run: it already publishes
+        # the code the controller executes and the helper systemd runs here.
+        # test_the_updater_unit_may_write_every_path_its_components_publish_into
+        # is the other half -- a component may not publish anywhere this list
+        # does not name.
         self.assertEqual(
             {
                 "/opt/gate-controller-deploy",
                 "/run/gate-controller-updater",
                 "-/usr/local/libexec/gate-controller",
+                "-/usr/local/lib/gate-camera-control",
+                "-/usr/local/lib/gate-media",
+                "-/etc/gate-media",
+                "-/etc/systemd/system",
+                "-/etc/tmpfiles.d",
+                "-/run/gate-camera",
             },
             set(shlex.split(service.get("ReadWritePaths", ""))),
         )
@@ -552,11 +571,118 @@ install_fixed_media_bootstrap {shlex.quote(str(REPOSITORY_ROOT))}
                     (REPOSITORY_ROOT / "gate_media_transcoder" / name).read_bytes(),
                     (bootstrap / "gate_media_transcoder" / name).read_bytes(),
                 )
-            updater = (
-                REPOSITORY_ROOT / "deployment/gate_controller_updater.py"
-            ).read_text(encoding="utf-8")
-            self.assertNotIn("gate-media-transcoder", updater)
-            self.assertNotIn("gate_media_transcoder", updater)
+            # Until 2026-09-16 the updater was asserted to mention no media
+            # artifact at all. It now republishes these same files from each
+            # active release, so the invariant that matters is that the two
+            # publish the *same* files, which the anti-drift test below checks.
+
+    def test_the_updater_publishes_exactly_what_the_media_installer_does(self):
+        """The release-follow refresh must not drift from the bootstrap installer.
+
+        `install_fixed_media_files` in install-media.sh is the definition of
+        what the media stack is made of. The updater republishes those files
+        from each active release, so a file added to one and not the other
+        would leave the Pi running a mixture of two releases.
+        """
+        from deployment.gate_controller_updater import (
+            MEDIA_PUBLISHED_FILES, MEDIA_SOURCES,
+        )
+
+        script = (REPOSITORY_ROOT / "deployment/install-media.sh").read_text(encoding="utf-8")
+        body = script[script.index("install_fixed_media_files() {"):]
+        body = body[:body.index("\n}\n")].replace("\\\n", " ")
+        variables = dict(re.findall(r"^([A-Z_]+)=(\S+)$", script, flags=re.MULTILINE))
+        variables.update(
+            source="", source_auth="/gate_media_auth",
+            source_gateway="/gate_media_gateway",
+            source_transcoder="/gate_media_transcoder",
+        )
+
+        def expand(text):
+            # Script variables are defined in terms of each other
+            # (MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml), so expand to a
+            # fixed point rather than in one pass.
+            for _pass in range(8):
+                expanded = text
+                for name in sorted(variables, key=len, reverse=True):
+                    expanded = expanded.replace(f"${name}", variables[name])
+                if expanded == text:
+                    return text
+                text = expanded
+            raise AssertionError(f"install-media.sh variables do not resolve: {text}")
+
+        installed = {}
+        for group, mode, source, destination in re.findall(
+            r'install\s+-o\s+root\s+-g\s+(\S+)\s+-m\s+(\d+)\s+"([^"]+)"\s+"([^"]+)"',
+            body,
+        ):
+            installed[expand(destination)] = (expand(source).lstrip("/"), int(mode, 8), group)
+
+        roots = {
+            "lib": "/usr/local/lib/gate-media",
+            "config": "/etc/gate-media",
+            "unit": "/etc/systemd/system",
+        }
+        refreshed = {}
+        for relative, destination, mode in MEDIA_PUBLISHED_FILES:
+            kind, _separator, name = destination.partition("/")
+            refreshed[f"{roots[kind]}/{name}"] = (relative, mode, "root")
+        refreshed["/etc/gate-media/mediamtx.yml"] = (
+            "deployment/media/mediamtx.yml", 0o640, "gate-media",
+        )
+
+        self.assertEqual(
+            installed, refreshed,
+            "install-media.sh and the updater's media refresh publish different files",
+        )
+        for relative, _destination, _mode in MEDIA_PUBLISHED_FILES:
+            self.assertTrue((REPOSITORY_ROOT / relative).is_file(), relative)
+        for relative in MEDIA_SOURCES:
+            self.assertTrue((REPOSITORY_ROOT / relative).exists(), relative)
+
+    def test_the_updater_unit_may_write_every_path_its_components_publish_into(self):
+        """ProtectSystem=strict makes anything outside ReadWritePaths read-only.
+
+        A component whose install root is missing from the unit cannot be
+        published at all, and the failure is a read-only filesystem on a live
+        Pi rather than anything CI would catch.
+        """
+        from deployment.gate_controller_updater import MANAGED_COMPONENTS
+
+        unit = (
+            REPOSITORY_ROOT / "deployment/systemd/gate-controller-updater.service"
+        ).read_text(encoding="utf-8")
+        line = next(
+            value for value in unit.splitlines()
+            if value.startswith("ReadWritePaths=")
+        )
+        granted = {
+            entry.lstrip("-") for entry in line.split("=", 1)[1].split()
+        }
+
+        for component in MANAGED_COMPONENTS:
+            for path in component.writable:
+                self.assertIn(
+                    str(path), granted,
+                    f"{component.name} publishes into {path}, which the updater "
+                    "unit does not grant",
+                )
+
+    def test_the_updater_refreshes_camera_control_through_its_own_installer(self):
+        from deployment.gate_controller_updater import (
+            CAMERA_CONTROL_SOURCES, MANAGED_COMPONENTS,
+        )
+
+        self.assertEqual(
+            {component.name for component in MANAGED_COMPONENTS},
+            {"camera-control", "media"},
+        )
+        for relative in CAMERA_CONTROL_SOURCES:
+            self.assertTrue((REPOSITORY_ROOT / relative).exists(), relative)
+        # The installer is the only thing that may publish the credentialed
+        # service: it validates the environment file before it publishes, and
+        # no credential is ever read into the updater.
+        self.assertIn("deployment/install-camera-control.sh", CAMERA_CONTROL_SOURCES)
 
     def test_fixed_media_bootstrap_is_installed_from_immutable_handoff(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

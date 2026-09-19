@@ -1,9 +1,13 @@
 # Reolink RLC-811A Gate Camera Swap
 
-The installed gate camera is an RLC-810A: fixed 4 mm lens, no optical zoom, no
-two-way audio. The gate has one Ethernet port, so only one camera can be
-fitted. The RLC-811A replaces the RLC-810A on the same pillar mount; the
-RLC-810A is removed and kept as the rollback unit. This document covers only
+The RLC-811A was fitted on 2026-09-11 at about 20:00 Irish time. The camera it
+replaced is an RLC-810A: fixed 4 mm lens, no optical zoom, no two-way audio.
+The gate has one Ethernet port, so only one camera can be fitted. The RLC-811A
+sits on the same pillar mount; the RLC-810A is removed and kept as the
+rollback unit. The first week after the swap produced one gate opening,
+because the steps below were not all carried out on the new unit; the
+evidence and the order to do them in are in
+[reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md). This document covers only
 what differs from
 [RLC-810A deployment and night calibration](reolink-rlc-810a.md). Network
 boundary, FTP burst setup, authenticated trigger provenance, stream settings,
@@ -11,7 +15,7 @@ and the Pi validation harness apply unchanged to the fitted camera.
 
 ## Hardware Differences
 
-| | RLC-810A (installed) | RLC-811A (replacement) |
+| | RLC-810A (removed, rollback unit) | RLC-811A (installed) |
 | --- | --- | --- |
 | Lens | fixed 4 mm | motorised 2.7-13.5 mm, 5x optical zoom |
 | Horizontal field of view | 87 degrees | 105 degrees wide to 31 degrees at full zoom |
@@ -75,6 +79,51 @@ or move the mount towards the drive centre line so the horizontal angle drops.
 
 ## Capture At The Stop
 
+**Superseded for this mount on 2026-09-16.** The camera is fixed to the
+wooden fence about 1 m before the gate on the right-hand side, roughly 1 m
+high and 1.5 to 2 m to the right of a vehicle's centreline. Drivers stop
+anywhere between 1 m and 3 m from the gate, which puts the plate level with
+the lens or 1 to 2 m ahead of it at a horizontal angle of 40 to 90 degrees,
+and no zoom or tilt makes that readable. The first week of the RLC-811A was
+spent aimed across the drive at the stop, and the evidence frames show
+exactly that oblique view (see
+[reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md)).
+The RLC-810A on the same mount read cars on the approach, 4 to 5 m from the
+gate and nearly head-on, with the tree line in the upper third of the frame.
+
+Approximate plate angles from this mount for a car on the drive centreline:
+
+| Car from gate | Plate ahead of camera | Horizontal | Vertical | Readable |
+| --- | --- | --- | --- | --- |
+| 1 m | 0 m | about 90 degrees | steep | no |
+| 2 m | 1 m | 60 to 65 degrees | 27 degrees | no |
+| 3 m | 2 m | 40 to 45 degrees | 14 degrees | marginal |
+| 5 m | 4 m | 20 to 25 degrees | 7 degrees | yes |
+| 7 m | 6 m | 15 to 17 degrees | 5 degrees | yes |
+
+So on this site the capture point is the **approach at 4 to 7 m from the
+gate**, and the aim is:
+
+1. Point the camera up the drive towards oncoming vehicles, not across it at
+   the gate, tilted about 5 degrees below level. The tree line sits across the
+   top third; the near gate post is at the very edge or out of frame. Dashboard
+   event 3714 (2026-09-11) is the reference view.
+2. A car parked 5 m from the gate sits mid-frame with its plate at about
+   mid-height and the whole car visible.
+3. Zoom only until the drive at the 5 m point fills the frame width; tighter
+   and a car hugging one side leaves the frame.
+4. Draw the vehicle detection zone over the drive from about 3 m to 8 m out,
+   not over the area in front of the gate, sensitivity 80.
+5. Set `GATE_TRIGGER_CAPTURE_DELAY_SECONDS=0` so the clear-stream series is
+   taken while the car is still on the approach, and re-derive
+   `GATE_PLATE_REGION` from `gate_ocr plate_box=` lines after re-aiming.
+
+Moving the camera 1 m forward onto the galvanised gate post gains about 1 m
+of distance for the same stop position and does not change this conclusion.
+Reading at the stop would need a camera in front of the vehicle, which the
+swinging leaves rule out. The original reasoning follows for a mount that can
+see the stop head-on.
+
 Vehicles stop at the closed gate, and a stopped vehicle gives the sharpest
 plate the camera can produce: no motion blur at any shutter, and one fixed
 position to aim and zoom at. Historical captures of moving vehicles are the
@@ -111,6 +160,78 @@ Set it up as:
    the vehicle is already stopped in the FTP frame, lower it.
 7. Save JPEGs of a car stopped at the mark, and of one stopped half a metre
    short and half a metre long, before enabling the alarm FTP schedule.
+
+## Frame Rate, And The Setting That Decides Whether You Get It
+
+Measured on 2026-09-17, after the swap: the camera was configured for 10 fps
+and delivering about 5, and at 6 fps it delivered 2.9. `Isp.constantFrameRate`
+was **2**; the RLC-810A ran at **1**, and the swap did not carry it over. At 2
+the encoder drops frames on a quiet scene, which an empty driveway always is,
+so the controller saw roughly half the pictures it was configured for and the
+`GATE_CLEAR_STREAM_SOURCE_FPS` it was told about was fiction.
+
+```sh
+sudo /root/camtool.py raw '[{"cmd":"SetIsp","action":0,"param":{"Isp":{<GetIsp.value.Isp with constantFrameRate: 1>}}}]'
+```
+
+With `constantFrameRate: 1` the same 6 fps configuration delivered 5.9 fps over
+ten seconds. Check it by measuring rather than by reading the setting back:
+
+```sh
+ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/clear -t 10 -an -f null -
+```
+
+Sixty video frames in ten stream-seconds is 6 fps; thirty is the encoder
+quietly deciding the scene was dull.
+
+**Rate against bitrate.** The stream is CBR, so the bitrate is spent whatever
+the frame rate: halving the rate doubles the data in each picture. At 4K the
+site now runs **6 fps at 6144 kbit/s**, which is 1024 kbit a frame against 614
+at the previous 10 fps, and costs the NVR nothing because the bitrate is
+unchanged. The camera offers 25/22/20/18/16/15/12/10/8/6/4/2 fps and bitrates
+to 8192; 8192 was measured and rejected as diminishing returns for a third
+more recording storage, since plate pixel width and night exposure dominate,
+not compression. Six is deliberately just above the five frames a second the
+on-device reader can consume.
+
+Two things must move with the frame rate, every time:
+
+- `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi. The session decoder reads an
+  Annex-B pipe with no timestamps, so a stated rate that is not the real one
+  silently changes how many pictures it keeps.
+- The I-frame interval, at 1x the frame rate, so there is still a keyframe
+  every second for an on-demand grab to start from.
+
+Exposure is **not** one of them, as long as it stays `Manual`. On `Auto` a
+lower frame rate lets the shutter stretch towards 1/6 s, which would brighten
+the picture and smear every moving plate. Read `Isp.exposure` back after any
+frame-rate change.
+
+
+### It still under-delivers, by about a quarter
+
+Measured again on 2026-09-17 in daylight, with `frameRate 6`, `bitRate 6144`,
+`gop 1` and `constantFrameRate 1` all confirmed in place:
+
+| Sample | Frames | Over | Delivered |
+| --- | --- | --- | --- |
+| 10 s | 41 | 10.0 s | 4.1 fps |
+| 20 s | 92 | 19.8 s | 4.6 fps |
+
+So about **4.5 fps against a configured 6**, or 75%. Setting `constantFrameRate`
+to 1 recovered the worst of it -- it was 2.9 before -- but not all of it.
+
+This caps everything downstream. The session decoder is asked for
+`GATE_SESSION_FPS=5`, which is *above* what arrives, so its `fps` filter has
+nothing to thin and repeats frames instead to make the rate up. A repeated
+frame costs the on-device reader its full ~200 ms for an answer already known,
+which is why the sweep now skips a frame identical to the one before it and
+reports `duplicates=` and `read_fps=` when the window ends.
+
+Do not chase this with a higher frame rate. At a fixed 6144 kbit/s more frames
+means fewer bits each, and the binding constraint on recognition at this site
+is plate size -- measured at 135-170 px at the stopping position on
+2026-09-17, against the 300 px the lens could give after re-aiming.
 
 ## Webhook Capture And Keyframes
 

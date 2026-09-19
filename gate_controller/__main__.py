@@ -25,6 +25,7 @@ from .direction import DirectionTracker, load_direction_config
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
+from .local_sweep import LocalSweepReader
 from .net_probe import NetProbeWorker, load_net_probe_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
 from .plate_region import parse_plate_region
@@ -52,6 +53,7 @@ from .settings import (
     CloudflareSettingsFetcher, MatchPolicyCache, SettingsRefreshWorker,
 )
 from .reolink_events import (
+    build_reolink_correlator,
     ReolinkEventCorrelator, ReolinkWebhookWorker,
     load_reolink_webhook_config,
 )
@@ -111,6 +113,10 @@ def main() -> None:
     # nothing recorded. Built before the coordinator because the coordinator is
     # the sole owner of the relay, and the relay is what labels the clips.
     audio_capture = _audio_capture_recorder(os.environ)
+    # The continuous recorder is independent of the per-event one: it holds no
+    # lock the pipeline takes, observes no actuation, and is never consulted by
+    # a gate decision. It only writes segments a later job cuts windows from.
+    audio_segments = _audio_segment_recorder(os.environ)
     coordinator = ActuationCoordinator(
         store, relay, timedelta(seconds=20), activation_observer=audio_capture,
     )
@@ -152,10 +158,21 @@ def main() -> None:
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
     clear_keyframes = _clear_stream_source(trigger_capture_config)
+    # The sweep reads session frames with the same recogniser, plate list and
+    # policy band the processor uses, so what it admits is what the processor
+    # will re-check. Built only when configured; None leaves capture as it was.
+    sweep_reader = (
+        LocalSweepReader(
+            local_recognizer, authorised=authorised.get, match_policy=match_policy.get,
+            plate_region=plate_region,
+        )
+        if trigger_capture_config.sweep_enabled and local_recognizer is not None
+        else None
+    )
     trigger_capture = (
         TriggerFrameCapture(
             trigger_capture_config, frame_source=clear_keyframes,
-            activity=activity,
+            activity=activity, sweep=sweep_reader,
         )
         if trigger_capture_config.enabled else None
     )
@@ -167,12 +184,15 @@ def main() -> None:
     metrics = build_metrics_ring(
         os.environ, state_directory=Path(arguments.database).resolve().parent,
     )
+    # Built before the workers so the heartbeat can report webhook acceptance
+    # and the camera's clock skew; the listener itself is wired further down.
+    trigger_correlator = build_reolink_correlator(os.environ)
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
-        trigger_capture=trigger_capture,
+        trigger_capture=trigger_capture, webhook=trigger_correlator,
         corpus=corpus, activity=activity, metrics=metrics,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
@@ -200,13 +220,18 @@ def main() -> None:
             and trigger_capture_config.crop_capture else None
         ),
     )
+    # The pipeline hands back the correlator it was given, so the listener,
+    # the burst resolver and the heartbeat all share one set of counters.
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
         os.environ,
         on_accepted=_camera_event_handler(trigger_capture, recognizer, audio_capture),
+        correlator=trigger_correlator,
     )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
     if audio_capture is not None:
         background_workers += (audio_capture,)
+    if audio_segments is not None:
+        background_workers += (audio_segments,)
     if hot_stream is not None:
         background_workers += (hot_stream,)
     if clear_keyframes is not None:
@@ -353,7 +378,20 @@ def _training_corpus(environment):
         max_bytes = int(raw) if raw else DEFAULT_MAX_BYTES
     except ValueError as error:
         raise ValueError("GATE_TRAINING_CORPUS_MAX_BYTES must be an integer") from error
-    return TrainingCorpus(path, max_bytes=max_bytes)
+    # The recorder owns its own segments: it keeps a rolling window on the card
+    # for the window cutter and the labeller to read, and prunes it against its
+    # retention and free-space floor. Shipping one must not empty that window.
+    from .audio_segments import load_segment_config
+    retained = []
+    try:
+        segments = load_segment_config(environment)
+    except Exception:
+        segments = None
+    # Only while the recorder is running: with nothing pruning that directory,
+    # keeping shipped payloads there would grow without a bound.
+    if segments and segments.get("enabled") and segments.get("directory"):
+        retained.append(Path(segments["directory"]))
+    return TrainingCorpus(path, max_bytes=max_bytes, retained_directories=retained)
 
 
 
@@ -413,6 +451,31 @@ def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
     return handle
 
 
+def _audio_segment_recorder(environment):
+    """A continuous recorder of the gate's sound, or None when off.
+
+    Off unless ``GATE_AUDIO_SEGMENTS_ENABLED`` is set: no thread, no child,
+    nothing written. A configuration error raises here, before the relay is
+    claimed, rather than leaving a half-configured recorder running.
+    """
+    from .audio_segments import SegmentRecorder, SegmentStore, load_segment_config
+
+    config = load_segment_config(environment)
+    if not config["enabled"] or config["directory"] is None:
+        return None
+    store = SegmentStore(
+        config["directory"],
+        retention_hours=config["retention_hours"],
+        min_free_bytes=config["min_free_bytes"],
+    )
+    return SegmentRecorder(
+        store,
+        source_url=config["source_url"],
+        segment_seconds=config["segment_seconds"],
+        keep_everything=config["keep_everything"],
+    )
+
+
 def _audio_capture_recorder(environment):
     """A bounded recorder of gate audio around each event, or None when off.
 
@@ -429,9 +492,9 @@ def _audio_capture_recorder(environment):
 
 
 
-def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None):
+def build_reolink_trigger_pipeline(environment=None, *, on_accepted=None, correlator=None):
     environment = os.environ if environment is None else environment
-    correlator = ReolinkEventCorrelator()
+    correlator = correlator if correlator is not None else build_reolink_correlator(environment)
     config = load_reolink_webhook_config(environment)
     workers = (
         (ReolinkWebhookWorker(config, correlator, on_accepted=on_accepted),)
@@ -583,7 +646,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
-                             corpus=None, activity=None, metrics=None):
+                             corpus=None, activity=None, metrics=None, webhook=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -643,7 +706,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             camera_stale_seconds=camera_stale_seconds,
             hot_stream=hot_stream, match_policy=match_policy,
             local_recognizer=local_recognizer,
-            trigger_capture=trigger_capture,
+            trigger_capture=trigger_capture, webhook=webhook,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
             metrics=metrics,
@@ -693,7 +756,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         camera_directory=camera_directory,
         camera_stale_seconds=camera_stale_seconds,
         hot_stream=hot_stream, local_recognizer=local_recognizer,
-        trigger_capture=trigger_capture, net_probe=net_probe,
+        trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity,
     )
 
@@ -745,7 +808,7 @@ def image_runtime_limits(environment) -> tuple[int, int]:
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,
                        camera_directory=None, camera_stale_seconds: float = 60.0,
                        hot_stream=None, match_policy=None, local_recognizer=None,
-                       trigger_capture=None, net_probe=None,
+                       trigger_capture=None, webhook=None, net_probe=None,
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
@@ -787,6 +850,12 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     trigger_capture_status = _trigger_capture_status(trigger_capture)
     if trigger_capture_status is not None:
         status["recognition"]["trigger_capture"] = trigger_capture_status
+    webhook_status = _webhook_status(webhook)
+    if webhook_status is not None:
+        status["recognition"]["webhook"] = webhook_status
+    gate = _gate_sound_status(store)
+    if gate is not None:
+        status["gate"] = gate
     host = _host_status(host_metrics, net_probe)
     if host:
         status["host"] = host
@@ -807,6 +876,20 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     if match_policy is not None:
         status["match_policy"] = match_policy.status()
     return status
+
+
+def _webhook_status(webhook) -> dict | None:
+    """Webhook acceptance counters and the camera's clock skew, when wired."""
+    if webhook is None:
+        return None
+    reader = getattr(webhook, "status", None)
+    if not callable(reader):
+        return None
+    try:
+        measured = reader()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
 
 
 def _corpus_status(corpus, corpus_upload, activity) -> dict | None:
@@ -863,6 +946,24 @@ def _age_seconds(timestamp: str | None, now: datetime) -> float | None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     age = (now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc))
     return round(max(0.0, age.total_seconds()), 1)
+
+
+def _gate_sound_status(store) -> dict | None:
+    """What the microphone says the gate did, or None when nothing has scanned.
+
+    Read-only and best-effort: the heartbeat must go out whether or not the
+    sound scanner has ever run, and a board without the model never will.
+    """
+    import sqlite3
+    from contextlib import closing
+
+    from .gate_sound_scan import gate_state
+
+    try:
+        with closing(sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)) as connection:
+            return gate_state(connection)
+    except Exception:
+        return None
 
 
 def _trigger_capture_status(trigger_capture) -> dict | None:

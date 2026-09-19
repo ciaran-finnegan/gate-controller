@@ -21,8 +21,14 @@ from .atomic import atomic_write
 
 
 API_PATH = "/cgi-bin/api.cgi"
-ALLOWED_COMMANDS = frozenset({"Login", "GetIrLights", "SetIrLights", "Snap"})
+ALLOWED_COMMANDS = frozenset({
+    "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed", "Snap", "GetTime", "SetTime",
+})
 IR_STATES = ("Auto", "Off")
+# The RLC-811A's white spotlight, as the firmware's `WhiteLed.state` reports it:
+# 1 lit, 0 dark. `mode` (off / night-smart / schedule) is the camera's own
+# automation and is never touched here -- only whether it is lit right now.
+SPOTLIGHT_STATES = ("On", "Off")
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MIN_LOGIN_INTERVAL_SECONDS = 60.0
 BREAKER_SECONDS = 60.0
@@ -195,6 +201,41 @@ class ReolinkClient:
         if state not in IR_STATES:
             raise ValueError("IR state must be Auto or Off")
         self._command("SetIrLights", 0, {"IrLights": {"state": state}})
+
+    def spotlight_state(self) -> str:
+        """Return whether the camera's white spotlight is lit now.
+
+        The firmware applies a change a moment after acknowledging it, so a read
+        straight after a write can still see the old state; the lease controller
+        records a confirmed write as the observation for exactly that reason.
+        """
+        value = self._command("GetWhiteLed", 0, {"channel": 0})
+        led = value.get("WhiteLed") if isinstance(value, dict) else None
+        state = led.get("state") if isinstance(led, dict) else None
+        if isinstance(state, bool) or state not in (0, 1):
+            raise CameraError("camera reported an unknown spotlight state")
+        return "On" if state == 1 else "Off"
+
+    def set_spotlight_state(self, state: str) -> None:
+        """Light or darken the spotlight now, leaving its automation mode alone."""
+        if state not in SPOTLIGHT_STATES:
+            raise ValueError("spotlight state must be On or Off")
+        self._command("SetWhiteLed", 0, {
+            "WhiteLed": {"channel": 0, "state": 1 if state == "On" else 0},
+        })
+
+    def clock_state(self) -> dict:
+        """The camera's clock as it displays it, with its DST block."""
+        value = self._command("GetTime", 1, {"channel": 0})
+        if not isinstance(value, dict) or not isinstance(value.get("Time"), dict):
+            raise CameraError("camera reported an unusable clock")
+        return {"Time": dict(value["Time"]), "Dst": dict(value.get("Dst") or {})}
+
+    def set_clock(self, time_fields: dict, dst: dict) -> None:
+        """Write the displayed time and the DST block back in one call."""
+        if not isinstance(time_fields, dict) or not isinstance(dst, dict):
+            raise ValueError("clock fields must be objects")
+        self._command("SetTime", 0, {"Time": dict(time_fields), "Dst": dict(dst)})
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""

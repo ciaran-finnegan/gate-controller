@@ -193,6 +193,40 @@ class SubdirectoryArtefactTests(unittest.TestCase):
         self.assertEqual(corpus.pending(), [])
         self.assertEqual(corpus.status()["discarded"], 1)
 
+    def test_a_retained_directory_keeps_its_payload_and_is_marked_instead(self):
+        """R2 having a segment is not a reason to take it off the card.
+
+        The recorder keeps a rolling window there for the window cutter and
+        the labeller to read, and nothing can read an artefact back out of R2.
+        """
+        corpus = self.corpus(retained_directories=[self.audio])
+        clip = self.clip("20260908T120030000000Z-abcdef123456")
+
+        self.assertTrue(corpus.discard(corpus.pending()[0]))
+
+        self.assertTrue(clip.exists())
+        self.assertFalse(clip.with_suffix(".json").exists())
+        self.assertTrue(clip.with_suffix(".shipped").exists())
+        self.assertEqual(corpus.status()["discarded"], 1)
+
+    def test_a_marked_payload_is_never_offered_again(self):
+        """Or every poll would re-upload bytes R2 already has, for ever."""
+        corpus = self.corpus(retained_directories=[self.audio])
+        self.clip("20260908T120030000000Z-abcdef123456")
+        corpus.discard(corpus.pending()[0])
+
+        self.assertEqual(corpus.pending(), [])
+
+    def test_retaining_one_directory_leaves_every_other_one_deleting(self):
+        """The root is still a buffer; only what somebody else prunes is kept."""
+        corpus = self.corpus(retained_directories=[self.audio])
+        frame = self.frame(corpus)
+
+        artefact = [a for a in corpus.pending() if a.payload_path.suffix == ".jpg"][0]
+        self.assertTrue(corpus.discard(artefact))
+
+        self.assertFalse(Path(frame).exists())
+
     def test_discarding_a_clip_leaves_the_frame_accounting_alone(self):
         """The bound counts what this corpus wrote, so only that comes off it.
 

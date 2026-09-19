@@ -16,7 +16,15 @@ UMask=0077
 RuntimeDirectory=gate-controller-updater
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
-ReadWritePaths=/opt/gate-controller-deploy /run/gate-controller-updater -/usr/local/libexec/gate-controller
+# The release tree, the lock, and the helper this unit executes. The rest are
+# the managed components the updater republishes from each active release
+# (deployment.md, "What An Automatic Release Covers"): without them
+# ProtectSystem=strict makes every publication fail on a read-only path. This
+# is not a widening of what the updater can ultimately do -- it already writes
+# the code the controller runs as root and the helper systemd executes here --
+# but it is deliberately enumerated rather than granted wholesale, and a "-"
+# path that does not exist on this host is simply skipped.
+ReadWritePaths=/opt/gate-controller-deploy /run/gate-controller-updater -/usr/local/libexec/gate-controller -/usr/local/lib/gate-camera-control -/usr/local/lib/gate-media -/etc/gate-media -/etc/systemd/system -/etc/tmpfiles.d -/run/gate-camera
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID
 NoNewPrivileges=true
 ProtectSystem=strict

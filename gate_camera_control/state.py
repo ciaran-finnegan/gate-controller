@@ -19,6 +19,7 @@ PUBLISH_INTERVAL_SECONDS = 5.0
 # an operator's own request ever observed it.
 REFRESH_INTERVAL_SECONDS = 30.0
 IR_STATES = ("Auto", "Off")
+SPOTLIGHT_STATES = ("On", "Off")
 REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
@@ -64,8 +65,66 @@ def talkback_document(talk_block) -> dict:
     }
 
 
-def state_document(ir_snapshot, *, now=None, talk_block=None) -> dict:
-    """Convert an IR snapshot into the exact nonsecret heartbeat document."""
+CLOCK_OUTCOMES = (
+    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
+    "camera_unreachable", "camera_error", "disabled",
+)
+
+
+def clock_block(clock_snapshot) -> dict | None:
+    """The bounded clock block, or None when the reconciler is not wired."""
+    if not isinstance(clock_snapshot, dict):
+        return None
+    outcome = clock_snapshot.get("outcome")
+    if outcome not in CLOCK_OUTCOMES:
+        outcome = "camera_error"
+    skew = clock_snapshot.get("skew_seconds")
+    if isinstance(skew, bool) or not isinstance(skew, int):
+        skew = None
+    checked_at = clock_snapshot.get("checked_at")
+    if not isinstance(checked_at, str) or not 0 < len(checked_at) <= 40:
+        checked_at = None
+    corrections = clock_snapshot.get("corrections")
+    if isinstance(corrections, bool) or not isinstance(corrections, int) or corrections < 0:
+        corrections = 0
+    return {
+        "synced": outcome in ("ok", "corrected"),
+        "outcome": outcome,
+        "skew_seconds": skew,
+        "checked_at": checked_at,
+        "corrections": corrections,
+    }
+
+
+def light_block(snapshot, states, default_fallback) -> dict:
+    """One light's lease state, in the exact shape the controller validates."""
+    state = snapshot.get("state")
+    if state not in states:
+        state = "unknown"
+    default = snapshot.get("default")
+    if default not in states:
+        default = default_fallback
+    effective_until = snapshot.get("effective_until")
+    if not isinstance(effective_until, str):
+        effective_until = None
+    return {
+        "state": state,
+        "default": default,
+        "effective_until": effective_until,
+        "revert_failed": bool(snapshot.get("revert_failed")),
+    }
+
+
+def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snapshot=None,
+                   talk_block=None) -> dict:
+    """Convert an IR snapshot into the exact nonsecret heartbeat document.
+
+    The spotlight rides alongside, when the service has one. It does not decide
+    `available` or `reason`: those describe whether camera control works at
+    all, which the IR read answers, and a camera without a spotlight is still a
+    camera whose IR can be controlled. Talkback is always published, as
+    not-enabled when the service has no talk controller.
+    """
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
         state = "unknown"
@@ -84,7 +143,7 @@ def state_document(ir_snapshot, *, now=None, talk_block=None) -> dict:
     effective_until = ir_snapshot.get("effective_until")
     if not isinstance(effective_until, str):
         effective_until = None
-    return {
+    document = {
         "observed_at": int(time.time() if now is None else now),
         "camera_control": {
             "available": state != "unknown",
@@ -98,6 +157,14 @@ def state_document(ir_snapshot, *, now=None, talk_block=None) -> dict:
             "talkback": talkback_document(talk_block),
         },
     }
+    clock = clock_block(clock_snapshot)
+    if clock is not None:
+        document["camera_control"]["clock"] = clock
+    if spotlight_snapshot is not None:
+        document["camera_control"]["spotlight"] = light_block(
+            spotlight_snapshot, SPOTLIGHT_STATES, "Off",
+        )
+    return document
 
 
 def write_state(path, document: dict) -> None:
@@ -118,9 +185,14 @@ class StatePublisher:
     def __init__(self, path, snapshot_provider, *,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
-                 clock=time.time, talk_provider=None, talk_refresher=None):
+                 clock=time.time, clock_provider=None, spotlight_provider=None,
+                 talk_provider=None, talk_refresher=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        # The spotlight controller's snapshot; None on a service without one.
+        self._spotlight_provider = spotlight_provider
+        # The clock reconciler's own snapshot; None when it is not wired.
+        self._clock_provider = clock_provider
         self._talk_provider = talk_provider
         self._talk_refresher = talk_refresher
         self._interval_seconds = float(interval_seconds)
@@ -141,8 +213,24 @@ class StatePublisher:
         self._thread.join(timeout=self._interval_seconds + 1)
 
     def publish_once(self) -> None:
+        clock_snapshot = None
+        if self._clock_provider is not None:
+            try:
+                clock_snapshot = self._clock_provider()
+            except Exception:
+                clock_snapshot = None
+        spotlight_snapshot = None
+        if self._spotlight_provider is not None:
+            try:
+                spotlight_snapshot = self._spotlight_provider()
+            except Exception:
+                # A spotlight fault must never stop IR and the clock being published.
+                spotlight_snapshot = {"state": "unknown"}
         talk_block = self._talk_provider() if self._talk_provider is not None else None
-        write_state(self._path, state_document(self._snapshot_provider(), talk_block=talk_block))
+        write_state(self._path, state_document(
+            self._snapshot_provider(), clock_snapshot=clock_snapshot,
+            spotlight_snapshot=spotlight_snapshot, talk_block=talk_block,
+        ))
 
     def refresh_if_due(self) -> bool:
         """Observe the camera at most once per refresh interval. True if it ran."""

@@ -84,10 +84,21 @@ the Pi as well; the suite refuses to run any command against a live stream, so
 doing that can no longer starve the board the way it did on 2026-09-07.
 Network, GitHub, rate-limit,
 dependency, staging, or verification failures leave the running release
-untouched; activation failures restore the previous managed symlink. The root
-updater helper and all systemd units are fixed copies installed only by explicit
-bootstrap, so changes to them require a deliberate bootstrap refresh rather
-than an automatic release.
+untouched; activation failures restore the previous managed symlink. After a
+release is active the updater also brings the services published outside the
+release tree up to it: `gate-camera-control` is re-published through its own
+installer, and the media library, its MediaMTX configuration and its units are
+copied and the media services restarted, each only when the files it is built
+from actually changed (a digest marker beside each installed copy). A component
+that fails to refresh leaves the controller release active, marks the run
+failed, and is retried every cycle. Because the updater runs under
+`ProtectSystem=strict`, a Pi whose updater unit predates this needs one
+`deployment/install.sh` re-run to grant those paths; the updater names the
+blocked path and that command until it happens. The root updater helper itself is refreshed
+from each verified release; only the updater's own systemd unit and timer, the
+MediaMTX binary, the rendered WHEP proxy configuration and the TURN credentials
+remain bootstrap-owned, because they depend on arguments only the operator's
+install command carries.
 Tailscale is optional break-glass administration only and is not required for
 gate operation or updates. See [Raspberry Pi deployment](docs/deployment.md)
 for migration, logs, retention, manual rollback, and optional private-token
@@ -216,7 +227,12 @@ is skipped when disabled, for `manual_test` events, inside the rate-limit
 interval, or while a series is already queued. The webhook never authorises or
 actuates; the frame takes the same path as an upload, and the FTP path stays
 as the fallback. `GATE_OCR_MAX_UPLOAD_WIDTH` can downscale frames before the
-OCR upload once the plate is large enough in the 4K image.
+OCR upload once the plate is large enough in the 4K image. With the local
+reader active, `GATE_LOCAL_SWEEP_ENABLED=true` replaces that spaced series
+with a sweep that reads every live session frame on the Pi for a bounded
+window and hands the pipeline only a frame the reader already authorises, so
+no sweep frame reaches the cloud; see
+[Local Sweep](docs/reolink-rlc-810a.md#local-sweep).
 
 The controller can also read plates on the Pi itself, from the very bytes it
 uploads, using two small MIT-licensed ONNX models. `GATE_LOCAL_OCR_MODE=shadow`
@@ -255,10 +271,18 @@ The wire fields, the reason table, and the one app-side change still needed
 
 ## Camera Deployment
 
-The installed camera is an RLC-810A. See
-[RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md). The
-gate has one Ethernet port, so the RLC-811A replaces it rather than joining
-it; see [RLC-811A gate camera swap](docs/reolink-rlc-811a.md).
+The installed camera is an RLC-811A, fitted on 2026-09-11 in place of the
+RLC-810A on the same mount; the RLC-810A is the rollback unit. Base setup and
+night calibration are in
+[RLC-810A deployment and night calibration](docs/reolink-rlc-810a.md); what
+differs for the fitted camera is in
+[RLC-811A gate camera swap](docs/reolink-rlc-811a.md). The swap was done
+without re-registering the webhook, re-aiming, or redrawing the detection
+zone, and recognition stopped as a result; the evidence and the order of
+commissioning work are in
+[reviews/2026-09-16-rlc-811a-first-week.md](docs/reviews/2026-09-16-rlc-811a-first-week.md).
+Remote diagnosis from the developer Mac is described in
+[deployment.md](docs/deployment.md#remote-diagnostics-from-the-developer-mac).
 The Pi performance harness is documented in
 [Pi Cloudflare performance validation](docs/pi-cloudflare-performance.md). It
 is intentionally deferred until reliable on-site network access is available.

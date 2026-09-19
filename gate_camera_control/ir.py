@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timezone
 
 from .atomic import atomic_write
-from .reolink import IR_STATES, CameraBusy, CameraError, CameraUnreachable
+from .reolink import IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable
 
 
 DEFAULT_LEASE_MINUTES = 10
@@ -42,13 +42,29 @@ MAX_LEASE_CLOCK_SKEW_SECONDS = 365 * 24 * 60 * 60
 
 
 class IrController:
-    """Serialises every camera change and owns the revert timer."""
+    """Serialises every camera change and owns the revert timer.
+
+    Written for the IR illuminator, and the model for any other light on the
+    camera that must never be left on: a subclass names its states and says how
+    to read and write them, and inherits the whole lease -- persisted before the
+    camera is touched, reverted on expiry and on restart, reconciled at startup.
+    """
+
+    STATES = IR_STATES
+    NAME = "IR"
+    JOURNAL_NAME = "ir"
+
+    def _read_camera_state(self) -> str:
+        return self._client.ir_state()
+
+    def _write_camera_state(self, state: str) -> None:
+        self._client.set_ir_state(state)
 
     def __init__(self, client, *, default_state="Off", lease_path=None,
                  default_lease_minutes=DEFAULT_LEASE_MINUTES,
                  max_lease_minutes=MAX_LEASE_MINUTES, clock=time.time, journal=None):
-        if default_state not in IR_STATES:
-            raise ValueError("the IR default must be Auto or Off")
+        if default_state not in self.STATES:
+            raise ValueError(f"the {self.NAME} default must be {' or '.join(self.STATES)}")
         if not 1 <= default_lease_minutes <= max_lease_minutes <= MAX_LEASE_MINUTES:
             raise ValueError("IR lease bounds are invalid")
         self._client = client
@@ -169,7 +185,7 @@ class IrController:
         if not self._camera_lock.acquire(blocking=False):
             return False
         try:
-            state = self._client.ir_state()
+            state = self._read_camera_state()
         except CameraError as error:
             with self._lock:
                 self._record_error_locked(error)
@@ -189,8 +205,8 @@ class IrController:
 
     def set_state(self, state: str, lease_minutes=None) -> dict:
         """Apply a bounded IR lease and return the resulting state."""
-        if state not in IR_STATES:
-            raise ValueError("IR state must be Auto or Off")
+        if state not in self.STATES:
+            raise ValueError(f"{self.NAME} state must be {' or '.join(self.STATES)}")
         minutes = self._bounded_lease_minutes(lease_minutes)
         with self._camera_writer():
             with self._lock:
@@ -207,7 +223,7 @@ class IrController:
                         "state": state, "expires_at": expires_at, "set_at": now,
                     })
             try:
-                self._client.set_ir_state(state)
+                self._write_camera_state(state)
             except CameraError as error:
                 with self._lock:
                     self._record_error_locked(error, invalidates_observation=True)
@@ -221,7 +237,7 @@ class IrController:
                             "state": state, "expires_at": expires_at, "set_at": now,
                         }
                     self._journal(
-                        "ir_set", state=state, lease_seconds=minutes * 60,
+                        f"{self.JOURNAL_NAME}_set", state=state, lease_seconds=minutes * 60,
                         outcome=error.code,
                     )
                 raise
@@ -234,7 +250,7 @@ class IrController:
                     self._write_lease(None)
                     self._revert_failed = False
                     self._revert_attempts = 0
-                    self._journal("ir_revert", state=state, outcome="completed")
+                    self._journal(f"{self.JOURNAL_NAME}_revert", state=state, outcome="completed")
                 else:
                     self._lease = {
                         "state": state, "expires_at": expires_at, "set_at": now,
@@ -242,7 +258,7 @@ class IrController:
                     self._revert_failed = False
                     self._revert_attempts = 0
                     self._journal(
-                        "ir_set", state=state, lease_seconds=minutes * 60,
+                        f"{self.JOURNAL_NAME}_set", state=state, lease_seconds=minutes * 60,
                         outcome="completed",
                     )
                 return self._snapshot_locked()
@@ -262,7 +278,7 @@ class IrController:
                     return False
             elif now < self._lease["expires_at"]:
                 return False
-        return self._revert(stage="ir_revert")
+        return self._revert(stage=f"{self.JOURNAL_NAME}_revert")
 
     def seconds_until_next_revert(self):
         with self._lock:
@@ -280,7 +296,7 @@ class IrController:
                 if self._lease is None:
                     return False
             try:
-                self._client.set_ir_state(self._default_state)
+                self._write_camera_state(self._default_state)
             except CameraError as error:
                 with self._lock:
                     self._record_error_locked(error, invalidates_observation=True)
@@ -419,7 +435,7 @@ class IrController:
             return None, True
         if (not isinstance(decoded, dict)
                 or set(decoded) != {"state", "expires_at", "set_at"}
-                or decoded["state"] not in IR_STATES):
+                or decoded["state"] not in self.STATES):
             return None, True
         now = self._clock()
         for key in ("expires_at", "set_at"):
@@ -455,15 +471,40 @@ class IrController:
         atomic_write(self._lease_path, body, 0o600)
 
 
+class SpotlightController(IrController):
+    """The RLC-811A's white spotlight, on the same lease as IR.
+
+    It lights the stop line brighter than anything else at the gate, and a
+    second light on a retroreflective plate washes it out (docs/reolink-rlc-811a.md,
+    Night Light), so it is only ever lit on a lease that switches it back off.
+    The default is always dark.
+    """
+
+    STATES = SPOTLIGHT_STATES
+    NAME = "spotlight"
+    JOURNAL_NAME = "spotlight"
+
+    def __init__(self, client, *, default_state="Off", **settings):
+        if default_state != "Off":
+            raise ValueError("the spotlight default is always Off")
+        super().__init__(client, default_state=default_state, **settings)
+
+    def _read_camera_state(self) -> str:
+        return self._client.spotlight_state()
+
+    def _write_camera_state(self, state: str) -> None:
+        self._client.set_spotlight_state(state)
+
+
 class RevertWorker:
     """Background thread that fires due reverts and retries failed ones."""
 
-    def __init__(self, controller, *, interval_seconds=1.0):
+    def __init__(self, controller, *, interval_seconds=1.0, name="camera-ir-revert"):
         self._controller = controller
         self._interval_seconds = float(interval_seconds)
         self._stopped = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="camera-ir-revert", daemon=True
+            target=self._run, name=name, daemon=True
         )
 
     def start(self) -> None:

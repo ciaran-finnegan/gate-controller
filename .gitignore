@@ -4,3 +4,5 @@
 .DS_Store
 .worktrees/
 __pycache__/
+.venv/
+.venv

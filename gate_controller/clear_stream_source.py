@@ -186,6 +186,26 @@ class ClearStreamSource:
             return None
         return keyframe
 
+    def frames_since(self, after: float | None = None, *, max_age: float = 1.2,
+                     limit: int = 3) -> list[tuple[bytes, float]]:
+        """Every fresh live session frame newer than ``after``, oldest first.
+
+        The decoder hands frames over in small clumps, so a caller that only
+        ever asks for the newest one reads a fraction of what was decoded.
+        At most ``limit`` of the newest unread frames are returned, so a
+        reader slower than the session rate falls behind by dropping the
+        oldest views rather than stacking up stale ones. Before the session
+        has produced anything, the newest buffered keyframe stands in.
+        """
+        with self._session_lock:
+            ring = self._session_ring
+        if ring is not None:
+            frames = ring.since(after, now=self._clock(), max_age=max_age)
+            if frames:
+                return frames[-max(1, limit):]
+        latest = self.latest(after=after)
+        return [] if latest is None else [latest]
+
     def stillest(self, *, after: float | None = None,
                  window_seconds: float = 1.0) -> tuple[bytes, float, float | None] | None:
         """The stillest live frame of the last ``window_seconds``.
