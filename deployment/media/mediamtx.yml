@@ -64,3 +64,10 @@ paths:
   gate:
     source: publisher
     overridePublisher: false
+  # Push-to-talk: the browser publishes its microphone here over WHIP on a
+  # `publish`/`talk` token; gate-camera-control reads it back over loopback
+  # RTSP and forwards it to the camera. One publisher at a time, and the
+  # camera-control service kicks it when its bounded session ends.
+  talk:
+    source: publisher
+    overridePublisher: false

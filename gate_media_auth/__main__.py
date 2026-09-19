@@ -15,7 +15,7 @@ from gate_media_config import (
 )
 
 from .capabilities import MediaHealthPublisher
-from .token import TokenValidationError, _unique_object, validate_media_token
+from .token import SESSION_ACTIONS, TokenValidationError, _unique_object, validate_media_token
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -111,7 +111,7 @@ def _allows_request(payload: dict, secret: str, *, now: int) -> bool:
         return False
     if _allows_local_rtsp(payload):
         return True
-    return _allows_viewer_read(payload, secret, now=now)
+    return _allows_webrtc_session(payload, secret, now=now)
 
 
 def _allows_local_rtsp(payload: dict) -> bool:
@@ -123,10 +123,13 @@ def _allows_local_rtsp(payload: dict) -> bool:
         ("read", "camera"),
         ("read", "clear"),
         ("publish", "gate"),
+        # The camera-control service pulling the browser's talk audio.
+        ("read", "talk"),
     }
 
 
-def _allows_viewer_read(payload: dict, secret: str, *, now: int) -> bool:
+def _allows_webrtc_session(payload: dict, secret: str, *, now: int) -> bool:
+    """A browser reading the gate, or publishing talk audio, on a matching token."""
     token = payload.get("token")
     if not isinstance(token, str) or not token:
         return False
@@ -134,12 +137,13 @@ def _allows_viewer_read(payload: dict, secret: str, *, now: int) -> bool:
         token = token[len("Bearer "):]
     if not token:
         return False
-    if payload.get("action") != "read" or payload.get("path") != "gate":
+    path = payload.get("path")
+    if path not in SESSION_ACTIONS or [payload.get("action")] != SESSION_ACTIONS[path]:
         return False
     if "protocol" in payload and payload["protocol"] != "webrtc":
         return False
     try:
-        validate_media_token(token, secret, now=now)
+        validate_media_token(token, secret, now=now, path=path)
     except TokenValidationError:
         return False
     return True

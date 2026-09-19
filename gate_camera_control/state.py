@@ -23,6 +23,10 @@ SPOTLIGHT_STATES = ("On", "Off")
 REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
+TALK_REASONS = (
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
+    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+)
 
 
 def default_state() -> dict:
@@ -37,7 +41,27 @@ def default_state() -> dict:
                 "effective_until": None,
                 "revert_failed": False,
             },
+            "talkback": default_talkback(),
         },
+    }
+
+
+def default_talkback() -> dict:
+    return {"available": False, "reason": "not_enabled", "active": False}
+
+
+def talkback_document(talk_block) -> dict:
+    """Bound the talk controller's block to the exact nonsecret shape published."""
+    if not isinstance(talk_block, dict):
+        return default_talkback()
+    reason = talk_block.get("reason")
+    if reason not in TALK_REASONS:
+        reason = "camera_error"
+    available = bool(talk_block.get("available")) and reason == "ready"
+    return {
+        "available": available,
+        "reason": reason if available or reason != "ready" else "camera_error",
+        "active": bool(talk_block.get("active")),
     }
 
 
@@ -91,13 +115,15 @@ def light_block(snapshot, states, default_fallback) -> dict:
     }
 
 
-def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snapshot=None) -> dict:
+def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snapshot=None,
+                   talk_block=None) -> dict:
     """Convert an IR snapshot into the exact nonsecret heartbeat document.
 
     The spotlight rides alongside, when the service has one. It does not decide
     `available` or `reason`: those describe whether camera control works at
     all, which the IR read answers, and a camera without a spotlight is still a
-    camera whose IR can be controlled.
+    camera whose IR can be controlled. Talkback is always published, as
+    not-enabled when the service has no talk controller.
     """
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
@@ -128,6 +154,7 @@ def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snap
                 "effective_until": effective_until,
                 "revert_failed": bool(ir_snapshot.get("revert_failed")),
             },
+            "talkback": talkback_document(talk_block),
         },
     }
     clock = clock_block(clock_snapshot)
@@ -158,13 +185,16 @@ class StatePublisher:
     def __init__(self, path, snapshot_provider, *,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
-                 clock=time.time, clock_provider=None, spotlight_provider=None):
+                 clock=time.time, clock_provider=None, spotlight_provider=None,
+                 talk_provider=None, talk_refresher=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
         # The spotlight controller's snapshot; None on a service without one.
         self._spotlight_provider = spotlight_provider
         # The clock reconciler's own snapshot; None when it is not wired.
         self._clock_provider = clock_provider
+        self._talk_provider = talk_provider
+        self._talk_refresher = talk_refresher
         self._interval_seconds = float(interval_seconds)
         self._refresher = refresher
         self._refresh_interval_seconds = float(refresh_interval_seconds)
@@ -196,9 +226,10 @@ class StatePublisher:
             except Exception:
                 # A spotlight fault must never stop IR and the clock being published.
                 spotlight_snapshot = {"state": "unknown"}
+        talk_block = self._talk_provider() if self._talk_provider is not None else None
         write_state(self._path, state_document(
             self._snapshot_provider(), clock_snapshot=clock_snapshot,
-            spotlight_snapshot=spotlight_snapshot,
+            spotlight_snapshot=spotlight_snapshot, talk_block=talk_block,
         ))
 
     def refresh_if_due(self) -> bool:
@@ -221,6 +252,13 @@ class StatePublisher:
                 # A camera that will not answer is already recorded as the
                 # controller's last error; it must never stop publication.
                 pass
+            if self._talk_refresher is not None:
+                try:
+                    # The talk probe keeps its own slow clock; a failure is its
+                    # own published reason and must never stop publication.
+                    self._talk_refresher()
+                except Exception:
+                    pass
             try:
                 self.publish_once()
             except (OSError, TypeError, ValueError):

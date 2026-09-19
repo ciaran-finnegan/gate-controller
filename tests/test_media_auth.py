@@ -55,6 +55,21 @@ def valid_auth_request(now):
     }
 
 
+def valid_talk_claims(now=1_700_000_000):
+    claims = valid_claims(now)
+    claims["path"] = "talk"
+    claims["actions"] = ["publish"]
+    return claims
+
+
+def talk_publish_request(now, token=None):
+    request = valid_auth_request(now)
+    request["token"] = token or make_token(valid_talk_claims(now))
+    request["action"] = "publish"
+    request["path"] = "talk"
+    return request
+
+
 def local_rtsp_request(action, path):
     return {
         "user": "",
@@ -109,6 +124,23 @@ class MediaTokenTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(TokenValidationError):
                 validate_media_token(make_token(claims), SECRET, now=1_700_000_000)
 
+    def test_a_talk_token_is_exactly_a_publish_on_talk_and_nothing_else(self):
+        talk = make_token(valid_talk_claims())
+        gate = make_token(valid_claims())
+
+        self.assertEqual(
+            valid_talk_claims(), validate_media_token(talk, SECRET, now=1_700_000_000, path="talk")
+        )
+        for token, path in ((talk, "gate"), (gate, "talk"), (talk, "other")):
+            with self.subTest(path=path), self.assertRaises(TokenValidationError):
+                validate_media_token(token, SECRET, now=1_700_000_000, path=path)
+        for field, value in (("actions", ["read"]), ("actions", ["publish", "read"]),
+                             ("path", "gate")):
+            claims = valid_talk_claims()
+            claims[field] = value
+            with self.subTest(field=field), self.assertRaises(TokenValidationError):
+                validate_media_token(make_token(claims), SECRET, now=1_700_000_000, path="talk")
+
     def test_rejects_malformed_base64_and_nonconstant_claim_shape(self):
         malformed = ("not-base64", "a.b.c", "eyJhbGciOiJIUzI1NiJ9.!.signature")
         extra_claim = valid_claims()
@@ -141,6 +173,7 @@ class MediaAuthServerTests(unittest.TestCase):
             ("read", "camera"),
             ("read", "clear"),
             ("publish", "gate"),
+            ("read", "talk"),
         ):
             with self.subTest(action=action, path=path):
                 body = json.dumps(local_rtsp_request(action, path)).encode("utf-8")
@@ -163,6 +196,7 @@ class MediaAuthServerTests(unittest.TestCase):
             ("read", "camera"),
             ("read", "clear"),
             ("publish", "gate"),
+            ("read", "talk"),
         )
 
         for action, path in allowed:
@@ -178,12 +212,45 @@ class MediaAuthServerTests(unittest.TestCase):
             ("read", "gate"),
             ("publish", "camera"),
             ("publish", "clear"),
+            # Only the browser, on a talk token over WebRTC, may publish talk.
+            ("publish", "talk"),
         ):
             with self.subTest(action=action, path=path):
                 payload = local_rtsp_request(action, path)
                 self.assertEqual(
                     401,
                     authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
+                )
+
+    def test_a_talk_token_publishes_talk_over_webrtc_and_nothing_else(self):
+        now = int(time.time())
+        talk = make_token(valid_talk_claims(now))
+        gate = make_token(valid_claims(now))
+
+        self.assertEqual(
+            200, authorize_body(json.dumps(talk_publish_request(now)).encode("utf-8"),
+                                SECRET, now=now),
+        )
+        rejected = []
+        with_gate_token = talk_publish_request(now, token=gate)
+        rejected.append(with_gate_token)
+        read_gate_with_talk_token = valid_auth_request(now)
+        read_gate_with_talk_token["token"] = talk
+        rejected.append(read_gate_with_talk_token)
+        publish_gate = talk_publish_request(now)
+        publish_gate["path"] = "gate"
+        rejected.append(publish_gate)
+        read_talk = talk_publish_request(now)
+        read_talk["action"] = "read"
+        rejected.append(read_talk)
+        over_rtsp = talk_publish_request(now)
+        over_rtsp["protocol"] = "rtsp"
+        rejected.append(over_rtsp)
+        for payload in rejected:
+            with self.subTest(action=payload["action"], path=payload["path"],
+                              protocol=payload["protocol"]):
+                self.assertEqual(
+                    401, authorize_body(json.dumps(payload).encode("utf-8"), SECRET, now=now),
                 )
 
     def test_rejects_removal_of_every_required_mediamtx_auth_field(self):
@@ -261,10 +328,20 @@ class MediaAuthConfigurationTests(unittest.TestCase):
             "GATE_MEDIA_TALKBACK_CONFIGURED": "false",
         }
 
-        self.assertEqual(valid, media_auth_main.validated_auth_environment(valid))
+        # The talkback verified flag is optional and defaults to false, so an
+        # auth file from before talkback existed keeps validating unchanged.
+        self.assertEqual(
+            {**valid, "GATE_MEDIA_TALKBACK_VERIFIED": "false"},
+            media_auth_main.validated_auth_environment(valid),
+        )
+        verified = {**valid, "GATE_MEDIA_TALKBACK_CONFIGURED": "true",
+                    "GATE_MEDIA_TALKBACK_VERIFIED": "true"}
+        self.assertEqual(verified, media_auth_main.validated_auth_environment(verified))
         for extra in (
             {"MTX_PATHS_CAMERA_SOURCE": "rtsp://camera.example/stream"},
             {"GATE_MEDIA_VIDEO_CONFIGURED": " false"},
+            {"GATE_MEDIA_TALKBACK_VERIFIED": "true"},
+            {"GATE_MEDIA_TALKBACK_VERIFIED": "yes"},
         ):
             with self.subTest(extra=extra), self.assertRaises(MediaConfigError):
                 media_auth_main.validated_auth_environment({**valid, **extra})

@@ -14,6 +14,9 @@ _BOUNDED_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _CLAIM_KEYS = frozenset({"v", "sub", "controller", "path", "actions", "iat", "exp", "nonce"})
 _HEADER_KEYS = frozenset({"alg", "typ"})
 _MAX_SESSION_SECONDS = 60
+# The only sessions that exist: watch the gate, or push microphone audio into
+# the talk path for the camera-control service to forward. A token names one.
+SESSION_ACTIONS = {"gate": ["read"], "talk": ["publish"]}
 
 
 class TokenValidationError(ValueError):
@@ -21,11 +24,17 @@ class TokenValidationError(ValueError):
 
 
 def validate_media_token(token: str, secret: str, *, now: int,
-                         controller: str = "primary") -> dict:
-    """Return validated claims, or raise TokenValidationError for an invalid JWT."""
+                         controller: str = "primary", path: str = "gate") -> dict:
+    """Return validated claims, or raise TokenValidationError for an invalid JWT.
+
+    ``path`` selects which session the caller is authorising; the token's
+    ``path`` and ``actions`` claims must be exactly that session's pair.
+    """
     if not isinstance(token, str) or not isinstance(secret, str) or not secret:
         raise TokenValidationError("invalid token")
     if not isinstance(now, int) or isinstance(now, bool):
+        raise TokenValidationError("invalid token")
+    if path not in SESSION_ACTIONS:
         raise TokenValidationError("invalid token")
 
     parts = token.split(".")
@@ -46,20 +55,20 @@ def validate_media_token(token: str, secret: str, *, now: int,
     if not isinstance(claims, Mapping) or set(claims) != _CLAIM_KEYS:
         raise TokenValidationError("invalid token")
 
-    _validate_claims(claims, now=now, controller=controller)
+    _validate_claims(claims, now=now, controller=controller, path=path)
     return dict(claims)
 
 
-def _validate_claims(claims: Mapping, *, now: int, controller: str) -> None:
+def _validate_claims(claims: Mapping, *, now: int, controller: str, path: str) -> None:
     issued_at = claims.get("iat")
     expires_at = claims.get("exp")
     if claims.get("v") != 1 or isinstance(claims.get("v"), bool):
         raise TokenValidationError("invalid token")
     if not _is_bounded_id(claims.get("sub")) or not _is_bounded_id(claims.get("nonce")):
         raise TokenValidationError("invalid token")
-    if claims.get("controller") != controller or claims.get("path") != "gate":
+    if claims.get("controller") != controller or claims.get("path") != path:
         raise TokenValidationError("invalid token")
-    if claims.get("actions") != ["read"]:
+    if claims.get("actions") != SESSION_ACTIONS[path]:
         raise TokenValidationError("invalid token")
     if not _is_int(issued_at) or not _is_int(expires_at):
         raise TokenValidationError("invalid token")
