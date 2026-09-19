@@ -35,6 +35,8 @@ class ArchiveFromEnvironment(unittest.TestCase):
             archive.list(kind="audio", since="2026-09-16")
 
         self.assertNotIn("s3cret", captured["url"])
+        # Cloudflare refuses Python's default agent with 403, error 1010.
+        self.assertEqual(captured["headers"]["User-agent"], fetch_corpus.USER_AGENT)
         self.assertIn("kind=audio", captured["url"])
         self.assertEqual(captured["headers"]["Cf-access-client-secret"], "s3cret")
 
