@@ -93,17 +93,21 @@ class VisionDirection:
         return self._reason
 
     def _load(self) -> None:
-        try:
-            import numpy as np
+        """Say why it cannot run, most useful reason first.
 
+        The model file is checked before anything is imported: on a board
+        without it, "not installed" is the answer that tells someone what to
+        do, and it should not be masked by a missing library on a machine --
+        CI, say -- that was never going to run it anyway.
+        """
+        try:
             spec = json.loads(self._spec_path.read_text(encoding="utf-8"))
+            labels = list(spec["labels"])
+            text = spec["text_embeddings"]
+            mean, std = spec["mean"], spec["std"]
             self._size = int(spec["input_size"])
-            self._mean = np.array(spec["mean"], dtype=np.float32)
-            self._std = np.array(spec["std"], dtype=np.float32)
             self._scale = float(spec["logit_scale"])
-            self._labels = list(spec["labels"])
-            self._text = np.array(spec["text_embeddings"], dtype=np.float32)
-        except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
+        except (OSError, ValueError, KeyError, TypeError) as error:
             self._reason = f"prompt embeddings unreadable: {type(error).__name__}"
             return
         path = self._model_dir / MODEL_FILENAME
@@ -111,8 +115,16 @@ class VisionDirection:
             self._reason = f"{path} is not installed"
             return
         try:
+            import numpy as np
             import onnxruntime as ort
-
+        except ImportError as error:
+            self._reason = f"{error.name or 'a dependency'} is not available"
+            return
+        try:
+            self._labels = labels
+            self._text = np.array(text, dtype=np.float32)
+            self._mean = np.array(mean, dtype=np.float32)
+            self._std = np.array(std, dtype=np.float32)
             options = ort.SessionOptions()
             # One thread, like every other model on this board: plate
             # recognition must never wait behind a direction verdict.
