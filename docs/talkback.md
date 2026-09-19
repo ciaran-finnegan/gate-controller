@@ -214,6 +214,30 @@ which run in other units.
    restart `gate-media-auth`. The heartbeat now reports talkback
    `ready` and `hardware_unverified`. The app still hides the button.
 
+## Remote check: the camera half, with nobody at the gate
+
+`scripts/talk_tone_check.py` runs as root on the Pi. It uses the service's own client, encoder and framing to play a test tone through the talk channel:
+1. 1.5 s at 1000 Hz
+2. a short gap
+3. 1.5 s at 1500 Hz
+
+While the tones play, it records the camera's own microphone from the gateway's loopback `camera` path. The gate speaker is loud in that microphone, so the check passes only if each tone comes back at its pitch for at least a second. The tones are audible at the gate for about four seconds. The check bypasses `gate-camera-control`, so never run it while an operator is talking.
+
+```bash
+RELEASE=$(readlink -f /opt/gate-controller-deploy/current)
+sudo python3 "$RELEASE/scripts/talk_tone_check.py" --save /root/talk-check.wav
+```
+
+What a pass proves: the camera accepts this login, plays this ADPCM at this framing, and plays all of it before the reset.
+
+What it does not prove: anything on the browser's side. The WHIP publish, the token, MediaMTX and ffmpeg need a press from the app and the supervised test below.
+
+Result on the fitted RLC-811A, 2026-09-19:
+- It negotiated `adpcm16000x1024` FDX.
+- 55 blocks went out in 3.5 s, and every acknowledgement came back in time.
+- Both tones were heard whole, at about -8 dBFS.
+- With `--drain 0`, the second tone lost its last 0.55 s. That measurement is behind the service's 0.8 s drain before `TalkReset`. With the drain, both tones were heard whole.
+
 ## Acceptance test — supervised, at the gate
 
 Two people, or one person and a phone recording at the gate. Nothing about
@@ -260,10 +284,12 @@ the app hides the button. Nothing else in the pipeline depends on talkback.
 ## Not done here
 
 - **Full-duplex.** The camera's `TalkAbility` reports `FDX` and the listen path
-  keeps running during a session, but echo cancellation is the browser's
-  (`echoCancellation: true` on the microphone track). If the gate speaker is
-  audible in the gate microphone at the stop position, expect the operator to
-  hear themselves with a delay; a hold-to-talk mute of the listen track is the
-  obvious follow-up.
+  keeps running during a session. The browser's echo cancellation
+  (`echoCancellation: true` on the microphone track) handles only the phone's
+  own speaker. The gate speaker is loud in the gate microphone (about -8 dBFS
+  measured), so the app mutes the live audio while Talk is held and brings it
+  back when the press ends. This is walkie-talkie style: the operator does not
+  hear the gate while talking, and does not hear themselves a second late
+  (access-gate-ui #82).
 - **The RLC-810A.** It has no speaker. `GATE_CAMERA_TALK_ENABLED` must stay
   `false` on the rollback unit; its `TalkAbility` answer, if any, is untested.
