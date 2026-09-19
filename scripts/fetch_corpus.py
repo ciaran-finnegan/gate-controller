@@ -31,6 +31,8 @@ from pathlib import Path
 import sys
 from urllib import error, parse, request
 
+USER_AGENT = "gate-controller-corpus/1"
+
 #: Long enough for a 2.4 MB segment on a domestic uplink, short enough that a
 #: hung connection does not silently stall a fetch of a whole day.
 TIMEOUT_SECONDS = 120
@@ -51,6 +53,12 @@ class Archive:
         self._headers = {
             "CF-Access-Client-Id": client_id,
             "CF-Access-Client-Secret": client_secret,
+            # Without this Cloudflare answers 403, error 1010: it refuses
+            # Python's default `Python-urllib` agent at the edge, before Access
+            # or the worker ever see the request. The controller's own client
+            # has always sent one, which is why its uploads worked and this
+            # script, as first shipped, never did.
+            "User-Agent": USER_AGENT,
         }
 
     @classmethod
