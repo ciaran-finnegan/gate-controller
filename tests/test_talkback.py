@@ -10,14 +10,17 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.request
 from io import BytesIO
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from gate_camera_control import baichuan
+from gate_camera_control import talk as talk_module
 from gate_camera_control.adpcm import (
     ImaAdpcmEncoder, decode_block, pcm16_to_samples, samples_per_block,
 )
@@ -25,8 +28,8 @@ from gate_camera_control.aes import Aes128
 from gate_camera_control.__main__ import CameraControlServer, build_service
 from gate_camera_control.state import StatePublisher, state_document
 from gate_camera_control.talk import (
-    HARD_MAX_SECONDS, MIN_SECONDS, TalkBusySession, TalkController, TalkUnavailable,
-    ffmpeg_command,
+    HARD_MAX_SECONDS, MIN_SECONDS, PROBE_SPACING_SECONDS, TalkBusySession, TalkController,
+    TalkUnavailable, ffmpeg_command,
 )
 from gate_controller.camera_control_state import read_camera_control_state
 from tests.fake_baichuan import FakeBaichuanCamera
@@ -289,6 +292,21 @@ class TalkAbilityParsingTests(unittest.TestCase):
         for broken in ("<body", template.format(**{**good, "duplex": "FDX</duplex><x>"})):
             with self.subTest(broken=broken[:20]), self.assertRaises(baichuan.BaichuanError):
                 baichuan.parse_talk_ability(broken)
+
+    def test_a_camera_reply_that_declares_a_dtd_is_refused_before_it_is_parsed(self):
+        bomb = (
+            '<?xml version="1.0"?><!DOCTYPE body [<!ENTITY a "aaaaaaaaaa">'
+            '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><body>&b;</body>'
+        )
+        with self.assertRaisesRegex(baichuan.BaichuanError, "DTD") as raised:
+            baichuan.parse_talk_ability(bomb)
+        self.assertNotIsInstance(raised.exception, baichuan.TalkUnsupported)
+        # The login nonce is read from the same kind of reply, before any key exists.
+        client = baichuan.BaichuanClient("127.0.0.1", "gate", "s3cret")
+        reply = baichuan._Message(baichuan.MSG_LOGIN, 0, 1, 0xDD00, baichuan.CLASS_MODERN_SHORT,
+                                  b"", bomb.encode("utf-8"))
+        with self.assertRaisesRegex(baichuan.BaichuanError, "DTD"):
+            client._nonce_from(reply)
 
 
 class BaichuanClientTests(unittest.TestCase):
@@ -585,6 +603,86 @@ class TalkControllerTests(unittest.TestCase):
         self.camera.sample_rate = 16000
         self.assertTrue(controller.refresh_if_due())
 
+    def test_an_arm_reprobes_a_camera_that_has_come_back(self):
+        clock = ManualClock()
+        with socket.socket() as spare:
+            spare.bind(("127.0.0.1", 0))
+            closed_port = spare.getsockname()[1]
+        reachable = {"now": False}
+
+        def client_factory():
+            port = self.camera.port if reachable["now"] else closed_port
+            return baichuan.BaichuanClient("127.0.0.1", "gate", "s3cret", port=port, timeout=1.0)
+
+        controller = TalkController(
+            client_factory, ffmpeg_binary=sys.executable, publisher_wait=2.0,
+            poll_interval=0.05, spawn=fake_spawn(0.5), opener=FakeGateway(), clock=clock,
+            journal=lambda stage, **fields: self.journal.append((stage, fields)),
+        )
+        self.assertFalse(controller.probe())
+        self.assertEqual("camera_unreachable", controller.snapshot()["reason"])
+        reachable["now"] = True
+        # Inside the spacing a press takes the last answer rather than logging in.
+        clock.advance(PROBE_SPACING_SECONDS - 1)
+        with self.assertRaises(TalkUnavailable) as raised:
+            controller.arm()
+        self.assertEqual("camera_unreachable", raised.exception.reason)
+        self.assertEqual(0, self.camera.logins)
+        # After it, the press finds the camera back instead of waiting up to
+        # fifteen minutes for the slow clock.
+        clock.advance(2)
+        armed = controller.arm()
+        self.assertTrue(armed["active"])
+        self.assertEqual("ready", armed["reason"])
+        stages = [stage for stage, _ in self.journal]
+        self.assertEqual(["talk_probe", "talk_probe", "talk_armed"], stages[:3])
+        self.assertEqual({"outcome": "ready"}, self.journal[1][1])
+        self.wait_until_ended(controller)
+
+    def test_an_arm_never_retries_credentials_the_camera_refused(self):
+        clock = ManualClock()
+        controller = TalkController(self.client_factory("wrong"), ffmpeg_binary=sys.executable,
+                                    opener=FakeGateway(), clock=clock)
+        self.assertFalse(controller.probe())
+        clock.advance(60 * 60)
+        for _ in range(3):
+            with self.assertRaises(TalkUnavailable) as raised:
+                controller.arm()
+            self.assertEqual("camera_auth", raised.exception.reason)
+        self.assertEqual(1, self.camera.logins)
+
+    def test_an_arm_answers_for_the_session_it_created(self):
+        controller = self.controller(ffmpeg_seconds=0.3)
+        controller.probe()
+
+        class EndsBeforeArmReturns:
+            """The worst interleaving: the session has run and ended before arm() returns."""
+
+            def __init__(self, target, args, name, daemon):
+                self.worker = threading.Thread(target=target, args=args, name=name, daemon=daemon)
+
+            def start(self):
+                self.worker.start()
+                self.worker.join(timeout=10)
+                if self.worker.is_alive():
+                    raise AssertionError("the session could not end while arm() held its lock")
+
+            def join(self, timeout=None):
+                self.worker.join(timeout)
+
+        stand_in = types.SimpleNamespace(
+            Thread=EndsBeforeArmReturns, Timer=threading.Timer, Event=threading.Event,
+            Lock=threading.Lock,
+        )
+        with mock.patch.object(talk_module, "threading", stand_in):
+            armed = controller.arm()
+        self.assertTrue(armed["active"])
+        self.assertEqual("armed", armed["state"])
+        ended = controller.snapshot()
+        self.assertFalse(ended["active"])
+        self.assertEqual("publisher_gone", ended["last_outcome"])
+        self.assertEqual(armed["session_id"], ended["session_id"])
+
     def test_the_ffmpeg_command_is_fixed_loopback_and_credential_free(self):
         command = ffmpeg_command("/usr/bin/ffmpeg", "rtsp://127.0.0.1:8554/talk", 16000)
         self.assertEqual("/usr/bin/ffmpeg", command[0])
@@ -672,15 +770,13 @@ class TalkHttpTests(unittest.TestCase):
         self.assertEqual("not_probed", body["talk"]["reason"])
         self.assertEqual(20, body["talk"]["max_seconds"])
 
-        status, body = self.request("POST", "/camera/talk", {"max_seconds": 10})
-        self.assertEqual(503, status)
-        self.assertEqual({"error": "talk_unavailable", "reason": "not_probed"}, body)
-
-        self.service.talk.probe()
+        # A press before the first probe probes the camera itself rather than
+        # refusing on "not_probed".
         status, body = self.request("POST", "/camera/talk", {"max_seconds": 10})
         self.assertEqual(200, status, body)
         self.assertEqual("armed", body["status"])
         self.assertTrue(body["talk"]["active"])
+        self.assertEqual("ready", body["talk"]["reason"])
         self.assertEqual(32, len(body["talk"]["session_id"]))
         self.assertLessEqual(body["talk"]["seconds_remaining"], 10)
         status, body = self.request("POST", "/camera/talk")
@@ -699,6 +795,18 @@ class TalkHttpTests(unittest.TestCase):
         self.assertLessEqual(body["talk"]["seconds_remaining"], 20)
         self.wait_until_idle()
         self.assertGreater(len(self.talk_camera.blocks), 0)
+
+    def test_hanging_up_is_never_rate_limited(self):
+        self.service.talk.probe()
+        status, body = self.request("POST", "/camera/talk", {"max_seconds": 10})
+        self.assertEqual(200, status, body)
+        statuses = [self.request("POST", "/camera/talk", {"max_seconds": 10})[0]
+                    for _ in range(8)]
+        self.assertIn(429, statuses)
+        status, body = self.request("DELETE", "/camera/talk")
+        self.assertEqual(200, status, body)
+        self.assertEqual("released", body["status"])
+        self.wait_until_idle()
 
     def test_bad_talk_requests_are_refused_before_the_camera(self):
         self.service.talk.probe()

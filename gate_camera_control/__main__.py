@@ -159,7 +159,8 @@ class CameraControlService:
         return response
 
     def release_talk(self) -> dict:
-        self._admit(self._talk_limiter, "talk_rate_limited")
+        # Never rate limited: hanging up is the fail-safe, and a run of refused
+        # arms must not be able to spend the budget it would need.
         snapshot = self._talk_snapshot() if self._talk is None else self._talk.release()
         response = self._talk_envelope(snapshot)
         response["status"] = "released"

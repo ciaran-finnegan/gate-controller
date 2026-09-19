@@ -89,6 +89,7 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `GET /camera/snap` | 1 every 2 s, service-wide |
 | `POST /camera/talk` | 6 at once, then 1 every 2 s |
 | `GET /camera/talk` | shares the state budget |
+| `DELETE /camera/talk` | none: hanging up is never refused |
 
 ### `GET /camera/state` — also served at `GET /camera/ir`
 

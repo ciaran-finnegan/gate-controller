@@ -77,7 +77,7 @@ hold unchanged. Talkback adds these:
 | --- | --- |
 | Camera credentials stay in one process | The Baichuan client lives in `gate-camera-control` and reads the same `/etc/gate-camera-control.env`. The media gateway, the auth sidecar, the Worker and the browser never see them |
 | No new network exposure | The camera-control service still binds loopback and still reaches nothing but loopback and the camera's `/32`; port 9000 is on that same address. The only new public surface is `/talk/whip` on the media hostname, behind the same nginx, Access and token check as `/gate/whep` |
-| Off by default, and nothing until enabled | `GATE_CAMERA_TALK_ENABLED=false` means the service never opens port 9000. With it `true`, the only unsolicited traffic is one `TalkAbility` probe at start, hourly once ready, every 15 min while not |
+| Off by default, and nothing until enabled | `GATE_CAMERA_TALK_ENABLED=false` means the service never opens port 9000. With it `true`, the only unsolicited traffic is one `TalkAbility` probe at start, hourly once ready, every 15 min while not. A press while the camera was last unreachable, busy or erroring probes first, at most once every 15 s; refused credentials are never retried by a press |
 | Bounded sessions with a hard time limit | One session at a time. `GATE_CAMERA_TALK_MAX_SECONDS` (5–60, default 30) is a **kill** of ffmpeg at the deadline from a timer thread, not a cooperative check a stalled read could miss. A publisher that never arrives ends the session at 10 s. The token is 60 s. Nothing here can be extended |
 | The browser cannot pick the camera or the format | The WHIP path is fixed to `talk`; ffmpeg's command is fixed and credential-free; the ADPCM format comes from the camera's own `TalkAbility` and its tokens are ASCII-checked before they are echoed back in `TalkConfig` |
 | Only operators and admins | Enforced twice: the Worker refuses the talk session and the WHIP proxy for viewers, and the media-session contract only ever reports `talkback: true` to those roles |
@@ -140,13 +140,14 @@ Unknown fields are a `400`.
 | Status | Body | When |
 | --- | --- | --- |
 | `409` | `{"error":"talk_busy"}` | a session is already armed or streaming |
-| `503` | `{"error":"talk_unavailable","reason":"…"}` | talk is not enabled, not yet probed, or the last probe failed; `reason` is the state-file reason |
+| `503` | `{"error":"talk_unavailable","reason":"…"}` | talk is not enabled, or the camera is not ready; `reason` is the state-file reason. While it is `not_probed`, `camera_unreachable`, `camera_busy` or `camera_error` the arm probes first (at most once every 15 s), so the answer is that probe's; `camera_auth`, `unsupported` and `ffmpeg_missing` wait for the slow clock |
 
 ### `GET /camera/talk`, `DELETE /camera/talk`
 
 `GET` returns the `talk` document above without `status`. `DELETE` ends the
 current session if there is one and answers `200 {"status":"released", …}`
-either way.
+either way. It has no budget: hanging up is the fail-safe, so a run of refused
+arms can never spend what it needs.
 
 ## Environment
 

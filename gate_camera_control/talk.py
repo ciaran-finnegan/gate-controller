@@ -44,6 +44,12 @@ PUBLISHER_WAIT_SECONDS = 10.0
 POLL_INTERVAL_SECONDS = 0.25
 PROBE_RETRY_SECONDS = 15 * 60.0
 PROBE_REFRESH_SECONDS = 60 * 60.0
+PROBE_SPACING_SECONDS = 15.0
+# Failures the camera can recover from without anyone touching the Pi. An arm
+# while one of these stands probes first rather than refusing on a readiness
+# that may be up to fifteen minutes stale. Refused credentials are not among
+# them: retrying those on every press is how a camera locks the account out.
+_REPROBE_ON_ARM = frozenset({"not_probed", "camera_unreachable", "camera_busy", "camera_error"})
 FFMPEG_STOP_GRACE_SECONDS = 2.0
 _MAX_API_BYTES = 64 * 1024
 _SESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
@@ -116,6 +122,7 @@ class TalkController:
         self._opener = opener
         self._journal = journal or (lambda *_arguments, **_keywords: None)
         self._lock = threading.Lock()
+        self._probe_lock = threading.Lock()
         self._session = None
         self._thread = None
         self._last = None
@@ -137,42 +144,50 @@ class TalkController:
     def available(self) -> bool:
         return self._enabled and self._reason == "ready"
 
-    def probe(self) -> bool:
-        """One login and ``TalkAbility``; the camera is never sent audio here."""
+    def probe(self, *, unless_within=None) -> bool:
+        """One login and ``TalkAbility``; the camera is never sent audio here.
+
+        Probes never overlap. ``unless_within`` takes the last answer instead
+        when a probe started that recently -- so an arm and the slow clock that
+        queue behind each other log in once between them, not twice.
+        """
         if not self._enabled:
             return False
-        with self._lock:
-            if self._session is not None:
+        with self._probe_lock:
+            with self._lock:
+                if self._session is not None:
+                    return self._probe_ok
+            if (unless_within is not None and self._probed_at is not None
+                    and self._clock() - self._probed_at < unless_within):
                 return self._probe_ok
-        self._probed_at = self._clock()
-        if not os.access(self._ffmpeg, os.X_OK):
-            self._set_reason("ffmpeg_missing", probe_ok=False)
-            return False
-        client = None
-        try:
-            client = self._client_factory()
-            client.login()
-            self._format = client.talk_ability()
-        except BaichuanError as error:
-            self._set_reason(_camera_reason(error), probe_ok=False)
-            return False
-        finally:
-            if client is not None:
-                client.logout()
-        self._set_reason("ready", probe_ok=True)
-        return True
+            self._probed_at = self._clock()
+            if not os.access(self._ffmpeg, os.X_OK):
+                self._set_reason("ffmpeg_missing", probe_ok=False)
+                return False
+            client = None
+            try:
+                client = self._client_factory()
+                client.login()
+                self._format = client.talk_ability()
+            except BaichuanError as error:
+                self._set_reason(_camera_reason(error), probe_ok=False)
+                return False
+            finally:
+                if client is not None:
+                    client.logout()
+            self._set_reason("ready", probe_ok=True)
+            return True
 
     def refresh_if_due(self) -> bool:
         """Probe on a slow clock: quickly after a failure, rarely once it is ready."""
         if not self._enabled:
             return False
-        if self._probed_at is None:
-            return self.probe()
-        elapsed = self._clock() - self._probed_at
-        interval = PROBE_REFRESH_SECONDS if self._probe_ok else PROBE_RETRY_SECONDS
-        if elapsed < interval:
-            return False
-        return self.probe()
+        if self._probed_at is not None:
+            elapsed = self._clock() - self._probed_at
+            interval = PROBE_REFRESH_SECONDS if self._probe_ok else PROBE_RETRY_SECONDS
+            if elapsed < interval:
+                return False
+        return self.probe(unless_within=PROBE_SPACING_SECONDS)
 
     def _set_reason(self, reason: str, *, probe_ok: bool) -> None:
         self._reason = reason
@@ -184,6 +199,11 @@ class TalkController:
     def arm(self, max_seconds=None) -> dict:
         if not self._enabled:
             raise TalkUnavailable("not_enabled")
+        if self._reason in _REPROBE_ON_ARM:
+            # A camera that has come back is found by the press, not by the
+            # slow clock; the spacing keeps a run of presses from becoming a
+            # run of logins.
+            self.probe(unless_within=PROBE_SPACING_SECONDS)
         if self._reason != "ready" or self._format is None:
             raise TalkUnavailable(self._reason)
         seconds = self._max_seconds if max_seconds is None else int(max_seconds)
@@ -194,12 +214,22 @@ class TalkController:
                 raise TalkBusySession()
             session = _Session(uuid.uuid4().hex, self._clock(), seconds)
             self._session = session
-            self._thread = threading.Thread(
+            # The answer is this session's, taken before its thread can end it
+            # and another arm replace it.
+            armed = self._snapshot_of(session, active=True, now=session.armed_at)
+            thread = threading.Thread(
                 target=self._run, args=(session,), name="camera-talk", daemon=True
             )
-            self._thread.start()
+            self._thread = thread
         self._journal("talk_armed", max_seconds=seconds, session=session.id[:12])
-        return self.snapshot()
+        try:
+            thread.start()
+        except RuntimeError:
+            # Out of tasks: a session that never ran must not hold talk busy.
+            with self._lock:
+                self._session = None
+            raise
+        return armed
 
     def release(self) -> dict:
         with self._lock:
@@ -221,6 +251,9 @@ class TalkController:
         with self._lock:
             session = self._session or self._last
             active = self._session is not None
+        return self._snapshot_of(session, active=active, now=now)
+
+    def _snapshot_of(self, session, *, active: bool, now: float) -> dict:
         talk = {
             "available": self.available(),
             "reason": self._reason,
@@ -280,6 +313,12 @@ class TalkController:
             outcome = "camera_error"
         finally:
             self._stop_process(session)
+            if session.process is not None and session.process.stdout is not None:
+                # ffmpeg is gone by now; its pipe stays open until this closes it.
+                try:
+                    session.process.stdout.close()
+                except OSError:
+                    pass
             if client is not None:
                 if client.logged_in:
                     try:

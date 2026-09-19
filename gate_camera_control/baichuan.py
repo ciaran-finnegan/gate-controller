@@ -142,7 +142,15 @@ def has_payload_offset(message_class: int) -> bool:
 
 
 def bcmedia_adpcm(block: bytes) -> bytes:
-    """Wrap one ADPCM block in the ``BcMedia`` frame the camera plays."""
+    """Wrap one ADPCM block in the ``BcMedia`` frame the camera plays.
+
+    The padding is over the block, not over the declared size (block + 4).
+    That is how neolink's talk writer frames it, and neolink sends four of
+    these back to back in one ``Talk`` message to real cameras; neolink's
+    reader pads over the declared size because that is how the camera frames
+    the audio it sends. Changing this to match the reader would be a guess
+    against the only framing known to play.
+    """
     block = bytes(block)
     if len(block) <= 4:
         raise ValueError("ADPCM block must carry a header and data")
@@ -155,12 +163,23 @@ def bcmedia_adpcm(block: bytes) -> bytes:
             + block + bytes(padding))
 
 
+def parse_camera_xml(xml_text: str, what: str):
+    """Parse one camera reply, refusing any DTD before the parser sees it.
+
+    Entity expansion is bounded by the Expat the host happens to ship; a reply
+    that declares a DTD is refused here instead, whatever that version is.
+    """
+    if "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+        raise BaichuanError(f"camera sent a DTD in its {what}")
+    try:
+        return ElementTree.fromstring(xml_text)  # noqa: S314 - DTDs are refused above
+    except ElementTree.ParseError as error:
+        raise BaichuanError(f"camera sent an unreadable {what}") from error
+
+
 def parse_talk_ability(xml_text: str) -> TalkAudioFormat:
     """Pick the camera's ADPCM configuration, bounded and ASCII-checked."""
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError as error:
-        raise BaichuanError("camera sent an unreadable TalkAbility") from error
+    root = parse_camera_xml(xml_text, "TalkAbility")
     ability = root.find(".//TalkAbility")
     if ability is None:
         raise TalkUnsupported("camera reported no TalkAbility")
@@ -443,10 +462,7 @@ class BaichuanClient:
 
     def _nonce_from(self, reply: _Message) -> str:
         text = self._decrypt_xml(reply.payload or reply.extension, reply)
-        try:
-            root = ElementTree.fromstring(text)
-        except ElementTree.ParseError as error:
-            raise BaichuanError("camera sent an unreadable encryption reply") from error
+        root = parse_camera_xml(text, "encryption reply")
         nonce = _text(root.find(".//nonce"))
         if not nonce or len(nonce) > 64 or not nonce.isascii() or not nonce.isprintable():
             raise BaichuanError("camera sent no usable login nonce")
