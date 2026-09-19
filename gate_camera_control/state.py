@@ -19,6 +19,7 @@ PUBLISH_INTERVAL_SECONDS = 5.0
 # an operator's own request ever observed it.
 REFRESH_INTERVAL_SECONDS = 30.0
 IR_STATES = ("Auto", "Off")
+SPOTLIGHT_STATES = ("On", "Off")
 REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
@@ -71,8 +72,33 @@ def clock_block(clock_snapshot) -> dict | None:
     }
 
 
-def state_document(ir_snapshot, *, now=None, clock_snapshot=None) -> dict:
-    """Convert an IR snapshot into the exact nonsecret heartbeat document."""
+def light_block(snapshot, states, default_fallback) -> dict:
+    """One light's lease state, in the exact shape the controller validates."""
+    state = snapshot.get("state")
+    if state not in states:
+        state = "unknown"
+    default = snapshot.get("default")
+    if default not in states:
+        default = default_fallback
+    effective_until = snapshot.get("effective_until")
+    if not isinstance(effective_until, str):
+        effective_until = None
+    return {
+        "state": state,
+        "default": default,
+        "effective_until": effective_until,
+        "revert_failed": bool(snapshot.get("revert_failed")),
+    }
+
+
+def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snapshot=None) -> dict:
+    """Convert an IR snapshot into the exact nonsecret heartbeat document.
+
+    The spotlight rides alongside, when the service has one. It does not decide
+    `available` or `reason`: those describe whether camera control works at
+    all, which the IR read answers, and a camera without a spotlight is still a
+    camera whose IR can be controlled.
+    """
     state = ir_snapshot.get("state")
     if state not in IR_STATES:
         state = "unknown"
@@ -107,6 +133,10 @@ def state_document(ir_snapshot, *, now=None, clock_snapshot=None) -> dict:
     clock = clock_block(clock_snapshot)
     if clock is not None:
         document["camera_control"]["clock"] = clock
+    if spotlight_snapshot is not None:
+        document["camera_control"]["spotlight"] = light_block(
+            spotlight_snapshot, SPOTLIGHT_STATES, "Off",
+        )
     return document
 
 
@@ -128,9 +158,11 @@ class StatePublisher:
     def __init__(self, path, snapshot_provider, *,
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
-                 clock=time.time, clock_provider=None):
+                 clock=time.time, clock_provider=None, spotlight_provider=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        # The spotlight controller's snapshot; None on a service without one.
+        self._spotlight_provider = spotlight_provider
         # The clock reconciler's own snapshot; None when it is not wired.
         self._clock_provider = clock_provider
         self._interval_seconds = float(interval_seconds)
@@ -157,8 +189,16 @@ class StatePublisher:
                 clock_snapshot = self._clock_provider()
             except Exception:
                 clock_snapshot = None
+        spotlight_snapshot = None
+        if self._spotlight_provider is not None:
+            try:
+                spotlight_snapshot = self._spotlight_provider()
+            except Exception:
+                # A spotlight fault must never stop IR and the clock being published.
+                spotlight_snapshot = {"state": "unknown"}
         write_state(self._path, state_document(
             self._snapshot_provider(), clock_snapshot=clock_snapshot,
+            spotlight_snapshot=spotlight_snapshot,
         ))
 
     def refresh_if_due(self) -> bool:

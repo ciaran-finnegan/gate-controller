@@ -13,6 +13,7 @@ from pathlib import Path
 
 CAMERA_CONTROL_STATE_PATH = Path("/run/gate-camera/state.json")
 _IR_STATES = frozenset({"Auto", "Off"})
+_SPOTLIGHT_STATES = frozenset({"On", "Off"})
 _REASONS = frozenset({
     "ready", "not_configured", "service_unhealthy", "not_observed",
     "camera_busy", "camera_unreachable", "camera_error",
@@ -63,7 +64,8 @@ def validated_camera_control(value) -> dict:
     """Return a canonical bounded camera-control object or a conservative default."""
     try:
         if not isinstance(value, dict) or not (
-            {"available", "reason", "ir"} <= set(value) <= {"available", "reason", "ir", "clock"}
+            {"available", "reason", "ir"} <= set(value)
+            <= {"available", "reason", "ir", "clock", "spotlight"}
         ):
             raise ValueError("invalid camera control snapshot")
         available, reason = value["available"], value["reason"]
@@ -79,6 +81,15 @@ def validated_camera_control(value) -> dict:
         block = {"available": available, "reason": reason, "ir": infrared}
         if "clock" in value:
             block["clock"] = _parse_clock(value["clock"])
+        if "spotlight" in value:
+            # The spotlight rides alongside IR. It does not decide `available`:
+            # a camera without one is still a camera whose IR works.
+            spotlight = _parse_light(value["spotlight"], _SPOTLIGHT_STATES, "spotlight")
+            # The service only ever leases it lit; a published lit default is a
+            # document that cannot have come from it.
+            if spotlight["default"] != "Off":
+                raise ValueError("the spotlight default is always Off")
+            block["spotlight"] = spotlight
         return block
     except (TypeError, ValueError, KeyError):
         return unavailable("service_unhealthy")
@@ -98,20 +109,25 @@ def unavailable(reason: str) -> dict:
 
 
 def _parse_ir(value) -> dict:
+    return _parse_light(value, _IR_STATES, "IR")
+
+
+def _parse_light(value, states, name) -> dict:
+    """One light's lease block -- IR or spotlight -- in its exact published shape."""
     if (not isinstance(value, dict)
             or set(value) != {"state", "default", "effective_until", "revert_failed"}):
-        raise ValueError("invalid IR snapshot")
+        raise ValueError(f"invalid {name} snapshot")
     state, default = value["state"], value["default"]
     effective_until, revert_failed = value["effective_until"], value["revert_failed"]
-    if (state not in _IR_STATES and state != "unknown"
-            or default not in _IR_STATES
+    if (state not in states and state != "unknown"
+            or default not in states
             or not isinstance(revert_failed, bool)):
-        raise ValueError("invalid IR snapshot")
+        raise ValueError(f"invalid {name} snapshot")
     if effective_until is not None and (
         not isinstance(effective_until, str)
         or not 0 < len(effective_until) <= _MAX_TIMESTAMP_LENGTH
     ):
-        raise ValueError("invalid IR lease expiry")
+        raise ValueError(f"invalid {name} lease expiry")
     return {
         "state": state,
         "default": default,

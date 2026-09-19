@@ -26,10 +26,11 @@ Therefore every change this service accepts is a **bounded lease** that reverts
 to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
 reboot: the lease record lives on durable storage, and a start that finds no
 usable record reads the camera once and puts it back if it disagrees. The
-service exposes IR only. It never calls `SetIsp`: the deployed Manual `s4 g16`
-exposure is a measured setting and stays a reviewed, on-Pi operation. The camera
-command allowlist is exactly `Login`, `GetIrLights`, `SetIrLights`, `Snap`, and
-no request body can widen it.
+service exposes IR and the spotlight only. It never calls `SetIsp`: the deployed
+Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
+operation. The camera command allowlist is exactly `Login`, `GetIrLights`,
+`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime` and `SetTime`,
+and no request body can widen it.
 
 ## Security model
 
@@ -77,8 +78,9 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 
 | Endpoint | Budget |
 | --- | --- |
-| `GET /camera/state` (and `GET /camera/ir`) | 10 at once, then 2 a second |
+| `GET /camera/state` (and `GET /camera/ir`, `GET /camera/spotlight`) | 10 at once, then 2 a second |
 | `POST /camera/ir` | 6 at once, then 1 every 2 s |
+| `POST /camera/spotlight` | 6 at once, then 1 every 2 s, its own bucket |
 | `GET /camera/snap` | 1 every 2 s, service-wide |
 
 ### `GET /camera/state` — also served at `GET /camera/ir`
@@ -170,6 +172,33 @@ A key records how its call ended, not merely that it happened:
 
 Setting `state` to the configured default cancels the lease immediately — that
 is the "revert now" action.
+
+### `POST /camera/spotlight`
+
+The RLC-811A's white spotlight, on exactly the IR lease: `{"state": "On" | "Off",
+"lease_minutes": 1-60, "idempotency_key": "..."}` (or `ttl_seconds`), the same
+bounds as IR, persisted before the camera is touched, reverted on expiry and on
+restart, reconciled at startup. `Off` ends a lease early. Its default is always
+`Off` -- it is only ever lit on a lease -- because a second light on a
+retroreflective plate washes it out ([Night Light](reolink-rlc-811a.md#night-light)).
+
+It sets only `WhiteLed.state` (1 lit, 0 dark). The camera's own automation
+`mode` and its brightness are the installer's settings and are never sent. The
+firmware applies a change a moment after acknowledging it, so a confirmed write
+is recorded as the observation rather than re-read.
+
+The response is the state envelope with the spotlight's lease beside IR's:
+
+```json
+{"observed_at": "...", "status": "completed",
+ "ir": {...},
+ "spotlight": {"state": "On", "default": "Off", "effective_until": "...", "lease_seconds_remaining": 600, "revert_failed": false}}
+```
+
+Idempotency keys are namespaced per light: one key sent to both is two changes.
+The lease record is `/var/lib/gate-camera/spotlight-lease.json`, independent of
+IR's. On a camera without a spotlight (the RLC-810A rollback unit) its reads fail
+and it is published as `unknown`; IR is unaffected.
 
 ### `GET /camera/snap` — also served at `POST /camera/snap`, and `GET`/`POST /camera/snapshot`
 

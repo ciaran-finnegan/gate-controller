@@ -25,8 +25,10 @@ from gate_media_config import (
 )
 
 from .clock import ClockReconciler, ClockWorker
-from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker
-from .reolink import IR_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient
+from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker, SpotlightController
+from .reolink import (
+    IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient,
+)
 from .state import STATE_PATH, StatePublisher
 
 
@@ -45,6 +47,8 @@ TOKEN_PATH = f"{RUNTIME_ROOT}/token.json"
 # leased state with nothing left on the Pi that knew to put it back.
 STATE_ROOT = "/var/lib/gate-camera"
 LEASE_PATH = f"{STATE_ROOT}/lease.json"
+# Its own record: an IR lease and a spotlight lease run and revert independently.
+SPOTLIGHT_LEASE_PATH = f"{STATE_ROOT}/spotlight-lease.json"
 SNAPSHOT_MIN_INTERVAL_SECONDS = 2.0
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_WAIT_SECONDS = 15.0
@@ -56,8 +60,11 @@ STATE_BURST = 10
 STATE_REFILL_PER_SECOND = 2.0
 IR_BURST = 6
 IR_REFILL_PER_SECOND = 0.5
+SPOTLIGHT_BURST = IR_BURST
+SPOTLIGHT_REFILL_PER_SECOND = IR_REFILL_PER_SECOND
 _IR_BODY_FIELDS = frozenset({"state", "lease_minutes", "ttl_seconds", "idempotency_key"})
-_STATE_PATHS = frozenset({"/camera/state", "/camera/ir"})
+_STATE_PATHS = frozenset({"/camera/state", "/camera/ir", "/camera/spotlight"})
+_LEASE_PATHS = frozenset({"/camera/ir", "/camera/spotlight"})
 _SNAPSHOT_PATHS = frozenset({"/camera/snap", "/camera/snapshot"})
 
 
@@ -85,8 +92,10 @@ class CameraControlService:
 
     def __init__(self, controller, client, *, clock=time.time, logger=None,
                  snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS,
-                 state_rate=None, ir_rate=None):
+                 state_rate=None, ir_rate=None, spotlight=None, spotlight_rate=None):
         self._controller = controller
+        # The spotlight's own lease controller, or None on a camera without one.
+        self._spotlight = spotlight
         self._client = client
         self._clock = clock
         self._logger = logger or logging.getLogger("gate_camera_control")
@@ -102,6 +111,11 @@ class CameraControlService:
         self._ir_limiter = ir_rate or _RateLimiter(
             IR_BURST, IR_REFILL_PER_SECOND, clock=clock
         )
+        # Its own bucket: a burst of spotlight presses must not use up the IR
+        # budget, nor the other way round.
+        self._spotlight_limiter = spotlight_rate or _RateLimiter(
+            SPOTLIGHT_BURST, SPOTLIGHT_REFILL_PER_SECOND, clock=clock
+        )
         self._idempotency = OrderedDict()
         self._idempotency_lock = threading.Lock()
 
@@ -109,19 +123,43 @@ class CameraControlService:
     def controller(self):
         return self._controller
 
+    @property
+    def spotlight(self):
+        return self._spotlight
+
     def state(self) -> dict:
         self._admit(self._state_limiter, "state_rate_limited")
         snapshot = self._controller.state(refresh_max_age=DIRECT_READ_MAX_AGE_SECONDS)
         return self._envelope(snapshot)
 
     def set_ir(self, payload) -> dict:
-        request = _parse_ir_request(payload, self._controller.max_lease_minutes)
-        key = request["idempotency_key"]
-        if key is None:
-            self._admit(self._ir_limiter, "ir_rate_limited")
-            return self._completed(
-                self._controller.set_state(request["state"], request["lease_minutes"])
-            )
+        return self._set_lease(
+            self._controller, self._ir_limiter, "ir_rate_limited", payload,
+            states=IR_STATES, key_prefix="", respond=self._completed,
+        )
+
+    def set_spotlight(self, payload) -> dict:
+        if self._spotlight is None:
+            raise SpotlightUnavailable()
+        return self._set_lease(
+            self._spotlight, self._spotlight_limiter, "spotlight_rate_limited", payload,
+            states=SPOTLIGHT_STATES, key_prefix="spotlight:",
+            respond=self._completed_spotlight,
+        )
+
+    def _set_lease(self, controller, limiter, stage, payload, *, states, key_prefix, respond) -> dict:
+        """One lease change, IR or spotlight, with the same guarantees for both.
+
+        Spotlight keys are stored under their own prefix (IR's are stored as
+        sent, as they always were): the same key sent to both lights is two
+        changes, and replaying one must never answer with the other's lease.
+        """
+        request = _parse_lease_request(payload, controller.max_lease_minutes, states)
+        client_key = request["idempotency_key"]
+        if client_key is None:
+            self._admit(limiter, stage)
+            return respond(controller.set_state(request["state"], request["lease_minutes"]))
+        key = f"{key_prefix}{client_key}"
         # Reserved before the camera is touched, so two concurrent posts of one
         # key produce one lease, not two: the loser waits for the winner and
         # then answers from the lease the winner actually created -- or repeats
@@ -129,9 +167,9 @@ class CameraControlService:
         # camera call the key stands for did not succeed.
         call, owned = self._reserve(key)
         if not owned:
-            return self._replay(key, call)
+            return self._replay(client_key, call, controller, respond)
         try:
-            self._admit(self._ir_limiter, "ir_rate_limited")
+            self._admit(limiter, stage)
         except RateLimited as error:
             # Refused before the camera was touched, so the key stands for
             # nothing: it is released for a later retry, and only the caller
@@ -140,9 +178,7 @@ class CameraControlService:
             call.fail(error)
             raise
         try:
-            snapshot = self._controller.set_state(
-                request["state"], request["lease_minutes"]
-            )
+            snapshot = controller.set_state(request["state"], request["lease_minutes"])
         except BaseException as error:
             # The camera was called and did not confirm. The key keeps that
             # outcome for its whole life, so a replay is answered with the same
@@ -151,12 +187,19 @@ class CameraControlService:
             call.fail(error)
             raise
         call.complete()
-        response = self._completed(snapshot)
-        response["idempotency_key"] = key
+        response = respond(snapshot)
+        response["idempotency_key"] = client_key
         return response
 
     def _completed(self, ir_snapshot) -> dict:
         response = self._envelope(ir_snapshot)
+        response["status"] = "completed"
+        return response
+
+    def _completed_spotlight(self, spotlight_snapshot) -> dict:
+        # IR is reported from what is already known: a spotlight change must not
+        # put an IR read on the camera.
+        response = self._envelope(self._controller.snapshot(), spotlight_snapshot)
         response["status"] = "completed"
         return response
 
@@ -181,15 +224,23 @@ class CameraControlService:
         journal(self._logger, "snapshot", bytes=len(image), outcome="completed")
         return image
 
-    def _envelope(self, ir_snapshot) -> dict:
-        return {
+    def _envelope(self, ir_snapshot, spotlight_snapshot=None) -> dict:
+        envelope = {
             "observed_at": datetime.now(timezone.utc).replace(
                 microsecond=0
             ).isoformat(),
             "ir": ir_snapshot,
         }
+        if self._spotlight is not None:
+            # From the last observation, never a fresh read: a state request
+            # already costs the camera one IR read, and the publisher keeps the
+            # spotlight observed in the background.
+            envelope["spotlight"] = (
+                spotlight_snapshot if spotlight_snapshot is not None else self._spotlight.snapshot()
+            )
+        return envelope
 
-    def _replay(self, key, call) -> dict:
+    def _replay(self, key, call, controller, respond) -> dict:
         """Answer a repeat post from the live lease, never from a frozen copy.
 
         A stored response would keep serving the `observed_at` and the
@@ -208,7 +259,7 @@ class CameraControlService:
             raise IdempotentCallInFlight()
         if call.error is not None:
             raise call.error
-        response = self._completed(self._controller.snapshot())
+        response = respond(controller.snapshot())
         response["idempotency_key"] = key
         return response
 
@@ -257,6 +308,10 @@ class _IdempotentCall:
         self.event.set()
 
 
+class SpotlightUnavailable(Exception):
+    """The service was built without a spotlight controller."""
+
+
 class IdempotentCallInFlight(Exception):
     """A replay whose owner had still not answered when the wait ran out."""
 
@@ -299,10 +354,14 @@ class SnapshotRateLimited(RateLimited):
 
 
 def _parse_ir_request(payload, max_lease_minutes) -> dict:
+    return _parse_lease_request(payload, max_lease_minutes, IR_STATES)
+
+
+def _parse_lease_request(payload, max_lease_minutes, states) -> dict:
     if not isinstance(payload, dict) or not set(payload) <= _IR_BODY_FIELDS:
         raise ValueError("invalid_request")
     state = payload.get("state")
-    if state not in IR_STATES:
+    if state not in states:
         raise ValueError("invalid_request")
     lease_minutes = payload.get("lease_minutes")
     ttl_seconds = payload.get("ttl_seconds")
@@ -368,18 +427,18 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         if path in _SNAPSHOT_PATHS:
             self._guarded(self._respond_snapshot)
             return
-        if path in _STATE_PATHS and path != "/camera/ir":
+        if path in _STATE_PATHS and path not in _LEASE_PATHS:
             self._respond_json(405, {"error": "method_not_allowed"})
             return
-        if path != "/camera/ir":
+        if path not in _LEASE_PATHS:
             self._respond_json(404, {"error": "not_found"})
             return
         payload = self._read_json_body()
         if payload is _INVALID:
             return
-        self._guarded(lambda: self._respond_json(
-            200, self.server.service.set_ir(payload)
-        ))
+        service = self.server.service
+        change = service.set_spotlight if path == "/camera/spotlight" else service.set_ir
+        self._guarded(lambda: self._respond_json(200, change(payload)))
 
     def do_HEAD(self):  # noqa: N802 - required by BaseHTTPRequestHandler
         """Answer the headers of the matching GET, and no body.
@@ -484,6 +543,8 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         except CameraError:
             journal(self.server.logger, "camera_error")
             self._respond_json(502, {"error": "camera_error"})
+        except SpotlightUnavailable:
+            self._respond_json(404, {"error": "not_found"})
         except IdempotentCallInFlight:
             # Not `completed`, and not a definite failure either: the first post
             # of this key is still talking to the camera. `502
@@ -548,9 +609,15 @@ def validated_camera_control_environment(environment) -> dict[str, str]:
 
 
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
+                  spotlight_lease_path=SPOTLIGHT_LEASE_PATH,
                   logger=None, connection_factory=None,
                   clock=time.time) -> CameraControlService:
-    """Wire the client and the IR controller from validated settings.
+    """Wire the client, the IR controller and the spotlight from validated settings.
+
+    The spotlight shares IR's lease bounds and is always dark by default: it is
+    only ever lit on a lease. On a camera without one (the RLC-810A rollback
+    unit) its reads fail and it is reported `unknown`, exactly as IR would be,
+    while IR carries on.
 
     One clock is threaded through the whole service -- the token bucket, the
     snapshot interval, the lease expiry and the login throttle all read it. In
@@ -577,7 +644,18 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         clock=clock,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
-    return CameraControlService(controller, client, clock=clock, logger=logger)
+    spotlight = SpotlightController(
+        client,
+        default_state="Off",
+        lease_path=spotlight_lease_path,
+        default_lease_minutes=int(settings["GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES"]),
+        max_lease_minutes=int(settings["GATE_CAMERA_IR_LEASE_MAX_MINUTES"]),
+        clock=clock,
+        journal=lambda stage, **fields: journal(logger, stage, **fields),
+    )
+    return CameraControlService(
+        controller, client, clock=clock, logger=logger, spotlight=spotlight,
+    )
 
 
 def build_clock_reconciler(settings, client, *, logger=None, clock=time.time) -> ClockReconciler:
@@ -620,18 +698,27 @@ def main(argv=None) -> int:
     os.makedirs(STATE_ROOT, mode=0o700, exist_ok=True)
     os.chmod(STATE_ROOT, 0o700)
     service = build_service(settings, logger=logger)
-    # A lease that outlived the previous process must never leave IR on.
+    # A lease that outlived the previous process must never leave IR -- or the
+    # spotlight -- on.
     service.controller.restore_default_on_start()
+    service.spotlight.restore_default_on_start()
     server = CameraControlServer((arguments.host, arguments.port), service, logger=logger)
     reverts = RevertWorker(service.controller)
+    spotlight_reverts = RevertWorker(service.spotlight, name="camera-spotlight-revert")
     clock_reconciler = build_clock_reconciler(settings, service._client, logger=logger)
     clock_worker = ClockWorker(clock_reconciler)
+    def refresh_lights() -> None:
+        service.controller.refresh_observation()
+        service.spotlight.refresh_observation()
+
     publisher = StatePublisher(
         arguments.state_path, service.controller.snapshot,
-        # One bounded observation behind the publication, so an idle camera is
-        # reported as it is rather than as never-observed until someone asks.
-        refresher=service.controller.refresh_observation,
+        # One bounded observation of each light behind the publication, so an
+        # idle camera is reported as it is rather than as never-observed until
+        # someone asks.
+        refresher=refresh_lights,
         clock_provider=clock_reconciler.snapshot,
+        spotlight_provider=service.spotlight.snapshot,
     )
     journal(logger, "started", port=arguments.port,
             clock_sync=clock_reconciler.enabled,
@@ -639,6 +726,7 @@ def main(argv=None) -> int:
             lease_default_minutes=service.controller.default_lease_minutes,
             lease_max_minutes=service.controller.max_lease_minutes)
     reverts.start()
+    spotlight_reverts.start()
     clock_worker.start()
     publisher.start()
     try:
@@ -646,6 +734,7 @@ def main(argv=None) -> int:
     finally:
         publisher.stop()
         clock_worker.stop()
+        spotlight_reverts.stop()
         reverts.stop()
         server.server_close()
     return 0
