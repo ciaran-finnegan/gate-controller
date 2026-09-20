@@ -21,6 +21,8 @@ from urllib.parse import urlsplit
 from gate_media_config import (
     MediaConfigError,
     relevant_camera_control_environment,
+    relevant_talk_credential_environment,
+    talk_rtsp_url,
     validate_camera_control_environment,
 )
 
@@ -31,7 +33,7 @@ from .reolink import (
     IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient,
 )
 from .state import STATE_PATH, StatePublisher
-from .talk import TalkBusySession, TalkController, TalkUnavailable
+from .talk import TALK_RTSP_BASE_URL, TalkBusySession, TalkController, TalkUnavailable
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -709,10 +711,31 @@ def validated_camera_control_environment(environment) -> dict[str, str]:
     )
 
 
+def _talk_rtsp_url(credential, logger):
+    """The credentialled loopback URL, or None when this host has no credential.
+
+    The URL itself never reaches the logger -- only whether one could be built.
+    """
+    selected = relevant_talk_credential_environment(credential or {})
+    if not selected:
+        logger.warning(
+            "talk is enabled but no talk credential is configured; the media "
+            "gateway will refuse the loopback pull. Re-run "
+            "deployment/install-camera-control.sh to mint one."
+        )
+        return None
+    try:
+        return talk_rtsp_url(TALK_RTSP_BASE_URL, selected)
+    except MediaConfigError:
+        logger.warning("the configured talk credential is invalid; talk is unavailable")
+        return None
+
+
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
                   spotlight_lease_path=SPOTLIGHT_LEASE_PATH,
                   logger=None, connection_factory=None, clock=time.time,
-                  talk_client_factory=None, talk_options=None) -> CameraControlService:
+                  talk_client_factory=None, talk_options=None,
+                  talk_credential=None) -> CameraControlService:
     """Wire the client, the IR controller, the spotlight and talk from validated settings.
 
     The spotlight shares IR's lease bounds and is always dark by default: it is
@@ -720,6 +743,10 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
     unit) its reads fail and it is reported `unknown`, exactly as IR would be,
     while IR carries on. Talk is built only when GATE_CAMERA_TALK_ENABLED is
     exactly true, so a Pi that has not opted in never opens the Baichuan port.
+    ``talk_credential`` is the process environment in production: the two keys
+    systemd reads out of /etc/gate-media/talk.env, which become the loopback
+    RTSP URL the gateway will accept. Without them talk reports
+    `no_credential` rather than pretending to be ready.
 
     One clock is threaded through the whole service -- the token bucket, the
     snapshot interval, the lease expiry and the login throttle all read it. In
@@ -748,6 +775,13 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
     )
     talk = None
     if settings.get("GATE_CAMERA_TALK_ENABLED") == "true":
+        options = dict(talk_options or {})
+        if "rtsp_url" not in options:
+            # No credential means no loopback pull the gateway would accept, so
+            # the controller is built anyway and reports `no_credential`. Saying
+            # so is the point: a talk that silently reported `not_enabled` would
+            # send the operator looking at the wrong setting.
+            options["rtsp_url"] = _talk_rtsp_url(talk_credential, logger)
         talk = TalkController(
             talk_client_factory or (lambda: BaichuanClient(
                 settings["GATE_CAMERA_HOST"],
@@ -757,7 +791,7 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
             max_seconds=int(settings["GATE_CAMERA_TALK_MAX_SECONDS"]),
             clock=clock,
             journal=lambda stage, **fields: journal(logger, stage, **fields),
-            **(talk_options or {}),
+            **options,
         )
     spotlight = SpotlightController(
         client,
@@ -812,7 +846,7 @@ def main(argv=None) -> int:
     # succeed when it did, which is the loud failure we want if it is missing.
     os.makedirs(STATE_ROOT, mode=0o700, exist_ok=True)
     os.chmod(STATE_ROOT, 0o700)
-    service = build_service(settings, logger=logger)
+    service = build_service(settings, logger=logger, talk_credential=os.environ)
     # A lease that outlived the previous process must never leave IR -- or the
     # spotlight -- on.
     service.controller.restore_default_on_start()

@@ -28,9 +28,11 @@ from gate_camera_control.aes import Aes128
 from gate_camera_control.__main__ import CameraControlServer, build_service
 from gate_camera_control.state import StatePublisher, state_document
 from gate_camera_control.talk import (
-    HARD_MAX_SECONDS, MIN_SECONDS, PROBE_SPACING_SECONDS, TalkBusySession, TalkController,
-    TalkUnavailable, ffmpeg_command,
+    HARD_MAX_SECONDS, MIN_SECONDS, PROBE_RETRY_SECONDS, PROBE_SPACING_SECONDS,
+    TALK_RTSP_BASE_URL,
+    TalkBusySession, TalkController, TalkUnavailable, ffmpeg_command,
 )
+from gate_media_config import generate_talk_credential, talk_rtsp_url
 from gate_controller.camera_control_state import read_camera_control_state
 from tests.fake_baichuan import FakeBaichuanCamera
 from tests.test_camera_control import FakeCamera, ManualClock, RecordingJournal
@@ -38,6 +40,11 @@ from tests.test_camera_control import FakeCamera, ManualClock, RecordingJournal
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_RATE = 16000
+# A stand-in for this host's /etc/gate-media/talk.env. Nothing in these tests
+# reaches a real gateway, so the value only has to be a well-formed credential;
+# what matters is that the controller is built the way production builds it.
+TALK_CREDENTIAL = generate_talk_credential()
+TALK_URL = talk_rtsp_url(TALK_RTSP_BASE_URL, TALK_CREDENTIAL)
 
 # A stand-in for ffmpeg: real-time PCM16 mono at 16 kHz on stdout, a 440 Hz
 # tone, for `limit` seconds or until it is terminated. Real process, real pipe,
@@ -433,6 +440,7 @@ class TalkControllerTests(unittest.TestCase):
             "drain_seconds": 0.0,
             "spawn": fake_spawn(ffmpeg_seconds),
             "opener": gateway or FakeGateway(),
+            "rtsp_url": TALK_URL,
             "journal": lambda stage, **fields: self.journal.append((stage, fields)),
         }
         options.update(keywords)
@@ -460,7 +468,7 @@ class TalkControllerTests(unittest.TestCase):
         cases = (
             (self.controller(ffmpeg_binary="/nonexistent/ffmpeg"), "ffmpeg_missing"),
             (TalkController(self.client_factory("wrong"), ffmpeg_binary=sys.executable,
-                            opener=FakeGateway()), "camera_auth"),
+                            opener=FakeGateway(), rtsp_url=TALK_URL), "camera_auth"),
         )
         self.camera.sample_rate = 44100
         cases += ((self.controller(), "unsupported"),)
@@ -475,7 +483,7 @@ class TalkControllerTests(unittest.TestCase):
         self.camera.stop()
         unreachable = TalkController(
             lambda: baichuan.BaichuanClient("127.0.0.1", "gate", "s3cret", port=port, timeout=0.5),
-            ffmpeg_binary=sys.executable, opener=FakeGateway(),
+            ffmpeg_binary=sys.executable, opener=FakeGateway(), rtsp_url=TALK_URL,
         )
         self.assertFalse(unreachable.probe())
         self.assertEqual("camera_unreachable", unreachable.snapshot()["reason"])
@@ -585,7 +593,12 @@ class TalkControllerTests(unittest.TestCase):
             with self.subTest(seconds=seconds), self.assertRaises(ValueError):
                 controller.arm(seconds)
         self.assertEqual(20, controller.max_seconds)
-        self.assertEqual(60, TalkController(self.client_factory(), max_seconds=999).max_seconds)
+        self.assertEqual(
+            60,
+            TalkController(
+                self.client_factory(), max_seconds=999, rtsp_url=TALK_URL
+            ).max_seconds,
+        )
 
     def test_the_probe_runs_on_a_slow_clock(self):
         clock = ManualClock()
@@ -618,6 +631,7 @@ class TalkControllerTests(unittest.TestCase):
         controller = TalkController(
             client_factory, ffmpeg_binary=sys.executable, publisher_wait=2.0,
             poll_interval=0.05, spawn=fake_spawn(0.5), opener=FakeGateway(), clock=clock,
+            rtsp_url=TALK_URL,
             journal=lambda stage, **fields: self.journal.append((stage, fields)),
         )
         self.assertFalse(controller.probe())
@@ -643,7 +657,7 @@ class TalkControllerTests(unittest.TestCase):
     def test_an_arm_never_retries_credentials_the_camera_refused(self):
         clock = ManualClock()
         controller = TalkController(self.client_factory("wrong"), ffmpeg_binary=sys.executable,
-                                    opener=FakeGateway(), clock=clock)
+                                    opener=FakeGateway(), clock=clock, rtsp_url=TALK_URL)
         self.assertFalse(controller.probe())
         clock.advance(60 * 60)
         for _ in range(3):
@@ -704,15 +718,85 @@ class TalkControllerTests(unittest.TestCase):
         self.assertEqual("talk_busy", self.wait_until_ended(controller)["last_outcome"])
         self.assertLess(time.monotonic() - started, 4.0)
 
-    def test_the_ffmpeg_command_is_fixed_loopback_and_credential_free(self):
-        command = ffmpeg_command("/usr/bin/ffmpeg", "rtsp://127.0.0.1:8554/talk", 16000)
+    def test_the_ffmpeg_command_is_fixed_loopback_and_carries_the_credential(self):
+        """The command is still fixed, but it is no longer credential-free.
+
+        It used to assert the opposite -- no "@" anywhere -- because the pull
+        was anonymous, which is exactly the hole this closes: any process on
+        the Pi could read the operator's live microphone off `talk`. The
+        credential is in the URL's userinfo because that is the only way ffmpeg
+        takes RTSP credentials; what the rest of these tests pin is that it
+        goes nowhere else.
+        """
+        command = ffmpeg_command("/usr/bin/ffmpeg", TALK_URL, 16000)
         self.assertEqual("/usr/bin/ffmpeg", command[0])
-        self.assertIn("rtsp://127.0.0.1:8554/talk", command)
+        self.assertIn(TALK_URL, command)
         self.assertEqual("pipe:1", command[-1])
         self.assertEqual(["-ar", "16000"], command[command.index("-ar"):command.index("-ar") + 2])
         self.assertEqual(["-f", "s16le"], command[command.index("-f"):command.index("-f") + 2])
         self.assertIn("-nostdin", command)
-        self.assertNotIn("@", " ".join(command))
+        # One URL, still loopback, still the one path.
+        self.assertEqual(
+            1, sum(1 for argument in command if argument.startswith("rtsp://"))
+        )
+        self.assertTrue(TALK_URL.endswith("@127.0.0.1:8554/talk"))
+        self.assertEqual(
+            TALK_RTSP_BASE_URL, "rtsp://" + TALK_URL.partition("@")[2]
+        )
+
+    def test_a_whole_session_never_puts_the_credential_in_the_journal(self):
+        """Not in a stage line, not in an outcome, not in a snapshot."""
+        controller = self.controller(ffmpeg_seconds=0.4)
+        controller.probe()
+        controller.arm()
+        snapshot = self.wait_until_ended(controller)
+
+        password = TALK_CREDENTIAL["GATE_TALK_RTSP_PASSWORD"]
+        username = TALK_CREDENTIAL["GATE_TALK_RTSP_USERNAME"]
+        recorded = repr(self.journal) + repr(snapshot) + repr(controller.state_block())
+        self.assertNotIn(password, recorded)
+        self.assertNotIn(username, recorded)
+        self.assertNotIn("rtsp://", recorded)
+
+    def test_without_a_credential_talk_is_unavailable_and_never_dials_the_camera(self):
+        """A Pi that has not been given a credential says so, rather than 401ing.
+
+        The gateway would refuse the loopback pull, so reporting "ready" here
+        would send the operator looking at the camera instead of at the one
+        file that is missing.
+        """
+        controller = self.controller(rtsp_url=None)
+
+        self.assertEqual("no_credential", controller.snapshot()["reason"])
+        self.assertFalse(controller.probe())
+        self.assertFalse(controller.refresh_if_due())
+        self.assertFalse(controller.available())
+        self.assertEqual("no_credential", controller.state_block()["reason"])
+        with self.assertRaises(TalkUnavailable) as raised:
+            controller.arm()
+        self.assertEqual("no_credential", raised.exception.reason)
+        self.assertEqual([], self.camera.messages)
+
+    def test_a_missing_credential_is_journalled_on_the_slow_clock_not_every_cycle(self):
+        """One line, then the retry interval -- the same as any probe failure.
+
+        The state publisher calls refresh_if_due every 30 s. An early return
+        that never recorded the attempt made every one of those a fresh probe,
+        so the journal filled with identical no_credential lines.
+        """
+        clock = ManualClock()
+        controller = self.controller(rtsp_url=None, clock=clock)
+
+        self.assertFalse(controller.refresh_if_due())
+        self.assertEqual([("talk_probe", {"outcome": "no_credential"})], self.journal)
+        for _ in range(5):
+            clock.advance(30)
+            self.assertFalse(controller.refresh_if_due())
+        self.assertEqual(1, len(self.journal))
+        # After the retry interval it tries again, exactly once.
+        clock.advance(PROBE_RETRY_SECONDS)
+        self.assertFalse(controller.refresh_if_due())
+        self.assertEqual(2, len(self.journal))
 
 
 class TalkHttpTests(unittest.TestCase):
@@ -758,6 +842,7 @@ class TalkHttpTests(unittest.TestCase):
                 "ffmpeg_binary": sys.executable, "publisher_wait": 0.5, "poll_interval": 0.05,
                 "drain_seconds": 0.0, "spawn": fake_spawn(0.5), "opener": self.gateway,
             },
+            talk_credential=TALK_CREDENTIAL,
         )
 
     def request(self, method, path, body=None, raw=None):

@@ -312,7 +312,23 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             REPOSITORY_ROOT / "deployment/systemd/gate-media-gateway.service"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("/etc/gate-media-auth.env", auth.get("EnvironmentFile"))
+        auth_unit = (
+            REPOSITORY_ROOT / "deployment/systemd/gate-media-auth.service"
+        ).read_text(encoding="utf-8")
+
+        # The sidecar reads its own file plus the talk credential it shares with
+        # gate-camera-control -- and nothing else. The credential is optional so
+        # a host that predates it still starts; talk then reports no_credential.
+        self.assertEqual(
+            [
+                "EnvironmentFile=/etc/gate-media-auth.env",
+                "EnvironmentFile=-/etc/gate-media/talk.env",
+            ],
+            [line for line in auth_unit.splitlines()
+             if line.startswith("EnvironmentFile=")],
+        )
+        self.assertNotIn("EnvironmentFile=/etc/gate-camera-control.env", auth_unit)
+        self.assertNotIn("/etc/gate-media/talk.env", gateway_unit)
         self.assertEqual(
             [
                 "EnvironmentFile=/etc/gate-media-gateway.env",

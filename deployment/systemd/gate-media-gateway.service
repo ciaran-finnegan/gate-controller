@@ -22,6 +22,11 @@ CPUQuota=40%
 TasksMax=128
 UMask=0077
 NoNewPrivileges=true
+# /proc/<pid>/cmdline is world-readable, and gate-camera-control's carries
+# the talk credential while ffmpeg is pulling the operator's microphone.
+# This service has no business reading another user's processes at all, and
+# with this it cannot.
+ProtectProc=invisible
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

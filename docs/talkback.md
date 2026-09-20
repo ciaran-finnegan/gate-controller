@@ -61,7 +61,9 @@ Worker /api/media/whip  ──►  Cloudflare Tunnel  ──►  nginx /talk/whi
    the `talk` path has a publisher, then runs one fixed ffmpeg pipeline
    (`rtsp://127.0.0.1:8554/talk` → PCM16 mono at the camera's sample rate on
    stdout), encodes DVI ADPCM blocks of the camera's `lengthPerEncoder`, and
-   sends each as one `Talk` message, waiting for its acknowledgement.
+   sends each as one `Talk` message, waiting for its acknowledgement. That
+   pull is authenticated with this host's talk credential; see
+   [The talk credential](#the-talk-credential) below.
 5. The session ends at the first of: the operator releasing the button (the
    browser deletes its WHIP resource and MediaMTX drops the path, so ffmpeg
    sees EOF); the Worker's `DELETE /camera/talk`; the **hard limit**; a camera
@@ -87,6 +89,47 @@ hold unchanged. Talkback adds these:
 | Only operators and admins | Enforced twice: the Worker refuses the talk session and the WHIP proxy for viewers, and the media-session contract only ever reports `talkback: true` to those roles |
 | No payload leaks | Errors are typed with no camera body attached; journal lines carry stage, outcome, block count and a truncated session id; the state file names no camera, address or credential |
 | The gateway cannot be talked into anything else | The auth sidecar allows exactly `("read","talk")` over loopback RTSP (the forwarder) and `("publish","talk")` over WebRTC on a talk token. A gate token cannot publish; a talk token cannot read |
+| Only gate-camera-control can hear the operator | `read`/`talk` over loopback RTSP needs this host's talk credential. `camera` and `clear` stay anonymous — they are the camera's own stream — but `talk` carries the operator's live microphone, so being a process on the Pi is not enough. See below |
+
+### The talk credential
+
+Until this was added, `read`/`talk` was allowed for anything on 127.0.0.1 with
+no credential, exactly like `camera` and `clear`. Those two are the camera's
+own stream; `talk` is the operator's live microphone, so any process on the Pi
+could open `rtsp://127.0.0.1:8554/talk` while a session was publishing and
+listen to whatever was being said into the phone. CodeRabbit raised this on
+PR #140, which was superseded by #166.
+
+| Property | How it is enforced |
+| --- | --- |
+| One random credential per host | `/etc/gate-media/talk.env`, root:root 0600, two URL-safe values (`GATE_TALK_RTSP_USERNAME`, `GATE_TALK_RTSP_PASSWORD`) from `secrets.token_urlsafe`. Nothing derives it from anything else on the host, and nothing on the host can predict another's |
+| Minted once, never rotated behind the services' backs | Whichever of `install-media.sh`, `install-camera-control.sh` and the updater reaches it first writes it, with an exclusive link so two of them racing cannot end with each service holding a different value. The rest validate it and leave it alone: rewriting it would leave the sidecar and gate-camera-control on different halves until both happened to restart, which fails exactly like an attack |
+| Two services that share nothing else both get it | They are deliberately kept out of each other's groups and environment files — `gate-camera-control.service` has `InaccessiblePaths=/etc/gate-media-auth.env` — so neither file could carry it. systemd reads this third file as root and hands each service the values, so nothing widens who can read what |
+| Never printed, never journalled | The validator writes it straight into the file, so it is never in a shell variable, a process listing or a `bash -x` trace. The installers only ever say whether one exists. The sidecar logs a warning when there is none and never what it is; the camera-control journal, the state file and every error carry stage, outcome and block counts only |
+| Fail closed | A sidecar with no credential refuses `read`/`talk` outright rather than falling back to the old anonymous rule. `camera`, `clear` and `gate` are unaffected |
+| Said plainly when it is missing | The talk reason `no_credential` — available, probe and arm all report it rather than dialling the camera. A Pi that predates the credential loses push-to-talk and nothing else, and one installer or updater run fixes it |
+| The credential opens nothing else | It is accepted only for `read`/`talk`. Presented on `camera`, `clear`, `gate` or a `publish` of `talk`, it is refused |
+
+**Residual exposure.** ffmpeg takes RTSP credentials only in the URL, so the
+credential is in gate-camera-control's `argv` for as long as a session runs,
+and `/proc/<pid>/cmdline` is world-readable. Every service on the Pi therefore
+carries `ProtectProc=invisible`, so none of them can read another's `argv`; a
+shell user with `sudo` can, but they can already read `/etc/gate-media/talk.env`
+itself. This is the trade the RTSP pull comes with — isolating the pull into a
+process of its own is the change to make if that ever stops being enough.
+
+**MediaMTX 1.19.3 specifics**, verified against the real binary on 2026-09-20:
+
+- there is no RTSP auth-method setting (`tests/fixtures/mediamtx-v1.19.3-schema.json`),
+  because RTSP digest was dropped once external auth existed — a hook cannot
+  validate a digest it has no plaintext password for. Basic is the only method,
+  which is what this needs: MediaMTX hands the sidecar the exact user and
+  password it received;
+- for an RTSP Basic request MediaMTX fills the hook's `token` field with the
+  same password it puts in `password`. The anonymous paths never see one, so
+  requiring an empty `token` everywhere looked right and refused the very
+  credential MediaMTX had just forwarded. For `read`/`talk` the field is pinned
+  to that one value instead of required empty.
 
 ## Capability flow
 
@@ -109,8 +152,8 @@ nothing:
 ```
 
 `reason` is one of `ready`, `not_enabled`, `not_probed`, `ffmpeg_missing`,
-`unsupported`, `camera_auth`, `camera_busy`, `camera_unreachable`,
-`camera_error`.
+`no_credential`, `unsupported`, `camera_auth`, `camera_busy`,
+`camera_unreachable`, `camera_error`.
 
 ## HTTP contract (camera-control service)
 
@@ -144,7 +187,7 @@ Unknown fields are a `400`.
 | Status | Body | When |
 | --- | --- | --- |
 | `409` | `{"error":"talk_busy"}` | a session is already armed or streaming |
-| `503` | `{"error":"talk_unavailable","reason":"…"}` | talk is not enabled, or the camera is not ready; `reason` is the state-file reason. While it is `not_probed`, `camera_unreachable`, `camera_busy` or `camera_error` the arm probes first (at most once every 15 s), so the answer is that probe's; `camera_auth`, `unsupported` and `ffmpeg_missing` wait for the slow clock |
+| `503` | `{"error":"talk_unavailable","reason":"…"}` | talk is not enabled, or the camera is not ready; `reason` is the state-file reason. While it is `not_probed`, `camera_unreachable`, `camera_busy` or `camera_error` the arm probes first (at most once every 15 s), so the answer is that probe's; `camera_auth`, `unsupported` and `ffmpeg_missing` wait for the slow clock. `no_credential` never dials the camera at all: the gateway would refuse the pull, so there is nothing a probe could learn |
 
 ### `GET /camera/talk`, `DELETE /camera/talk`
 
@@ -170,6 +213,21 @@ One optional key in `/etc/gate-media-auth.env`:
 
 Both files keep validating without the new keys, so nothing changes on a Pi
 that has not opted in.
+
+`/etc/gate-media/talk.env` (root:root 0600) is the third file, and the operator
+never writes it — see [The talk credential](#the-talk-credential). It is read by
+`gate-media-auth` and `gate-camera-control` as an optional `EnvironmentFile=`,
+so a host that has not been given one still starts and reports `no_credential`.
+
+| Key | Rules |
+| --- | --- |
+| `GATE_TALK_RTSP_USERNAME` | 16–128 URL-safe bytes (`A-Za-z0-9_-`), generated |
+| `GATE_TALK_RTSP_PASSWORD` | the same, and never equal to the username |
+
+To rotate it: stop `gate-camera-control` and `gate-media-auth`, delete the file,
+re-run either installer, start both. There is no live rotation — the two
+services read it at start, so replacing it under a running pair breaks talk
+until they restart, which is why nothing rewrites it automatically.
 
 ## Journal
 
@@ -268,6 +326,11 @@ this test is remote-only: the whole point is a human hearing the speaker.
    audio still arrives during and after a talk session.
 7. Confirm the IR lease and the still are unaffected: `GET /camera/state`
    during a session answers normally; `GET /camera/snap` still works.
+8. While a session is streaming, from a shell on the Pi run
+   `ffprobe -rtsp_transport tcp rtsp://127.0.0.1:8554/talk`. Expected: it fails
+   with 401 Unauthorized. This is the one step that checks nobody but
+   gate-camera-control can hear the operator; if it succeeds, stop and treat
+   the credential as missing (`journalctl -u gate-media-auth` will say so).
 
 Only when every step passes: set `GATE_MEDIA_TALKBACK_VERIFIED=true`, restart
 `gate-media-auth`, and record the date, firmware version and the
@@ -280,6 +343,8 @@ Set `GATE_CAMERA_TALK_ENABLED=false` (or remove the key), re-run the
 camera-control installer, and set `GATE_MEDIA_TALKBACK_CONFIGURED=false`. The
 service stops opening port 9000, the heartbeat reports `not_configured`, and
 the app hides the button. Nothing else in the pipeline depends on talkback.
+The talk credential can be left where it is: it grants one loopback read of a
+path with no publisher.
 
 ## Not done here
 

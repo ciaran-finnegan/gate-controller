@@ -1217,6 +1217,13 @@ later run until each one matches:
 | `gate-camera-control` | `gate_camera_control/`, `gate_media_config.py`, its installer and unit | `bash deployment/install-camera-control.sh --source <release>` (idempotent; restarts the service) | `/usr/local/lib/gate-camera-control/.gate-release-digest` |
 | media stack | `gate_media_auth/`, `gate_media_gateway/`, `gate_media_transcoder/`, `gate_media_config.py`, the TURN refresh helper, `mediamtx.yml`, the WHEP template and the five media units | files copied with the installer's owners and modes, `systemctl daemon-reload`, `systemctl try-restart` of the three media services and the TURN-refresh timer | `/usr/local/lib/gate-media/.gate-release-digest` |
 
+Both refreshes also mint `/etc/gate-media/talk.env` if the host has none — the
+per-host credential that lets only `gate-camera-control` read the push-to-talk
+path off the media gateway (see [Push-to-talk § The talk credential](talkback.md#the-talk-credential)).
+It is written once and never rewritten, so a Pi that only ever follows releases
+gets a working push-to-talk without a bootstrap. A host that cannot hold it
+loses push-to-talk, which then reports `no_credential`, and nothing else.
+
 **Enabling it once.** The updater runs under `ProtectSystem=strict`, so it
 can only write what its own unit's `ReadWritePaths` names. A Pi whose
 `gate-controller-updater.service` predates release-following has every

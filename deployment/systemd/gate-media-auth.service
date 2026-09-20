@@ -10,6 +10,13 @@ Type=simple
 User=gate-media-auth
 Group=gate-media-auth
 EnvironmentFile=/etc/gate-media-auth.env
+# This host's loopback RTSP credential for the `talk` path, minted by
+# whichever installer or updater run reached it first. Optional (`-`)
+# so a host that predates it still starts: without it push-to-talk
+# reports `no_credential` and everything else is unaffected. systemd
+# reads it as root, which is why two services that share no group and
+# no other file can both be given it.
+EnvironmentFile=-/etc/gate-media/talk.env
 Environment=PYTHONPATH=/usr/local/lib/gate-media
 ExecStart=/usr/bin/python3 -m gate_media_auth
 Restart=always
@@ -21,6 +28,11 @@ TasksMax=64
 UMask=0077
 ReadWritePaths=/run/gate-media
 NoNewPrivileges=true
+# /proc/<pid>/cmdline is world-readable, and gate-camera-control's carries
+# the talk credential while ffmpeg is pulling the operator's microphone.
+# This service has no business reading another user's processes at all, and
+# with this it cannot.
+ProtectProc=invisible
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

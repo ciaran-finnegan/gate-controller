@@ -50,6 +50,24 @@ _RUNTIME_TURN_KEYS = frozenset(_RUNTIME_TURN_KEY_ORDER)
 _GATEWAY_KEYS = _GATEWAY_STATIC_KEYS | _RUNTIME_TURN_KEYS
 _LEGACY_GATEWAY_SOURCE_KEY = "MTX_PATHS_GATE_SOURCE"
 _TURN_KEYS = frozenset({"TURN_KEY_ID", "TURN_KEY_API_TOKEN"})
+# The per-host credential that gate-camera-control presents to MediaMTX when it
+# pulls the browser's microphone back off the `talk` path over loopback RTSP.
+# It lives in its own root-only file because the two services that need it --
+# the auth sidecar and gate-camera-control -- are deliberately kept out of each
+# other's groups and environment files, so neither one's file can carry it.
+#
+# The keys are outside the GATE_MEDIA_ and MTX_ prefixes on purpose:
+# `relevant_auth_environment` and `relevant_gateway_environment` select by those
+# prefixes, so a credential named under them would be swept into the auth
+# environment and rejected as a forbidden key.
+TALK_CREDENTIAL_PATH = "/etc/gate-media/talk.env"
+_TALK_CREDENTIAL_KEY_ORDER = ("GATE_TALK_RTSP_USERNAME", "GATE_TALK_RTSP_PASSWORD")
+_TALK_CREDENTIAL_KEYS = frozenset(_TALK_CREDENTIAL_KEY_ORDER)
+# URL-safe base64 only: the value is carried in RTSP userinfo, where ":", "@"
+# and "/" would change where the URL splits.
+_TALK_CREDENTIAL_VALUE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+_TALK_USERNAME_BYTES = 12
+_TALK_PASSWORD_BYTES = 32
 _BOOLEAN_AUTH_KEYS = _AUTH_KEYS - {"GATE_MEDIA_HMAC_SECRET"}
 _CAMERA_CONTROL_REQUIRED_KEYS = frozenset({
     "GATE_CAMERA_HOST",
@@ -386,6 +404,93 @@ def write_camera_address_dropin(path, values: Mapping[str, str]) -> None:
     _atomic_write_trusted_file(path, body, mode=0o644)
 
 
+def validate_talk_credential_environment(
+    values: Mapping[str, str]
+) -> dict[str, str]:
+    """Validate the per-host loopback RTSP credential for the `talk` path.
+
+    Both halves are required and must differ: the sidecar compares each one
+    against what MediaMTX forwarded, and a credential whose two halves are the
+    same value halves the work of guessing it.
+    """
+    selected = dict(values)
+    _validate_effective_values(selected)
+    if set(selected) != _TALK_CREDENTIAL_KEYS:
+        raise MediaConfigError("talk credential has missing or forbidden keys")
+    if any(not _TALK_CREDENTIAL_VALUE.fullmatch(selected[key])
+           for key in _TALK_CREDENTIAL_KEY_ORDER):
+        raise MediaConfigError("talk credential values must be 16 to 128 URL-safe bytes")
+    if secrets.compare_digest(
+        selected["GATE_TALK_RTSP_USERNAME"], selected["GATE_TALK_RTSP_PASSWORD"]
+    ):
+        raise MediaConfigError("the talk credential must not repeat one value")
+    return selected
+
+
+def relevant_talk_credential_environment(
+    environment: Mapping[str, str]
+) -> dict[str, str]:
+    """Select only the exact talk credential keys, never a prefix match."""
+    return {
+        key: value for key, value in environment.items() if key in _TALK_CREDENTIAL_KEYS
+    }
+
+
+def generate_talk_credential() -> dict[str, str]:
+    """A fresh credential for this host. Never derived from anything on it."""
+    return {
+        "GATE_TALK_RTSP_USERNAME": secrets.token_urlsafe(_TALK_USERNAME_BYTES),
+        "GATE_TALK_RTSP_PASSWORD": secrets.token_urlsafe(_TALK_PASSWORD_BYTES),
+    }
+
+
+def ensure_talk_credential(path) -> bool:
+    """Create this host's talk credential once; return True only if it was written.
+
+    Both installers and the updater call this, so whichever of them runs first
+    on a host mints the credential and the rest find it and leave it alone. The
+    value is never returned, printed or logged: the only way it reaches the two
+    services is systemd reading this file as ``EnvironmentFile=``.
+
+    An existing file is validated rather than replaced. Rewriting it would give
+    the sidecar and gate-camera-control different halves of a rotation until
+    both happened to restart, which is a talk path that fails with the same
+    401 an attacker would get. A zero-length file counts as absent.
+    """
+    if _trusted_file_has_content(path):
+        validate_talk_credential_environment(parse_trusted_environment(path))
+        return False
+    body = _serialize_environment(generate_talk_credential(), _TALK_CREDENTIAL_KEY_ORDER)
+    if _atomic_write_trusted_file(path, body, mode=0o600, exclusive=True):
+        return True
+    # The file already exists. Either something minted a credential between the
+    # check above and the link -- keep that one, so two callers racing can
+    # never leave the two services on different halves -- or it is zero-length,
+    # which an interrupted run or an operator's `touch` can leave behind and
+    # which has nothing to lose, so it is replaced in one step.
+    if _trusted_file_has_content(path):
+        validate_talk_credential_environment(parse_trusted_environment(path))
+        return False
+    _atomic_write_trusted_file(path, body, mode=0o600)
+    return True
+
+
+def talk_rtsp_url(base_url: str, credential: Mapping[str, str]) -> str:
+    """Put the validated credential into ``base_url``'s userinfo.
+
+    The caller holds the result only for as long as it takes to build one
+    ffmpeg command; it is never journalled, published in the state file, or
+    included in an error.
+    """
+    settings = validate_talk_credential_environment(credential)
+    scheme, separator, remainder = base_url.partition("://")
+    if not separator or not remainder or "@" in remainder:
+        raise MediaConfigError("talk RTSP URL is invalid")
+    username = settings["GATE_TALK_RTSP_USERNAME"]
+    password = settings["GATE_TALK_RTSP_PASSWORD"]
+    return f"{scheme}://{username}:{password}@{remainder}"
+
+
 def relevant_camera_control_environment(
     environment: Mapping[str, str]
 ) -> dict[str, str]:
@@ -542,7 +647,18 @@ def _atomic_write_environment(path, body: bytes) -> None:
     _atomic_write_trusted_file(path, body, mode=0o600)
 
 
-def _atomic_write_trusted_file(path, body: bytes, *, mode: int) -> None:
+def _atomic_write_trusted_file(
+    path, body: bytes, *, mode: int, exclusive: bool = False
+) -> bool:
+    """Publish ``body`` at ``path`` in one step, returning whether it landed.
+
+    ``exclusive`` links the staged file into place instead of renaming over it,
+    so a file that already exists is left exactly as it is and False is
+    returned. That is what makes minting a secret idempotent: two installers
+    racing each other cannot end with each service holding a different value,
+    and neither a crash nor a full disk can leave a half-written credential
+    under the real name.
+    """
     path = os.path.abspath(os.fspath(path))
     parent, name = os.path.split(path)
     if not name or not body or len(body) > _MAX_CONFIG_BYTES:
@@ -575,12 +691,24 @@ def _atomic_write_trusted_file(path, body: bytes, *, mode: int) -> None:
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        os.replace(
-            temporary, name,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
-        )
+        if exclusive:
+            try:
+                os.link(
+                    temporary, name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                return False
+        else:
+            os.replace(
+                temporary, name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
         os.fsync(directory_descriptor)
+        return True
     except MediaConfigError:
         raise
     except OSError as error:
@@ -676,6 +804,9 @@ def main(argv=None) -> int:
     camera_control = subparsers.add_parser("camera-control")
     camera_control.add_argument("--env", required=True)
     camera_control.add_argument("--write-address-dropin")
+    talk_credential = subparsers.add_parser("talk-credential")
+    talk_credential.add_argument("--env", required=True)
+    talk_credential.add_argument("--ensure", action="store_true")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "checksum":
@@ -690,6 +821,15 @@ def main(argv=None) -> int:
             )
         elif arguments.command == "turn":
             validate_turn_environment(parse_trusted_environment(arguments.env))
+        elif arguments.command == "talk-credential":
+            # Nothing is printed either way: the credential must not reach a
+            # shell variable, a process listing or a `bash -x` trace.
+            if arguments.ensure:
+                ensure_talk_credential(arguments.env)
+            else:
+                validate_talk_credential_environment(
+                    parse_trusted_environment(arguments.env)
+                )
         elif arguments.command == "camera-control":
             values = parse_trusted_environment(arguments.env)
             validate_camera_control_environment(values)
