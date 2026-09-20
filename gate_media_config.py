@@ -455,8 +455,7 @@ def ensure_talk_credential(path) -> bool:
     An existing file is validated rather than replaced. Rewriting it would give
     the sidecar and gate-camera-control different halves of a rotation until
     both happened to restart, which is a talk path that fails with the same
-    401 an attacker would get. A zero-length file -- what both installers create
-    before they populate anything -- counts as absent.
+    401 an attacker would get. A zero-length file counts as absent.
     """
     if _trusted_file_has_content(path):
         validate_talk_credential_environment(parse_trusted_environment(path))
@@ -465,9 +464,10 @@ def ensure_talk_credential(path) -> bool:
     if _atomic_write_trusted_file(path, body, mode=0o600, exclusive=True):
         return True
     # The file already exists. Either something minted a credential between the
-    # check above and the link -- keep that one -- or it is the zero-length
-    # placeholder both installers create before they populate anything, which
-    # has nothing to lose and is replaced in one step.
+    # check above and the link -- keep that one, so two callers racing can
+    # never leave the two services on different halves -- or it is zero-length,
+    # which an interrupted run or an operator's `touch` can leave behind and
+    # which has nothing to lose, so it is replaced in one step.
     if _trusted_file_has_content(path):
         validate_talk_credential_environment(parse_trusted_environment(path))
         return False

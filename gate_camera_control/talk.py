@@ -185,11 +185,6 @@ class TalkController:
         """
         if not self._enabled:
             return False
-        if self._rtsp_url is None:
-            # Nothing to probe for: the camera may be perfectly well, but the
-            # gateway will refuse the pull, so "ready" would be a lie.
-            self._set_reason("no_credential", probe_ok=False)
-            return False
         with self._probe_lock:
             with self._lock:
                 if self._session is not None:
@@ -197,7 +192,16 @@ class TalkController:
             if (unless_within is not None and self._probed_at is not None
                     and self._clock() - self._probed_at < unless_within):
                 return self._probe_ok
+            # Recorded before the checks below, not after, so the slow clock
+            # treats a failure here exactly as it treats a camera that did not
+            # answer: one journal line, then the retry interval. Returning
+            # early without it left refresh_if_due re-probing on every cycle.
             self._probed_at = self._clock()
+            if self._rtsp_url is None:
+                # Nothing to probe for: the camera may be perfectly well, but
+                # the gateway will refuse the pull, so "ready" would be a lie.
+                self._set_reason("no_credential", probe_ok=False)
+                return False
             if not os.access(self._ffmpeg, os.X_OK):
                 self._set_reason("ffmpeg_missing", probe_ok=False)
                 return False

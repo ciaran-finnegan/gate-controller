@@ -28,7 +28,8 @@ from gate_camera_control.aes import Aes128
 from gate_camera_control.__main__ import CameraControlServer, build_service
 from gate_camera_control.state import StatePublisher, state_document
 from gate_camera_control.talk import (
-    HARD_MAX_SECONDS, MIN_SECONDS, PROBE_SPACING_SECONDS, TALK_RTSP_BASE_URL,
+    HARD_MAX_SECONDS, MIN_SECONDS, PROBE_RETRY_SECONDS, PROBE_SPACING_SECONDS,
+    TALK_RTSP_BASE_URL,
     TalkBusySession, TalkController, TalkUnavailable, ffmpeg_command,
 )
 from gate_media_config import generate_talk_credential, talk_rtsp_url
@@ -775,6 +776,27 @@ class TalkControllerTests(unittest.TestCase):
             controller.arm()
         self.assertEqual("no_credential", raised.exception.reason)
         self.assertEqual([], self.camera.messages)
+
+    def test_a_missing_credential_is_journalled_on_the_slow_clock_not_every_cycle(self):
+        """One line, then the retry interval -- the same as any probe failure.
+
+        The state publisher calls refresh_if_due every 30 s. An early return
+        that never recorded the attempt made every one of those a fresh probe,
+        so the journal filled with identical no_credential lines.
+        """
+        clock = ManualClock()
+        controller = self.controller(rtsp_url=None, clock=clock)
+
+        self.assertFalse(controller.refresh_if_due())
+        self.assertEqual([("talk_probe", {"outcome": "no_credential"})], self.journal)
+        for _ in range(5):
+            clock.advance(30)
+            self.assertFalse(controller.refresh_if_due())
+        self.assertEqual(1, len(self.journal))
+        # After the retry interval it tries again, exactly once.
+        clock.advance(PROBE_RETRY_SECONDS)
+        self.assertFalse(controller.refresh_if_due())
+        self.assertEqual(2, len(self.journal))
 
 
 class TalkHttpTests(unittest.TestCase):

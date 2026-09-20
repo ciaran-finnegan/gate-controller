@@ -162,12 +162,27 @@ def _matches_talk_credential(payload: dict, talk_credential) -> bool:
     if not talk_credential:
         return False
     username, password = talk_credential
-    if not (
-        hmac.compare_digest(payload["user"], username)
-        and hmac.compare_digest(payload["password"], password)
-    ):
+    # Every field is compared, and the results combined afterwards, so the time
+    # this takes says nothing about which half was wrong.
+    matches = _constant_time_equal(payload["user"], username)
+    matches &= _constant_time_equal(payload["password"], password)
+    matches &= not payload["token"] or _constant_time_equal(payload["token"], password)
+    return matches
+
+
+def _constant_time_equal(value: str, expected: str) -> bool:
+    """Compare a field MediaMTX forwarded against a validated credential half.
+
+    The value came out of JSON and can be any string; `hmac.compare_digest`
+    raises TypeError on a str with non-ASCII in it, which would have taken the
+    sidecar's handler thread down instead of answering 401. The credential is
+    validated URL-safe ASCII, so anything that will not encode cannot be it.
+    """
+    try:
+        candidate = value.encode("ascii")
+    except UnicodeEncodeError:
         return False
-    return not payload["token"] or hmac.compare_digest(payload["token"], password)
+    return hmac.compare_digest(candidate, expected.encode("ascii"))
 
 
 def validated_talk_credential(environment):

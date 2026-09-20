@@ -304,6 +304,22 @@ class MediaAuthServerTests(unittest.TestCase):
             with self.subTest(action=action, path=path):
                 self.assertEqual(401, authorize(payload, now=now))
 
+    def test_a_non_ascii_field_is_refused_rather_than_raising(self):
+        """`hmac.compare_digest` raises TypeError on a str with non-ASCII in it.
+
+        The fields come out of JSON, so a caller could pick them. Unhandled,
+        that took the handler thread down instead of answering 401.
+        """
+        now = int(time.time())
+
+        for field in ("user", "password", "token"):
+            payload = local_talk_read_request()
+            payload[field] = "caf\u00e9" * 4
+            with self.subTest(field=field):
+                self.assertEqual(401, authorize(payload, now=now))
+        # And a valid request is still 200 with a credential that is pure ASCII.
+        self.assertEqual(200, authorize(local_talk_read_request(), now=now))
+
     def test_a_host_with_no_credential_refuses_the_talk_read_outright(self):
         """Fail closed. A sidecar that cannot tell gate-camera-control from any
         other local process must not hand either of them the microphone."""
