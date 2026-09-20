@@ -19,8 +19,9 @@ _REASONS = frozenset({
     "camera_busy", "camera_unreachable", "camera_error",
 })
 _TALK_REASONS = frozenset({
-    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
-    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "no_credential",
+    "unsupported", "camera_auth", "camera_busy", "camera_unreachable",
+    "camera_error",
 })
 _MAX_STATE_BYTES = 8 * 1024
 _MAX_TIMESTAMP_LENGTH = 40

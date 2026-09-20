@@ -8,6 +8,12 @@
 set -Eeuo pipefail
 
 CAMERA_ENV=/etc/gate-camera-control.env
+# This host's loopback RTSP credential for the media gateway's `talk` path. It
+# is not in CAMERA_ENV because the auth sidecar needs the same value and must
+# never be able to read the camera API credentials that live there; systemd
+# reads this file as root for both services.
+MEDIA_CONFIG_ROOT=/etc/gate-media
+TALK_CREDENTIAL_ENV=$MEDIA_CONFIG_ROOT/talk.env
 CAMERA_LIBRARY=/usr/local/lib/gate-camera-control
 CAMERA_TMPFILES=/etc/tmpfiles.d/gate-camera.conf
 CAMERA_RUNTIME_ROOT=/run/gate-camera
@@ -84,6 +90,32 @@ reject_gpio_membership() {
 # not first cause a new library to be published over the running one.
 camera_environment_configured() {
   python3 "$SOURCE/gate_media_config.py" camera-control --env "$CAMERA_ENV" >/dev/null
+}
+
+# Mints the credential once per host and never prints it: the value goes from
+# the validator straight into a root-only file, so it never reaches a shell
+# variable, a process listing or a `bash -x` trace. Whichever of this installer
+# and install-media.sh runs first on a host writes it; the other validates it
+# and leaves it alone. Rewriting it would leave the two services holding
+# different halves until both happened to restart.
+ensure_talk_credential() {
+  [[ ! -L $TALK_CREDENTIAL_ENV ]] || fail "$TALK_CREDENTIAL_ENV must not be a symlink"
+  # Same owner and mode install-media.sh gives it, so whichever installer gets
+  # there first leaves the other nothing to correct. It holds the credential
+  # rather than /etc directly because that is the directory the updater already
+  # grants itself, and a credential it could not mint would leave every
+  # automatic release with a talk path that 401s.
+  [[ ! -L $MEDIA_CONFIG_ROOT ]] || fail "$MEDIA_CONFIG_ROOT must not be a symlink"
+  # Not fatal. A host that cannot hold the credential loses push-to-talk, which
+  # then reports `no_credential`; it must not lose IR, stills and the spotlight
+  # with it, and it must not stop following releases.
+  if ! install -d -o root -g root -m 0755 "$MEDIA_CONFIG_ROOT" \
+    || ! python3 "$SOURCE/gate_media_config.py" talk-credential \
+      --env "$TALK_CREDENTIAL_ENV" --ensure; then
+    printf 'gate camera control install: no talk credential; push-to-talk will report no_credential.\n' >&2
+    return 0
+  fi
+  validate_root_file "$TALK_CREDENTIAL_ENV" 600
 }
 
 render_camera_address_dropin() {
@@ -241,6 +273,11 @@ main() {
   preflight
   ensure_account
   ensure_environment_file
+  # Independent of the camera environment, and done before the validity gate
+  # below: a host whose camera credentials are not populated yet still ends up
+  # with the credential the sidecar needs, so the media side is never left
+  # refusing a talk the operator has just enabled.
+  ensure_talk_credential
 
   # The environment is judged before anything is published. An installer that
   # published first and validated second replaced the running library on its way

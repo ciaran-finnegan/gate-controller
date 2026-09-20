@@ -9,6 +9,10 @@ MEDIA_STATE_ROOT=/var/lib/gate-media
 MEDIA_RUNTIME_TURN_ENV=$MEDIA_STATE_ROOT/turn.env
 MEDIA_CONFIG_ROOT=/etc/gate-media
 MEDIA_CONFIG=$MEDIA_CONFIG_ROOT/mediamtx.yml
+# This host's loopback RTSP credential for the `talk` path. Its own file,
+# because the auth sidecar and gate-camera-control are deliberately kept out of
+# each other's groups and environment files; systemd reads it as root for both.
+MEDIA_TALK_CREDENTIAL_ENV=$MEDIA_CONFIG_ROOT/talk.env
 MEDIA_PROXY_TEMPLATE=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf.template
 MEDIA_PROXY_CONFIG=$MEDIA_CONFIG_ROOT/nginx-whep-locations.conf
 MEDIA_TMPFILES=/etc/tmpfiles.d/gate-media.conf
@@ -101,6 +105,21 @@ PY
   )
   [[ $owner == 0 && $group == 0 && $actual_mode == "$mode" ]] \
     || fail "$path must be root:root mode $mode"
+}
+
+# Mints the credential once per host and never prints it: the value goes from
+# the validator straight into a root-only file, so it is never in a shell
+# variable, a process listing or a `bash -x` trace. A file that already has one
+# is validated and left alone -- rewriting it would leave the sidecar and
+# gate-camera-control holding different halves until both restarted.
+ensure_talk_credential() {
+  local validator=${SOURCE:-${BASH_SOURCE[0]%/*}/..}/gate_media_config.py
+
+  [[ ! -L $MEDIA_TALK_CREDENTIAL_ENV ]] \
+    || fail "$MEDIA_TALK_CREDENTIAL_ENV must not be a symlink"
+  python3 "$validator" talk-credential --env "$MEDIA_TALK_CREDENTIAL_ENV" --ensure \
+    || fail "the talk credential could not be established"
+  validate_root_file "$MEDIA_TALK_CREDENTIAL_ENV" 600
 }
 
 media_environment_complete() {
@@ -984,6 +1003,7 @@ main() {
     install -o root -g root -m 0600 /dev/null "$MEDIA_AUTH_ENV"
   fi
   validate_root_file "$MEDIA_AUTH_ENV" 600
+  ensure_talk_credential
   prepare_gateway_environments
   install_fixed_media_files "$SOURCE"
   STAGED_MEDIA_PROXY_CONFIG=$MEDIA_PROXY_CONFIG.new.$$

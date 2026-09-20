@@ -13,6 +13,12 @@ camera over Baichuan. Everything about the session is bounded:
   every exit, and the WHIP publisher is kicked from the gateway so the app sees
   the end rather than a silently dead channel.
 
+The loopback pull is authenticated. ``talk`` carries the operator's live
+microphone, so the auth sidecar grants ``read``/``talk`` only to the holder of
+this host's ``/etc/gate-media/talk.env`` credential; without it, being a process
+on the Pi is not enough. The credential reaches ffmpeg in the RTSP URL's
+userinfo and nowhere else.
+
 No camera payload, address or credential reaches the journal or the snapshot.
 """
 
@@ -35,7 +41,10 @@ from .baichuan import (
 
 GATEWAY_API = "http://127.0.0.1:9997"
 TALK_PATH = "talk"
-TALK_RTSP_URL = f"rtsp://127.0.0.1:8554/{TALK_PATH}"
+# Credential-free: the caller puts this host's talk credential into the
+# userinfo (gate_media_config.talk_rtsp_url) before handing it to the
+# controller. A controller built without one refuses to arm.
+TALK_RTSP_BASE_URL = f"rtsp://127.0.0.1:8554/{TALK_PATH}"
 FFMPEG_BINARY = "/usr/bin/ffmpeg"
 DEFAULT_MAX_SECONDS = 30
 HARD_MAX_SECONDS = 60
@@ -60,8 +69,9 @@ _PLAYED_OUT = frozenset({"publisher_gone", "released", "time_limit"})
 _MAX_API_BYTES = 64 * 1024
 _SESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 REASONS = (
-    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
-    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "no_credential",
+    "unsupported", "camera_auth", "camera_busy", "camera_unreachable",
+    "camera_error",
 )
 END_REASONS = (
     "time_limit", "publisher_gone", "released", "no_publisher", "talk_busy",
@@ -70,7 +80,15 @@ END_REASONS = (
 
 
 def ffmpeg_command(binary: str, rtsp_url: str, sample_rate: int) -> list:
-    """The fixed decode pipeline: loopback RTSP in, PCM16 mono at the camera's rate out."""
+    """The fixed decode pipeline: loopback RTSP in, PCM16 mono at the camera's rate out.
+
+    ``rtsp_url`` carries this host's talk credential in its userinfo, so the
+    returned command is a secret for as long as the session runs. It is passed
+    straight to ``Popen`` and never journalled, formatted into an error, or put
+    in the state file. It is still visible in this process's ``/proc`` entry
+    while ffmpeg runs, which is why the other services on the Pi carry
+    ``ProtectProc=invisible``; see docs/talkback.md.
+    """
     return [
         binary, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-fflags", "nobuffer", "-rtsp_transport", "tcp", "-i", rtsp_url,
@@ -110,7 +128,7 @@ class TalkController:
 
     def __init__(self, client_factory, *, enabled: bool = True,
                  max_seconds: int = DEFAULT_MAX_SECONDS, gateway_api: str = GATEWAY_API,
-                 ffmpeg_binary: str = FFMPEG_BINARY, rtsp_url: str = TALK_RTSP_URL,
+                 ffmpeg_binary: str = FFMPEG_BINARY, rtsp_url=None,
                  publisher_wait: float = PUBLISHER_WAIT_SECONDS,
                  poll_interval: float = POLL_INTERVAL_SECONDS,
                  drain_seconds: float = TALK_DRAIN_SECONDS, clock=time.time,
@@ -135,7 +153,12 @@ class TalkController:
         self._session = None
         self._thread = None
         self._last = None
-        self._reason = "not_enabled" if not self._enabled else "not_probed"
+        if not self._enabled:
+            self._reason = "not_enabled"
+        elif self._rtsp_url is None:
+            self._reason = "no_credential"
+        else:
+            self._reason = "not_probed"
         self._probed_at = None
         self._probe_ok = False
         self._format = None
@@ -161,6 +184,11 @@ class TalkController:
         queue behind each other log in once between them, not twice.
         """
         if not self._enabled:
+            return False
+        if self._rtsp_url is None:
+            # Nothing to probe for: the camera may be perfectly well, but the
+            # gateway will refuse the pull, so "ready" would be a lie.
+            self._set_reason("no_credential", probe_ok=False)
             return False
         with self._probe_lock:
             with self._lock:

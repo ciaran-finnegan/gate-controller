@@ -199,9 +199,29 @@ class MediaRefreshTests(unittest.TestCase):
             self.assertEqual(len(installed), len(updater.MEDIA_PUBLISHED_FILES) + 1)
             self.assertIn(("deployment/gate_media_turn_refresh.py", "/usr/local/lib/gate-media/gate_media_turn_refresh.py", 0o700, "root"), installed)
             self.assertIn(("deployment/media/mediamtx.yml", "/etc/gate-media/mediamtx.yml", 0o640, "gate-media"), installed)
-            self.assertEqual(recorded[0], ["systemctl", "daemon-reload"])
-            self.assertEqual(recorded[1][:2], ["systemctl", "try-restart"])
-            self.assertEqual(set(recorded[1][2:]), set(updater.MEDIA_SERVICES))
+            # The talk credential is minted before the units that read it are
+            # republished and restarted, so a host that only ever follows
+            # releases ends the run with a working push-to-talk rather than a
+            # sidecar refusing the loopback pull.
+            self.assertEqual(
+                recorded[0][1:],
+                [str(release / "gate_media_config.py"), "talk-credential",
+                 "--env", str(updater.TALK_CREDENTIAL_ENVIRONMENT), "--ensure"],
+            )
+            self.assertEqual(recorded[1], ["systemctl", "daemon-reload"])
+            self.assertEqual(recorded[2][:2], ["systemctl", "try-restart"])
+            self.assertEqual(set(recorded[2][2:]), set(updater.MEDIA_SERVICES))
+            self.assertEqual(
+                Path("/etc/gate-media/talk.env"), updater.TALK_CREDENTIAL_ENVIRONMENT
+            )
+
+    def test_a_release_without_the_config_validator_cannot_mint_a_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "release"
+            release.mkdir()
+
+            with self.assertRaises(UpdateError):
+                updater._ensure_talk_credential(release, config())
 
 
 class ProxyTemplateTests(unittest.TestCase):

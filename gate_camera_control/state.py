@@ -24,8 +24,9 @@ REASONS = (
     "ready", "not_observed", "camera_busy", "camera_unreachable", "camera_error",
 )
 TALK_REASONS = (
-    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "unsupported",
-    "camera_auth", "camera_busy", "camera_unreachable", "camera_error",
+    "ready", "not_enabled", "not_probed", "ffmpeg_missing", "no_credential",
+    "unsupported", "camera_auth", "camera_busy", "camera_unreachable",
+    "camera_error",
 )
 
 

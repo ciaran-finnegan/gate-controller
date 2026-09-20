@@ -10,6 +10,13 @@ Type=simple
 User=gate-camera-control
 Group=gate-camera-control
 EnvironmentFile=/etc/gate-camera-control.env
+# This host's loopback RTSP credential for the `talk` path, minted by
+# whichever installer or updater run reached it first. Optional (`-`)
+# so a host that predates it still starts: without it push-to-talk
+# reports `no_credential` and everything else is unaffected. systemd
+# reads it as root, which is why two services that share no group and
+# no other file can both be given it.
+EnvironmentFile=-/etc/gate-media/talk.env
 Environment=PYTHONPATH=/usr/local/lib/gate-camera-control
 ExecStart=/usr/bin/python3 -m gate_camera_control
 Restart=always
@@ -28,6 +35,11 @@ ReadWritePaths=/run/gate-camera
 StateDirectory=gate-camera
 StateDirectoryMode=0700
 NoNewPrivileges=true
+# /proc/<pid>/cmdline is world-readable, and this service's own carries the
+# talk credential for as long as ffmpeg is pulling the operator's microphone.
+# Nothing here reads another user's processes, and with this it cannot -- the
+# other services on the Pi carry the same line for the other direction.
+ProtectProc=invisible
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

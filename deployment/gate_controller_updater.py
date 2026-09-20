@@ -1076,6 +1076,12 @@ CAMERA_CONTROL_LIBRARY = Path("/usr/local/lib/gate-camera-control")
 CAMERA_CONTROL_ENVIRONMENT = Path("/etc/gate-camera-control.env")
 MEDIA_LIBRARY = Path("/usr/local/lib/gate-media")
 MEDIA_CONFIG_ROOT = Path("/etc/gate-media")
+# This host's loopback RTSP credential for the media gateway's `talk` path,
+# shared by the auth sidecar and gate-camera-control through systemd reading it
+# as root for both. It lives under MEDIA_CONFIG_ROOT because that is a directory
+# this unit already grants itself: a credential the updater could not mint would
+# leave every automatic release with push-to-talk refused.
+TALK_CREDENTIAL_ENVIRONMENT = MEDIA_CONFIG_ROOT / "talk.env"
 SYSTEMD_UNIT_ROOT = Path("/etc/systemd/system")
 TMPFILES_ROOT = Path("/etc/tmpfiles.d")
 # try-restart, so a unit the operator has stopped stays stopped. The
@@ -1286,6 +1292,27 @@ def _warn_if_proxy_template_changed(release: Path) -> bool:
     return True
 
 
+def _ensure_talk_credential(release: Path, config: UpdateConfig) -> None:
+    """Mint this host's talk credential once, before the units that read it.
+
+    install-media.sh and install-camera-control.sh do the same thing, so a Pi
+    that is bootstrapped by hand already has one and this is a no-op. It is here
+    so that a host which only ever follows releases gets one too -- otherwise
+    the sidecar would refuse `read`/`talk` forever and push-to-talk would report
+    `no_credential` with nothing in the release able to fix it.
+
+    Nothing is printed: the validator writes the value straight into the file.
+    """
+    validator = release / "gate_media_config.py"
+    if validator.is_symlink() or not validator.is_file():
+        raise UpdateError("release does not contain gate_media_config.py")
+    _run_command(
+        [sys.executable, validator, "talk-credential",
+         "--env", TALK_CREDENTIAL_ENVIRONMENT, "--ensure"],
+        config=config, cwd=release, timeout=60,
+    )
+
+
 def _refresh_media(release: Path, config: UpdateConfig) -> None:
     """Publish the media library, config template and units, then restart.
 
@@ -1298,6 +1325,7 @@ def _refresh_media(release: Path, config: UpdateConfig) -> None:
         "lib": MEDIA_LIBRARY, "config": MEDIA_CONFIG_ROOT, "unit": SYSTEMD_UNIT_ROOT,
     }
     _warn_if_proxy_template_changed(release)
+    _ensure_talk_credential(release, config)
     for relative, published, mode in MEDIA_PUBLISHED_FILES:
         kind, _separator, name = published.partition("/")
         _install_file(release / relative, targets[kind] / name, mode)
@@ -1319,7 +1347,8 @@ MANAGED_COMPONENTS: tuple[ManagedComponent, ...] = (
         marker=CAMERA_CONTROL_LIBRARY / COMPONENT_MARKER_NAME,
         configured=_camera_control_configured,
         refresh=_refresh_camera_control,
-        writable=(CAMERA_CONTROL_LIBRARY, SYSTEMD_UNIT_ROOT, TMPFILES_ROOT),
+        writable=(CAMERA_CONTROL_LIBRARY, SYSTEMD_UNIT_ROOT, TMPFILES_ROOT,
+                  MEDIA_CONFIG_ROOT),
     ),
     ManagedComponent(
         name="media",

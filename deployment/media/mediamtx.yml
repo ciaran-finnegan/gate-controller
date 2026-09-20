@@ -21,6 +21,12 @@ playbackAddress: 127.0.0.1:9996
 # The RTSP server is TCP-only and loopback-only for the isolated transcoder.
 rtsp: true
 rtspTransports: ["tcp"]
+# There is deliberately no RTSP auth-method setting here: 1.19.3 has no such
+# key (tests/fixtures/mediamtx-v1.19.3-schema.json), because RTSP digest was
+# dropped once external auth existed -- a hook cannot validate a digest it has
+# no plaintext password for. Basic is the only method, which is what the `talk`
+# credential below relies on: MediaMTX hands the sidecar the exact user and
+# password it received.
 rtspAddress: 127.0.0.1:8554
 rtspsAddress: 127.0.0.1:8322
 rtpAddress: 127.0.0.1:8000
@@ -68,6 +74,10 @@ paths:
   # `publish`/`talk` token; gate-camera-control reads it back over loopback
   # RTSP and forwards it to the camera. One publisher at a time, and the
   # camera-control service kicks it when its bounded session ends.
+  #
+  # Unlike `camera` and `clear`, that read is not anonymous: the sidecar grants
+  # `read`/`talk` only to this host's /etc/gate-media/talk.env credential, so
+  # another process on the Pi cannot pull the operator's live microphone.
   talk:
     source: publisher
     overridePublisher: false
