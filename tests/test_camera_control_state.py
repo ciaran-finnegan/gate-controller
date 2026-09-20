@@ -325,7 +325,20 @@ class CameraControlDeploymentTests(unittest.TestCase):
 
         self.assertEqual("gate-camera-control", unit["User"])
         self.assertEqual("gate-camera-control", unit["Group"])
-        self.assertEqual("/etc/gate-camera-control.env", unit["EnvironmentFile"])
+        # Its own camera credentials, plus the talk credential it shares with
+        # the auth sidecar -- which is a separate file precisely so the sidecar
+        # never gets near the camera credentials above. Optional, so a host
+        # that predates it still starts and talk reports no_credential.
+        self.assertEqual(
+            [
+                "EnvironmentFile=/etc/gate-camera-control.env",
+                "EnvironmentFile=-/etc/gate-media/talk.env",
+            ],
+            [line for line in (
+                REPOSITORY_ROOT / "deployment/systemd/gate-camera-control.service"
+            ).read_text(encoding="utf-8").splitlines()
+             if line.startswith("EnvironmentFile=")],
+        )
         self.assertEqual("/usr/bin/python3 -m gate_camera_control", unit["ExecStart"])
         self.assertEqual("/run/gate-camera", unit["ReadWritePaths"])
 
