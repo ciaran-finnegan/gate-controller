@@ -29,7 +29,9 @@ from datetime import datetime, timezone
 import logging
 import subprocess
 
-from .audio_segments import SegmentStore, segment_started_at
+from .audio_segments import (
+    GapLedger, SegmentStore, listening_gaps, segment_coverage, segment_started_at,
+)
 from .gate_audio_detect import (
     CONFIRMED, FRAME_SAMPLES, UNCONFIRMED, analyse_frames, find_clangs,
     movements_from, summarise,
@@ -193,7 +195,73 @@ def scan(store: SegmentStore, model: GateSoundModel, *, already_scanned=(),
     return ScanResult(len(scanned), frames, len(moves), len(segments) - len(pending)), moves, scanned
 
 
-def record(connection, moves, scanned, *, now=None) -> int:
+#: Created here rather than in the store's migration, for the reason the
+#: scanner already opens the store first: the scanner can be a newer release
+#: than the service beside it, and "no such table" is how that was found out.
+LISTENING_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS gate_listening (
+        segment TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        span_seconds REAL NOT NULL,
+        audio_seconds REAL NOT NULL,
+        missing_seconds REAL NOT NULL,
+        recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS gate_listening_started_at
+        ON gate_listening (started_at DESC);
+    CREATE TABLE IF NOT EXISTS gate_listening_gaps (
+        started_at TEXT NOT NULL,
+        cause TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        missing_seconds REAL NOT NULL,
+        detail TEXT,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (started_at, cause)
+    );
+"""
+
+
+@dataclass(frozen=True)
+class Listening:
+    """How much of the scanned span was audio, and the gaps in it."""
+
+    coverage: tuple
+    gaps: tuple
+
+
+def measure_listening(store: SegmentStore, scanned) -> Listening:
+    """For the segments just scanned: what was heard, and what was not.
+
+    A movement that is not in ``gate_movements`` has until now meant one
+    thing, that the gate did not move. Over 44 measured hours the recorder
+    held 95% of the wall clock, and one relay-commanded cycle lost the whole
+    of its closing to the other 5%. Silence and deafness have to be told
+    apart, and this is where they are: every scanned segment is measured
+    against the span it covers, and what is missing is written down with the
+    recorder's own reason where it left one.
+
+    Reads each segment's frame headers once more. That is 2.4 MB a segment
+    beside a decode and a MobileNet pass over the same file, off the path.
+    """
+    names = [name for name, _ in scanned]
+    if not names:
+        return Listening((), ())
+    coverage = segment_coverage(store, names)
+    if not coverage:
+        return Listening((), ())
+    since = min(row["started_at"] for row in coverage)
+    recorded = GapLedger(store.directory).read(since=since)
+    gaps = listening_gaps(coverage, recorded)
+    for gap in gaps:
+        LOGGER.warning(
+            "gate_sound stage=not_listening from=%s to=%s missing_seconds=%.1f cause=%s",
+            gap["started_at"].isoformat(), gap["ended_at"].isoformat(),
+            gap["missing_seconds"], gap["cause"],
+        )
+    return Listening(tuple(coverage), tuple(gaps))
+
+
+def record(connection, moves, scanned, *, now=None, listening: Listening | None = None) -> int:
     """Write movements and mark the segments, in one transaction.
 
     A movement is keyed on when it started, so re-scanning a segment after a
@@ -201,7 +269,28 @@ def record(connection, moves, scanned, *, now=None) -> int:
     """
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     written = 0
+    if listening is not None:
+        connection.executescript(LISTENING_SCHEMA)
     with connection:
+        for row in (listening.coverage if listening is not None else ()):
+            connection.execute(
+                "INSERT INTO gate_listening (segment, started_at, span_seconds,"
+                " audio_seconds, missing_seconds, recorded_at) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(segment) DO UPDATE SET span_seconds=excluded.span_seconds,"
+                " audio_seconds=excluded.audio_seconds,"
+                " missing_seconds=excluded.missing_seconds, recorded_at=excluded.recorded_at",
+                (row["segment"], row["started_at"].isoformat(), round(row["span_seconds"], 2),
+                 round(row["audio_seconds"], 2), round(row["missing_seconds"], 2), stamp),
+            )
+        for gap in (listening.gaps if listening is not None else ()):
+            connection.execute(
+                "INSERT INTO gate_listening_gaps (started_at, cause, ended_at,"
+                " missing_seconds, detail, recorded_at) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(started_at, cause) DO UPDATE SET ended_at=excluded.ended_at,"
+                " missing_seconds=excluded.missing_seconds, detail=excluded.detail",
+                (gap["started_at"].isoformat(), gap["cause"], gap["ended_at"].isoformat(),
+                 round(gap["missing_seconds"], 2), gap["detail"], stamp),
+            )
         for move in moves:
             connection.execute(
                 "INSERT INTO gate_movements (started_at, ended_at, seconds, outcome,"
@@ -301,7 +390,7 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
         ended = datetime.fromisoformat(last[1])
     except (TypeError, ValueError):
         ended = moment
-    return {
+    report = {
         "state": state,
         "state_confirmation": last[3] or UNCONFIRMED,
         "since": last[1],
@@ -321,4 +410,53 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
         "segments_scanned": scanned[0] if scanned else 0,
         "last_scan_at": scanned[1] if scanned else None,
         "detector": DETECTOR,
+    }
+    # Additive, and absent until the scanner has measured something.
+    report.update(listening_state(connection, now=moment, recent_hours=recent_hours))
+    return report
+
+
+def listening_state(connection, *, now=None, recent_hours: int = 24) -> dict:
+    """How much of the window the microphone was actually heard, for the heartbeat.
+
+    Every other number in the gate block is a count of things heard, and none
+    of them can be read without this one: "no closing heard" from a recorder
+    that was listening is a gate standing open, and from one that was not it is
+    nothing at all.
+
+    ``listening_24h_seconds`` is audio on the card, measured from its frames,
+    not time a process was up. ``not_listening_24h_seconds`` is the span those
+    segments cover less that audio, so the two add up to what was scanned
+    rather than to 86400 -- a scanner two hours old must not read as 92% deaf.
+
+    Empty when nothing has been measured, which a reader must show as unknown.
+    """
+    moment = now or datetime.now(timezone.utc)
+    since = (moment - _seconds(recent_hours * 3600)).isoformat()
+    try:
+        heard = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(audio_seconds), 0), COALESCE(SUM(missing_seconds), 0)"
+            " FROM gate_listening WHERE started_at >= ?", (since,),
+        ).fetchone()
+        gaps = connection.execute(
+            "SELECT COUNT(*), COALESCE(MAX(missing_seconds), 0) FROM gate_listening_gaps"
+            " WHERE started_at >= ?", (since,),
+        ).fetchone()
+        latest = connection.execute(
+            "SELECT started_at, ended_at, cause FROM gate_listening_gaps"
+            " WHERE started_at >= ? ORDER BY started_at DESC LIMIT 1", (since,),
+        ).fetchone()
+    except Exception:
+        # A database the newer scanner has not written to yet.
+        return {}
+    if not heard or not heard[0]:
+        return {}
+    return {
+        "listening_24h_seconds": round(heard[1]),
+        "not_listening_24h_seconds": round(heard[2]),
+        "listening_gaps_24h": gaps[0],
+        "longest_gap_24h_seconds": round(gaps[1]),
+        "last_gap_at": latest[0] if latest else None,
+        "last_gap_until": latest[1] if latest else None,
+        "last_gap_cause": latest[2] if latest else None,
     }
