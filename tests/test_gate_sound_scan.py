@@ -108,6 +108,53 @@ class Recording(unittest.TestCase):
     def test_a_database_without_the_table_scans_everything_rather_than_failing(self):
         self.assertEqual(already_scanned(sqlite3.connect(":memory:")), set())
 
+    def test_how_sure_the_detector_is_survives_the_write(self):
+        """The dashboard was shown a count with no confidence attached to it.
+
+        Over 49.2 hours of recording the previous model produced 25-59
+        movements a day that a person looking at the spectrogram identified as
+        wind, rain, a car on the road or a farm machine, and the heartbeat
+        presented the total as a number of times the gate moved.
+        """
+        record(self.connection, self.movement(outcome="shut"), [("gate-a.aac", 100)])
+
+        row = self.connection.execute(
+            "SELECT confirmation, latch_at, latch_peak_dbfs FROM gate_movements"
+        ).fetchone()
+        self.assertEqual(row[0], "confirmed")
+        self.assertIsNotNone(row[1])
+        self.assertAlmostEqual(row[2], -24.0)
+
+    def test_a_movement_only_the_model_believes_in_says_so(self):
+        moves = movements_from(
+            [MotorRun(start=MOMENT, end=MOMENT + timedelta(seconds=20))], [],
+        )
+        record(self.connection, moves, [("gate-a.aac", 100)])
+
+        row = self.connection.execute(
+            "SELECT confirmation, latch_at FROM gate_movements"
+        ).fetchone()
+        self.assertEqual(row[0], "unconfirmed")
+        self.assertIsNone(row[1])
+
+    def test_a_latch_heard_beside_an_opening_is_still_written_down(self):
+        """The alternation decides what a latch *meant*; it is recorded either
+        way, because a heard impact is evidence and the alternation is a
+        guess that a single false movement inverts."""
+        moves = movements_from(
+            [MotorRun(start=MOMENT, end=MOMENT + timedelta(seconds=20))],
+            [Clang(at=MOMENT + timedelta(seconds=19), high_share=0.7, peak_dbfs=-24.0)],
+            initial_state="shut",
+        )
+        record(self.connection, moves, [("gate-a.aac", 100)])
+
+        row = self.connection.execute(
+            "SELECT outcome, clang_at, latch_at FROM gate_movements"
+        ).fetchone()
+        self.assertEqual(row[0], "open")
+        self.assertIsNone(row[1], "the state machine did not call this a closure")
+        self.assertIsNotNone(row[2], "but the impact was still heard")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -173,6 +220,36 @@ class GateStateForTheHeartbeat(unittest.TestCase):
 
         self.assertEqual(state["uncommanded_24h"], 1)
         self.assertEqual(state["movements_24h"], 1)
+
+    def test_the_heartbeat_separates_corroborated_movements_from_the_rest(self):
+        """`movements_24h` is a ceiling, not a count, and the dashboard needs
+        to be able to tell the difference without being told how."""
+        record(self.connection, self.movement(
+            seconds_ago=600, seconds=20, commanded=True, shut=True,
+        ), [("a.aac", 10)], now=self.now)
+        record(self.connection, movements_from(
+            [MotorRun(start=self.now - timedelta(seconds=900),
+                      end=self.now - timedelta(seconds=880))], [],
+        ), [("b.aac", 10)], now=self.now)
+
+        state = self.gate_state(self.connection, now=self.now)
+
+        self.assertEqual(state["movements_24h"], 2)
+        self.assertEqual(state["confirmed_24h"], 1)
+        self.assertEqual(state["unconfirmed_24h"], 1)
+        self.assertEqual(state["latches_heard_24h"], 1)
+
+    def test_the_state_carries_how_sure_the_detector_was_of_it(self):
+        """A gate reported shut on nothing but a classifier's opinion must not
+        look the same as one whose latch was heard."""
+        record(self.connection, self.movement(
+            seconds_ago=300, seconds=20, commanded=False, shut=False,
+        ), [("a.aac", 10)], now=self.now)
+
+        self.assertEqual(
+            self.gate_state(self.connection, now=self.now)["state_confirmation"],
+            "unconfirmed",
+        )
 
     def test_a_database_without_the_tables_says_nothing(self):
         self.assertIsNone(self.gate_state(sqlite3.connect(":memory:"), now=self.now))

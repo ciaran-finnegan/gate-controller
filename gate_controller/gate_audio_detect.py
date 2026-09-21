@@ -80,6 +80,45 @@ MOTOR_GAP_SECONDS = 1.5
 #: belongs to it, and a level floor is what stops birdsong qualifying.
 CLANG_HIGH_SHARE = 0.25
 CLANG_MIN_DBFS = -38.0
+#: How far the impact must stand above the audio around it.
+#:
+#: This is the number that stops the rule calling loud noise a latch. Measured
+#: on the ten commanded cycles in 49.2 hours of retained recording, taking the
+#: median level of the two seconds either side of each candidate:
+#:
+#: ===================  =========  ========  ==========
+#: candidate            local med  peak      prominence
+#: ===================  =========  ========  ==========
+#: latch 09-19 08:28        -51.5     -24.2      27.3 dB
+#: latch 09-19 18:35        -55.3     -27.8      27.5 dB
+#: latch 09-20 09:58        -58.3     -26.2      32.1 dB
+#: latch 09-20 15:12        -57.4     -25.2      32.2 dB
+#: latch 09-20 18:16        -36.5     -15.0      21.5 dB
+#: *not* a latch 18:59       -9.0      -5.5       3.5 dB
+#: *not* a latch 12:29       -6.4      -5.4       1.0 dB
+#: *not* a latch 16:58       -6.8      -5.3       1.5 dB
+#: ===================  =========  ========  ==========
+#:
+#: The three at the bottom are a repeating chirp -- a bird, four calls a
+#: second -- in audio the microphone has pinned at about -7 dBFS. Every frame
+#: of it clears both the share and the level floor, because when everything is
+#: loud a level floor means nothing. Clustering happened to keep the real
+#: latch in those three windows, so this fixes a near miss rather than a
+#: reported error: over the same 49.2 hours it removes 75 of 795 candidates
+#: and keeps all eight of the commanded latches.
+#:
+#: Prominence is a difference of levels, so unlike a band *share* it has no
+#: denominator to saturate, which is the same fault that killed the first
+#: motor rule. Twelve decibels sits in the empty space between 3.5 and 21.5,
+#: nearer the noise, because inventing a closure is worse than missing one:
+#: the claim this supports is that the property is secured.
+CLANG_PROMINENCE_DB = 12.0
+#: How much audio either side of a candidate counts as "the background it
+#: stands above". Two seconds is long enough to average over a gust and short
+#: enough that the measurement belongs to this moment rather than to the
+#: minute; it is also the window the eight commanded latches above were
+#: measured over.
+CLANG_BACKGROUND_SECONDS = 2.0
 #: One impact rings for a few hundred milliseconds. Frames inside this of each
 #: other are the same clang, reported once.
 CLANG_CLUSTER_SECONDS = 1.5
@@ -121,6 +160,17 @@ class Clang:
     peak_dbfs: float
 
 
+#: A movement two independent things agree on: the relay fired, or the latch
+#: was heard, or both. Only these should ever be counted out loud.
+CONFIRMED = "confirmed"
+#: A movement only the motor classifier believes in. It may well be real -- a
+#: fob opening fires no relay and a gate standing open has no latch to hear --
+#: but nothing outside the model says so, and over 49.2 hours of recording the
+#: previous model produced 25-59 of these a day that a person looking at the
+#: spectrogram identified as wind, rain, a passing car or a farm machine.
+UNCONFIRMED = "unconfirmed"
+
+
 @dataclass(frozen=True)
 class GateMovement:
     """One motor run and what it turned out to be."""
@@ -135,6 +185,26 @@ class GateMovement:
     #: True when no relay command preceded this. Somebody used a fob, a keypad
     #: or a hand, and until now nothing in the system would have known.
     uncommanded: bool = False
+    #: A relay firing brackets this run. Unlike ``uncommanded`` -- which is
+    #: about openings only, because nobody commands the auto-close -- this is
+    #: asked of every run, and is half of what ``confirmation`` is made of.
+    commanded: bool = False
+    #: A latch heard beside this run's end, *whatever the state machine made
+    #: of it*. ``clang`` above is the subset the alternation accepted as proof
+    #: of closure; this is the physical observation, kept separately because
+    #: the alternation is the least reliable belief in the system and a latch
+    #: is not. Measured on the ten commanded cycles in the retained audio: the
+    #: latch is audible on eight of the nine whose auto-close was recorded,
+    #: and six to seven of those eight land within the four seconds of a motor
+    #: run's end that the state machine will look at -- but whether that run
+    #: is read as a *closing* depends on an alternation that one false
+    #: movement inverts for the rest of the scan.
+    latch: Clang | None = None
+
+    @property
+    def confirmation(self) -> str:
+        """Whether anything outside the motor model agrees this happened."""
+        return CONFIRMED if (self.commanded or self.latch is not None) else UNCONFIRMED
 
     def as_dict(self) -> dict:
         return {
@@ -143,10 +213,16 @@ class GateMovement:
             "seconds": round(self.seconds, 2),
             "outcome": self.outcome,
             "uncommanded": self.uncommanded,
+            "confirmation": self.confirmation,
             "clang": None if self.clang is None else {
                 "at": self.clang.at.isoformat(),
                 "high_share": round(self.clang.high_share, 3),
                 "peak_dbfs": round(self.clang.peak_dbfs, 1),
+            },
+            "latch": None if self.latch is None else {
+                "at": self.latch.at.isoformat(),
+                "high_share": round(self.latch.high_share, 3),
+                "peak_dbfs": round(self.latch.peak_dbfs, 1),
             },
         }
 
@@ -215,10 +291,37 @@ def find_motor_runs(frames) -> list[MotorRun]:
 
 
 def find_clangs(frames) -> list[Clang]:
-    """Impacts bright enough to be metal, clustered so one impact is one event."""
+    """Impacts bright enough to be metal, loud enough, and *prominent*.
+
+    The third test is what was missing. ``high_share`` and ``dbfs`` both
+    describe the frame on its own, and a frame of continuous loud noise
+    satisfies them as readily as an impact does -- which is why a bird calling
+    four times a second into a microphone pinned at -7 dBFS produced latch
+    candidates at all, in three of the eight commanded cycles measured.
+
+    An impact is by definition a departure from what came before it. The
+    caller passes the window it cares about -- ``scan_segment`` passes the
+    four seconds either side of a motor run's end -- and the median level of
+    that window is the background the candidate has to stand above.
+    """
+    frames = list(frames)
+    if not frames:
+        return []
+    levels = [frame["dbfs"] for frame in frames]
+    span = max(1, int(CLANG_BACKGROUND_SECONDS / (HOP_SAMPLES / 16000.0)))
     found: list[Clang] = []
-    for frame in frames:
+    for index, frame in enumerate(frames):
         if frame["high_share"] < CLANG_HIGH_SHARE or frame["dbfs"] < CLANG_MIN_DBFS:
+            continue
+        # The background is taken from beside this frame rather than from the
+        # whole of whatever the caller passed in: a caller handing over two
+        # minutes would otherwise measure a candidate against a median from a
+        # different minute of weather.
+        near = sorted(levels[max(0, index - span):index + span + 1])
+        middle = len(near) // 2
+        background = (near[middle] if len(near) % 2
+                      else (near[middle - 1] + near[middle]) / 2)
+        if frame["dbfs"] < background + CLANG_PROMINENCE_DB:
             continue
         candidate = Clang(frame["at"], frame["high_share"], frame["dbfs"])
         if found and (candidate.at - found[-1].at).total_seconds() <= CLANG_CLUSTER_SECONDS:
@@ -278,13 +381,18 @@ def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut"
     out: list[GateMovement] = []
     for run in runs:
         closing = state == "open"
-        ending = None
-        if closing:
-            for clang in clangs:
-                offset = (clang.at - run.end).total_seconds()
-                if -CLANG_ATTRIBUTION_SECONDS <= offset <= CLANG_ATTRIBUTION_SECONDS:
-                    if ending is None or clang.peak_dbfs > ending.peak_dbfs:
-                        ending = clang
+        # The loudest latch beside this run's end, found whatever the state
+        # machine believes. It is recorded either way and only *interpreted*
+        # when the gate was open, which keeps the outcome rule exactly as it
+        # was while stopping a heard latch from being thrown away because the
+        # alternation had drifted.
+        latch = None
+        for clang in clangs:
+            offset = (clang.at - run.end).total_seconds()
+            if -CLANG_ATTRIBUTION_SECONDS <= offset <= CLANG_ATTRIBUTION_SECONDS:
+                if latch is None or clang.peak_dbfs > latch.peak_dbfs:
+                    latch = clang
+        ending = latch if closing else None
         if closing:
             # A closing run with no clang did not finish: the gate is stuck,
             # was reversed, or the recorder missed it. "open" is the safe
@@ -293,13 +401,15 @@ def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut"
             outcome = "shut" if ending is not None else "open"
         else:
             outcome = "open"
-        uncommanded = (not closing) and not any(
+        commanded = any(
             -COMMAND_BEFORE_SECONDS <= (run.start - moment).total_seconds() <= COMMAND_AFTER_SECONDS
             for moment in commands
         )
+        uncommanded = (not closing) and not commanded
         out.append(GateMovement(
             start=run.start, end=run.end, seconds=run.seconds,
             outcome=outcome, clang=ending, uncommanded=uncommanded,
+            commanded=commanded, latch=latch,
         ))
         state = "shut" if outcome == "shut" else "open"
     return out
@@ -310,9 +420,17 @@ def summarise(moves) -> dict:
     moves = list(moves)
     if not moves:
         return {"movements": 0, "final_state": "unknown", "uncommanded": 0,
-                "shut": 0, "left_open": 0}
+                "shut": 0, "left_open": 0, "confirmed": 0, "unconfirmed": 0,
+                "latches_heard": 0}
     return {
         "movements": len(moves),
+        # The count worth saying out loud, and the count that is only the
+        # model's opinion. Reporting the sum as though it were one number is
+        # how a hundred and twenty movements a day came to be presented as a
+        # fact about a gate that moves about twenty times.
+        "confirmed": sum(1 for m in moves if m.confirmation == CONFIRMED),
+        "unconfirmed": sum(1 for m in moves if m.confirmation == UNCONFIRMED),
+        "latches_heard": sum(1 for m in moves if m.latch is not None),
         # The last movement is what the gate is doing now: if it ended with a
         # clang the gate is shut, and if it did not, the gate is standing open.
         "final_state": "shut" if moves[-1].outcome == "shut" else "open",

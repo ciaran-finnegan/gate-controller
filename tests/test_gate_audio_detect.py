@@ -110,10 +110,20 @@ class ClangTests(unittest.TestCase):
 class MovementTests(unittest.TestCase):
     """The part that matters: what the gate was left doing."""
 
+    #: The motor is *quiet*. Measured over 49.2 hours of recording at this
+    #: gate, a closing travel sits at -49 to -58 dBFS and the latch that ends
+    #: it peaks at -15 to -31: the impact is twenty to thirty decibels above
+    #: the motor that preceded it. This fixture used to make them the same
+    #: loudness, which is not a gate and which is why the detector had no
+    #: reason to notice that a bird pinning the microphone at -7 dBFS looks
+    #: nothing like an impact.
+    MOTOR_AMPLITUDE = 0.01
+
     def _cycle(self, *, with_clang: bool):
         # The measured shape: motor, then a pause, then motor, ending with the
         # leaves meeting -- or not.
-        samples = quiet(1.0) + tone(6.0, 2000) + quiet(4.0) + tone(6.0, 2000)
+        motor = lambda: tone(6.0, 2000, amplitude=self.MOTOR_AMPLITUDE)
+        samples = quiet(1.0) + motor() + quiet(4.0) + motor()
         samples += clang() if with_clang else quiet(1.0)
         return frames_of(samples + quiet(1.0))
 
@@ -152,7 +162,8 @@ class MovementTests(unittest.TestCase):
     def test_a_gate_already_open_closes_on_its_next_movement(self):
         # One run, ending in the leaves meeting, on a gate that was standing
         # open: the movement can only be a close, and it completed.
-        frames = frames_of(quiet(1.0) + tone(6.0, 2000) + clang() + quiet(1.0))
+        frames = frames_of(quiet(1.0) + tone(6.0, 2000, amplitude=self.MOTOR_AMPLITUDE)
+                           + clang() + quiet(1.0))
         moves = movements(frames, initial_state="open")
         self.assertEqual(moves[0].outcome, "shut")
         self.assertIsNotNone(moves[0].clang)
@@ -161,7 +172,8 @@ class MovementTests(unittest.TestCase):
         # Identical audio, opposite starting state, opposite meaning. This is
         # exactly why alternation carries the interpretation and the clang
         # alone does not.
-        frames = frames_of(quiet(1.0) + tone(6.0, 2000) + clang() + quiet(1.0))
+        frames = frames_of(quiet(1.0) + tone(6.0, 2000, amplitude=self.MOTOR_AMPLITUDE)
+                           + clang() + quiet(1.0))
         moves = movements(frames, initial_state="shut")
         self.assertEqual(moves[0].outcome, "open")
 
