@@ -58,13 +58,27 @@ class ThePass(unittest.TestCase):
                     " VALUES (?, '2026-09-20T08:00:00+00:00', 'ocr', 'no_match', 0, ?)", (event_id, key))
 
     def test_only_decisive_verdicts_are_sent(self):
-        """An unknown is kept locally but never sent: it could only erase."""
+        """An unknown is kept locally but never sent as a verdict: it could only
+        erase. What is sent is now the passage's combined verdict rather than
+        the single photo's, so the three events are set ten minutes apart to
+        make them three passages, as they were when this was written."""
+        from gate_controller import direction_passages
+
         now = "2026-09-20T09:00:00+00:00"
+        with self.connection:
+            for event_id, minute in ((2, 10), (3, 20)):
+                self.connection.execute("UPDATE events SET received_at = ? WHERE id = ?",
+                                        (f"2026-09-20T08:{minute}:00+00:00", event_id))
         self.scan.record(self.connection, 1, status="read", reading=FrameReading(0.04, 0.95, "rear"), now=now)
         self.scan.record(self.connection, 2, status="read", reading=FrameReading(0.0, 0.0, "empty"), now=now)
         self.scan.record(self.connection, 3, status="no_image", now=now)
+        direction_passages.ensure_schema(self.connection)
 
-        self.assertEqual([(row[0], row[2]) for row in self.scan.unshipped(self.connection)], [(1, EXITING)])
+        passages = direction_passages.judge_passages(self.connection, "2026-09-20T00:00:00+00:00")
+        verdicts, retractions = self.scan.outstanding(self.connection, passages)
+
+        self.assertEqual([(entry["event_id"], entry["direction"]) for entry in verdicts], [(1, EXITING)])
+        self.assertEqual(retractions, [])
 
     def test_a_judged_event_is_not_judged_again(self):
         self.scan.record(self.connection, 1, status="read", reading=FrameReading(1.0, 0.0, "front"),
