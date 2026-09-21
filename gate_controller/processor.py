@@ -337,18 +337,25 @@ class GateProcessor:
         if not _is_fresh(self._clock(), received_at, self._max_image_age):
             return prepared
         if self._local_pass is not None:
-            self._prepare_local_pass(prepared, deadline, stillness)
+            self._prepare_local_pass(prepared, deadline, stillness, sweep_read)
         if not prepared.decided:
-            # A frame the device could not decide may be a machine with no
-            # plate to read. The reading is begun now, while the frame is new,
-            # and costs this thread nothing unless the policy is `on`.
+            # A frame the device could not decide -- read here, or carried in
+            # already read by the sweep -- may be a machine with no plate to
+            # read. The reading is begun now, while the frame is new, and
+            # costs this thread nothing unless the policy is `on`. A frame the
+            # device *did* decide, by either read, is never shown to it.
             self._begin_farm_machinery(prepared, deadline)
         return prepared
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
-                            stillness: float | None) -> None:
-        """The on-device read for the first frame, recorded on ``prepared``."""
-        paths, trace = prepared.paths, prepared.trace
+                            stillness: float | None, sweep_read=None) -> None:
+        """The on-device read for the first frame, recorded on ``prepared``.
+
+        A read the sweep carried in with the frame is adopted first, and stands
+        in for the inference only (:meth:`_adopt_sweep_read`); the ordinary
+        local pass runs when there is none, or it cannot be adopted.
+        """
+        paths, digests, trace = prepared.paths, prepared.digests, prepared.trace
         pass_started = self._decision_clock()
         attempt = self._adopt_sweep_read(
             paths[0], digests[0], sweep_read, deadline, trace.trace_id,

@@ -572,6 +572,141 @@ class ThroughTheFastLane(unittest.TestCase):
         self.assertEqual(self.relay.pulses, [])
 
 
+class WithAReadTheSweepCarriedIn(unittest.TestCase):
+    """The sweep's own read of a frame arrives with it (gate-controller #175).
+
+    ``prepare(sweep_read=...)`` adopts it in place of the inference, before any
+    ordinary local pass, through the real client and the real recogniser. The
+    rule for the farm-machinery model is the same as for any on-device read: a
+    carried read that *decides* the frame means the model never sees it; one
+    that does not decide leaves an undecided frame like any other.
+    """
+
+    def setUp(self):
+        from tests.test_processor import RecordingRelay as PlateRelay
+        from tests.test_sweep_pipeline import Gate, digest, frame
+
+        self.gate = Gate(self, answers={})
+        self.addCleanup(self.gate.close)
+        self.root = Path(self.gate.directory.name)
+        self.frame_bytes, self.digest = frame, digest
+        self.tower = TowerByFrame()
+        self.pulses = []
+        self.store = self.gate.store
+        self.PlateRelay = PlateRelay
+
+    def processor(self, mode):
+        return GateProcessor(
+            recognizer=self.gate.client, store=self.store, relay=self.PlateRelay(self.pulses),
+            authorised=lambda: {"10CE1990"}, decision_timeout=7.0,
+            farm_machinery=FarmMachineryPolicy(
+                mode, self.tower, PromptScorer(), hours=Hours.parse("00:00-24:00"),
+            ),
+        )
+
+    def carried(self, seed, plate, score, embedding, *, of=None):
+        from gate_controller.local_recognizer import LocalRecognition
+        from gate_controller.local_sweep import SweepRead
+
+        data = self.frame_bytes(seed)
+        path = self.root / f"frame-{seed}.jpg"
+        path.write_bytes(data)
+        self.tower.shows(path, embedding)
+        return path, SweepRead(
+            status="recognized", plate=plate, score=score, authorised=True,
+            recognition=LocalRecognition(
+                plate=plate, score=score, mean_score=score, status="recognized",
+            ),
+            frame_digest=self.digest(data if of is None else self.frame_bytes(of)),
+        )
+
+    def decide(self, processor, path, read, *, seconds_ago=0.0):
+        captured = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        prepared = processor.prepare((path,), received_at=captured, sweep_read=read)
+        return prepared, processor.process((path,), prepared=prepared)
+
+    def kept(self, result):
+        with closing(sqlite3.connect(self.root / "gate.db")) as connection:
+            return connection.execute(
+                "SELECT would_admit, opened, verdict FROM event_appearance WHERE event_id = ?",
+                (result.event_id,),
+            ).fetchone()
+
+    def test_a_carried_read_that_decides_is_never_shown_to_the_model(self):
+        path, read = self.carried(900, "10CE1990", 0.877, LORRY)
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            prepared, result = self.decide(self.processor("on"), path, read)
+
+        self.assertIn("read=sweep", "\n".join(journal.output), "the carried read was adopted")
+        self.assertTrue(prepared.decided)
+        self.assertIsNone(prepared.appearance_pending)
+        self.assertEqual(self.tower.seen, [], "a frame the device decided never reaches the model")
+        self.assertTrue(result.opened)
+        self.assertEqual(self.pulses, ["relay"])
+        stored = self.store.event_payload(result.event_id)
+        self.assertEqual((stored["source"], stored["reason"], stored["authorised_plate"]),
+                         ("local", "exact_match", "10CE1990"))
+        self.assertIsNone(self.kept(result))
+
+    def test_a_carried_read_that_does_not_decide_leaves_an_undecided_frame_like_any_other(self):
+        """A tractor whose unlisted plate the sweep read: seen once, then seen waiting."""
+        processor = self.processor("on")
+        first, first_read = self.carried(901, "191D12345", 0.99, TELEHANDLER)
+        second, second_read = self.carried(902, "191D12345", 0.99, TELEHANDLER)
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            _prepared, seen_once = self.decide(processor, first, first_read, seconds_ago=2.0)
+            prepared, waiting = self.decide(processor, second, second_read)
+
+        self.assertEqual("\n".join(journal.output).count("read=sweep"), 2)
+        self.assertFalse(prepared.decided)
+        self.assertEqual(len(self.tower.seen), 2, "each undecided frame was read once")
+        self.assertFalse(seen_once.opened)
+        self.assertEqual(self.kept(seen_once), (0, 0, "not_standing_still"))
+        self.assertTrue(waiting.opened)
+        self.assertEqual(self.pulses, ["relay"])
+        stored = self.store.event_payload(waiting.event_id)
+        self.assertEqual((stored["source"], stored["reason"], stored["authorised_plate"]),
+                         ("appearance", "farm_machinery", None))
+        self.assertEqual(self.kept(waiting), (1, 1, "machine_clear"))
+
+    def test_in_shadow_a_carried_read_that_does_not_decide_is_assessed_and_nothing_opens(self):
+        processor = self.processor("shadow")
+        first, first_read = self.carried(903, "191D12345", 0.99, TELEHANDLER)
+        second, second_read = self.carried(904, "191D12345", 0.99, TELEHANDLER)
+        self.decide(processor, first, first_read, seconds_ago=2.0)
+        _prepared, waiting = self.decide(processor, second, second_read)
+
+        self.assertFalse(waiting.opened)
+        self.assertEqual(self.pulses, [])
+        self.assertEqual(self.store.event_payload(waiting.event_id)["reason"], "no_match")
+        self.assertEqual(self.kept(waiting), (1, 0, "machine_clear"))
+
+    def test_the_sweeps_authorised_flag_does_not_keep_a_lorry_from_the_model_or_let_it_in(self):
+        """Flagged authorised by the sweep, not on the list: undecided, assessed, refused."""
+        path, read = self.carried(905, "191D12345", 0.99, LORRY)
+        prepared, result = self.decide(self.processor("on"), path, read)
+
+        self.assertFalse(prepared.decided)
+        self.assertEqual(len(self.tower.seen), 1)
+        self.assertFalse(result.opened)
+        self.assertEqual(self.pulses, [])
+        self.assertEqual(self.kept(result), (0, 0, "road_vehicle"))
+
+    def test_a_read_carried_for_other_pixels_is_refused_before_the_model_is_asked_anything(self):
+        """The digest guard still runs first: the listed plate belongs to another frame."""
+        path, read = self.carried(906, "10CE1990", 0.99, LORRY, of=907)
+        with self.assertLogs("gate_controller", level="INFO") as journal:
+            prepared, result = self.decide(self.processor("on"), path, read)
+
+        text = "\n".join(journal.output)
+        self.assertIn("stage=sweep_read_refused reason=digest_mismatch", text)
+        self.assertIn("read=pipeline", text, "the frame was read afresh, as it always was")
+        self.assertFalse(prepared.decided)
+        self.assertFalse(result.opened)
+        self.assertEqual(self.pulses, [])
+        self.assertEqual(self.kept(result), (0, 0, "road_vehicle"))
+
+
 class TheLiveCallSite(unittest.TestCase):
     """Proof by reading the source that production reaches the policy."""
 
@@ -782,6 +917,34 @@ class TheAssessment(unittest.TestCase):
         while policy._running.locked() and monotonic() < deadline:
             sleep(0.005)
         self.assertEqual(pending.result(0.0).verdict, "road_vehicle")
+
+    def test_no_flood_of_frames_can_make_the_model_a_standing_load(self):
+        clock = {"now": 1000.0}
+        tower = StubTower(LORRY)
+        policy = FarmMachineryPolicy("shadow", tower, PromptScorer(), clock=lambda: clock["now"])
+        verdicts = []
+        for _ in range(agricultural.MAX_READINGS_PER_MINUTE + 3):
+            clock["now"] += 0.5
+            verdicts.append(policy.assess((self.frame,), budget_seconds=5.0, at=NOON).verdict)
+        self.assertEqual(verdicts[:agricultural.MAX_READINGS_PER_MINUTE],
+                         ["road_vehicle"] * agricultural.MAX_READINGS_PER_MINUTE)
+        self.assertEqual(verdicts[agricultural.MAX_READINGS_PER_MINUTE:], ["rate_limited"] * 3)
+        self.assertEqual(tower.calls, agricultural.MAX_READINGS_PER_MINUTE)
+        clock["now"] += 61.0
+        self.assertEqual(policy.assess((self.frame,), budget_seconds=5.0, at=NOON).verdict,
+                         "road_vehicle", "and a minute later it is asked again")
+
+    def test_one_alarm_at_the_sweeps_ceilings_stays_under_the_cap(self):
+        from gate_controller import trigger_capture
+
+        shipped = (trigger_capture.DEFAULT_SWEEP_CLOUD_FRAMES
+                   + trigger_capture.MAX_SWEEP_AUTHORISED_INJECTIONS
+                   + trigger_capture.DEFAULT_SWEEP_FALLBACK_FRAMES)
+        ceiling = (trigger_capture.MAX_SWEEP_CLOUD_FRAMES
+                   + trigger_capture.MAX_SWEEP_AUTHORISED_INJECTIONS
+                   + trigger_capture.MAX_SWEEP_FALLBACK_FRAMES)
+        self.assertEqual((shipped, ceiling), (9, 16), "re-derive MAX_READINGS_PER_MINUTE if these move")
+        self.assertLess(ceiling, agricultural.MAX_READINGS_PER_MINUTE)
 
     def test_the_journal_line_carries_no_path_and_no_plate(self):
         line = Assessment(True, "machine_clear", (FrameScores(0.98, "plant", 0.02, "lorry", 0.0),)).journal()

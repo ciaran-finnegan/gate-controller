@@ -14,6 +14,15 @@ authorised plate. Nothing in it is called OCR.
 `gate_controller/agricultural.py` is the whole of it; `GateProcessor` consults
 it. It is **off** unless the environment says otherwise.
 
+> **Every number below was measured on the old camera aim.** The camera was
+> re-aimed on 2026-09-20 between 16:58 and 18:15 UTC and the crop band is now
+> `GATE_PLATE_REGION=0.10,0.15,0.75,0.75`. All six machinery passages, and all
+> but 19 of the 929 frames, were taken before that; **no machine has been seen
+> on the new aim at all.** The thresholds are therefore a starting point, not a
+> calibration. **A shadow run on the new aim is the validation that gates
+> `on`**: `on` should not be set until shadow has recorded real machinery
+> arriving and leaving on this aim and every `would_admit` has been looked at.
+
 ## The flag
 
 | `GATE_AGRI_ADMIT` | What happens |
@@ -115,19 +124,25 @@ relay is pulsed for a vehicle that is already out — which is what the plate
 path does today for a departing car whose rear plate reads, and is the reason
 to read a shadow run before turning this on.
 
-`DirectionTracker`'s box-width estimate is not consulted: it is fitted on plate
-boxes, answers on 1.8% of passages, and `docs/vehicle-direction.md` records it
-being wrong at this mount. The gate's own movement would be the best signal of
-all and is not available live — `gate_sound_scan` reads finished audio segments
-on a timer, and on 2026-09-19 it logged the telehandler's engine as a 50-second
-gate movement.
+Nothing else available live does better, and `docs/vehicle-direction.md`
+reaches the same place from the other side. `DirectionTracker`'s box-width fit
+is fitted on plate boxes, resolved 7 of 78 passages there and was wrong on two
+of the seven. The gate's own movement is not available live — `gate_sound_scan`
+reads finished audio segments on a timer — and a diesel at walking pace reads
+as the gate motor for most of a minute, so that page's combined verdict says
+nothing when the photo's top label is `machine`: it leaves **both telehandler
+passages of 2026-09-19 `unknown`**, one each way, exactly as here. It also
+records that a pulse for a departure is not hypothetical: the relay fired for
+five departing cars that week, on their rear plates.
 
 ## What was measured
 
 **The photos.** Every event photo the dashboard still holds from 2026-09-01 to
 2026-09-20: **929 frames in 231 passages** (630 on the RLC-810A, 299 on the
 RLC-811A fitted 2026-09-11), fetched back with the controller's own service
-token. The image tower was run **on the Pi** — those are the numbers production
+token. Only the last 19 frames (events 3133–3151, no machinery among them, top
+machinery share 0.001) follow the re-aim of 2026-09-20; everything that says
+anything about machinery is old-aim. The image tower was run **on the Pi** — those are the numbers production
 will produce — and the shipped policy was then replayed over the embeddings in
 capture order. (The Mac agrees to a mean of 0.001 in the machinery share, with
 one frame of 542 differing by 0.18 and crossing the threshold. Quantised
@@ -185,7 +200,14 @@ the four or five it takes the next frame to arrive. A machine that stops too
 far back to score 0.75 (frames 2632 and 2633, at 0.42 and 0.61) is not
 admitted until it pulls forward.
 
-**What has not been measured.** Night: there is not one photo of a machine
+**What has not been measured.** **The current camera aim** — see the note at
+the top. The model reads the *centre square* of the frame (the crop
+`direction_vision` measured; a letterbox shrinks the vehicle until the model
+stops seeing it), so on a 16:9 frame the outer ~22% on each side is never
+looked at. On the old aim machines stood inside it. On the new aim, frame 3140
+shows a car waiting at the far left edge that the model called `empty`; whether
+a tractor stops inside the square on this aim is exactly what shadow has to
+show. Night: there is not one photo of a machine
 after dark, which is why the hours default to #63's window and why
 `outside_hours` is still assessed and recorded. Rain, low sun, and any machine
 other than these three. A lorry: `lorry` was the top class on three frames, all
@@ -199,13 +221,47 @@ over; scoring it against the prompts, in plain Python, adds 1.3 ms). A standalon
 process holding the model peaks at 182 MB; the controller is at 180 MB today
 under a `MemoryMax` of 512 MB on the Pi's unit.
 
+## How many frames it reads
+
+One burst from the sweep is one frame, so one reading. A camera alarm puts a
+bounded number of frames into the pipeline (`trigger_capture.py`):
+
+| | shipped | configuration ceiling |
+| --- | --- | --- |
+| cloud handovers (`GATE_LOCAL_SWEEP_CLOUD_FRAMES`) | 5 | 10 |
+| authorised injections that then failed to decide (`MAX_SWEEP_AUTHORISED_INJECTIONS`) | 3 | 3 |
+| fallback frames when the window closes | 1 | 3 |
+| **undecided frames, so readings, per alarm — worst case** | **9** | **16** |
+
+The sweep's waiting phase (#175: up to 30 s at one read a second) reads on the
+device and injects nothing beyond those caps — its handovers share the same
+five, and while waiting only a frame with a plate in it is handed over. A
+machine with no plate is the measured case: five blind handovers and a
+fallback, **six readings an alarm, which is what the telehandler produced on
+2026-09-19 before #175 as well**. Nine readings is 1.25 s of one core spread
+over a 40 s sweep (139 ms each), beside a sweep that itself uses about 90% of a
+core for its first 10 s. An authorised injection that *does* decide is never
+read at all.
+
+Two things bound it regardless. Readings are strictly one at a time — a burst
+arriving while one runs is answered `busy`, never queued — and no more than
+`MAX_READINGS_PER_MINUTE` = 30 are begun in any rolling minute (4.2 s of one
+core in sixty); past that a burst is answered `rate_limited` and the plate path
+carries on alone. Thirty is three worst-case alarms a minute as shipped. A
+camera's own FTP still, which can carry two frames, costs two.
+
 ## Where it sits, and what it costs a plate
 
 Production reaches `GateProcessor` through the worker's fast lane:
 `prepare` on the burst thread, then `process` there or on the cloud lane.
 
-* `prepare` takes the on-device plate read. **A frame it decides is never shown
-  to the model** — a known plate the device reads opens exactly as it did.
+* `prepare` takes the on-device plate read — the read the sweep carried in with
+  the frame (#175), adopted first and judged exactly as #175 judges it, or
+  else the ordinary local pass. **A frame either one decides is never shown to
+  the model** — a known plate the device reads opens exactly as it did. A
+  carried read that does *not* decide (unlisted plate, under the bar, refused
+  for a digest that is not this file's) leaves an undecided frame like any
+  other, and the sweep's own `authorised` flag is consulted by nothing here.
 * For an undecided frame `prepare` *begins* the reading on its own thread and
   returns. In `shadow` no plate decision waits for it: `process` collects it
   after the plate path has finished with the burst, by which time — a cloud
@@ -274,8 +330,11 @@ ORDER BY e.received_at;
 
 Every `would_admit = 1` wants its photo looked at. `machine`, `margin`,
 `rival` and `direction` are the weakest frame's. `gate_agri` in the journal
-carries the same line per burst, with `elapsed_ms`; `verdict=timeout`, `busy`
-and `no_budget` are the ones that say the Pi is short of time.
+carries the same line per burst, with `elapsed_ms`; `verdict=timeout`, `busy`,
+`rate_limited` and `no_budget` are the ones that say the Pi is short of time.
 
-Re-aiming the camera, which is pending, changes what every frame looks like.
-Re-measure before trusting any number above.
+The camera has been re-aimed since these photos were taken (2026-09-20), which
+changes what every frame looks like. What to look for in the shadow run, before
+`on`: machinery arriving scores `machine_clear` and reaches `would_admit = 1`
+once it has stopped; machinery leaving never does; nothing else comes near
+`machine >= 0.75`; and `verdict` is rarely `timeout`, `busy` or `rate_limited`.

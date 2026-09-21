@@ -22,8 +22,9 @@ What it is careful about, because it opens a physical gate
 * **Nothing that is leaving.** A departing vehicle comes from behind the camera
   and shows its rear (docs/vehicle-direction.md). A frame the direction prompts
   read as ``exiting`` refuses the burst -- but they are prompts about cars, and
-  on a machine they answer ``unknown`` almost every time (20 of the 22 clear
-  machinery frames in the stored photos, two departures among them). So an
+  on a machine they answer ``unknown`` almost every time (25 of the 28 clear
+  machinery frames in the stored photos, every clear frame of two departures
+  among them). So an
   unknown direction is settled by something a camera *can* see: **a machine
   that is waiting to come in is standing still in front of a closed gate, and
   one that is leaving has the gate behind it and keeps going.** It is admitted
@@ -31,7 +32,8 @@ What it is careful about, because it opens a physical gate
   looks the same as this one. docs/agricultural-admit.md has the measurement.
 * **Anything else is the ordinary answer.** Unsure, model missing, a library
   missing, an unreadable frame, an inference that overruns its budget, a second
-  assessment while one is still running, an exception from anywhere: each is a
+  assessment while one is still running, more readings in a minute than any
+  passage produces, an exception from anywhere: each is a
   verdict of "no", the plate path's own decision stands untouched, and the gate
   does whatever it would have done had this module not existed.
 
@@ -124,6 +126,15 @@ DEFAULT_TIMEZONE = "Europe/Dublin"
 #: (measured 2026-09-21: 8 ms to decode and crop, 106 ms in the image tower,
 #: one thread), and two is what "more than one frame agrees" needs.
 MAX_FRAMES = 2
+#: Readings begun in any rolling minute. One camera alarm puts at most nine
+#: undecided frames into the pipeline as shipped -- five cloud handovers, three
+#: authorised injections that then failed to decide, one fallback -- and
+#: sixteen at the configuration's ceilings; the sweep's thirty-second waiting
+#: phase reads on the device and injects nothing beyond those caps. Thirty is
+#: three such alarms a minute, 4.2 s of one core in sixty, and past it a burst
+#: is answered ``rate_limited`` so that no flood of frames, from whatever
+#: cause, can turn this model into a standing load beside the plate reader.
+MAX_READINGS_PER_MINUTE = 30
 #: A reading that has not finished is not waited for with less than this left
 #: before the relay's own deadline, and never for longer than the ceiling
 #: however much budget there is: two frames are 0.3 s at the Pi's p95, and a
@@ -143,6 +154,7 @@ VERDICT_UNAVAILABLE = "model_unavailable"
 VERDICT_UNREADABLE = "unreadable"
 VERDICT_TIMEOUT = "timeout"
 VERDICT_BUSY = "busy"
+VERDICT_RATE_LIMITED = "rate_limited"
 VERDICT_NO_BUDGET = "no_budget"
 VERDICT_ERROR = "error"
 
@@ -568,6 +580,7 @@ class FarmMachineryPolicy:
         self._clock = clock or monotonic
         self._running = Lock()
         self._memory_lock = Lock()
+        self._begun: deque = deque()
         self._clear_frames: deque = deque(maxlen=STILL_MEMORY)
 
     @property
@@ -617,6 +630,9 @@ class FarmMachineryPolicy:
             return PendingAssessment(self._refusal(VERDICT_UNREADABLE))
         if not self._running.acquire(blocking=False):
             return PendingAssessment(self._refusal(VERDICT_BUSY))
+        if not self._within_rate():
+            self._running.release()
+            return PendingAssessment(self._refusal(VERDICT_RATE_LIMITED))
         answer: Queue = Queue(maxsize=1)
 
         def read():
@@ -631,6 +647,16 @@ class FarmMachineryPolicy:
             self._running.release()
             return PendingAssessment(self._refusal(VERDICT_ERROR))
         return PendingAssessment(None, answer, self._refusal)
+
+    def _within_rate(self) -> bool:
+        """Whether another reading may start this minute. Holds ``_running``."""
+        now = self._clock()
+        while self._begun and now - self._begun[0] >= 60.0:
+            self._begun.popleft()
+        if len(self._begun) >= MAX_READINGS_PER_MINUTE:
+            return False
+        self._begun.append(now)
+        return True
 
     def _refusal(self, verdict: str) -> Assessment:
         return Assessment(

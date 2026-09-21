@@ -1191,7 +1191,7 @@ class LocalStore:
                     shipped_at TEXT
                 );
                 -- What the farm-machinery appearance check made of an event
-                -- the plate path had declined to open, and whether it would
+                -- the device's plate read had not decided, and whether it would
                 -- have opened the gate. Local only: shadow mode exists to fill
                 -- this table, and the ingest contract has no block for it.
                 -- `opened` is 1 only where this check is what worked the relay.
