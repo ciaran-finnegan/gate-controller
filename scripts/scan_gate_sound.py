@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gate_controller.audio_segments import SegmentStore, load_segment_config  # noqa: E402
 from gate_controller.gate_sound_scan import (  # noqa: E402
-    already_scanned, record, scan,
+    already_scanned, measure_listening, record, scan,
 )
 from gate_controller.sound_model import GateSoundModel  # noqa: E402
 from gate_controller.store import LocalStore  # noqa: E402
@@ -100,8 +100,18 @@ def main(argv=None) -> int:
         if args.dry_run:
             LOGGER.info("gate_sound stage=dry_run %s", result.as_dict())
             return 0
-        written = record(connection, moves, scanned)
-        LOGGER.info("gate_sound stage=recorded movements=%d %s", written, result.as_dict())
+        # What was not heard goes down beside what was, in the same
+        # transaction: a movement missing from a span nobody was listening to
+        # must never read as a gate that stayed still.
+        listening = measure_listening(store, scanned)
+        written = record(connection, moves, scanned, listening=listening)
+        LOGGER.info(
+            "gate_sound stage=recorded movements=%d %s heard_seconds=%d missing_seconds=%d gaps=%d",
+            written, result.as_dict(),
+            round(sum(row["audio_seconds"] for row in listening.coverage)),
+            round(sum(row["missing_seconds"] for row in listening.coverage)),
+            len(listening.gaps),
+        )
     finally:
         connection.close()
     return 0
