@@ -210,6 +210,14 @@ removes completed leftovers from an interrupted cleanup. During a prolonged
 receiver outage, pending evidence can grow by at most 512KB per distinct image;
 monitor the state filesystem together with outbox depth.
 
+The relay is pulsed at most once per gate cycle. After any relay pulse, plate
+reads are recorded as grants but do not pulse again for
+`GATE_ACTUATION_COOLDOWN_SECONDS` (default 90, longer than the measured
+open-hold-close cycle), because the operator's input is step-by-step and a
+second pulse closes or stops the gate. A person's open command from the app
+uses the shorter `GATE_COMMAND_COOLDOWN_SECONDS` (default 20). See
+`docs/deployment.md`, "Relay Cooldown".
+
 Image work is bounded and freshness checked. Startup JPEGs older than
 `GATE_MAX_IMAGE_AGE_SECONDS`, coalesced queue entries, OCR failures, no-plate
 results, authorization errors, and worker exceptions are stored as denied/error

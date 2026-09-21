@@ -299,10 +299,14 @@ class CooldownGrantWireTests(unittest.TestCase):
             # Asked about the window that opens one second after the pulse,
             # only the pulse may answer -- and it is already behind us.
             after_the_pulse = store.was_opened_since(self.NOW + timedelta(seconds=1))
-            next_car = self.NOW + timedelta(seconds=21)
+            # One second past the automatic window (90 s by default, was 20 s
+            # when this read +21 s): the pulse at NOW is outside it, and the
+            # coalesced record at NOW+2 s would still be inside it if it
+            # counted -- which is the whole point of the test.
+            next_car = self.NOW + timedelta(seconds=91)
             reopened = ActuationCoordinator(
                 store, OpenRelay(), clock=lambda: next_car,
-                monotonic_clock=lambda: 121.0, boot_id="boot-1",
+                monotonic_clock=lambda: 191.0, boot_id="boot-1",
             ).actuate(self._matched("image:next-car", next_car), outbox_payload={})
 
         self.assertFalse(
