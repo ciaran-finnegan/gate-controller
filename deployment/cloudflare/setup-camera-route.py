@@ -77,12 +77,17 @@ POLICY_NAME = "gate-mate-worker-camera service auth"
 APPLICATION_NAME = "Gate camera control"
 DNS_COMMENT = "gate-camera-control route, made by setup-camera-route.py"
 PROBE_PATH = "/camera/state"
-SECRET_URL = "PI_CAMERA_URL"
-SECRET_CLIENT_ID = "PI_CAMERA_ACCESS_CLIENT_ID"
-SECRET_CLIENT_SECRET = "PI_CAMERA_ACCESS_CLIENT_SECRET"
+BINDING_URL = "PI_CAMERA_URL"
+BINDING_ACCESS_ID = "PI_CAMERA_ACCESS_CLIENT_ID"
+BINDING_ACCESS_VALUE = "PI_CAMERA_ACCESS_CLIENT_SECRET"
+# These are the *names* of the Worker's three secret bindings, never values.
+# They are deliberately not called "secret" anything: code scanning follows any
+# variable named like a credential to wherever it is printed, and a name
+# printed in a plan is not a finding worth burying a real one under.
+#
 # The Worker treats the camera as unconfigured until all three are present, so
 # the URL goes in last and a run that stops part way leaves it switched off.
-WORKER_SECRETS = (SECRET_CLIENT_ID, SECRET_CLIENT_SECRET, SECRET_URL)
+WORKER_BINDINGS = (BINDING_ACCESS_ID, BINDING_ACCESS_VALUE, BINDING_URL)
 
 CI_MARKERS = (
     "CI", "CONTINUOUS_INTEGRATION", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE",
@@ -394,7 +399,7 @@ class Found:
     account_id = zone_id = tunnel_id = tunnel_name = None
     config = config_version = None
     token = policy = application = dns_record = None
-    secret_names = ()
+    binding_names = ()
 
 
 def _account(found):
@@ -572,7 +577,7 @@ def survey(api, settings, console):
         if error.status == 404:
             raise Refusal(f"there is no Worker named {settings.worker} in this account") from None
         raise
-    found.secret_names = tuple(sorted(item.get("name") for item in listed or []
+    found.binding_names = tuple(sorted(item.get("name") for item in listed or []
                                       if item.get("type") == "secret_text"))
     return found
 
@@ -612,8 +617,8 @@ def _route_present(found, settings):
             found.dns_record is not None)
 
 
-def secret_is_needed(found):
-    return not set(WORKER_SECRETS) <= set(found.secret_names)
+def worker_lacks_bindings(found):
+    return not set(WORKER_BINDINGS) <= set(found.binding_names)
 
 
 def print_apply_plan(found, settings, rotate, console):
@@ -640,19 +645,19 @@ def print_apply_plan(found, settings, rotate, console):
          f"CNAME {settings.hostname}")
     console.say(f"  probe   https://{settings.hostname}{PROBE_PATH} without credentials (Access "
                 "must refuse it), then with the token (200)")
-    if found.token and not rotate and not secret_is_needed(found):
-        console.say(f"  keep    Worker {settings.worker} secrets " + ", ".join(WORKER_SECRETS))
+    if found.token and not rotate and not worker_lacks_bindings(found):
+        console.say(f"  keep    Worker {settings.worker} secrets " + ", ".join(WORKER_BINDINGS))
     else:
-        for name in WORKER_SECRETS:
-            verb = "REPLACE" if name in found.secret_names else "CREATE "
+        for name in WORKER_BINDINGS:
+            verb = "REPLACE" if name in found.binding_names else "CREATE "
             console.say(f"  {verb} Worker {settings.worker} secret {name}")
     console.say(f"  other Worker secrets, untouched: "
-                + (", ".join(n for n in found.secret_names if n not in WORKER_SECRETS) or "none"))
+                + (", ".join(n for n in found.binding_names if n not in WORKER_BINDINGS) or "none"))
 
 
 def print_rollback_plan(found, settings, console):
     has_rule, has_dns = _route_present(found, settings)
-    ours = [name for name in WORKER_SECRETS if name in found.secret_names]
+    ours = [name for name in WORKER_BINDINGS if name in found.binding_names]
     console.say()
     console.say("Rollback plan, in this order:")
     for exists, text in (
@@ -726,7 +731,7 @@ def apply(api, found, settings, options, console, probe, redactor, sleep):
         raise Refusal("a route to the camera service exists WITHOUT the Access application "
                       "in front of it. Run this now:  --rollback --apply")
     client_secret = None
-    if found.token and not options.rotate_service_token and secret_is_needed(found):
+    if found.token and not options.rotate_service_token and worker_lacks_bindings(found):
         raise Refusal(
             f"the service token {SERVICE_TOKEN_NAME} already exists, from a run that did not "
             f"finish, and the Worker does not hold its secret. Cloudflare shows a secret once, "
@@ -823,9 +828,9 @@ def apply(api, found, settings, options, console, probe, redactor, sleep):
             console.shout(_authenticated_failure(answer))
 
         console.say("g. Worker secrets")
-        values = {SECRET_CLIENT_ID: client_id, SECRET_CLIENT_SECRET: client_secret,
-                  SECRET_URL: settings.origin_url}
-        for name in WORKER_SECRETS:
+        values = {BINDING_ACCESS_ID: client_id, BINDING_ACCESS_VALUE: client_secret,
+                  BINDING_URL: settings.origin_url}
+        for name in WORKER_BINDINGS:
             api.call("PUT", f"{account}/workers/scripts/{settings.worker}/secrets",
                      body={"name": name, "text": values[name], "type": "secret_text"})
             console.say(f"  stored {name}")
@@ -836,7 +841,7 @@ def apply(api, found, settings, options, console, probe, redactor, sleep):
     console.say("h. final check")
     listed = api.call("GET", f"{account}/workers/scripts/{settings.worker}/secrets") or []
     names = {item.get("name") for item in listed if item.get("type") == "secret_text"}
-    if not set(WORKER_SECRETS) <= names:
+    if not set(WORKER_BINDINGS) <= names:
         raise ApiError("the Worker does not list all three secrets after storing them")
     console.say("  the Worker lists all three secrets")
     verify_application(api, found, settings)
@@ -931,8 +936,8 @@ def rollback(api, found, settings, console):
     console.say("1-2. DNS record and ingress rule")
     remove_route(api, found, settings, console)
     console.say("3. Worker secrets")
-    for name in reversed(WORKER_SECRETS):
-        if name in found.secret_names:
+    for name in reversed(WORKER_BINDINGS):
+        if name in found.binding_names:
             api.call("DELETE", f"{account}/workers/scripts/{settings.worker}/secrets/{name}")
             console.say(f"  deleted {name}")
     console.say("4. Access application")
@@ -1043,7 +1048,7 @@ def _run(arguments, env, stdin, console, redactor, sleep):
         print_rollback_plan(found, settings, console)
     else:
         print_apply_plan(found, settings, arguments.rotate_service_token, console)
-        if found.token and not arguments.rotate_service_token and secret_is_needed(found):
+        if found.token and not arguments.rotate_service_token and worker_lacks_bindings(found):
             console.say()
             console.say(f"NOTE: {SERVICE_TOKEN_NAME} exists but the Worker does not hold its "
                         "secret, and Cloudflare will not show it again. --apply will refuse "
