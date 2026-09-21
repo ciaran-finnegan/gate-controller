@@ -607,6 +607,39 @@ class BurstThreadFastLaneTests(unittest.TestCase):
             self.assertEqual(discarded, ["service_stopping"])
             self.assertEqual(coalesced, ["service_stopping"])
 
+    def test_a_frame_with_a_plate_in_it_is_asked_before_frames_with_none(self):
+        """2026-09-20 19:16:14: a frame carrying 10CE1990 queued behind three
+        frames the device had found nothing in, waited 5.8 s, and reached the
+        front with 974 ms left -- too little to ask at all."""
+        class Attempt:
+            decided = False
+
+            def __init__(self, saw_no_plate):
+                self.saw_no_plate = saw_no_plate
+
+        order = []
+        lane = CloudLane(lambda paths, received_at, *timing, **options: (
+            order.append(Path(paths[0]).name) or ProcessingResult(False, "no_match")
+        ))
+        entries = [
+            ("blind-1.jpg", Attempt(True)), ("blind-2.jpg", Attempt(True)),
+            ("plate.jpg", Attempt(False)), ("unread.jpg", None), ("blind-3.jpg", Attempt(True)),
+        ]
+        for name, attempt in entries:
+            item = self._item(Path("/nonexistent") / name)
+            prepared = self._prepared(item[0])
+            prepared.local_attempt = attempt
+            self.assertTrue(lane.submit(item, prepared, {}, None, []))
+        runner = Thread(target=lane.run, daemon=True)
+        runner.start()
+        self.assertTrue(wait_for(lambda: len(order) == 5))
+        lane.stop()
+        runner.join(5)
+        # Plate-seen (and "could not say") first, each kind in arrival order.
+        self.assertEqual(
+            order, ["plate.jpg", "unread.jpg", "blind-1.jpg", "blind-2.jpg", "blind-3.jpg"],
+        )
+
     def test_stopping_the_lane_hands_back_what_was_waiting(self):
         lane = CloudLane(lambda *a, **k: None)
         item = self._item(Path("/nonexistent/frame.jpg"))

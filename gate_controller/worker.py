@@ -1,7 +1,8 @@
 import logging
 import os
 from pathlib import Path
-from queue import Empty, Queue
+from itertools import count
+from queue import Empty, PriorityQueue, Queue
 import signal
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -769,7 +770,22 @@ class CloudLane:
     waited on cloud lookups for two frames that could not be read, and the
     gate opened 8.9 s after the alarm. A burst arrives here already prepared
     (identity, trace, local pass); this thread only finishes it.
+
+    **Order.** Not first come, first served: a frame the on-device detector
+    found a plate in goes ahead of any frame it found nothing in, and arrival
+    order holds within each kind. The lane is strictly serial and one answer
+    takes 1.2-4.2 s, so the order *is* the latency. On 2026-09-20 at 19:16 a
+    frame carrying ``10CE1990`` queued behind three frames with no plate in
+    them, waited 5.8 s, and reached the front with 974 ms of its budget left
+    -- too little to ask at all. In that passage 6 of the 8 frames the sweep
+    handed to the cloud had no plate the device could see, and the cloud found
+    none in any of them either. A frame with nothing in it that waits too long
+    simply runs out its decision deadline, unasked and unbilled.
     """
+
+    #: Queue ranks. A frame whose local pass could not say (reader busy or
+    #: unavailable, or no local reader at all) is treated as worth asking.
+    _PLATE_SEEN, _NO_PLATE_SEEN, _SENTINEL = 0, 1, 2
 
     def __init__(self, emit, *, on_error=None, on_result=None, on_dropped=None,
                  superseded=None, coalesce=None):
@@ -779,16 +795,29 @@ class CloudLane:
         self._on_dropped = on_dropped
         self._superseded = superseded
         self._coalesce = coalesce
-        self._queue: Queue = Queue()
+        self._queue: PriorityQueue = PriorityQueue()
+        self._sequence = count()
         self._lock = Lock()
         self._closed = False
+
+    @classmethod
+    def _rank(cls, prepared) -> int:
+        try:
+            attempt = getattr(prepared, "local_attempt", None)
+            blind = attempt is not None and bool(attempt.saw_no_plate)
+        except Exception:
+            blind = False
+        return cls._NO_PLATE_SEEN if blind else cls._PLATE_SEEN
 
     def submit(self, item, prepared, options, trigger_summary, timing) -> bool:
         """Queue a prepared burst for the cloud. False once the lane has closed."""
         with self._lock:
             if self._closed:
                 return False
-            self._queue.put((item, prepared, options, trigger_summary, timing))
+            self._queue.put((
+                self._rank(prepared), next(self._sequence),
+                (item, prepared, options, trigger_summary, timing),
+            ))
             return True
 
     @property
@@ -797,7 +826,7 @@ class CloudLane:
 
     def run(self) -> None:
         while True:
-            entry = self._queue.get()
+            _rank, _sequence, entry = self._queue.get()
             if entry is None:
                 return
             item, prepared, options, trigger_summary, timing = entry
@@ -828,10 +857,10 @@ class CloudLane:
             pending = []
             while True:
                 try:
-                    pending.append(self._queue.get_nowait())
+                    pending.append(self._queue.get_nowait()[2])
                 except Empty:
                     break
-            self._queue.put(None)
+            self._queue.put((self._SENTINEL, next(self._sequence), None))
         return [entry for entry in pending if entry is not None]
 
 
