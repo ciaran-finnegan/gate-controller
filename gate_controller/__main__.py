@@ -274,7 +274,7 @@ def main() -> None:
 
     def prepare(paths, received_at=None, decision_started_at=None,
                 processing_started_at=None, *, trigger=None,
-                idempotency_key=None, stillness=None):
+                idempotency_key=None, stillness=None, sweep_read=None):
         # The fast lane's half of a decision: identity, trace and the
         # on-device read, never the network. `process` finishes it.
         latest_image["path"] = str(paths[0]) if paths else None
@@ -288,6 +288,9 @@ def main() -> None:
                 trigger=trigger,
                 idempotency_key=idempotency_key,
                 stillness=stillness,
+                # The read the sweep already took of this frame, so it is
+                # judged rather than taken again (see `_adopt_sweep_read`).
+                sweep_read=sweep_read,
             )
 
     def process(paths, received_at=None, decision_started_at=None,

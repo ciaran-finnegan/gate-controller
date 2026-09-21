@@ -583,6 +583,76 @@ class PlateRecognizerClient:
         )
         return LocalPass(observation=observation, state=state)
 
+    def adopt_local_read(self, path: Path, read, *, trace_id: str | None = None,
+                         digest: str | None = None,
+                         budget: float | None = None) -> LocalPass | None:
+        """The local pass for a frame the sweep has *already* read. Or None.
+
+        A sweep frame arrives with the on-device read that was taken of it
+        (:class:`~gate_controller.local_sweep.SweepRead`). That read stands in
+        for the inference :meth:`local_pass` would have run -- and for nothing
+        else. It still has to clear ``GATE_LOCAL_OCR_MIN_CONFIDENCE`` and the
+        controller's own :func:`decide_access` under the band and the plate
+        list in force *now*, through the very same `_local_decision` a fresh
+        read goes through; a read that does not decide leaves the frame to the
+        cloud exactly as before. The processor then applies the match policy,
+        the allow-list, the schedule, the cooldown and the relay path itself,
+        once, as it does for every frame.
+
+        Why not simply read it again: the pipeline's upload is the same band
+        re-encoded at a different JPEG quality, and that alone moved one
+        frame's weakest character from 0.877 to 0.723 (2026-09-20 19:16:14),
+        across the bar, so an authorised driver was refused on a frame that
+        had already been read correctly.
+
+        ``None`` means "no read to adopt; take the ordinary local pass": the
+        recogniser is off, in shadow, or in ``always`` mode, the read is not
+        one this process produced, or -- the one that matters -- ``digest``
+        (the pipeline's identity for the file) is not the digest of the frame
+        the read was taken from. A read can only ever speak for its own
+        pixels. Never raises.
+        """
+        local = self._local
+        if local is None or not local.enabled or not local.config.active:
+            return None
+        if local.config.cloud == CLOUD_ALWAYS:
+            return None
+        try:
+            recognition = getattr(read, "recognition", None)
+            read_digest = getattr(read, "frame_digest", None)
+            if recognition is None or not read_digest or not digest:
+                return None
+            if str(read_digest) != str(digest):
+                _LOGGER.warning("gate_ocr stage=sweep_read_refused reason=digest_mismatch")
+                return None
+            frame = local.adopt(
+                recognition, trace_id=trace_id,
+                authorised=self._authorised, policy=self._match_policy,
+            )
+            if frame is NULL_FRAME:
+                return None
+            state: dict = {
+                "frame": frame,
+                "deadline": self._budget_deadline(budget),
+                # Deliberately no "upload_bytes": if this frame goes on to the
+                # cloud it is uploaded exactly as any other frame is.
+            }
+            with self._activity.activity("ocr"):
+                observation = self._local_decision(
+                    path, trace_id, frame, getattr(read, "image", None),
+                    getattr(read, "geometry", None), state, reserve=0.0,
+                )
+        except Exception:
+            _LOGGER.warning("gate_ocr stage=sweep_read_adopt_failed")
+            return None
+        _LOGGER.info(
+            "gate_ocr stage=sweep_read_adopted trace_id=%s plate=%s score=%.3f decided=%s",
+            trace_id or "-", getattr(recognition, "plate", None) or "-",
+            float(getattr(recognition, "score", 0.0) or 0.0),
+            "true" if observation is not None else "false",
+        )
+        return LocalPass(observation=observation, state=state)
+
     def recognise(self, path: Path, timeout: tuple[float, float] | None = None,
                   trace_id: str | None = None,
                   budget: float | None = None,

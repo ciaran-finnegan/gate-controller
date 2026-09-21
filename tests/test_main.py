@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Thread
 from time import monotonic
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import (
@@ -575,6 +575,41 @@ class MainConfigurationTests(unittest.TestCase):
             run_worker.call_args.kwargs["on_timed_skipped"],
             run_worker.call_args.kwargs["on_skipped"],
         )
+
+    def test_the_sweeps_read_reaches_the_processor_through_mains_own_prepare(self):
+        """`run_worker` calls the `prepare` that `main` builds, not the
+        processor's. A keyword that wrapper does not forward never arrives, and
+        the sweep's read would be dropped on the floor with every test of the
+        processor still passing."""
+        processor = MagicMock()
+        with patch.dict(
+            os.environ, self.isolated_state_environment(), clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=processor
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
+            gate_main.main()
+
+        prepare = run_worker.call_args.kwargs["prepare"]
+        read = object()
+        prepare((Path("/nonexistent/frame.jpg"),), stillness=0.002, sweep_read=read)
+        self.assertIs(processor.prepare.call_args.kwargs["sweep_read"], read)
+        self.assertEqual(processor.prepare.call_args.kwargs["stillness"], 0.002)
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(

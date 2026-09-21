@@ -4,7 +4,7 @@ from pathlib import Path
 from itertools import count
 from queue import Empty, PriorityQueue, Queue
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 from time import monotonic, sleep, time
@@ -41,6 +41,12 @@ class BurstIdentity:
     # it (0 is stationary), or None when the capture could not say. Internal:
     # it reaches the processor's `prepare`, never the wire.
     stillness: float | None = None
+    # The on-device read the local sweep already took of this very frame (a
+    # `local_sweep.SweepRead`), or None. Internal in the same way: it reaches
+    # `prepare`, which adopts it instead of reading the frame a second time,
+    # and never the wire. Excluded from equality so two identities still
+    # compare by what they identify.
+    sweep_read: object | None = field(default=None, compare=False, repr=False)
 
     @property
     def camera_event(self) -> tuple | None:
@@ -598,11 +604,14 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     if not callable(superseded):
         superseded = None
 
-    def inject_trigger_burst(paths, received_at, trigger, stillness=None):
+    def inject_trigger_burst(paths, received_at, trigger, stillness=None,
+                             sweep_read=None):
         # A webhook-triggered clear frame enters the same bounded queue as an
         # FTP burst, with its own content identity and sanitized trigger.
         paths = tuple(Path(path) for path in paths)
-        identity = BurstIdentity(content_digest(paths[0]), trigger, stillness)
+        identity = BurstIdentity(
+            content_digest(paths[0]), trigger, stillness, sweep_read=sweep_read,
+        )
         enqueue((paths, received_at, monotonic(), datetime.now(timezone.utc), identity))
 
     if trigger_capture is not None:
@@ -907,6 +916,10 @@ def _process_bursts(
             prepare_options = dict(options)
             if identity is not None and identity.stillness is not None:
                 prepare_options["stillness"] = identity.stillness
+            if identity is not None and identity.sweep_read is not None:
+                # Only ever passed when there is one, so a `prepare` that has
+                # never heard of it is called exactly as before.
+                prepare_options["sweep_read"] = identity.sweep_read
             try:
                 prepared = prepare(paths, received_at, *timing, **prepare_options)
             except Exception as error:

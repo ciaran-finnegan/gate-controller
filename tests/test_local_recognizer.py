@@ -994,6 +994,116 @@ class OcrClientIntegrationTests(unittest.TestCase):
         self.assertEqual(len(record["local"]["box"]), 4)
         local.close()
 
+    # -- a read the sweep already took (2026-09-20: 0.877, re-read at 0.723) --
+
+    def _sweep_read(self, plate, score, *, digest="frame-digest", image=b"band-bytes"):
+        from gate_controller.local_sweep import SweepRead
+
+        return SweepRead(
+            status="recognized" if plate else "no_plate", plate=plate, score=score,
+            authorised=True,
+            recognition=LocalRecognition(
+                plate=plate, score=score, mean_score=score,
+                status="recognized" if plate else "no_plate", total_ms=215.0,
+            ),
+            frame_digest=digest, image=image,
+        )
+
+    def test_an_adopted_read_decides_without_inference_and_is_journalled_as_local(self):
+        logger = RecordingLogger()
+        local = recognizer([], mode="active", logger=logger)  # an empty script: nothing to infer
+        corpus = RecordingCorpus()
+        client = self._client(local, FakeSession([]), corpus=corpus)
+
+        attempt = client.adopt_local_read(
+            self.path, self._sweep_read("12D3456", 0.877), trace_id="trace-adopt",
+            digest="frame-digest",
+        )
+
+        self.assertTrue(attempt.decided)
+        self.assertEqual(
+            (attempt.observation.plate, attempt.observation.confidence,
+             attempt.observation.source, attempt.observation.cloud_lookup),
+            ("12D3456", 0.877, "local", False),
+        )
+        line = logger.line("active")
+        self.assertIn("local_plate=12D3456 local_score=0.877", line)
+        self.assertIn("authorised=local_match decision_source=local", line)
+        block = local.summary("trace-adopt")
+        self.assertEqual((block["plate"], block["score"], block["decision_source"]),
+                         ("12D3456", 0.877, "local"))
+        self.assertEqual(local.status()["latency_ms"]["samples"], 0, "no inference ran")
+        # The corpus keeps the bytes the model actually read.
+        self.assertEqual(corpus.records[0]["extra"]["cloud"], "skipped")
+        self.assertEqual(corpus.records[0]["local"]["plate"], "12D3456")
+        local.close()
+
+    def test_an_adopted_read_faces_the_same_gates_as_a_fresh_one(self):
+        cases = (
+            ("under the daytime exact bar", "12D3456", 0.74),
+            ("under the local admission gate", "12D3456", 0.49),
+            ("a plate that is not listed", "99KK9999", 0.99),
+            ("no plate at all", None, 0.0),
+            ("a score that is not a number", "12D3456", float("nan")),
+        )
+        for label, plate, score in cases:
+            with self.subTest(label):
+                local = recognizer([], mode="active")
+                client = self._client(local, FakeSession([]))
+                attempt = client.adopt_local_read(
+                    self.path, self._sweep_read(plate, score), trace_id=f"trace-{label}",
+                    digest="frame-digest",
+                )
+                self.assertIsNotNone(attempt)
+                self.assertFalse(attempt.decided, "the frame must fall through to the cloud")
+                local.close()
+
+    def test_a_read_is_only_ever_adopted_for_the_frame_it_was_taken_from(self):
+        local = recognizer([], mode="active")
+        client = self._client(local, FakeSession([]))
+        read_of_another_frame = self._sweep_read("12D3456", 0.99, digest="another-frame")
+        for digest in ("frame-digest", None, ""):
+            with self.subTest(digest=digest):
+                self.assertIsNone(client.adopt_local_read(
+                    self.path, read_of_another_frame, trace_id="trace-x", digest=digest,
+                ))
+        self.assertIsNone(local.summary("trace-x"))
+        local.close()
+
+    def test_adoption_is_refused_wherever_the_local_reader_may_not_decide(self):
+        for mode, cloud in (("shadow", "fallback"), ("active", "always")):
+            with self.subTest(mode=mode, cloud=cloud):
+                local = recognizer([], mode=mode, cloud=cloud)
+                client = self._client(local, FakeSession([]))
+                self.assertIsNone(client.adopt_local_read(
+                    self.path, self._sweep_read("12D3456", 0.99), trace_id="trace-mode",
+                    digest="frame-digest",
+                ))
+                local.close()
+        client = PlateRecognizerClient("token", session=FakeSession([]))
+        self.assertIsNone(client.adopt_local_read(
+            self.path, self._sweep_read("12D3456", 0.99), digest="frame-digest",
+        ))
+
+    def test_an_adopted_read_that_does_not_decide_still_gets_its_cloud_answer(self):
+        local = recognizer([], mode="active")
+        session = FakeSession([FakeResponse(cloud_payload("12D3456", 0.97))])
+        client = self._client(local, session)
+        attempt = client.adopt_local_read(
+            self.path, self._sweep_read("12D3456", 0.60), trace_id="trace-cloud",
+            digest="frame-digest",
+        )
+        self.assertFalse(attempt.decided)
+
+        observation = client.recognise(self.path, trace_id="trace-cloud", attempt=attempt)
+
+        self.assertEqual((observation.plate, observation.source), ("12D3456", "cloud"))
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(local.status()["latency_ms"]["samples"], 0, "and still no second read")
+        # The 0.60 local read is there to corroborate the cloud's, as any is.
+        self.assertEqual([o.confidence for o in client.local_observations("trace-cloud")], [0.60])
+        local.close()
+
     def test_active_mode_answers_without_the_cloud_when_it_is_confident(self):
         logger = RecordingLogger()
         local = recognizer([read("12D3456", 0.99)], mode="active", logger=logger)
