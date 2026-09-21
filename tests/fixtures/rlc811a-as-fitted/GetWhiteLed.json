@@ -1,0 +1,25 @@
+[
+ {
+  "cmd": "GetWhiteLed",
+  "code": 0,
+  "value": {
+   "WhiteLed": {
+    "LightingSchedule": {
+     "EndHour": 6,
+     "EndMin": 0,
+     "StartHour": 18,
+     "StartMin": 0
+    },
+    "bright": 85,
+    "channel": 0,
+    "mode": 1,
+    "state": 1,
+    "wlAiDetectType": {
+     "dog_cat": 1,
+     "people": 1,
+     "vehicle": 1
+    }
+   }
+  }
+ }
+]

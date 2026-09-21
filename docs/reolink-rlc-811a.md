@@ -336,13 +336,18 @@ leave ONVIF and RTMP at 0).
 (installed on the Pi as `/root/configure-rlc811a.py`, next to
 [`camtool.py`](../scripts/reolink/camtool.py)) reads every block, prints a
 field-level diff, and writes only with `--apply`, backing each block up under
-`/root/rlc811a-swap-<stamp>/` and reading it back to verify. Every row below
-was written and verified on the fitted unit.
+`/root/rlc811a-swap-<stamp>/` and reading it back to verify. The table is the
+configuration as it stands **today**, not as it was written on cutover day:
+the frame rate and `constantFrameRate` rows below were corrected after the
+2026-09-17 measurements in [Frame Rate](#frame-rate-and-the-setting-that-decides-whether-you-get-it),
+and `tests/test_camera_setup_script.py` pins them by rehearsing the script
+against saved camera blocks, so they cannot drift back.
 
 | Block | Setting |
 | --- | --- |
-| `SetEnc` | clear 3840x2160 H.265 6144 kbit/s **10 fps, gop 1** (keyframe every second); fluent 640x360 H.264 10 fps 256 kbit/s; `audio 1` |
-| `SetIsp` | `exposure Manual`, `shutter 4/4` (1/250 s), `gain 16/16`, `antiFlicker Off`, `backLight Off`, `hdr 0`, `nr3d 1`, **`dayNight Color`** |
+| `SetEnc` | clear 3840x2160 H.265 6144 kbit/s **6 fps, gop 1** (keyframe every second); `audio 1`; the fluent stream is left as found |
+| `SetIsp` | `exposure Manual`, `shutter 4/4` (1/250 s), `gain 16/16`, `antiFlicker Off`, `backLight Off`, `hdr 0`, `nr3d 1`, **`dayNight Color`**, **`constantFrameRate 1`** |
+| `SetNtp` | `enable 1`, `pool.ntp.org`, 60 min. The time itself is never written here: `gate-camera-control` owns the camera clock (see [Camera clock reconcile](camera-control.md#camera-clock-reconcile)) |
 | `SetIrLights` | `Off` |
 | `SetWhiteLed` | `mode 0`, `state 0`: the PIR floodlight is the only plate light (Night Light above) |
 | `SetFtpV20` | server `192.168.0.33:21`, `ftp-user`, `onlyFtps 0`, `streamType 3`, `picInterval 5`, 4K stills, schedule `AI_VEHICLE` only |
@@ -351,7 +356,13 @@ was written and verified on the fitted unit.
 | `SetAiAlarm` | `vehicle` sensitivity 80 (the frozen baseline) |
 
 Left as found on purpose: SD recording on all AI and motion rules, the email
-block (no address), OSD, `AutoUpgrade 1`, `PowerLed On`.
+block (no address), OSD, `AutoUpgrade 1`, `PowerLed On`, the displayed time and
+the DST block, and **zoom and focus**. The lens position follows the physical
+re-aim in [Capture At The Stop](#capture-at-the-stop) and is set at the gate;
+the script holds no position and sends no `ZoomFocus` command, so it can never
+undo a re-aim. It also warns when `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi
+disagrees with the frame rate it is about to write, because the two must move
+together.
 
 ### FTP credentials are masked by the API
 
@@ -392,22 +403,22 @@ vsftpd log shows the login and upload.
   an IR lease (`Auto`, 1 minute) set and reverted correctly.
 - Audio is in both streams and the controller captured a 41.5 s clip from the
   synthetic vehicle event.
-- Talkback remains **not implemented** in the media stack
-  (`GATE_MEDIA_TALKBACK_CONFIGURED=false`, `hardware_unverified`): the RLC-811A
-  has the hardware, the software does not exist yet.
+- Talkback was not implemented in the media stack on cutover day; it has since
+  shipped as `gate-camera-control`'s own Baichuan path and still reports
+  `hardware_unverified` pending the supervised test at the gate. See
+  [Push-to-talk](talkback.md) and the intro above.
 
 ### Still open
 
-- **Zoom.** The owner zoomed in slightly (`zoom pos 9` of 0-28, focus 173,
-  autofocus on). Finish it in daylight against a parked car per Capture At The
-  Stop: a plate 300-600 px wide in a saved 4K JPEG with the whole stop
-  position, half a metre short and long, still in frame. The retired 4 mm lens
-  gave about 196 px at the 19:28 passage that day, and the RLC-811A's wide end
-  (105 degrees) is wider than the RLC-810A's 87, so expect to need noticeably
-  more zoom than position 9. The journal's `gate_ocr plate_box=` width fraction
-  times 3840 gives the measurement from real passages.
+- **Zoom and aim.** Unfinished on cutover day and superseded on 2026-09-16:
+  the lens was at the wide end and aimed across the drive, and the fix is the
+  re-aim up the approach in [Capture At The Stop](#capture-at-the-stop), not a
+  zoom position recorded here. Measure from the journal's `gate_ocr plate_box=`
+  width fraction times 3840.
 - **Line-crossing rule** and a tighter vehicle detection zone (currently the
-  full frame): app only.
+  full frame): app only, and this firmware exposes no `AI_CROSSLINE_*` schedule
+  row at all (see the first-week review, section 3). The script therefore
+  leaves any line-crossing row it does find enabled rather than zeroing it.
 - **Day and night captures** of a stopped car as the acceptance baseline.
 
 ## Cutover And Rollback

@@ -1,0 +1,11 @@
+[
+ {
+  "cmd": "GetPushCfg",
+  "code": 0,
+  "value": {
+   "PushCfg": {
+    "pushInterval": 30
+   }
+  }
+ }
+]

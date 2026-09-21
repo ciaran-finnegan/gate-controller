@@ -26,6 +26,12 @@ TOKEN_FILE = "/root/.camtool-token.json"
 # GATE_PLATE_REGION default from /etc/gate-controller.env
 PLATE_REGION = (0.05, 0.4, 0.9, 0.6)
 
+# The camera presents a self-signed certificate and HOST is a literal address on
+# the gate LAN, so verification is disabled exactly as `curl -k` does today. This
+# is the same trust boundary gate-camera-control documents (docs/camera-control.md,
+# Security model): the reach is one pinned address, not a name that DNS resolves.
+# Do not point HOST at a hostname without giving this context a CA to trust
+# first — the Login below carries the camera administrator password.
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
@@ -64,7 +70,10 @@ def login():
     token = entry["value"]["Token"]["name"]
     lease = int(entry["value"]["Token"].get("leaseTime", 3600))
     record = {"token": token, "expires": time.time() + lease - 120}
-    with open(TOKEN_FILE, "w", encoding="utf-8") as handle:
+    # Created 0600 rather than chmod-ed afterwards: the token is a credential and
+    # must never exist world-readable, not even for the length of one write.
+    descriptor = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(record, handle)
     os.chmod(TOKEN_FILE, 0o600)
     return token

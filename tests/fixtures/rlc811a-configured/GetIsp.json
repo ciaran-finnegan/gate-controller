@@ -1,0 +1,50 @@
+[
+ {
+  "cmd": "GetIsp",
+  "code": 0,
+  "value": {
+   "Isp": {
+    "antiFlicker": "Off",
+    "backLight": "Off",
+    "bd_day": {
+     "bright": 128,
+     "dark": 128,
+     "mode": "Auto"
+    },
+    "bd_led_color": {
+     "bright": 128,
+     "dark": 128,
+     "mode": "Auto"
+    },
+    "bd_night": {
+     "bright": 128,
+     "dark": 128,
+     "mode": "Auto"
+    },
+    "blc": 128,
+    "blueGain": 128,
+    "channel": 0,
+    "constantFrameRate": 1,
+    "dayNight": "Color",
+    "dayNightThreshold": 50,
+    "drc": 128,
+    "encType": "CBR",
+    "exposure": "Manual",
+    "gain": {
+     "max": 16,
+     "min": 16
+    },
+    "hdr": 0,
+    "mirroring": 0,
+    "nr3d": 1,
+    "redGain": 128,
+    "rotation": 0,
+    "shutter": {
+     "max": 4,
+     "min": 4
+    },
+    "whiteBalance": "Auto"
+   }
+  }
+ }
+]

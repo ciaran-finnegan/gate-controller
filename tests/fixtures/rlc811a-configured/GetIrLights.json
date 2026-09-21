@@ -1,0 +1,11 @@
+[
+ {
+  "cmd": "GetIrLights",
+  "code": 0,
+  "value": {
+   "IrLights": {
+    "state": "Off"
+   }
+  }
+ }
+]

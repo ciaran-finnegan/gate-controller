@@ -1,0 +1,32 @@
+[
+ {
+  "cmd": "GetEnc",
+  "code": 0,
+  "value": {
+   "Enc": {
+    "audio": 0,
+    "channel": 0,
+    "mainStream": {
+     "bitRate": 6144,
+     "frameRate": 10,
+     "gop": 2,
+     "height": 2160,
+     "profile": "High",
+     "size": "3840*2160",
+     "vType": "h265",
+     "width": 3840
+    },
+    "subStream": {
+     "bitRate": 256,
+     "frameRate": 10,
+     "gop": 4,
+     "height": 360,
+     "profile": "High",
+     "size": "640*360",
+     "vType": "h265",
+     "width": 640
+    }
+   }
+  }
+ }
+]
