@@ -286,7 +286,11 @@ class ASourceDropMidSegment(RecorderCase):
         world.drive(recorder)
         first = SegmentStore(self.directory).segments()[0]
         self.assertLess(first.duration(), 137.0 - 5.0)
-        self.assertAlmostEqual(first.duration() % BUFFER_SECONDS, 0.0, delta=0.1)
+        # A whole number of buffers, to the nearest: 127.99999999999 is four of
+        # them, and `% 32` of it is 31.99999999999.
+        buffers = first.duration() / BUFFER_SECONDS
+        self.assertGreaterEqual(round(buffers), 1)
+        self.assertAlmostEqual(buffers, round(buffers), delta=0.01)
 
     def test_the_stall_guard_outlasts_an_unflushed_buffer(self):
         """Were it shorter, an ffmpeg that ignored the flush flag would be
