@@ -248,8 +248,8 @@ the buffered keyframe covers that gap as it always did.
 The pipe carries no timestamps of its own, so the decoder is told the rate it
 is being fed at (`-r`) and everything else about the input is left unprobed
 (`-analyzeduration 0 -probesize 32 -fpsprobesize 0`; the default probe costs
-about two seconds at 4K). That rate is `GATE_CLEAR_STREAM_SOURCE_FPS` (10),
-and **it must match the camera's main-stream frame rate**. Nothing detects a
+about two seconds at 4K). That rate is `GATE_CLEAR_STREAM_SOURCE_FPS`,
+and **it must equal the camera's main-stream frame rate, currently 6**. Nothing detects a
 mismatch, and nothing in the pipe could: `fps=N` against a stated rate `R`
 keeps `N/R` of the pictures, whatever rate they really arrive at. A camera
 reconfigured to 15 fps and left stated at 10 would run its "5 fps" session at

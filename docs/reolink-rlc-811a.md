@@ -121,7 +121,9 @@ gate**, and the aim is:
    not over the area in front of the gate, sensitivity 80.
 5. Set `GATE_TRIGGER_CAPTURE_DELAY_SECONDS=0` so the clear-stream series is
    taken while the car is still on the approach, and re-derive
-   `GATE_PLATE_REGION` from `gate_ocr plate_box=` lines after re-aiming.
+   `GATE_PLATE_REGION` from `gate_ocr plate_box=` lines after re-aiming — done
+   2026-09-20/21, recorded in
+   [Re-aim, 2026-09-20, and the band re-fitted to it](#re-aim-2026-09-20-and-the-band-re-fitted-to-it).
 
 Moving the camera 1 m forward onto the galvanised gate post gains about 1 m
 of distance for the same stop position and does not change this conclusion.
@@ -410,16 +412,163 @@ vsftpd log shows the login and upload.
 
 ### Still open
 
-- **Zoom and aim.** Unfinished on cutover day and superseded on 2026-09-16:
-  the lens was at the wide end and aimed across the drive, and the fix is the
-  re-aim up the approach in [Capture At The Stop](#capture-at-the-stop), not a
-  zoom position recorded here. Measure from the journal's `gate_ocr plate_box=`
-  width fraction times 3840.
+- **Zoom and aim.** The camera was physically re-aimed on 2026-09-20 and the
+  plate band re-fitted and proven by replay; see
+  [Re-aim, 2026-09-20, and the band re-fitted to it](#re-aim-2026-09-20-and-the-band-re-fitted-to-it)
+  for the record, the new band, and what is still open on zoom.
 - **Line-crossing rule** and a tighter vehicle detection zone (currently the
   full frame): app only, and this firmware exposes no `AI_CROSSLINE_*` schedule
   row at all (see the first-week review, section 3). The script therefore
   leaves any line-crossing row it does find enabled rather than zeroing it.
 - **Day and night captures** of a stopped car as the acceptance baseline.
+
+## Re-aim, 2026-09-20, and the band re-fitted to it
+
+The camera was physically re-aimed (pan and tilt) on 2026-09-20. Comparing
+stored photos side by side, the last event on the old across-the-drive view
+landed at 16:58:08 UTC and the first event on the new view at 18:15:43 UTC;
+telemetry shows nothing of the move, so the photo comparison is the only
+record of when it happened. Zoom stayed at pos 2 (range 0-28), focus stayed
+at pos 80 (range 0-238), autofocus enabled — only the aim moved.
+
+`GATE_PLATE_REGION` is `x,y,w,h` frame fractions
+(`gate_controller/plate_region.py`), **not** `x0,y0,x1,y1`. The band in force
+until 2026-09-21 02:24 UTC was `0.25,0,0.75,0.6`: x 0.25-1.00, y 0.00-0.60,
+journaled as `crop=480,0,1920,648` on the 1920x1080 decode.
+
+### Post-re-aim plate measurements
+
+This is a thin base: one arrival (dusk, Skoda 10CE1990, 12 frames) and one
+departure (floodlit night, 4 rear-plate frames), measured from photos as the
+threshold bounding box scaled ×3 to the 3840 frame, about ±10 px.
+
+- **Approach (6 frames):** widths 192, 216, 216, 249, 258, 375 px; centre x
+  0.19-0.47, y 0.42-0.54. Three of the six sat fully left of the old band and
+  one was clipped at its left edge.
+- **Rolling to a stop (1 frame):** 372 px at x 0.52, y 0.56 — inside the old
+  band.
+- **Stopped at the gate (5 frames):** 369-372 px, sharp, tilted about 15
+  degrees, centre x 0.65-0.67, y 0.62-0.63, the plate spanning y 0.571-0.682
+  — all five clipped by the old band's 0.60 bottom edge.
+
+Nine of the twelve arrival frames were therefore missed or clipped by the old
+band. Rear plates on the departure: 390, 390, 192, 138 px.
+
+Median width over the twelve arrival frames: 370 px. The target is about 300
+px; the pre-re-aim figure was 135-170 px at the stopping position (see
+[Frame Rate](#frame-rate-and-the-setting-that-decides-whether-you-get-it)
+above), and the nine journal `plate_box` lines of 19-20 September, before the
+re-aim, ran 145-364 px, median 184.
+
+### Consequence: a 41 s wait
+
+The same evening this cost a driver 41 seconds at the gate: from the first
+frame at 18:15:44.649 UTC to the relay firing at 18:16:25.516 UTC, both Pi
+clock times (camera-vs-Pi clock skew was measured within 1 s and is ruled
+out). The stopped car's plate sat below the band, so neither reader saw it;
+the driver reversed and re-approached, and the plate was read while the car
+was moving back through the band.
+
+In context, over 24 plate-triggered openings between 16 and 20 September,
+first-event-to-relay was a median of 2.2 s, p90 9.7 s, max 40.9 s, with the
+next-largest at 15.3 s. The 41 s wait was the extreme case, not the typical
+one.
+
+### New band, applied 2026-09-21 02:24 UTC
+
+`GATE_PLATE_REGION=0.10,0.15,0.75,0.75`: x 0.10-0.85, y 0.15-0.90 (crop
+192,162 to 1632,972 on the 1920x1080 decode). It contains all twelve front
+and four rear measured boxes above. The previous env file was kept as
+`/etc/gate-controller.env.bak-2026-09-21-band`.
+
+Making the band taller costs nothing at the detector. The local detector
+(`yolo-v9-t-384`) letterboxes the crop with `r = min(384/h, 384/w)`; while the
+crop stays wider than tall, only the crop's **width** sets how many pixels
+the plate occupies at the detector, and width is unchanged at 0.75 (1440 px).
+Each additional 0.05 of band width, by contrast, would cost about 6% of the
+plate's pixels at the detector.
+
+### Proof by replay
+
+The band change was proven by replaying the same 41 s passage (deployed
+release `989fa3d` models, `yolo-v9-t-384` + `cct-xs-v2`) through both bands on
+the Pi. Caveats: dashboard 1280x720 copies upscaled to 1920x1080, JPEG q90;
+one vehicle, one passage, dusk.
+
+| Event | Received (UTC) | OLD band | NEW band |
+| --- | --- | --- | --- |
+| 3133 | 18:15:44.649 | 12C6827 0.179 | 1LE6911 0.110 (motion-blurred, headlight glare) |
+| 3135 | 18:15:45.453 | no plate | 10CE1990 0.971 |
+| 3134 | 18:15:45.889 | no plate | 10CE1990 0.969 |
+| 3136 | 18:15:47.136 | no plate | 10CE1990 0.999 |
+| 3137 | 18:15:48.323 | no plate | 10CE11900 0.641 |
+| 3138 | 18:15:49.420 | no plate | 10CE1990 0.998 |
+| 3139 | 18:16:10.412 | 99T 0.197 | 10CE1991 0.507 |
+| 3141 | 18:16:11.264 | no plate | 10CE1990 0.991 |
+| 3140 | 18:16:11.823 | no plate | 10CE1990 0.863 |
+| 3142 | 18:16:13.428 | no plate | 0CE15301 0.293 |
+| 3143 | 18:16:14.626 | 10CE1990 0.893 | 10CE1990 0.577 |
+| 3144 | 18:16:24.113 | 10CE1990 0.804 | 10CE1990 0.974 |
+
+Reads at or above 0.75: old band 2 of 12, new band 7 of 12. First
+authorisable read after the first alarm: +30 s under the old band, +0.8 s
+under the new (event 3135).
+
+One frame reads worse under the new band: event 3143, 0.577 against 0.893
+old. The weakest-character score is sensitive to small preprocessing
+differences; see the carried-read fix in
+[On-device plate recognition](local-recognition.md#the-sweeps-read-travels-with-its-frame)
+(#175), not restated here.
+
+### Zoom: not changed, and why
+
+Headroom scaling about the frame centre with a 5% margin is about x1.33,
+limited by the far-approach plate at the left edge (x0 = 0.163, the first
+approach frame above), not by the stopped plate, which would allow x2.11 on
+the right edge or x2.47 on the bottom. Keeping **whole vehicles** in frame —
+needed because the CLIP direction and farm-machine classifiers need the whole
+vehicle — allows only about x1.07-1.11, because car bodies already reach x
+about 0.08 on the left.
+
+Zooming would also make the camera's own vehicle alarm fire later, and it
+already fires late: on the 41 s passage the car was close and the plate
+already about 360 px wide, motion-blurred and headlight-glared, at the first
+alarm. Plates are already about 370 px where cars are actually read (at the
+stop), above the 300 px target; only the far approach (192-258 px) is below
+it, and a x1.33 zoom would bring that to about 255-343 px.
+
+The zoom-position-to-scale mapping for this lens is not calibrated. The
+daylight calibration procedure, not yet run:
+
+1. Read `GetZoomFocus` and take a 4K snapshot.
+2. Record pixel positions of three fixed features: the top of the
+   ivy-covered fence post at x about 0.90; the small fence post at x about
+   0.57, y about 0.35; the near fence post at the left edge.
+3. Step zoom one position at a time, wait about 5 s for autofocus, and read
+   back both positions.
+4. Compute scale from the distance between the first two features relative
+   to pos 2, solving for the true scaling centre rather than assuming the
+   frame centre.
+5. Stop at the first position where scale >= 1.3, or where x = 0.163 would
+   map past x = 0.05.
+6. Check focus by the edge sharpness of a fence rail at about 5 m, against
+   the pos-2 baseline.
+7. Roll back to zoom 2, then focus 80, and confirm by readback and that the
+   three features sit within ±3 px of baseline.
+
+If the zoom is later increased to about x1.33, the plates measured here map
+to x 0.05-0.78, y 0.26-0.74, and the proposed band is `0,0.18,0.85,0.64` — to
+be re-proven from frames taken after the change, never from this arithmetic
+alone.
+
+### To re-check
+
+After the next several real daylight arrivals, confirm from `gate_local_sweep`
+and `gate_ocr plate_box=` journal lines that both stopped and approach plates
+fall inside the new band. The Pi journal retains only about 1.8 days (it is
+size-capped), and the Pi keeps only the last three event photos in
+`/var/lib/gate-controller/event-evidence/`; older frames have to be fetched
+back from the dashboard.
 
 ## Cutover And Rollback
 
