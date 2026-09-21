@@ -467,8 +467,17 @@ class LayerTests(unittest.TestCase):
         self.assertIn("empty", answer["shares"])
         self.assertEqual(len(policy._begun), 0)
         self.assertEqual(len(policy._clear_frames), 0)
+        # A reading in progress does not stop a look, and -- the point -- a
+        # look in progress can never make a real burst's reading answer `busy`.
         policy._running.acquire()
+        self.assertEqual(policy.look(b"jpeg")["status"], "ok")
+        policy._running.release()
+        policy._looking.acquire()
         self.assertEqual(policy.look(b"jpeg")["status"], "skipped_busy")
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "frame.jpg"
+            Image.new("RGB", (64, 64), (90, 90, 90)).save(frame, format="JPEG")
+            self.assertNotEqual(policy.begin((frame,)).result(2.0).verdict, "busy")
         unavailable = FarmMachineryPolicy("shadow", None, scorer, unavailable_reason="no model")
         self.assertEqual(unavailable.look(b"jpeg")["status"], "unavailable")
 
@@ -531,6 +540,28 @@ class CorrelatorTests(unittest.TestCase):
         store.correlate(base + 200)
         row = self._rows()[0]
         self.assertEqual((row["first_read_event_id"], row["first_read_score"]), (2, 0.93))
+
+    def test_a_read_at_the_very_edge_of_the_passage_is_found_whatever_its_timestamp_looks_like(self):
+        """The controller writes microseconds, or no fraction at all; `_iso` writes milliseconds."""
+        base = 1_790_000_000.0
+        from datetime import datetime, timezone
+
+        for offset, text in (
+            (62.0, datetime.fromtimestamp(base + 62.0, timezone.utc).isoformat()),          # no fraction
+            (61.999999, datetime.fromtimestamp(base + 61.999999, timezone.utc).isoformat()),  # microseconds
+        ):
+            events = Path(self.directory.name) / f"gate-{offset}.db"
+            with closing(sqlite3.connect(str(events))) as connection, connection:
+                connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, received_at TEXT)")
+                connection.execute(
+                    "CREATE TABLE event_telemetry (event_id INTEGER PRIMARY KEY, payload TEXT)")
+                connection.execute("INSERT INTO events VALUES (1, ?)", (text,))
+                connection.execute("INSERT INTO event_telemetry VALUES (1, ?)", (json.dumps({
+                    "local_ocr": {"status": "recognized", "plate": "10CE1990", "score": 0.9}}),))
+            # The alarm is at base + 2, so the passage runs to base + 62.
+            read = early_trigger._first_good_read(events, base + 2.0)
+            self.assertIsNotNone(read, text)
+            self.assertIsNone(early_trigger._first_good_read(events, base - 1.0), "and not beyond it")
 
     def test_the_record_is_its_own_file_beside_the_controllers_database(self):
         directory = Path(self.directory.name)

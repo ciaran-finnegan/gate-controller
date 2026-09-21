@@ -256,7 +256,8 @@ vehicle has the controller):
   `pickup` 0.68 / `car` 0.26 / `empty` 0.03; two dusk arrival frames read as
   vehicles either way. The *empty* lane by day was not put through it, so the
   negative is unchecked. Needs `GATE_AGRI_ADMIT=shadow|on`; otherwise
-  `unavailable`.
+  `unavailable`. The look has a lock of its own and never takes the readings'
+  lock, so it can never make a real burst's machinery reading answer `busy`.
 - *Plate look.* Would the local detector find a plate box in the first three
   looks? In `on` the early sweep's own reads are the answer.
 

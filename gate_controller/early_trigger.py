@@ -138,7 +138,15 @@ STATUS_EVERY_SECONDS = 600.0
 
 @dataclass(frozen=True)
 class DetectorConfig:
-    """Two detectors' thresholds. Every one is settable; see ``load_config``."""
+    """Two detectors' thresholds.
+
+    The ones a shadow day is expected to move are settable from the
+    environment (``load_config``: the rate, the day delta, areas, scatter and
+    persistence, and every night threshold but the hysteresis and the largest
+    area). The rest -- the global-jump bound, the largest areas, the noise
+    multiplier and the time constants -- are code defaults, and changing one
+    is a change to this file.
+    """
 
     fps: float = DEFAULT_FPS
     # -- day: log-domain contrast against the background -------------------
@@ -802,7 +810,12 @@ def _first_good_read(events_database: Path | None, alarm_epoch: float):
     """
     if events_database is None or not Path(events_database).exists():
         return None
-    low, high = _iso(alarm_epoch - 10.0), _iso(alarm_epoch + CORRELATION_SECONDS)
+    # The controller writes `received_at` with microseconds (or with no
+    # fraction at all) and `_iso` writes milliseconds, and SQLite compares the
+    # two as text. So the text window is a second wider than the real one, and
+    # the real one is applied to the parsed times below.
+    first, last = alarm_epoch - 10.0, alarm_epoch + CORRELATION_SECONDS
+    low, high = _iso(first - 1.0), _iso(last + 1.0)
     try:
         with closing(sqlite3.connect(f"file:{events_database}?mode=ro", uri=True, timeout=2.0)) as events:
             rows = events.execute(
@@ -815,6 +828,11 @@ def _first_good_read(events_database: Path | None, alarm_epoch: float):
         return None
     for event_id, received_at, payload in rows:
         try:
+            moment = datetime.fromisoformat(str(received_at))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            if not first <= moment.timestamp() <= last:
+                continue
             local = (json.loads(payload) or {}).get("local_ocr") or {}
             score = float(local.get("score") or 0.0)
         except (TypeError, ValueError):
