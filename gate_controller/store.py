@@ -1127,7 +1127,19 @@ class LocalStore:
                     clang_at TEXT,
                     clang_peak_dbfs REAL,
                     detector TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    -- `confirmed` when a relay firing or a heard latch agrees
+                    -- with the motor classifier, `unconfirmed` when nothing
+                    -- but the model says this happened. NULL on rows written
+                    -- before the column existed: those were never judged.
+                    confirmation TEXT,
+                    -- The latch heard beside this run's end whatever the
+                    -- alternation believed. `clang_at` is the narrower thing:
+                    -- the latch the state machine accepted as proof the gate
+                    -- shut, which it will only do for a run it thinks is a
+                    -- closing.
+                    latch_at TEXT,
+                    latch_peak_dbfs REAL
                 );
                 CREATE INDEX IF NOT EXISTS gate_movements_started_at
                     ON gate_movements (started_at DESC);
@@ -1157,6 +1169,21 @@ class LocalStore:
                     movements INTEGER NOT NULL
                 );
             """)
+            movement_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(gate_movements)")
+            }
+            # Additive, and deliberately not backfilled. `confirmation` is a
+            # judgement about evidence that was never recorded for the rows
+            # already here, and NULL is the honest value for "nobody asked".
+            # A reader that treats NULL as `confirmed` would be inventing
+            # corroboration for the movements least likely to have any.
+            for name, kind in (("confirmation", "TEXT"),
+                               ("latch_at", "TEXT"),
+                               ("latch_peak_dbfs", "REAL")):
+                if name not in movement_columns:
+                    connection.execute(
+                        f"ALTER TABLE gate_movements ADD COLUMN {name} {kind}"
+                    )
             event_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(events)")
             }

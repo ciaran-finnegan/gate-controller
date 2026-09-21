@@ -45,8 +45,37 @@ HOP_SECONDS = 0.48
 
 DEFAULT_MODEL_DIR = Path("/var/lib/gate-controller/models")
 YAMNET_FILENAME = "yamnet.onnx"
-#: Shipped in this package; see ``models/gate-motor-v1.json``.
-CLASSIFIER_FILENAME = "gate-motor-v1.json"
+#: Shipped in this package; see ``models/gate-motor-v2.json``.
+#:
+#: v1 was trained on four cycles from one afternoon and reported about a
+#: hundred gate movements a day at a site that sees ten passages. v2 is
+#: trained on 49.2 hours of retained recording -- rain, wind, night, daylight
+#: and three quarters of an hour of farm machinery -- and is scored by held-out
+#: *day*, never by held-out cycle. Measured, with the day in question excluded
+#: from training entirely:
+#:
+#: ====================================  ==========  ==========
+#: held-out day                          2026-09-19  2026-09-20
+#: ====================================  ==========  ==========
+#: motor runs per day, v1                      79.4       107.5
+#: motor runs per day, v2                      25.0        19.3
+#: uncorroborated runs per day, v1             25.0        58.8
+#: uncorroborated runs per day, v2               0.0         0.0
+#: relay openings found, v1                      4/4         6/6
+#: relay openings found, v2                      4/4         5/6
+#: runs confirmed by eye, v1                     8/8       15/15
+#: runs confirmed by eye, v2                     8/8       13/15
+#: ====================================  ==========  ==========
+#:
+#: "Uncorroborated" means a run with no relay firing, no latch clang and no
+#: camera event within four minutes either side. Thirty-six of those were
+#: rendered as spectrograms and looked at: every one was wind, a road vehicle,
+#: rain or farm machinery, and none was overturned.
+#:
+#: v1 is kept beside it. A model is evidence about a moment in a site's life,
+#: and the previous one is what the movements already in the database were
+#: judged by; deleting it would make those rows unreadable.
+CLASSIFIER_FILENAME = "gate-motor-v2.json"
 
 #: Above this a frame is the motor. 0.5 is where a logistic classifier's own
 #: decision boundary sits; it is named rather than inlined because it is the

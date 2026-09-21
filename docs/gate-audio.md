@@ -506,8 +506,13 @@ place it is looked for now.
   inverts every outcome after it.
 * **One travel can still be reported as two.** A dropout longer than 1.5 s
   splits a run; the 14:20 closing came out as 15.4 s plus 9.6 s.
-* **The gate-motor classifier is trained on four cycles** from one afternoon.
-  It is the starting point the corpus exists to improve.
+* **The gate-motor classifier was trained on four cycles** from one
+  afternoon. Replaced 2026-09-21 by one trained on 49.2 hours — see section
+  2d, including what that retrain still does not cover.
+* **The recorder drops five percent of the wall clock**, in gaps of up to
+  three minutes, from repeated restarts against the clear stream. It is the
+  largest single cause of a gate movement going unrecorded and nothing in
+  this document's detectors can compensate for it.
 
 ### Installing it on a board
 
@@ -522,6 +527,225 @@ sudo systemctl enable --now gate-sound-scan.timer
 
 Without it the detector reports itself unavailable and does nothing, which is
 the correct behaviour for an analysis model on a gate controller.
+
+## 2d. The Retrain, And What 49 Hours Of Recording Said
+
+Measured 2026-09-21 over everything the recorder had kept: **662 segments,
+49.2 hours of audio inside 51.5 hours of wall clock**, from 2026-09-18 22:50
+to 2026-09-21 02:20 UTC. All analysis was done off the board; the Pi was only
+read.
+
+### What the corpus actually contains
+
+| | |
+| --- | --- |
+| Recorded audio | 49.2 h (95.5% of the wall clock it spans) |
+| Full days | **two** — 2026-09-19 (22.1 h) and 2026-09-20 (23.7 h) |
+| Part days | 2026-09-18 (1.2 h), 2026-09-21 (2.3 h) |
+| Relay-commanded cycles inside it | **ten** |
+| Human labels in existence | **none** |
+
+Conditions, read off the audio itself because the site has no weather station
+— a minute is `impulsive` when a loud frame occurs more than five percent of
+the time, which is rain on the housing, and `windy` when the sub-150 Hz band
+carries it:
+
+| Condition | Minutes |
+| --- | --- |
+| Quiet daylight | 1317 |
+| Quiet night | 987 |
+| Impulsive (rain) | 447 |
+| Windy | 218 |
+| Loud | 8 |
+
+Plus one unplanned gift: **about forty-five minutes of farm machinery** on
+2026-09-20 between 15:00 and 15:45, a sustained low harmonic drone. That is
+the tractor case this document predicted and had never recorded.
+
+**The recorder loses audio, and it is the largest single failure found here.**
+121 gaps over one second, 71 over twenty, 57 over a minute, totalling 2.4
+hours — five percent of the wall clock. The journal shows the segment recorder
+restarting 46 times over the two days, mostly `method DESCRIBE failed: 404`
+against the clear stream, and each restart loses the segment in flight. One
+commanded cycle on 2026-09-20 at 10:47 had **97 consecutive seconds missing**,
+covering the whole of its auto-close. No detector can be measured on audio
+that does not exist, and no threshold can recover it.
+
+### How the labels were made, with no labels to start from
+
+The labelling loop in section 2b has never been run: the store is empty. So
+ground truth was built out of signals the motor model does not produce.
+
+* **Positives** — motor runs bracketed by a relay firing. 27 runs, 1203
+  frames, 577 seconds of motor, over two days.
+* **Negatives** — runs with no relay firing, no latch and no camera event
+  within four minutes either side. 81 runs, 2935 frames.
+* **Easy negatives** — 120,000 frames sampled from stretches with no evidence
+  of any kind, across every condition above.
+
+**Thirty-six of each were rendered as spectrograms and looked at.**
+
+| | Sampled | Confirmed by eye | Overturned |
+| --- | --- | --- | --- |
+| Claimed negatives | 36 | 36 | **0** |
+| Claimed positives | 36 | 24 | **12** |
+
+Every claimed negative was wind swell, a road vehicle, rain or the farm
+machinery. The overturned positives are the useful result: broken out by what
+corroborated them,
+
+| Corroborated by | n | Really the gate |
+| --- | --- | --- |
+| A relay firing | 19 | 17 (89%) |
+| A latch and nothing else | 17 | **7 (41%)** |
+
+so **latch corroboration alone is not good enough to train on** — it would
+have taught the model that rain is the motor. Only relay-corroborated runs
+were used as positives.
+
+### The numbers, by held-out day
+
+Leave-one-*day*-out, as issue #155 requires. The held-out day contributes
+nothing to training — no positives, no negatives, no threshold choice. The
+decision threshold stays at the shipped 0.5; it was not tuned.
+
+| Held-out day | | 2026-09-19 | 2026-09-20 |
+| --- | --- | --- | --- |
+| Recorded audio | | 22.1 h | 23.7 h |
+| Motor runs per day | v1 | 79.4 | 107.5 |
+| | **v2** | **25.0** | **19.3** |
+| Uncorroborated runs per day | v1 | 25.0 | 58.8 |
+| | **v2** | **0.0** | **0.0** |
+| Relay openings found | v1 | 4/4 | 6/6 |
+| | **v2** | 4/4 | **5/6** |
+| Runs confirmed by eye, found | v1 | 8/8 | 15/15 |
+| | **v2** | 8/8 | **13/15** |
+| Movements reading `shut` | v1 | 13% | 10% |
+| | **v2** | **39%** | **37%** |
+
+**This is a real improvement and a real cost.** The false positives go to
+zero on both held-out days; two of fifteen confirmed movements and one of six
+commanded openings are lost on 2026-09-20. The shut fraction — a gate that
+opens n times shuts n times, so a healthy detector should approach 50% —
+roughly triples.
+
+### What this result is not
+
+* **It is two days.** Issue #155 asks for a week, and this is not one. The
+  positive class is 27 runs.
+* **No snow, no jam, no stall, no tractor driven through the gate.** The
+  machinery on 2026-09-20 was nearby, not passing through.
+* **The confirmation split is not independent of the training signal.**
+  "Uncorroborated" is both what the negatives were selected by and what the
+  held-out day is scored on. The recall figures — relay openings, and runs
+  confirmed by a person looking at a spectrogram — are not, and they are the
+  ones that carry the cost side of the trade.
+* At a threshold of 0.35 rather than 0.5, 2026-09-20 keeps 14 of 15 confirmed
+  runs at the same zero uncorroborated runs. That was measured **on the
+  held-out day**, so it is not a number to ship on; it is a thing to check on
+  the next retrain, with more days.
+
+### `MIN_RUN_SECONDS` was left alone
+
+Raising the eight-second floor is the obvious way to cut the count and it is
+wrong. Of the 54 clang-confirmed closings recorded to date, **22 are shorter
+than twelve seconds** — 41% — so a twelve-second floor would discard two
+fifths of the closings the system can actually confirm. The inflation was
+never in the duration rule.
+
+## 2e. The Latch: Why Closings Looked Unreliable
+
+The complaint that the gate's shutting is not detected reliably is right
+about the effect and wrong about the cause. Measured on the ten commanded
+cycles in the
+retained audio — the only closings whose existence needs no detector, because
+the auto-close is not optional:
+
+| | |
+| --- | --- |
+| Commanded cycles | 10 |
+| Auto-close window actually recorded | 9 |
+| **Latch found by the band rule** | **8** |
+| Recall on recordable closings | **8/9 = 89%** |
+
+All eight were confirmed by eye: the motor band stops, one bright broadband
+transient follows, often with one or two smaller ones behind it as the leaves
+settle. The two misses are **one lost to a 97-second recording gap** and
+**one masked by wind** (2026-09-19 10:30, where the window was itself only
+60% recorded).
+
+**So the latch detector is not the problem.** What made closings look
+unreliable is the denominator: with 107 movements a day and 11 of them
+reading `shut`, the dashboard showed a gate that apparently moved a hundred
+times and closed eleven. Removing the false movements moved that ratio from
+10-13% to 37-39% without touching the latch rule at all.
+
+Three things were measured and **not** changed, because the data refused them:
+
+* **Lowering the −38 dBFS floor.** At −42 the raw candidate count over the
+  same audio goes from 403 to 678 a day; at −46, to 1126. The floor is
+  holding back a flood, not hiding latches.
+* **Widening the ±4 s search window.** Widening it to ±8, ±12 and ±20 s
+  changed *nothing at all* on either held-out day. The binding constraint is
+  the alternation — a clang is only interpreted when the state machine
+  already believes the gate is open — and not the window.
+* **The camera's re-aiming.** The clang peak level has drifted down: median
+  −24.9 dBFS on 2026-09-16, −30.2 and −30.3 on 19 and 20 September, with 17%
+  of detected latches now within 3 dB of the floor. Real, worth watching, and
+  with 54 latches over five days there is not enough to place a discontinuity
+  at a timestamp. It is not currently causing misses.
+
+### What did change: prominence
+
+The rule tested `high_share` and `dbfs`, both of which describe a frame on
+its own. A frame of continuous loud noise satisfies them as readily as an
+impact. Measured against the two seconds either side of each candidate:
+
+| Candidate | Local median | Peak | Prominence |
+| --- | --- | --- | --- |
+| Latch 09-19 08:28 | −51.5 | −24.2 | 27.3 dB |
+| Latch 09-20 09:58 | −58.3 | −26.2 | 32.1 dB |
+| Latch 09-20 18:16 | −36.5 | −15.0 | 21.5 dB |
+| A bird, 09-20 12:29 | −6.4 | −5.4 | **1.0 dB** |
+| A bird, 09-20 16:58 | −6.8 | −5.3 | **1.5 dB** |
+
+A bird calling four times a second pins the microphone near −7 dBFS, and
+every frame of it clears both tests. In those three windows the clustering
+rule happened to return the real latch anyway, so this is a near miss being
+closed rather than a reported error being corrected — which is exactly why it
+is worth closing before the day it does not happen to work.
+`CLANG_PROMINENCE_DB = 12.0` sits in the empty space between 3.5 and 21.5. Prominence is a *difference* of levels, so
+unlike a band share it has no denominator to saturate — the fault that killed
+the first motor rule.
+
+Its measured effect is honest and modest: **75 of 795 raw candidates removed
+over 49.2 hours, with all eight commanded latches kept.** It is shipped
+because the failure it closes is demonstrated in this site's own audio, not
+because it moved the headline number.
+
+### The latch is now written down even when the alternation ignores it
+
+`clang_at` is only ever populated for a run the state machine already thought
+was a closing. One false movement early in a scan inverts every outcome after
+it, and the latch went with them — the one physical observation in the chain
+discarded because a model guessed wrong about something else. `latch_at` and
+`latch_peak_dbfs` record the impact regardless, and `outcome` keeps exactly
+its old meaning.
+
+## 2f. Saying How Sure It Is
+
+Every movement now carries a `confirmation`:
+
+* **`confirmed`** — a relay firing brackets it, or a latch was heard beside
+  its end. Something outside the motor model agrees.
+* **`unconfirmed`** — only the classifier says so. It may be real; a fob
+  opening fires no relay and a gate left standing open has no latch to hear.
+
+The heartbeat's `gate` block gains `confirmed_24h`, `unconfirmed_24h`,
+`latches_heard_24h` and `state_confirmation` beside the existing
+`movements_24h`. Nothing was removed. **`movements_24h` is a ceiling, not a
+count**, and a dashboard should be showing the confirmed figure with the rest
+available behind it.
 
 ## 3. What Is Proposed
 

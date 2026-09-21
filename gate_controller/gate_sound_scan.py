@@ -31,7 +31,8 @@ import subprocess
 
 from .audio_segments import SegmentStore, segment_started_at
 from .gate_audio_detect import (
-    FRAME_SAMPLES, analyse_frames, find_clangs, movements_from, summarise,
+    CONFIRMED, FRAME_SAMPLES, UNCONFIRMED, analyse_frames, find_clangs,
+    movements_from, summarise,
 )
 from .sound_model import GateSoundModel, SAMPLE_RATE, motor_runs
 
@@ -41,7 +42,9 @@ LOGGER = logging.getLogger(__name__)
 #: other work. Sixty seconds at a time keeps the resident set small, and the
 #: boundary costs the one 0.96 s patch that straddles it.
 CHUNK_SECONDS = 60
-DETECTOR = "yamnet-linear-v1"
+#: Stamped on every row, so a movement judged by the model trained on four
+#: cycles is never silently compared with one judged by its replacement.
+DETECTOR = "yamnet-linear-v2"
 
 
 @dataclass(frozen=True)
@@ -202,19 +205,23 @@ def record(connection, moves, scanned, *, now=None) -> int:
         for move in moves:
             connection.execute(
                 "INSERT INTO gate_movements (started_at, ended_at, seconds, outcome,"
-                " uncommanded, clang_at, clang_peak_dbfs, detector, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " uncommanded, clang_at, clang_peak_dbfs, detector, created_at,"
+                " confirmation, latch_at, latch_peak_dbfs)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(started_at) DO UPDATE SET"
                 " ended_at=excluded.ended_at, seconds=excluded.seconds,"
                 " outcome=excluded.outcome, uncommanded=excluded.uncommanded,"
                 " clang_at=excluded.clang_at, clang_peak_dbfs=excluded.clang_peak_dbfs,"
-                " detector=excluded.detector",
+                " detector=excluded.detector, confirmation=excluded.confirmation,"
+                " latch_at=excluded.latch_at, latch_peak_dbfs=excluded.latch_peak_dbfs",
                 (
                     move.start.isoformat(), move.end.isoformat(), round(move.seconds, 2),
                     move.outcome, 1 if move.uncommanded else 0,
                     None if move.clang is None else move.clang.at.isoformat(),
                     None if move.clang is None else round(move.clang.peak_dbfs, 1),
-                    DETECTOR, stamp,
+                    DETECTOR, stamp, move.confirmation,
+                    None if move.latch is None else move.latch.at.isoformat(),
+                    None if move.latch is None else round(move.latch.peak_dbfs, 1),
                 ),
             )
             written += 1
@@ -255,7 +262,7 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
     moment = now or datetime.now(timezone.utc)
     try:
         last = connection.execute(
-            "SELECT started_at, ended_at, outcome FROM gate_movements"
+            "SELECT started_at, ended_at, outcome, confirmation FROM gate_movements"
             " ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
         since = (moment - _seconds(recent_hours * 3600)).isoformat()
@@ -266,6 +273,18 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
         uncommanded = connection.execute(
             "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ? AND uncommanded = 1",
             (since,),
+        ).fetchone()[0]
+        confirmed = connection.execute(
+            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
+            " AND confirmation = ?", (since, CONFIRMED),
+        ).fetchone()[0]
+        unconfirmed = connection.execute(
+            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
+            " AND confirmation = ?", (since, UNCONFIRMED),
+        ).fetchone()[0]
+        latches = connection.execute(
+            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
+            " AND latch_at IS NOT NULL", (since,),
         ).fetchone()[0]
         scanned = connection.execute(
             "SELECT COUNT(*), MAX(scanned_at) FROM gate_sound_scans"
@@ -284,9 +303,19 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
         ended = moment
     return {
         "state": state,
+        "state_confirmation": last[3] or UNCONFIRMED,
         "since": last[1],
         "open_for_seconds": round((moment - ended).total_seconds()) if state == "open" else 0,
         "movements_24h": sum(counts.values()),
+        # The three numbers a dashboard should be reading instead of
+        # `movements_24h`. Over 49.2 hours of recording the previous model put
+        # 25-59 movements a day into that total that a person looking at the
+        # spectrogram identified as wind, rain, a car on the road or a farm
+        # machine. `movements_24h` is kept because removing it would break
+        # anything already reading it, but it is a ceiling, not a count.
+        "confirmed_24h": confirmed,
+        "unconfirmed_24h": unconfirmed,
+        "latches_heard_24h": latches,
         "closed_24h": counts.get("shut", 0),
         "uncommanded_24h": uncommanded,
         "segments_scanned": scanned[0] if scanned else 0,
