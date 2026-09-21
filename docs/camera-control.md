@@ -509,6 +509,106 @@ sudo journalctl -u gate-camera-control | grep -i 'ip firewalling\|bpf'
 **no** "IP firewalling not supported" or "Failed to install BPF" line. If there
 is, stop: the address filter is not in force.
 
+### Steps 5 to 7 with the script (preferred)
+
+Steps 5, 6 and 7 below are one ordering problem: the hostname resolves the
+moment its DNS record exists, so Access has to be in front of it first, and the
+service token's secret is shown once and has to reach the Worker without being
+pasted anywhere. `deployment/cloudflare/setup-camera-route.py` does all three in
+that order, checks each step before the next, and takes the route out again by
+itself if the hostname ever answers without Access in front of it. The manual
+procedure is kept below it, and is what the script does.
+
+Run it from a workstation, by hand. It refuses to run under CI, it is a dry run
+unless given `--apply`, and `--apply` asks for the hostname to be typed.
+
+```bash
+# cloudflare.env holds one line, a reference and not a token:
+#   CLOUDFLARE_API_TOKEN=op://<vault>/<item>/<field>
+op run --env-file=cloudflare.env -- python3 deployment/cloudflare/setup-camera-route.py           # plan only
+op run --env-file=cloudflare.env -- python3 deployment/cloudflare/setup-camera-route.py --apply   # do it
+```
+
+Without 1Password, `export CLOUDFLARE_API_TOKEN` in the shell first (read it
+with `read -rs CLOUDFLARE_API_TOKEN` so it is not in the shell history) and run
+the same two commands without the `op run … --` prefix. The token is read from
+that environment variable and from nowhere else: there is no flag for it, it is
+never written to disk, and neither it, the client secret nor any header
+carrying one is ever printed — a Cloudflare error that quotes one back is
+redacted before it is shown. The client ID is not a secret but stays out of the
+output unless `--show-client-id`.
+
+**The token's permissions.** Check what an existing token already holds (My
+Profile → API Tokens → the token → *View summary*) before minting another, and
+do not mint a broad one. The script needs exactly:
+
+| Scope | Permission | Used for |
+|---|---|---|
+| Account | Cloudflare Tunnel → Edit | read the tunnel and its configuration, write the ingress list |
+| Account | Access: Service Tokens → Edit | create, read, rotate, delete the service token |
+| Account | Access: Apps and Policies → Edit | the policy and the application |
+| Account | Workers Scripts → Edit | list secret names, store and delete the three secrets |
+| Zone `shopshield.app` | DNS → Edit | find the tunnel from `gate-command`'s CNAME; the new CNAME |
+| Zone `shopshield.app` | Zone → Read | only to look the zone and account up by name; not needed with `--zone-id` and `--account-id` |
+
+**What it does, in order.** Everything is found by name or hostname before it
+is created, so a run that stopped part way is resumed by running it again.
+
+| | Step | Checked before the next by |
+|---|---|---|
+| a | service token `gate-mate-worker-camera` (one year; `--token-duration`) — the secret is held in memory only | reading the token back |
+| b | reusable Access policy `gate-mate-worker-camera service auth`: decision Service Auth (`non_identity`), include that one token; then the self-hosted application `Gate camera control` for the bare hostname with that one policy, session `30m` (`--session-duration`), hidden from the App Launcher | — |
+| c | — | reading the application back: self-hosted, covers exactly the bare hostname (a `host/path` application would leave every other path open), exactly one policy, Service Auth, that token only |
+| d | ingress rule `gate-camera… → http://127.0.0.1:8767`, inserted ahead of the catch-all, every existing rule and every other key of the configuration sent back as read | re-reading the configuration first and refusing if it moved since the plan; reading it back after |
+| e | proxied CNAME to `<tunnel-id>.cfargotunnel.com` | reading it back |
+| f | probe `GET /camera/state` from outside | without credentials: `403`, `401` or a `302` to `*.cloudflareaccess.com`. With the token: `200` |
+| g | Worker secrets `PI_CAMERA_ACCESS_CLIENT_ID`, `PI_CAMERA_ACCESS_CLIENT_SECRET`, then `PI_CAMERA_URL` last — the Worker treats the camera as unconfigured until all three exist | listing the Worker's secret names |
+| h | re-checks the application, prints what to look at in the app | |
+
+It refuses, before creating anything, if the tunnel is locally managed, if the
+last ingress rule is not a catch-all, if `127.0.0.1:8767` is already published
+under another hostname, if the hostname already has DNS or an Access
+application that is not its own, or if the Worker does not exist. Any hostname,
+port, zone or Worker other than the documented ones needs
+`--allow-undocumented-target` as well, so a typo cannot publish the wrong local
+service; the origin address is always `127.0.0.1`.
+
+**If the probe is not refused by Access.** A `200` without credentials means
+the service was reachable unprotected; the tunnel's `404` means the rule has
+not applied *and* Access is not in front (Access would have refused first); no
+answer at all proves nothing. In every one of those cases the script removes
+the DNS record and then the ingress rule at once, says so loudly, and exits
+`3`. The same removal happens if anything at all fails between adding the rule
+and the probe passing. A service that is simply down (`502` with the token) is
+not a security problem: the secrets are stored anyway, so the secret is not
+lost, and the script exits `4`.
+
+**The secret is shown once.** If a run made the token and then failed before
+step g, the secret is gone. The next run says so and changes nothing; it goes
+on only with `--rotate-service-token`, which makes a new secret and kills the
+old one at once. It never rotates silently.
+
+**Why the Worker settings are secrets.** `wrangler.jsonc` in access-gate-ui
+declares no `vars` and no `keep_vars`, and CI runs a bare `wrangler deploy` on
+every merge, which drops plaintext variables it does not know about. Secrets
+survive a deploy. They are stored with `PUT
+/accounts/{account_id}/workers/scripts/gate-mate/secrets`, which is the call
+`wrangler secret put` makes: it creates a new version of the Worker with that
+one secret added, deploys it, and leaves the code and every other binding as
+they were. By hand, the equivalent is `npx wrangler secret put <NAME> --name
+gate-mate`, three times, pasting each value at its prompt.
+
+**What it cannot see.** The app. After it finishes, check by eye: Night vision
+reads "Off" (or "Auto") rather than "Unavailable"; Photo returns a still; on the
+Pi, `journalctl -u gate-camera-control --since -5m` shows `stage=snapshot …
+outcome=completed` and `journalctl -u cloudflared` shows the configuration
+update. And put the token's expiry in a calendar: it lasts a year.
+
+`--rollback` prints, and `--rollback --apply` performs, the removal of exactly
+these objects, found by name and hostname, in the reverse order: DNS record,
+ingress rule, the three Worker secrets, Access application, policy, service
+token.
+
 ### 5. Create the Access application and its service token — before any DNS
 
 In Cloudflare Zero Trust, create a **separate** Access application for the
@@ -581,7 +681,10 @@ service: remove the DNS record immediately and go back to step 5).
 ### 7. Store the service token in the Worker
 
 Put the token's client ID and secret in the Worker's secrets, exactly as the
-`gate-command` token is stored. The token never goes near the Pi.
+`gate-command` token is stored, as `PI_CAMERA_ACCESS_CLIENT_ID` and
+`PI_CAMERA_ACCESS_CLIENT_SECRET`, and then `PI_CAMERA_URL` as the bare origin
+`https://gate-camera.example.com` — no path, no query, no trailing anything, or
+the Worker treats the camera as unconfigured. The token never goes near the Pi.
 
 ### Re-run the installer on every controller release
 
@@ -635,8 +738,10 @@ with the documented rollback in
 [Front Gate camera night configuration](reviews/2026-09-06-camera-night-configuration.md)
 § rollback, or from the camera web interface.
 
-Finally, remove the `gate-camera` ingress hostname from the tunnel config and
-delete its Access application and service token.
+Finally, remove the `gate-camera` DNS record and ingress hostname from the
+tunnel config, the three `PI_CAMERA_*` Worker secrets, and the Access
+application, policy and service token — in that order, which is what
+`python3 deployment/cloudflare/setup-camera-route.py --rollback --apply` does.
 
 ## Not implemented: the "clearer" live stream
 
