@@ -25,6 +25,9 @@ from .cloudflare_client import (
 from .command_server import CommandServerWorker, DirectCommandExecutor
 from .control_plane import HeartbeatWorker
 from .direction import DirectionTracker, load_direction_config
+from .early_trigger import MODE_ON as EARLY_TRIGGER_ON
+from .early_trigger import build_worker as build_early_trigger
+from .early_trigger import load_mode as load_early_trigger_mode
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
@@ -33,7 +36,8 @@ from .net_probe import NetProbeWorker, load_net_probe_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
 from .plate_region import parse_plate_region
 from .trigger_capture import (
-    ClearKeyframeBuffer, TriggerFrameCapture, load_trigger_capture_config,
+    ClearKeyframeBuffer, TriggerFrameCapture, decoder_input_arguments,
+    load_trigger_capture_config,
 )
 from .camera_control_state import (
     CAMERA_CONTROL_STATE_PATH, read_camera_control_state,
@@ -190,8 +194,27 @@ def main() -> None:
         TriggerFrameCapture(
             trigger_capture_config, frame_source=clear_keyframes,
             activity=activity, sweep=sweep_reader,
+            # GATE_EARLY_TRIGGER=off|shadow|on. Only `on` lets the capture
+            # accept an early trigger at all; in `shadow` the entry point is
+            # there and refuses, whoever calls it.
+            early_trigger=load_early_trigger_mode(os.environ) == EARLY_TRIGGER_ON,
         )
         if trigger_capture_config.enabled else None
+    )
+    # Off unless GATE_EARLY_TRIGGER is `shadow` or `on`: no thread, no child,
+    # no file. It watches a patch of the camera's small stream for a vehicle
+    # arriving, ahead of the camera's own alarm, and records what it saw. In
+    # `on` it may also ask the capture for a local-only sweep; the rule that
+    # keeps such a sweep off the cloud reader lives in the capture, the
+    # pipeline and the cloud client, not in it.
+    early_trigger = build_early_trigger(
+        os.environ, state_directory=Path(arguments.database).resolve().parent,
+        events_database=Path(arguments.database), capture=trigger_capture,
+        activity=activity, clear_stream=clear_keyframes, sweep_reader=sweep_reader,
+        decoder_arguments=decoder_input_arguments(trigger_capture_config),
+        download_filters=(
+            ("hwdownload", "format=nv12") if trigger_capture_config.hwaccel == "drm" else ()
+        ),
     )
     corpus = _training_corpus(os.environ)
     # The metrics ring is built here, before the workers, because two things
@@ -241,7 +264,9 @@ def main() -> None:
     # the burst resolver and the heartbeat all share one set of counters.
     trigger_correlator, trigger_workers = build_reolink_trigger_pipeline(
         os.environ,
-        on_accepted=_camera_event_handler(trigger_capture, recognizer, audio_capture),
+        on_accepted=_camera_event_handler(
+            trigger_capture, recognizer, audio_capture, early_trigger=early_trigger,
+        ),
         correlator=trigger_correlator,
     )
     background_workers = tuple(background_workers) + tuple(trigger_workers)
@@ -255,6 +280,8 @@ def main() -> None:
         background_workers += (clear_keyframes,)
     if trigger_capture is not None:
         background_workers += (trigger_capture,)
+    if early_trigger is not None:
+        background_workers += (early_trigger,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
         recognizer=recognizer,
@@ -276,10 +303,16 @@ def main() -> None:
         # once, so no decision ever pays for it.
         farm_machinery=build_farm_machinery_policy(os.environ),
     )
+    if early_trigger is not None:
+        # The image tower the processor's policy loaded is the one the early
+        # trigger's shadow record asks what it sees; it loads no second copy.
+        early_trigger.set_clip_look(
+            getattr(getattr(processor, "farm_machinery", None), "look", None))
 
     def prepare(paths, received_at=None, decision_started_at=None,
                 processing_started_at=None, *, trigger=None,
-                idempotency_key=None, stillness=None, sweep_read=None):
+                idempotency_key=None, stillness=None, sweep_read=None,
+                cloud_permit=None):
         # The fast lane's half of a decision: identity, trace and the
         # on-device read, never the network. `process` finishes it.
         latest_image["path"] = str(paths[0]) if paths else None
@@ -296,6 +329,9 @@ def main() -> None:
                 # The read the sweep already took of this frame, so it is
                 # judged rather than taken again (see `_adopt_sweep_read`).
                 sweep_read=sweep_read,
+                # Only on a frame of a passage the early trigger started: the
+                # cloud reader is not asked until the camera has spoken.
+                **({"cloud_permit": cloud_permit} if cloud_permit is not None else {}),
             )
 
     def process(paths, received_at=None, decision_started_at=None,
@@ -360,6 +396,11 @@ def main() -> None:
     )
 
     def shutdown():
+        if early_trigger is not None:
+            try:
+                early_trigger.close()
+            except BaseException:
+                logging.getLogger(__name__).warning("early_trigger_close_failed", exc_info=True)
         return _shutdown_controller_with_hot_stream(
             hot_stream, processor, relay, trigger_capture=trigger_capture,
             clear_keyframes=clear_keyframes, net_probe=net_probe,
@@ -466,7 +507,7 @@ def _clear_stream_source(config):
 
 
 
-def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
+def _camera_event_handler(trigger_capture, recognizer, audio_capture=None, early_trigger=None):
     """Warm the OCR connection the instant the camera fires, then capture.
 
     The prewarm is fire-and-forget and must never delay or break capture, and
@@ -477,7 +518,11 @@ def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
     prewarm = getattr(recognizer, "prewarm", None)
     capture = trigger_capture.on_camera_event if trigger_capture is not None else None
     audio = audio_capture.on_camera_event if audio_capture is not None else None
-    if capture is None and audio is None and not callable(prewarm):
+    # The early trigger only writes down that the alarm came, and when: it is
+    # what its would-triggers are measured against. After the capture, and
+    # never able to change what the capture returns.
+    early = early_trigger.note_camera_alarm if early_trigger is not None else None
+    if capture is None and audio is None and early is None and not callable(prewarm):
         return None
 
     def handle(event):
@@ -491,9 +536,14 @@ def _camera_event_handler(trigger_capture, recognizer, audio_capture=None):
                 audio(event)
             except Exception:
                 pass
-        if capture is not None:
-            return capture(event)
-        return None
+        try:
+            return capture(event) if capture is not None else None
+        finally:
+            if early is not None:
+                try:
+                    early(event)
+                except Exception:
+                    pass
 
     return handle
 

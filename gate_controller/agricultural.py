@@ -351,6 +351,14 @@ class PromptScorer:
         )
 
 
+    def shares(self, embedding) -> dict[str, float]:
+        """Every label's share for one embedding, ``empty`` and the road kinds included."""
+        embedding = tuple(float(value) for value in embedding)
+        if len(embedding) != len(self._text[0]) or not all(map(math.isfinite, embedding)):
+            raise ValueError("not an image embedding")
+        return _softmax_by_label(self._text, self._labels, embedding, self._scale)
+
+
 def _softmax_by_label(text, labels, embedding, scale: float) -> dict[str, float]:
     logits = [
         scale * sum(weight * value for weight, value in zip(row, embedding))
@@ -579,6 +587,9 @@ class FarmMachineryPolicy:
         self._unavailable_reason = unavailable_reason
         self._clock = clock or monotonic
         self._running = Lock()
+        # The early trigger's shadow look, kept apart from `_running` so that
+        # it can never be the reason a reading is refused.
+        self._looking = Lock()
         self._memory_lock = Lock()
         self._begun: deque = deque()
         self._clear_frames: deque = deque(maxlen=STILL_MEMORY)
@@ -647,6 +658,37 @@ class FarmMachineryPolicy:
             self._running.release()
             return PendingAssessment(self._refusal(VERDICT_ERROR))
         return PendingAssessment(None, answer, self._refusal)
+
+    def look(self, jpeg: bytes) -> dict:
+        """What is in one picture, for a caller that decides nothing. Never raises.
+
+        The early trigger's shadow record asks this of the frame that made it
+        fire: label shares, ``empty`` against every kind of vehicle. It has a
+        lock of its own -- one look at a time -- and never takes the readings'
+        lock, so a look in progress can never make :meth:`begin` answer
+        ``busy`` to a real burst: for the tenth of a second they overlap the
+        tower simply runs twice, which it is safe to do. It touches neither
+        the rate the readings are capped at nor the standing-still memory.
+        """
+        if self._unavailable_reason is not None or self._embed is None:
+            return {"status": "unavailable"}
+        if not self._looking.acquire(blocking=False):
+            return {"status": "skipped_busy"}
+        try:
+            embedding = self._embed(jpeg)
+            if embedding is None:
+                return {"status": "unreadable"}
+            shares = self._scorer.shares(embedding)
+            return {
+                "status": "ok",
+                "shares": {label: round(share, 4) for label, share in shares.items()},
+                "top": max(shares, key=shares.get),
+                "empty": round(shares.get("empty", 0.0), 4),
+            }
+        except Exception:
+            return {"status": "error"}
+        finally:
+            self._looking.release()
 
     def _within_rate(self) -> bool:
         """Whether another reading may start this minute. Holds ``_running``."""

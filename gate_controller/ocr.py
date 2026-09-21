@@ -328,6 +328,19 @@ def _spent(observation, state: dict):
     return replace(observation, cloud_lookup=spent)
 
 
+def _cloud_permitted(cloud_permit) -> bool:
+    """No permit means a camera-origin frame, which may always be sent.
+
+    A permit that raises, or answers anything but True, has answered no.
+    """
+    if cloud_permit is None:
+        return True
+    try:
+        return cloud_permit() is True
+    except Exception:
+        return False
+
+
 def _mark_post_started(state: dict) -> None:
     """Tell the caller that a request is about to go out on this attempt.
 
@@ -657,8 +670,15 @@ class PlateRecognizerClient:
                   trace_id: str | None = None,
                   budget: float | None = None,
                   attempt: LocalPass | None = None,
-                  on_post_started: Callable[[], None] | None = None) -> PlateObservation:
+                  on_post_started: Callable[[], None] | None = None,
+                  cloud_permit: Callable[[], bool] | None = None) -> PlateObservation:
         """Read one frame.
+
+        ``cloud_permit`` travels only with a frame of an *early-origin*
+        passage -- a sweep the early trigger started ahead of the camera's
+        alarm. It is asked immediately before the request would go out, and
+        while it answers no, nothing is posted: the on-device answer stands,
+        or "no plate" when there is none. See ``_recognise_once``.
 
         ``budget`` is the seconds of decision time left for this frame when
         the call starts. It bounds what the local guard may spend and re-sizes
@@ -683,11 +703,12 @@ class PlateRecognizerClient:
         with self._activity.activity("ocr"):
             return self._recognise(
                 path, timeout, trace_id, budget, attempt, on_post_started,
+                cloud_permit,
             )
 
     def _recognise(self, path: Path, timeout, trace_id, budget=None,
                    attempt: LocalPass | None = None,
-                   on_post_started=None) -> PlateObservation:
+                   on_post_started=None, cloud_permit=None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
@@ -703,6 +724,7 @@ class PlateRecognizerClient:
         # prepared off the slot, so it is set on whichever state we ended up
         # with: a reused pass must still be able to report that it posted.
         state["on_post_started"] = on_post_started
+        state["cloud_permit"] = cloud_permit
         # A reused pass carries the deadline *it* was bounded by, which the
         # processor holds short of the decision's so the cloud keeps its
         # reserve. The request itself answers to the decision deadline, so
@@ -931,6 +953,19 @@ class PlateRecognizerClient:
         # the request is sized for the budget it actually has rather than the
         # one the processor split before the guard ran.
         timeout = self._bounded_timeout(timeout, state.get("deadline"))
+        if not _cloud_permitted(state.get("cloud_permit")):
+            # The one place every request to the cloud reader leaves from. A
+            # frame of a passage the early trigger started goes no further
+            # until the camera has raised its own vehicle event for it: the
+            # on-device answer stands if there is one, and nothing is sent.
+            upload.close()
+            _LOGGER.info("gate_ocr stage=cloud_refused reason=no_camera_event")
+            decided = state.get("local_observation")
+            if decided is not None:
+                return decided
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
         try:
             self._pace(generation)
             # Past the throttle window, the upload and every abandonment

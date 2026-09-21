@@ -47,6 +47,15 @@ class BurstIdentity:
     # and never the wire. Excluded from equality so two identities still
     # compare by what they identify.
     sweep_read: object | None = field(default=None, compare=False, repr=False)
+    # Who started the passage this frame belongs to: "camera", or "early" for a
+    # sweep the early trigger started ahead of the camera's alarm. Stated by
+    # the capture, never inferred here. An early-origin frame carries
+    # `cloud_permit` -- a callable that answers whether the camera's own
+    # vehicle event for the passage has arrived -- and nothing may send it to
+    # the cloud plate reader while that answers no. Internal, like the two
+    # fields above: it reaches `prepare`, never the wire.
+    origin: str = field(default="camera", compare=False)
+    cloud_permit: object | None = field(default=None, compare=False, repr=False)
 
     @property
     def camera_event(self) -> tuple | None:
@@ -605,12 +614,17 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         superseded = None
 
     def inject_trigger_burst(paths, received_at, trigger, stillness=None,
-                             sweep_read=None):
+                             sweep_read=None, origin="camera", cloud_permit=None):
         # A webhook-triggered clear frame enters the same bounded queue as an
         # FTP burst, with its own content identity and sanitized trigger.
         paths = tuple(Path(path) for path in paths)
+        if origin != "camera" and cloud_permit is None:
+            # An early-origin frame with nothing to say when the cloud may be
+            # asked is never to be asked about at all.
+            cloud_permit = _never
         identity = BurstIdentity(
             content_digest(paths[0]), trigger, stillness, sweep_read=sweep_read,
+            origin=origin, cloud_permit=cloud_permit,
         )
         enqueue((paths, received_at, monotonic(), datetime.now(timezone.utc), identity))
 
@@ -920,6 +934,9 @@ def _process_bursts(
                 # Only ever passed when there is one, so a `prepare` that has
                 # never heard of it is called exactly as before.
                 prepare_options["sweep_read"] = identity.sweep_read
+            if identity is not None and identity.cloud_permit is not None:
+                # Likewise: only an early-origin frame has one.
+                prepare_options["cloud_permit"] = identity.cloud_permit
             try:
                 prepared = prepare(paths, received_at, *timing, **prepare_options)
             except Exception as error:
@@ -942,10 +959,24 @@ def _process_bursts(
                     _remove_uploads(paths)
                 continue
             options["prepared"] = prepared
+        elif identity is not None and identity.cloud_permit is not None:
+            # Without the fast lane there is no `prepare` to carry the permit
+            # to the recogniser, and a frame that cannot carry it is not read.
+            LOGGER.warning("gate_burst stage=skipped cause=early_origin_needs_fast_lane")
+            if coalesce is not None:
+                _give_up(coalesce, item, "queue_coalesced")
+            else:
+                _report_lost(on_dropped, paths, "queue_coalesced")
+                _remove_uploads(paths)
+            continue
         _decide_burst(
             paths, received_at, timing, options, trigger_summary,
             emit, on_error, on_result, on_dropped,
         )
+
+
+def _never() -> bool:
+    return False
 
 
 def _burst_options(item, trigger_resolver):
