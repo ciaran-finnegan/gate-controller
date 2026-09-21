@@ -28,7 +28,7 @@ for 15.5 s nothing read a frame of a car sitting at the gate.
 import logging
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -223,7 +223,9 @@ class Gate:
         self.store = LocalStore(root / "gate.db")
         self.processor = GateProcessor(
             recognizer=self.client, store=self.store, relay=RecordingRelay(self.relay_calls),
-            authorised=lambda: authorised, cooldown=timedelta(seconds=20),
+            # The shipped automatic cooldown (the gate's whole cycle), which
+            # is what refuses a second pulse for the same passage.
+            authorised=lambda: authorised,
             decision_timeout=7.0, min_cloud_request_seconds=1.0,
             match_policy=pipeline_policy,
         )
