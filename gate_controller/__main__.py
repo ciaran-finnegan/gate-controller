@@ -11,7 +11,9 @@ from threading import Thread
 from urllib.parse import urlparse
 
 from .audio import PromptPlayer
-from .actuation import ActuationCoordinator
+from .actuation import (
+    DEFAULT_AUTOMATIC_COOLDOWN, DEFAULT_COMMAND_COOLDOWN, ActuationCoordinator,
+)
 from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_seconds
 from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
@@ -69,6 +71,16 @@ from .runtime import require_python_version
 MIN_QUIET_WINDOW_SECONDS = 0.1
 MAX_QUIET_WINDOW_SECONDS = 2.0
 DEFAULT_QUIET_WINDOW_SECONDS = 0.2
+#: Bounds on GATE_ACTUATION_COOLDOWN_SECONDS. The floor is above the measured
+#: opening travel (~20.5 s, gate-controller#171): anything shorter re-pulses a
+#: gate that is still opening, which stops it dead. The ceiling keeps a typo
+#: from locking the next vehicle out for an hour.
+MIN_ACTUATION_COOLDOWN_SECONDS = 30.0
+MAX_ACTUATION_COOLDOWN_SECONDS = 600.0
+#: Bounds on GATE_COMMAND_COOLDOWN_SECONDS. The floor clears the 2 s relay
+#: pulse and a double-tap in the app.
+MIN_COMMAND_COOLDOWN_SECONDS = 5.0
+MAX_COMMAND_COOLDOWN_SECONDS = 600.0
 MANAGED_RELEASES_ROOT = Path("/opt/gate-controller-deploy/releases")
 MANAGED_RELEASE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
@@ -117,8 +129,12 @@ def main() -> None:
     # lock the pipeline takes, observes no actuation, and is never consulted by
     # a gate decision. It only writes segments a later job cuts windows from.
     audio_segments = _audio_segment_recorder(os.environ)
+    # One coordinator, shared by the recognition pipeline and the command
+    # server, so both windows are measured from the same last pulse.
+    automatic_cooldown, command_cooldown = actuation_cooldowns(os.environ)
     coordinator = ActuationCoordinator(
-        store, relay, timedelta(seconds=20), activation_observer=audio_capture,
+        store, relay, automatic_cooldown, activation_observer=audio_capture,
+        command_cooldown=command_cooldown,
     )
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
@@ -244,7 +260,9 @@ def main() -> None:
         store=store,
         relay=relay,
         authorised=authorised.get,
-        cooldown=timedelta(seconds=20),
+        # Inert while a coordinator is passed -- the coordinator above owns the
+        # windows -- but kept equal to it so nothing here ever says 20 s again.
+        cooldown=automatic_cooldown,
         outbox=outbox,
         coordinator=coordinator,
         max_image_age=timedelta(seconds=max_image_age),
@@ -560,6 +578,56 @@ def _cloud_skip_stillness(environment):
             "gate_ocr key=GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS status=rejected"
         )
         return None
+
+
+def actuation_cooldowns(environment) -> tuple[timedelta, timedelta]:
+    """The automatic and the human-command relay windows, in that order.
+
+    ``GATE_ACTUATION_COOLDOWN_SECONDS`` (default 90) is how long after any
+    relay pulse a plate read may not pulse again; it has to outlast a whole
+    gate cycle, because a pulse into a cycle closes or stops the gate.
+    ``GATE_COMMAND_COOLDOWN_SECONDS`` (default 20) is the same for a person's
+    command from the app, who can see the gate and may need to recover it.
+
+    A value that cannot be used -- unreadable, non-finite, or outside the
+    bounds -- is rejected whole, logged as an error, and replaced by the
+    shipped default. It is never clamped to something near what was asked for,
+    and never replaced by the old 20 s. Refusing to start was the alternative
+    and is worse here: a controller that is down opens for nobody and cannot
+    take the app's recovery command either, while the shipped default is the
+    value measured to be safe on this gate.
+    """
+    automatic = _cooldown_seconds(
+        environment, "GATE_ACTUATION_COOLDOWN_SECONDS", DEFAULT_AUTOMATIC_COOLDOWN,
+        MIN_ACTUATION_COOLDOWN_SECONDS, MAX_ACTUATION_COOLDOWN_SECONDS,
+    )
+    command = _cooldown_seconds(
+        environment, "GATE_COMMAND_COOLDOWN_SECONDS", DEFAULT_COMMAND_COOLDOWN,
+        MIN_COMMAND_COOLDOWN_SECONDS, MAX_COMMAND_COOLDOWN_SECONDS,
+    )
+    logging.getLogger(__name__).info(
+        "actuation_cooldown automatic_seconds=%g command_seconds=%g",
+        automatic.total_seconds(), command.total_seconds(),
+    )
+    return automatic, command
+
+
+def _cooldown_seconds(environment, key: str, default: timedelta,
+                      minimum: float, maximum: float) -> timedelta:
+    raw = str(environment.get(key, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if not math.isfinite(seconds) or not minimum <= seconds <= maximum:
+        logging.getLogger(__name__).error(
+            "actuation_cooldown key=%s status=rejected allowed=%g..%g using_default_seconds=%g",
+            key, minimum, maximum, default.total_seconds(),
+        )
+        return default
+    return timedelta(seconds=seconds)
 
 
 def _ocr_upload_width(environment) -> int:

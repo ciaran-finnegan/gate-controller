@@ -13,9 +13,10 @@ from unittest.mock import Mock, patch
 
 import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import (
-    _quiet_window, _shutdown_controller, build_background_workers,
-    build_reolink_trigger_pipeline, default_runtime_paths,
+    _quiet_window, _shutdown_controller, actuation_cooldowns,
+    build_background_workers, build_reolink_trigger_pipeline, default_runtime_paths,
 )
+from gate_controller.actuation import ActuationCoordinator
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
@@ -391,6 +392,159 @@ class MainConfigurationTests(unittest.TestCase):
                 argparse.ArgumentTypeError, "quiet window must be between 0.1 and 2 seconds"
             ):
                 _quiet_window(value)
+
+    def test_actuation_cooldowns_default_to_a_whole_gate_cycle_and_20s_for_a_person(self):
+        self.assertEqual(
+            actuation_cooldowns({}), (timedelta(seconds=90), timedelta(seconds=20))
+        )
+        self.assertEqual(
+            actuation_cooldowns({
+                "GATE_ACTUATION_COOLDOWN_SECONDS": " ",
+                "GATE_COMMAND_COOLDOWN_SECONDS": "",
+            }),
+            (timedelta(seconds=90), timedelta(seconds=20)),
+        )
+
+    def test_actuation_cooldowns_accept_bounded_values(self):
+        for automatic, command in (("30", "5"), ("75.5", "12"), ("600", "600")):
+            with self.subTest(automatic=automatic, command=command):
+                self.assertEqual(
+                    actuation_cooldowns({
+                        "GATE_ACTUATION_COOLDOWN_SECONDS": automatic,
+                        "GATE_COMMAND_COOLDOWN_SECONDS": command,
+                    }),
+                    (timedelta(seconds=float(automatic)), timedelta(seconds=float(command))),
+                )
+
+    def test_a_rejected_automatic_cooldown_is_logged_and_never_becomes_20s(self):
+        """Below the opening travel, unreadable or absurd: the shipped 90 s."""
+        for value in ("20", "29.9", "0", "-90", "601", "nan", "inf", "-inf",
+                      "ninety", "90s", "1e9"):
+            with self.subTest(value=value), self.assertLogs(
+                "gate_controller.__main__", level="ERROR"
+            ) as logs:
+                automatic, command = actuation_cooldowns(
+                    {"GATE_ACTUATION_COOLDOWN_SECONDS": value}
+                )
+            self.assertEqual(automatic, timedelta(seconds=90))
+            self.assertEqual(command, timedelta(seconds=20))
+            self.assertIn("key=GATE_ACTUATION_COOLDOWN_SECONDS status=rejected",
+                          "\n".join(logs.output))
+
+    def test_a_rejected_command_cooldown_is_logged_and_keeps_its_default(self):
+        for value in ("0", "4.9", "-1", "601", "nan", "soon"):
+            with self.subTest(value=value), self.assertLogs(
+                "gate_controller.__main__", level="ERROR"
+            ) as logs:
+                automatic, command = actuation_cooldowns({
+                    "GATE_ACTUATION_COOLDOWN_SECONDS": "120",
+                    "GATE_COMMAND_COOLDOWN_SECONDS": value,
+                })
+            self.assertEqual(automatic, timedelta(seconds=120))
+            self.assertEqual(command, timedelta(seconds=20))
+            self.assertIn("key=GATE_COMMAND_COOLDOWN_SECONDS status=rejected",
+                          "\n".join(logs.output))
+
+    def test_the_example_environment_ships_the_documented_cooldown_defaults(self):
+        root = Path(gate_main.__file__).resolve().parent.parent
+        example = dict(
+            line.split("=", 1)
+            for line in (root / ".env.example").read_text(encoding="utf-8").splitlines()
+            if line.startswith(("GATE_ACTUATION_COOLDOWN", "GATE_COMMAND_COOLDOWN"))
+        )
+        documentation = (root / "docs/deployment.md").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            sorted(example),
+            ["GATE_ACTUATION_COOLDOWN_SECONDS", "GATE_COMMAND_COOLDOWN_SECONDS"],
+        )
+        self.assertEqual(actuation_cooldowns(example), actuation_cooldowns({}))
+        self.assertIn("| `GATE_ACTUATION_COOLDOWN_SECONDS` | `90` |", documentation)
+        self.assertIn("| `GATE_COMMAND_COOLDOWN_SECONDS` | `20` |", documentation)
+
+    def _coordinators_main_hands_out(self, **environment):
+        """Run ``main`` and return the coordinator each consumer was given.
+
+        ``ActuationCoordinator`` and ``actuation_cooldowns`` are the real ones:
+        the point is what ``main`` constructs, not what a helper would return
+        if something called it.
+        """
+        class Relay:
+            def begin_shutdown(self):
+                return True
+
+            def shutdown(self):
+                return True
+
+        class Store:
+            path = Path("gate.db")
+
+            def recover_interrupted_actuations(self):
+                pass
+
+        class Authorised:
+            def get(self):
+                return ()
+
+        processor = Mock()
+        with patch.dict(
+            os.environ, self.isolated_state_environment(**environment), clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController", return_value=Relay()
+        ), patch.object(
+            gate_main, "LocalStore", return_value=Store()
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache", return_value=Authorised()
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ) as workers, patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=processor
+        ) as create_processor, patch.object(
+            gate_main, "run_worker", side_effect=lambda *args, **kwargs: kwargs["shutdown"]()
+        ), no_live_state_access():
+            gate_main.main()
+        return (
+            workers.call_args.kwargs["coordinator"],
+            create_processor.call_args.kwargs["coordinator"],
+            create_processor.call_args.kwargs["cooldown"],
+        )
+
+    def test_main_builds_the_one_shared_coordinator_with_the_90s_and_20s_defaults(self):
+        for_commands, for_plates, processor_cooldown = self._coordinators_main_hands_out()
+
+        self.assertIsInstance(for_plates, ActuationCoordinator)
+        self.assertIs(
+            for_commands, for_plates,
+            "the command server and the pipeline must measure from the same last pulse",
+        )
+        self.assertEqual(for_plates.automatic_cooldown, timedelta(seconds=90))
+        self.assertEqual(for_plates.command_cooldown, timedelta(seconds=20))
+        self.assertEqual(processor_cooldown, timedelta(seconds=90))
+
+    def test_main_carries_the_configured_cooldowns_into_the_coordinator(self):
+        for_commands, for_plates, processor_cooldown = self._coordinators_main_hands_out(
+            GATE_ACTUATION_COOLDOWN_SECONDS="75", GATE_COMMAND_COOLDOWN_SECONDS="15",
+        )
+
+        self.assertIs(for_commands, for_plates)
+        self.assertEqual(for_plates.automatic_cooldown, timedelta(seconds=75))
+        self.assertEqual(for_plates.command_cooldown, timedelta(seconds=15))
+        self.assertEqual(processor_cooldown, timedelta(seconds=75))
+
+    def test_main_starts_on_the_safe_default_when_the_cooldown_is_nonsense(self):
+        with self.assertLogs("gate_controller.__main__", level="ERROR"):
+            _for_commands, for_plates, _ = self._coordinators_main_hands_out(
+                GATE_ACTUATION_COOLDOWN_SECONDS="20",
+            )
+
+        self.assertEqual(for_plates.automatic_cooldown, timedelta(seconds=90))
+        self.assertEqual(for_plates.command_cooldown, timedelta(seconds=20))
 
     def test_candidate_release_defaults_to_200ms_without_a_refreshed_service_argument(self):
         with patch.dict(

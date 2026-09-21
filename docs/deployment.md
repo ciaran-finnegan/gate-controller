@@ -115,6 +115,59 @@ observe the daemon exiting, including a forced process kill. Software cannot
 de-energize GPIO during a kernel failure or unstable power. Use a pulse-limited
 hardware relay or monostable timer for a fail-safe physical upper bound.
 
+## Relay Cooldown: One Pulse Per Gate Cycle
+
+The relay contact (one 2.0 s pulse) drives the TOPENS operator's step-by-step
+input: open, stop, close, stop, open. A second pulse therefore never "holds the
+gate open". Measured from the gate audio on 21 September 2026
+(gate-controller#171):
+
+- a pulse landing on a **fully open** gate started it **closing** about 2 s
+  later (shut clang at +24.6 s and +25.5 s, two complete cases);
+- per the manufacturer's manual a pulse on a **moving** gate stops it dead, and
+  the next pulse reverses it;
+- one undisturbed cycle after an opening pulse: opening travel about 20.5 s,
+  hold open 16 s (sometimes 25 to 27 s), closing about 23 s, leaves shut at
+  +69.0 to +71.8 s (three clean arrivals), and up to +100 s in disturbed cycles.
+
+The cooldown used to be hard-coded at 20 s, shorter than the opening travel
+alone. A car still waiting for the leaves was read again and pulsed again: in
+five retained days, at +29.3 s, +51.8 s and +65.3 s after the first pulse
+(3 of about 17 arrivals). It is now two windows, both measured from the last
+relay pulse by **any** source:
+
+| Variable | Default | Accepted | Applies to |
+| --- | --- | --- | --- |
+| `GATE_ACTUATION_COOLDOWN_SECONDS` | `90` | 30 to 600 | Every automatic actuation: plate reads, and any source that is not a person's command |
+| `GATE_COMMAND_COOLDOWN_SECONDS` | `20` | 5 to 600 | A person's open command from the app (`remote_command`) |
+
+90 s covers the whole undisturbed cycle (shut by about +72 s) with margin. The
+command window stays short on purpose: someone watching the live camera may
+need a second pulse to recover a gate that stopped mid-travel, and can see what
+the gate is doing. A person's pulse starts the automatic window like any other,
+so a plate read 30 s after a remote open does not pulse.
+
+The window is global, not per plate, because the gate is one physical object: a
+second authorised vehicle arriving inside the window is not pulsed either. It
+is still recorded as a grant (`actuation_outcome = "cooldown"`, see
+`docs/gate-event-ingest.md`), and a vehicle still waiting when the window ends
+is read again and pulsed then.
+
+A value that is unreadable, non-finite or outside the accepted range is
+rejected whole: the controller logs
+`actuation_cooldown key=... status=rejected ... using_default_seconds=...` at
+ERROR and starts on the shipped default. It never falls back to the old 20 s
+for plate reads, and it does not refuse to start, because a controller that is
+down opens for nobody and cannot take the app's recovery command either. The
+windows in force are logged once at startup:
+`actuation_cooldown automatic_seconds=90 command_seconds=20`.
+
+After a reboot (not a service restart) the wall clock cannot be trusted, so
+automatic actuations are refused until the new boot's uptime reaches the
+automatic window, exactly as they were for the first 20 s before. With the
+default that is the first 90 s of uptime; the app's open command is available
+after 20 s.
+
 ## FTP Upload Ownership
 
 Bootstrap adds `ftp-user` to the `gate-controller` group, configures

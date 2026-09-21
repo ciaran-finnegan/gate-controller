@@ -13,7 +13,7 @@ from queue import Empty, Queue
 from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
-from .actuation import ActuationCoordinator
+from .actuation import DEFAULT_AUTOMATIC_COOLDOWN, ActuationCoordinator
 from .direction import passage_key
 from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
@@ -152,7 +152,7 @@ class PreparedBurst:
 
 class GateProcessor:
     def __init__(self, recognizer, store, relay, authorised: Iterable[str],
-                 cooldown: timedelta = timedelta(seconds=20), outbox=None, clock=None,
+                 cooldown: timedelta = DEFAULT_AUTOMATIC_COOLDOWN, outbox=None, clock=None,
                  coordinator=None, max_image_age: timedelta = timedelta(seconds=8),
                  decision_timeout: float = 4.0,
                  activation_guard_seconds: float | None = None,

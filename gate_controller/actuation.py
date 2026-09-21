@@ -7,15 +7,48 @@ from time import monotonic
 from .models import ActuationExecution, GateEvent
 
 
+#: How long after ANY relay pulse an automatic actuation is refused.
+#:
+#: The relay contact drives the operator's step-by-step input: a pulse on a
+#: fully open gate starts it closing, and a pulse on a moving gate stops it
+#: dead. So a second automatic pulse inside one gate cycle never "holds the
+#: gate open" -- it shuts it on the car, or strands it half-way. Measured on
+#: the site gate (gate-controller#171): opening travel ~20.5 s, hold 16 s
+#: (sometimes 25-27 s), closing ~23 s, leaves shut at +69.0 .. +71.8 s after
+#: the opening pulse. The old 20 s window was shorter than the opening travel
+#: alone, and a waiting car was re-pulsed at +29.3 s, +51.8 s and +65.3 s.
+#: 90 s covers the whole undisturbed cycle with margin.
+DEFAULT_AUTOMATIC_COOLDOWN = timedelta(seconds=90)
+
+#: How long after any relay pulse a person's command from the app is refused.
+#:
+#: Deliberately shorter than the automatic window. Someone watching the live
+#: camera may need a second pulse to recover a gate that stopped mid-travel,
+#: and they can see what the gate is doing; the plate reader cannot.
+DEFAULT_COMMAND_COOLDOWN = timedelta(seconds=20)
+
+#: Event sources with a person behind them. Everything else -- the recognition
+#: pipeline, and any source added later that nobody thought to list here --
+#: gets the automatic window, which is the safe side to be wrong on.
+HUMAN_COMMAND_SOURCES = frozenset({"remote_command"})
+
+
 class ActuationCoordinator:
     """The sole in-process owner of claim, cooldown, relay, and finalization."""
 
-    def __init__(self, store, relay, cooldown: timedelta = timedelta(seconds=20), clock=None,
-                 monotonic_clock=None, boot_id: str | None = None,
-                 activation_observer=None):
+    def __init__(self, store, relay, cooldown: timedelta = DEFAULT_AUTOMATIC_COOLDOWN,
+                 clock=None, monotonic_clock=None, boot_id: str | None = None,
+                 activation_observer=None, *, command_cooldown: timedelta | None = None):
         self._store = store
         self._relay = relay
+        # ``cooldown`` is the automatic window. The command window is never
+        # longer than it unless a caller says so explicitly, so a coordinator
+        # built with ``cooldown=0`` has no window for anyone.
         self._cooldown = cooldown
+        self._command_cooldown = (
+            min(cooldown, DEFAULT_COMMAND_COOLDOWN)
+            if command_cooldown is None else command_cooldown
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic_clock = monotonic_clock or monotonic
         self._boot_id = _linux_boot_id() if boot_id is None else boot_id
@@ -27,6 +60,27 @@ class ActuationCoordinator:
         # pipeline's and the command server's alike. It must never raise and
         # never block: the first notification runs while the relay is on.
         self._activation_observer = activation_observer
+
+    @property
+    def automatic_cooldown(self) -> timedelta:
+        return self._cooldown
+
+    @property
+    def command_cooldown(self) -> timedelta:
+        return self._command_cooldown
+
+    def _cooldown_for(self, event: GateEvent, command_ack) -> timedelta:
+        """The window this request has to clear, measured from the last pulse.
+
+        Both windows are measured from the most recent pulse by *any* source:
+        the store and ``_last_attempt_monotonic`` record pulses, not who asked
+        for them. Only the length differs by who is asking now. So a person's
+        pulse starts the automatic window like any other, and a plate read
+        30 s after a remote open is still in cooldown.
+        """
+        if command_ack is not None or event.source in HUMAN_COMMAND_SOURCES:
+            return self._command_cooldown
+        return self._cooldown
 
     def actuate(self, event: GateEvent, *, outbox_payload: dict | None = None,
                 command_ack: tuple[str, datetime] | None = None,
@@ -46,11 +100,12 @@ class ActuationCoordinator:
                 return ActuationExecution(False, terminal.detail or terminal.status, terminal.event_id,
                                          terminal.status, terminal.detail)
             claim_time = event.decision_at or self._clock()
+            cooldown = self._cooldown_for(event, command_ack)
             try:
                 monotonic_now = self._monotonic_clock()
                 claim = self._store.claim_actuation(
-                    key, claim_time, claim_time - self._cooldown,
-                    monotonic_cutoff=monotonic_now - self._cooldown.total_seconds(),
+                    key, claim_time, claim_time - cooldown,
+                    monotonic_cutoff=monotonic_now - cooldown.total_seconds(),
                     boot_id=self._boot_id,
                     event=event, outbox_payload=outbox_payload,
                     command_ack=command_ack,
@@ -98,7 +153,7 @@ class ActuationCoordinator:
                 return ActuationExecution(False, claim.status, None, "failed", claim.status)
             if (self._last_attempt_monotonic is not None
                     and monotonic_now - self._last_attempt_monotonic
-                    < self._cooldown.total_seconds()):
+                    < cooldown.total_seconds()):
                 inhibition = inhibition_now()
                 if inhibition is None:
                     terminal = _cooldown_event(event, key, claim_time)
