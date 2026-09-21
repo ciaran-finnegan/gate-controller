@@ -1,0 +1,42 @@
+[
+ {
+  "cmd": "GetWebHook",
+  "code": 0,
+  "value": {
+   "WebHook": [
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "http://192.168.0.33:8766/reolink/events?secret=PLACEHOLDERSECRET0123456789",
+     "index": 0,
+     "indexEnable": 1
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 1,
+     "indexEnable": 0
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 2,
+     "indexEnable": 0
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 3,
+     "indexEnable": 0
+    }
+   ]
+  }
+ }
+]

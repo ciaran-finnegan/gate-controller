@@ -1,0 +1,14 @@
+[
+ {
+  "cmd": "GetNtp",
+  "code": 0,
+  "value": {
+   "Ntp": {
+    "enable": 1,
+    "interval": 60,
+    "port": 123,
+    "server": "pool.ntp.org"
+   }
+  }
+ }
+]

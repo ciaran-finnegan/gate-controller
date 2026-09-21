@@ -295,6 +295,132 @@ If plates wash out at night, reduce exposure or gain, never add a second light.
 If they are dark, move or re-aim the lamp closer to the camera axis before
 slowing the shutter.
 
+## Fitted Unit, 2026-09-11
+
+The RLC-811A was fitted on the evening of 2026-09-11. What follows is the
+record of that cutover and the settings actually applied, so the next person
+does not rediscover the firmware's quirks.
+
+| | |
+| --- | --- |
+| Model / hardware | RLC-811A, `IPC_560B158MP`, item `P430` |
+| Firmware at fitting | `v3.1.0.4695_2504301440` (older than the RLC-810A's `5764`; `AutoUpgrade` is on) |
+| MAC | `ec:71:db:64:63:9f` |
+| Address | static `192.168.0.54`, set in the Reolink app. It is the retired unit's address, so no file on the Pi changed |
+| Name | `Front Gate` (the webhook `device`/`channelName` and the FTP file prefix) |
+
+### Getting the API open
+
+Current Reolink firmware ships with only the app protocol on port 9000
+enabled; HTTP, HTTPS, RTSP, ONVIF and RTMP are all off, so the Pi cannot pull
+a stream, the API is unreachable, and a browser gets `ERR_CONNECTION_REFUSED`.
+The mobile app's Port Settings toggles did **not** take on this unit. What
+worked was the same protocol the app uses, from a scratch venv on the Mac:
+
+```python
+from reolink_aio.api import Host
+from reolink_aio.baichuan.util import PortType
+host = Host("192.168.0.54", "admin", password)
+await host.baichuan.login()
+for port in (PortType.http, PortType.https, PortType.rtsp):
+    await host.baichuan.set_port_enabled(port, True)
+print(await host.baichuan.get_ports())
+```
+
+Confirm with `GetNetPort` (`httpEnable`, `httpsEnable`, `rtspEnable` all 1;
+leave ONVIF and RTMP at 0).
+
+### Settings applied
+
+[`scripts/reolink/configure-rlc811a.py`](../scripts/reolink/configure-rlc811a.py)
+(installed on the Pi as `/root/configure-rlc811a.py`, next to
+[`camtool.py`](../scripts/reolink/camtool.py)) reads every block, prints a
+field-level diff, and writes only with `--apply`, backing each block up under
+`/root/rlc811a-swap-<stamp>/` and reading it back to verify. The table is the
+configuration as it stands **today**, not as it was written on cutover day:
+the frame rate and `constantFrameRate` rows below were corrected after the
+2026-09-17 measurements in [Frame Rate](#frame-rate-and-the-setting-that-decides-whether-you-get-it),
+and `tests/test_camera_setup_script.py` pins them by rehearsing the script
+against saved camera blocks, so they cannot drift back.
+
+| Block | Setting |
+| --- | --- |
+| `SetEnc` | clear 3840x2160 H.265 6144 kbit/s **6 fps, gop 1** (keyframe every second); `audio 1`; the fluent stream is left as found |
+| `SetIsp` | `exposure Manual`, `shutter 4/4` (1/250 s), `gain 16/16`, `antiFlicker Off`, `backLight Off`, `hdr 0`, `nr3d 1`, **`dayNight Color`**, **`constantFrameRate 1`** |
+| `SetNtp` | `enable 1`, `pool.ntp.org`, 60 min. The time itself is never written here: `gate-camera-control` owns the camera clock (see [Camera clock reconcile](camera-control.md#camera-clock-reconcile)) |
+| `SetIrLights` | `Off` |
+| `SetWhiteLed` | `mode 0`, `state 0`: the PIR floodlight is the only plate light (Night Light above) |
+| `SetFtpV20` | server `192.168.0.33:21`, `ftp-user`, `onlyFtps 0`, `streamType 3`, `picInterval 5`, 4K stills, schedule `AI_VEHICLE` only |
+| `SetPushV20` / `SetPushCfg` | enabled, schedule `AI_VEHICLE` only, `pushInterval 20` (firmware minimum) |
+| `SetWebHook` | slot 0 enabled, `http://192.168.0.33:8766/reolink/events?secret=<GATE_REOLINK_WEBHOOK_SECRET>`, Content Default |
+| `SetAiAlarm` | `vehicle` sensitivity 80 (the frozen baseline) |
+
+Left as found on purpose: SD recording on all AI and motion rules, the email
+block (no address), OSD, `AutoUpgrade 1`, `PowerLed On`, the displayed time and
+the DST block, and **zoom and focus**. The lens position follows the physical
+re-aim in [Capture At The Stop](#capture-at-the-stop) and is set at the gate;
+the script holds no position and sends no `ZoomFocus` command, so it can never
+undo a re-aim. It also warns when `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi
+disagrees with the frame rate it is about to write, because the two must move
+together.
+
+### FTP credentials are masked by the API
+
+`GetFtpV20` returns `userName` as `ft****er` and `password` as asterisks, and
+the older backups on the Pi hold exactly those masked strings. Round-tripping
+a masked block into an already-provisioned camera leaves the credentials
+alone, which is why schedule edits on the RLC-810A worked; it cannot provision
+a fresh unit. The `ftp-user` account's password was not recorded anywhere, so
+[`scripts/reolink/reset-ftp-user-password.sh`](../scripts/reolink/reset-ftp-user-password.sh)
+(on the Pi as `/root/reset-ftp-user-password.sh`) gives it a new random one,
+stores it root-only in `/root/ftp-user.credentials`, and proves an FTP login;
+the configuration script reads it from there. The camera's `TestFtp` uploads a
+small `.txt` into the watched tree, which the controller ignores, and the
+vsftpd log shows the login and upload.
+
+### API shapes on this firmware
+
+- `GetWebHook` needs `param {"channel": 0}`; it returns four slots
+  (`index`, `indexEnable`, `hookUrl`, `bCustom`, `hookBody`).
+- `SetWebHook` takes `param {"WebHook": {"channel", "index", "indexEnable",
+  "hookUrl", "bCustom", "hookBody"}}`.
+- `TestWebHook` accepts `param {"channel": 0, "index": 0}` but answers
+  `rspCode -100 "test failed"` on this firmware, and the Pi saw no connection
+  attempt on port 8766 for any URL or body variant tried. The listener itself
+  was proven with a synthetic post from the Pi (`type TEST` is journaled as
+  `manual_test`; a synthetic `VEHICLE` ran a full clear-stream session and a
+  41 s audio clip). Treat the first real passage as the webhook acceptance
+  test: look for `reolink_webhook` and `gate_trigger_capture outcome=captured`
+  in the journal, and if only the FTP path fires, revisit the webhook.
+- `GetPushCfg` / `SetPushCfg` carry `pushInterval`.
+- `GetEnc` ranges: main `gop` 1-2, `frameRate` down to 2; `audio` boolean.
+- `GetIsp` ranges: `shutter` 0-125, `gain` 1-100, `constantFrameRate` 0-2.
+
+### Verified after the cutover
+
+- MediaMTX `clear` and `camera` paths came back online within seconds of the
+  encoder change; the camera-control service's breaker closed on its own and
+  an IR lease (`Auto`, 1 minute) set and reverted correctly.
+- Audio is in both streams and the controller captured a 41.5 s clip from the
+  synthetic vehicle event.
+- Talkback was not implemented in the media stack on cutover day; it has since
+  shipped as `gate-camera-control`'s own Baichuan path and still reports
+  `hardware_unverified` pending the supervised test at the gate. See
+  [Push-to-talk](talkback.md) and the intro above.
+
+### Still open
+
+- **Zoom and aim.** Unfinished on cutover day and superseded on 2026-09-16:
+  the lens was at the wide end and aimed across the drive, and the fix is the
+  re-aim up the approach in [Capture At The Stop](#capture-at-the-stop), not a
+  zoom position recorded here. Measure from the journal's `gate_ocr plate_box=`
+  width fraction times 3840.
+- **Line-crossing rule** and a tighter vehicle detection zone (currently the
+  full frame): app only, and this firmware exposes no `AI_CROSSLINE_*` schedule
+  row at all (see the first-week review, section 3). The script therefore
+  leaves any line-crossing row it does find enabled rather than zeroing it.
+- **Day and night captures** of a stopped car as the acceptance baseline.
+
 ## Cutover And Rollback
 
 Only one camera is on the port at any time, so the swap is a short outage:

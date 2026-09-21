@@ -1,0 +1,35 @@
+[
+ {
+  "cmd": "GetIsp",
+  "code": 0,
+  "value": {
+   "Isp": {
+    "antiFlicker": "Off",
+    "backLight": "Off",
+    "blc": 128,
+    "blueGain": 128,
+    "channel": 0,
+    "constantFrameRate": 2,
+    "dayNight": "Auto",
+    "dayNightThreshold": 50,
+    "drc": 128,
+    "encType": "CBR",
+    "exposure": "Auto",
+    "gain": {
+     "max": 62,
+     "min": 1
+    },
+    "hdr": 0,
+    "mirroring": 0,
+    "nr3d": 1,
+    "redGain": 128,
+    "rotation": 0,
+    "shutter": {
+     "max": 125,
+     "min": 0
+    },
+    "whiteBalance": "Auto"
+   }
+  }
+ }
+]

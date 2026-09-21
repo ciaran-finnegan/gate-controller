@@ -1,0 +1,42 @@
+[
+ {
+  "cmd": "GetWebHook",
+  "code": 0,
+  "value": {
+   "WebHook": [
+    {
+     "bCustom": 1,
+     "channel": 0,
+     "hookBody": "{\"custom\":1}",
+     "hookUrl": "",
+     "index": 0,
+     "indexEnable": 0
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 1,
+     "indexEnable": 0
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 2,
+     "indexEnable": 0
+    },
+    {
+     "bCustom": 0,
+     "channel": 0,
+     "hookBody": "",
+     "hookUrl": "",
+     "index": 3,
+     "indexEnable": 0
+    }
+   ]
+  }
+ }
+]
