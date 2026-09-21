@@ -383,6 +383,34 @@ class LocalStore:
                 (_OUTBOX_READY, event_id, _OUTBOX_AWAITING_TELEMETRY),
             )
 
+    def record_appearance(self, event_id: int, *, mode: str, opened: bool,
+                          assessment: dict, assessed_at: datetime) -> None:
+        """Keep one farm-machinery assessment beside the event it was made for.
+
+        The headline columns are the weakest frame's -- the one the rule had
+        the most reason to doubt -- so a query over ``margin`` reads as "how
+        close did this come"; every frame's scores are in ``detail``.
+        """
+        frames = list(assessment.get("frames") or ())
+        weakest = min(frames, key=lambda frame: frame.get("margin", 0.0), default={})
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO event_appearance
+                    (event_id, mode, would_admit, opened, verdict, machine, margin,
+                     rival, direction, frames, elapsed_ms, detail, assessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id, mode, int(bool(assessment.get("would_admit"))),
+                    int(bool(opened)), str(assessment.get("verdict")),
+                    weakest.get("machine"), weakest.get("margin"), weakest.get("rival"),
+                    weakest.get("direction"), len(frames),
+                    int(assessment.get("elapsed_ms") or 0), _encode_json(assessment),
+                    _timestamp(assessed_at),
+                ),
+            )
+
     def attach_event_telemetry(self, event_id: int, telemetry: EventTelemetry) -> bool:
         """Attach one trace after the terminal event transaction has committed."""
         payload = _telemetry_payload(telemetry)
@@ -1161,6 +1189,26 @@ class LocalStore:
                     method TEXT NOT NULL,
                     classified_at TEXT NOT NULL,
                     shipped_at TEXT
+                );
+                -- What the farm-machinery appearance check made of an event
+                -- the device's plate read had not decided, and whether it would
+                -- have opened the gate. Local only: shadow mode exists to fill
+                -- this table, and the ingest contract has no block for it.
+                -- `opened` is 1 only where this check is what worked the relay.
+                CREATE TABLE IF NOT EXISTS event_appearance (
+                    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                    mode TEXT NOT NULL,
+                    would_admit INTEGER NOT NULL,
+                    opened INTEGER NOT NULL DEFAULT 0,
+                    verdict TEXT NOT NULL,
+                    machine REAL,
+                    margin REAL,
+                    rival TEXT,
+                    direction TEXT,
+                    frames INTEGER NOT NULL DEFAULT 0,
+                    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL,
+                    assessed_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS gate_sound_scans (
                     segment TEXT PRIMARY KEY,
