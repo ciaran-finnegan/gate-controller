@@ -307,10 +307,11 @@ sequenceDiagram
 | Which frames | all of them, newest first | the newest the device could not place |
 | Good at | a clean plate, instantly | a plate the device cannot read at all, such as one inside a headlight blaze |
 
-Neither waits for the other. A frame the device authorises is injected and
-the sweep waits for that verdict, because it is about to open the gate. A
-frame handed to the cloud is *not* waited for: the sweep keeps reading while
-it is in flight, which is what makes the two parallel rather than one behind
+Neither waits for the other. A frame the device authorises is injected
+together with the read that authorised it, and the sweep **keeps reading**
+while that verdict is outstanding (it used to stop, and on 2026-09-20 spent
+5.2 s of a window looking at nothing). A frame handed to the cloud is not
+waited for either, which is what makes the two parallel rather than one behind
 the other. Set `GATE_LOCAL_SWEEP_CLOUD_FRAMES=0` to keep the paid reader out
 of the window entirely and make the sweep local-only.
 
@@ -323,23 +324,32 @@ first, never one twice, at most `GATE_LOCAL_SWEEP_MAX_FPS`, default 5) is
 cropped to `GATE_PLATE_REGION` and read locally under the same plate list and
 policy band the processor uses. Nothing is injected, so nothing reaches the
 cloud, until the reader's own answer is an authorised plate; that frame is
-then handed to the ordinary burst pipeline, which re-reads it through its
-normal local pass and applies every existing safeguard (freshness, the
-authorisation re-check under the relay lock, cooldown, idempotency) before
+then handed to the ordinary burst pipeline *with the read*, which judges that
+read rather than taking another of a re-encoded copy (see
+[on-device recognition](local-recognition.md#the-sweeps-read-travels-with-its-frame)
+for the 0.877-then-0.723 measurement) and applies every existing safeguard
+(the confidence gate, the shared matching under the band in force, freshness,
+the authorisation re-check under the relay lock, cooldown, idempotency) before
 the relay moves. The sweep decides nothing itself, and stops on an open.
 
 If the window ends with no authorised read, `GATE_LOCAL_SWEEP_FALLBACK_FRAMES`
 (default 1, 0 to 3) of the best frames seen -- highest local score, else the
 newest -- go through the ordinary path, cloud fallback included, so the
 passage is still recorded and the cloud gets a last-resort read; 0 keeps
-every sweep frame off the cloud. The presence session then runs as before
-for whatever remains of its window. The sweep is skipped, and the series runs
+every sweep frame off the cloud. A frame already handed over is never handed
+over again. If the picture still shows something other than the empty drive,
+the on-device reader then **keeps looking** at `GATE_LOCAL_SWEEP_WAITING_FPS`
+(default 1 a second) for up to `GATE_LOCAL_SWEEP_WAITING_SECONDS` (default 30,
+0 disables, never past `GATE_SESSION_SECONDS`), ending on an open, a
+conclusive denial, a new alarm, three empty frames in a row, or the cap. The
+presence session then runs as before for whatever remains of its window -
+which, measured from the alarm, is usually nothing after a sweep. The sweep is skipped, and the series runs
 unchanged, whenever the local reader is off, in shadow mode, or not loaded.
 
 Journal: `gate_local_sweep stage=read plate=… score=… authorised=… read_ms=…`
 for every frame that read characters, and one
-`gate_local_sweep outcome=ended reason=opened|window|new_event|stopping|plate_denied|final_…
-frames=N reads=N busy=N authorised=N injected=N fallback=N best_plate=… best_score=…`
+`gate_local_sweep outcome=ended reason=opened|window|departed|wait_cap|new_event|stopping|plate_denied|final_…
+frames=N reads=N busy=N authorised=N injected=N fallback=N best_plate=… best_score=… waiting_reads=N`
 per event (a warning when nothing was injected). Injected frames log the
 usual `gate_trigger_capture outcome=captured` with `source=sweep` or
 `source=sweep_fallback`. `busy` counts frames the reader declined because the
