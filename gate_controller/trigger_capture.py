@@ -109,6 +109,23 @@ SWEEP_PACE_SLICE_SECONDS = 0.25
 # ends the sweep before the ceiling matters. Never more than one is
 # outstanding at a time, so one passage cannot put two opens in flight.
 MAX_SWEEP_AUTHORISED_INJECTIONS = 3
+# An early-origin sweep -- one the early trigger asked for, before any camera
+# alarm -- reads on the device and nowhere else. How long it may run with the
+# camera still silent: the camera's own alarm has been measured about two
+# seconds after a vehicle first shows, so six is that with a wide margin, and a
+# would-trigger further ahead of the alarm than this bought the passage nothing.
+DEFAULT_EARLY_MAX_SECONDS = 6.0
+MAX_EARLY_MAX_SECONDS = 30.0
+# ...and how soon it gives up on an empty drive: this many frames in a row with
+# no plate box in them and nothing in the picture. The session decoder delivers
+# five frames a second and the watched patch overlaps the plate band, so a
+# vehicle that really tripped it is in the band within a second; five blank
+# frames is that second, and it bounds what any false trigger can cost
+# whatever caused it. 0 disables the quick abort.
+DEFAULT_EARLY_ABORT_FRAMES = 5
+MAX_EARLY_ABORT_FRAMES = 100
+ORIGIN_CAMERA, ORIGIN_EARLY = "camera", "early"
+EARLY_EVENT_TYPE = "early_trigger"
 # One keyframe per second at the camera's 1x interval; the ring only has to
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
@@ -292,6 +309,9 @@ class TriggerCaptureConfig:
     # See DEFAULT_SWEEP_WAITING_SECONDS for where the numbers come from.
     sweep_waiting_seconds: float = DEFAULT_SWEEP_WAITING_SECONDS
     sweep_waiting_fps: float = DEFAULT_SWEEP_WAITING_FPS
+    # An early-origin sweep with the camera still silent: see the constants.
+    early_max_seconds: float = DEFAULT_EARLY_MAX_SECONDS
+    early_abort_frames: int = DEFAULT_EARLY_ABORT_FRAMES
 
 
 def load_trigger_capture_config(
@@ -433,6 +453,14 @@ def load_trigger_capture_config(
         ),
         MIN_SWEEP_WAITING_FPS, MAX_SWEEP_WAITING_FPS,
     )
+    early_max_seconds = _number(
+        environment.get("GATE_EARLY_TRIGGER_MAX_SECONDS", str(DEFAULT_EARLY_MAX_SECONDS)),
+        1.0, MAX_EARLY_MAX_SECONDS,
+    )
+    early_abort_frames = _integer(
+        environment.get("GATE_EARLY_TRIGGER_ABORT_FRAMES", str(DEFAULT_EARLY_ABORT_FRAMES)),
+        0, MAX_EARLY_ABORT_FRAMES,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -468,6 +496,8 @@ def load_trigger_capture_config(
         sweep_cloud_spacing_seconds=sweep_cloud_spacing,
         sweep_waiting_seconds=sweep_waiting_seconds,
         sweep_waiting_fps=sweep_waiting_fps,
+        early_max_seconds=early_max_seconds,
+        early_abort_frames=early_abort_frames,
     )
 
 
@@ -514,6 +544,60 @@ class LostFrame:
     reason: str
     opened: bool = False
     decision: None = None
+
+
+@dataclass(frozen=True)
+class EarlyEvent:
+    """What stands in for a camera event when the early trigger starts a sweep.
+
+    It is not a camera event and never claims to be one: it has no alarm time,
+    and on the wire a frame carrying it is an unverified one.
+    """
+
+    features: dict | None = None
+    event_type: str = EARLY_EVENT_TYPE
+    rule_id: str = EARLY_EVENT_TYPE
+    event_at: None = None
+
+
+def _is_early(event) -> bool:
+    return isinstance(event, EarlyEvent)
+
+
+class SweepPassage:
+    """Whose idea a sweep was, and whether the camera has agreed yet.
+
+    **The invariant this carries:** no picture of a passage goes to the cloud
+    plate reader unless the *camera* has raised a vehicle event for that
+    passage. A sweep the camera started is confirmed from its first instant. A
+    sweep the early trigger started is not, until :meth:`confirm` is called
+    with the camera's alarm -- and until then it may hand the pipeline only a
+    frame its own on-device read already authorises, and that frame carries
+    :meth:`cloud_allowed` with it so that nothing downstream can send it on.
+
+    The origin is stated, never inferred from timing.
+    """
+
+    def __init__(self, origin: str = ORIGIN_CAMERA):
+        self.origin = origin if origin in (ORIGIN_CAMERA, ORIGIN_EARLY) else ORIGIN_EARLY
+        self._confirmed = self.origin == ORIGIN_CAMERA
+        self.confirmed_at: float | None = None
+
+    @property
+    def early(self) -> bool:
+        return self.origin == ORIGIN_EARLY
+
+    @property
+    def confirmed(self) -> bool:
+        return self._confirmed
+
+    def confirm(self, now: float | None = None) -> None:
+        """The camera's own vehicle event for this passage has arrived."""
+        self._confirmed = True
+        self.confirmed_at = now
+
+    def cloud_allowed(self) -> bool:
+        return self._confirmed
 
 
 class ClearKeyframeBuffer(HotStreamBuffer):
@@ -596,8 +680,18 @@ class TriggerFrameCapture:
 
     def __init__(self, config: TriggerCaptureConfig, *, popen=subprocess.Popen,
                  clock=monotonic, wall_clock=None, frame_source=None,
-                 activity=NULL_GATE, sweep=None):
+                 activity=NULL_GATE, sweep=None, early_trigger: bool = False):
         self.config = config
+        # Whether `on_early_trigger` may start anything at all. False unless
+        # GATE_EARLY_TRIGGER=on: in `off` and `shadow` the entry point exists
+        # and refuses, whoever calls it.
+        self._early_enabled = bool(early_trigger)
+        self._early_observer = None
+        self._passage = SweepPassage(ORIGIN_CAMERA)
+        self._sweep_upgrade: tuple | None = None
+        self._early_sweeps = 0
+        self._early_upgraded = 0
+        self._early_aborted = 0
         # A camera event owns the uplink from the first frame to the end of
         # the presence session. The corpus asks this gate before it sends.
         self._activity = activity or NULL_GATE
@@ -625,6 +719,7 @@ class TriggerFrameCapture:
         self._inject = None
         self._inject_accepts_stillness = False
         self._inject_accepts_sweep_read = False
+        self._inject_accepts_cloud_permit = False
         self._lock = Lock()
         self._process = None
         self._closed = False
@@ -686,6 +781,11 @@ class TriggerFrameCapture:
         self._inject_accepts_stillness = _accepts_keyword(inject, "stillness")
         # Likewise the sweep's own read of the frame it injects.
         self._inject_accepts_sweep_read = _accepts_keyword(inject, "sweep_read")
+        # ...and the permit an early-origin frame must carry. Named exactly:
+        # a bare `**kwargs` would swallow it, which is not carrying it.
+        self._inject_accepts_cloud_permit = _accepts_keyword(
+            inject, "cloud_permit", variadic=False,
+        )
 
     def on_camera_event(self, event) -> str:
         """Schedule a capture from the webhook thread without blocking it."""
@@ -709,13 +809,72 @@ class TriggerFrameCapture:
                     try:
                         self._queue.put_nowait((event, now))
                     except Full:
-                        outcome = "skipped_busy"
+                        # The one slot may be holding an early trigger nobody
+                        # has picked up yet. A camera alarm is never the one
+                        # that gives way.
+                        outcome = (
+                            "scheduled" if self._displace_early((event, now))
+                            else "skipped_busy"
+                        )
                     else:
-                        self._last_scheduled_at = now
                         outcome = "scheduled"
+                    if outcome == "scheduled":
+                        self._last_scheduled_at = now
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s",
             outcome, getattr(event, "event_type", "unknown"),
+        )
+        return outcome
+
+    def _displace_early(self, item) -> bool:
+        """Put a camera event in the slot in place of a queued early one. Holds ``_lock``."""
+        try:
+            queued = self._queue.get_nowait()
+        except Empty:
+            queued = None
+        if queued is not None and not _is_early(queued[0]):
+            self._queue.put_nowait(queued)
+            return False
+        try:
+            self._queue.put_nowait(item)
+        except Full:
+            return False
+        return True
+
+    def set_early_observer(self, observer) -> None:
+        """Who is told how each early-origin sweep ended (the early trigger's record)."""
+        self._early_observer = observer
+
+    def session_active(self) -> bool:
+        with self._session_lock:
+            return self._session_active
+
+    def on_early_trigger(self, features=None) -> str:
+        """Ask for a local-only sweep ahead of the camera's alarm. Never blocks.
+
+        Refused unless the early trigger is ``on``, the local sweep can run
+        (there is no early spaced series and no early grab: only the sweep
+        knows how to keep a frame off the cloud), and nothing else is in hand.
+        It takes no part in the camera's own rate limit, so an early sweep can
+        never be the reason a real alarm is `skipped_interval`.
+        """
+        if not self.config.enabled or not self._early_enabled:
+            outcome = "disabled"
+        elif not self._sweep_ready():
+            outcome = "unavailable"
+        elif self.session_active():
+            outcome = "skipped_busy"
+        else:
+            with self._lock:
+                try:
+                    self._queue.put_nowait((EarlyEvent(features=features), self._clock()))
+                except Full:
+                    outcome = "skipped_busy"
+                else:
+                    outcome = "scheduled"
+        LOGGER.info(
+            "gate_trigger_capture outcome=%s event_type=%s origin=%s",
+            outcome, EARLY_EVENT_TYPE, ORIGIN_EARLY,
         )
         return outcome
 
@@ -729,15 +888,36 @@ class TriggerFrameCapture:
                 event, scheduled_at = self._queue.get(timeout=0.25)
             except Empty:
                 continue
+            early = _is_early(event)
+            # Every event starts with its own passage, so nothing a previous
+            # early sweep left behind can describe this one.
+            self._passage = SweepPassage(ORIGIN_EARLY if early else ORIGIN_CAMERA)
+            self._sweep_upgrade = None
+            if early and not (self._early_enabled and self._sweep_ready()):
+                # Only the sweep can keep a frame off the cloud, so an early
+                # trigger never falls back to the spaced series.
+                LOGGER.info("gate_trigger_capture outcome=early_unavailable")
+                continue
             # One span over both halves: a vehicle is at the gate for the
             # whole of it, including the quiet gaps between frames.
-            with self._activity.activity("camera_event"):
+            with self._activity.activity(EARLY_EVENT_TYPE if early else "camera_event"):
                 try:
                     if self._sweep_ready():
                         self.local_sweep(event, scheduled_at, stop_event)
                     else:
                         self.capture_series(event, scheduled_at, stop_event)
-                    self.presence_session(event, scheduled_at, stop_event)
+                    upgrade = self._sweep_upgrade if early else None
+                    if upgrade is not None:
+                        # The camera's alarm arrived during the early sweep:
+                        # from here on this is that alarm's passage.
+                        event, scheduled_at = upgrade
+                    if early and upgrade is None:
+                        # The camera never spoke. The presence session hands
+                        # frames to the pipeline for the cloud to read, so an
+                        # unconfirmed passage does not get one.
+                        self._stop_live_session("early_unconfirmed")
+                    else:
+                        self.presence_session(event, scheduled_at, stop_event)
                 finally:
                     with self._session_lock:
                         self._session_active = False
@@ -811,6 +991,18 @@ class TriggerFrameCapture:
         config = self.config
         self._reset_session()
         self._sweep_runs += 1
+        # Stated, not inferred: a sweep is early-origin because the early
+        # trigger asked for it, and stays unconfirmed until the camera's own
+        # alarm is taken off the queue below. See `SweepPassage`.
+        passage = SweepPassage(ORIGIN_EARLY if _is_early(event) else ORIGIN_CAMERA)
+        self._passage = passage
+        self._sweep_upgrade = None
+        self._early_sweeps += 1 if passage.early else 0
+        sweep_started_at = scheduled_at
+        early_deadline = scheduled_at + min(config.early_max_seconds, config.sweep_seconds)
+        blank = plate_reads = 0
+        first_plate_read: int | None = None
+        first_plate_ms: int | None = None
         self._start_live_session()
         window_deadline = scheduled_at + config.sweep_seconds
         final_deadline = window_deadline + max(0.0, config.sweep_waiting_seconds)
@@ -862,18 +1054,31 @@ class TriggerFrameCapture:
             """Why the sweep must stop now, or None to keep going."""
             if stop_event.is_set():
                 return "stopping"
-            if not self._queue.empty():
+            unconfirmed = passage.early and not passage.confirmed
+            if not self._queue.empty() and not unconfirmed:
+                # (An unconfirmed early sweep takes the camera's alarm off the
+                # queue itself, at the top of the loop, and carries on.)
                 return "new_event"
             with self._session_lock:
                 settled = self._session_settled
             if settled is not None:
                 return settled
+            if unconfirmed:
+                if config.early_abort_frames > 0 and blank >= config.early_abort_frames:
+                    return "early_abort"
+                if self._clock() >= early_deadline:
+                    return "early_unconfirmed"
             if self._clock() >= final_deadline:
                 return "wait_cap" if waiting else "window"
             return None
 
         def hand_over(frame, captured_at, digest, read, *, source) -> Path | None:
             if digest in handed:
+                return None
+            if source != "sweep" and not passage.cloud_allowed():
+                # `sweep_cloud` and `sweep_fallback` exist to be read by the
+                # cloud. Until the camera has raised its own event for this
+                # passage, neither leaves this function.
                 return None
             path = self._inject_bytes(
                 frame, captured_at, event, scheduled_at, source=source, read=read,
@@ -885,7 +1090,7 @@ class TriggerFrameCapture:
         def run_fallback() -> None:
             nonlocal fallback, fallback_done
             fallback_done = True
-            if injected or config.sweep_fallback_frames <= 0:
+            if injected or config.sweep_fallback_frames <= 0 or not passage.cloud_allowed():
                 return
             candidates = []
             if best is not None:
@@ -899,6 +1104,30 @@ class TriggerFrameCapture:
                     fallback += 1
 
         while True:
+            if passage.early and not passage.confirmed:
+                camera = self._take_camera_event()
+                if camera is not None:
+                    # The camera's alarm for this passage. The sweep is
+                    # upgraded where it stands -- same decoder session, same
+                    # frames already read -- and the car gets its whole read
+                    # window measured from the alarm, as it would have had.
+                    lead = max(0.0, camera[1] - sweep_started_at)
+                    event, scheduled_at = camera
+                    passage.confirm(self._clock())
+                    self._sweep_upgrade = camera
+                    self._early_upgraded += 1
+                    window_deadline = scheduled_at + config.sweep_seconds
+                    final_deadline = window_deadline + max(0.0, config.sweep_waiting_seconds)
+                    if config.sweep_waiting_seconds > 0 and config.session_seconds > config.sweep_seconds:
+                        final_deadline = min(
+                            final_deadline, sweep_started_at + config.session_seconds,
+                        )
+                    LOGGER.info(
+                        "gate_local_sweep stage=upgraded origin=early event_type=%s lead_ms=%d "
+                        "reads=%d plate_reads=%d",
+                        getattr(event, "event_type", "unknown"), round(lead * 1000),
+                        reads, plate_reads,
+                    )
             reason = halted()
             if reason is not None:
                 break
@@ -932,6 +1161,7 @@ class TriggerFrameCapture:
                     authorised_path = None
             if (
                 config.sweep_cloud_frames > 0
+                and passage.cloud_allowed()
                 and handovers < config.sweep_cloud_frames
                 # While waiting, only a frame with a plate in it is worth a
                 # paid lookup: the fallback has already given the cloud its
@@ -1005,6 +1235,7 @@ class TriggerFrameCapture:
             ):
                 self._skipped_empty += 1
                 consecutive_empty += 1
+                blank += 1
                 if waiting:
                     # Looked at, even though it was not read: pace the next
                     # look the same way.
@@ -1036,6 +1267,16 @@ class TriggerFrameCapture:
                 busy += 1
                 continue
             newest = (frame, captured_at, digest, read)
+            if read.recognised:
+                blank = 0
+                plate_reads += 1
+                if first_plate_read is None:
+                    first_plate_read = reads
+                    first_plate_ms = round((self._clock() - sweep_started_at) * 1000)
+            elif scene_difference is None:
+                # No idle baseline to compare with, so an unread frame is all
+                # there is to say the drive is empty.
+                blank += 1
             if read.recognised:
                 LOGGER.info(
                     "gate_local_sweep stage=read plate=%s score=%.3f authorised=%s "
@@ -1075,8 +1316,26 @@ class TriggerFrameCapture:
         self._sweep_fallbacks += fallback
         self._sweep_cloud_handovers += handovers
         self._sweep_waiting_reads += waiting_reads
+        unconfirmed = passage.early and not passage.confirmed
+        if passage.early:
+            self._early_aborted += 1 if reason == "early_abort" else 0
+            self._report_early_sweep({
+                "reason": reason, "upgraded": passage.confirmed,
+                "lead_ms": (
+                    None if not passage.confirmed
+                    else round(max(0.0, scheduled_at - sweep_started_at) * 1000)
+                ),
+                "frames": frames, "reads": reads, "plate_reads": plate_reads,
+                "first_plate_read": first_plate_read, "first_plate_ms": first_plate_ms,
+                "blank_frames": blank, "authorised": authorised, "injected": injected,
+                "cloud_handovers": handovers, "fallback": fallback,
+                "best_score": None if best is None else round(best[0], 3),
+                "elapsed_ms": round(max(0.0, self._clock() - sweep_started_at) * 1000),
+            })
         LOGGER.log(
-            logging.INFO if injected or fallback else logging.WARNING,
+            # An early sweep the camera never confirmed is expected to end with
+            # nothing handed on; that is the design, not a fault to warn about.
+            logging.INFO if injected or fallback or unconfirmed else logging.WARNING,
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
             "busy=%d duplicates=%d read_fps=%.1f authorised=%d injected=%d "
             "cloud_handovers=%d blind_handovers=%d fallback=%d "
@@ -1088,6 +1347,33 @@ class TriggerFrameCapture:
             round(max(0.0, self._clock() - scheduled_at) * 1000), waiting_reads,
         )
         return injected + fallback + handovers
+
+    def _take_camera_event(self):
+        """The camera alarm waiting in the slot, taken off it; or None."""
+        try:
+            queued = self._queue.get_nowait()
+        except Empty:
+            return None
+        if _is_early(queued[0]):
+            # A second early trigger says nothing the running sweep does not know.
+            return None
+        return queued
+
+    def _report_early_sweep(self, report: dict) -> None:
+        LOGGER.info(
+            "gate_local_sweep stage=early_ended reason=%s upgraded=%s lead_ms=%s reads=%d "
+            "plate_reads=%d first_plate_ms=%s blank_frames=%d injected=%d cloud_handovers=%d",
+            report["reason"], "yes" if report["upgraded"] else "no", report["lead_ms"],
+            report["reads"], report["plate_reads"], report["first_plate_ms"],
+            report["blank_frames"], report["injected"], report["cloud_handovers"],
+        )
+        observer = self._early_observer
+        if observer is None:
+            return
+        try:
+            observer(report)
+        except Exception:
+            LOGGER.warning("gate_local_sweep stage=early_observer_failed")
 
     def _unread_frames(self, after: float | None) -> list[tuple[bytes, float]]:
         """Fresh session frames newer than ``after``, oldest first.
@@ -1512,18 +1798,33 @@ class TriggerFrameCapture:
         captured_at = self._wall_clock()
         origin = started if scheduled_at is None else scheduled_at
         delta_ms = max(0.0, (self._clock() - origin) * 1000.0)
-        trigger = TriggerTelemetry(
-            source="reolink_webhook",
-            event_type=event.event_type,
-            rule_id=event.rule_id,
-            correlation="matched",
-            event_at=event.event_at,
-            delta_ms=delta_ms,
-        )
+        passage = self._passage
+        unconfirmed = _is_early(event) or (passage.early and not passage.confirmed)
+        if unconfirmed:
+            # Not a camera event, and it does not say it is one: on the wire
+            # this is an unverified frame, exactly like an FTP still.
+            trigger = TriggerTelemetry(
+                source=EARLY_EVENT_TYPE, event_type="unverified", correlation="unverified",
+            )
+        else:
+            trigger = TriggerTelemetry(
+                source="reolink_webhook",
+                event_type=event.event_type,
+                rule_id=event.rule_id,
+                correlation="matched",
+                event_at=event.event_at,
+                delta_ms=delta_ms,
+            )
         inject = self._inject
         if inject is None:
             path.unlink(missing_ok=True)
             LOGGER.warning("gate_trigger_capture outcome=unattached")
+            return False
+        if passage.early and not self._inject_accepts_cloud_permit:
+            # An injector that cannot carry the permit would hand this frame
+            # on with nothing to stop it reaching the cloud. It does not go.
+            path.unlink(missing_ok=True)
+            LOGGER.warning("gate_trigger_capture outcome=early_refused reason=no_cloud_permit")
             return False
         with self._session_lock:
             self._session_paths.add(path)
@@ -1543,6 +1844,12 @@ class TriggerFrameCapture:
             and getattr(sweep_read, "carried", False)
         ):
             extra["sweep_read"] = sweep_read
+        if passage.early:
+            # Carried with the frame for the whole of its life in the
+            # pipeline, and asked at the moment a request would go out: the
+            # answer is no until the camera's own alarm has arrived.
+            extra["origin"] = passage.origin
+            extra["cloud_permit"] = passage.cloud_allowed
         try:
             inject((path,), captured_at, trigger, **extra)
         except Exception:
@@ -1766,14 +2073,15 @@ class TriggerFrameCapture:
         return bytes(buffer), None
 
 
-def _accepts_keyword(callable_object, keyword: str) -> bool:
-    """Whether *callable_object* takes this keyword (a ``**kwargs`` counts)."""
+def _accepts_keyword(callable_object, keyword: str, *, variadic: bool = True) -> bool:
+    """Whether *callable_object* takes this keyword (a ``**kwargs`` counts unless told not to)."""
     try:
         parameters = inspect.signature(callable_object).parameters.values()
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == keyword or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        parameter.name == keyword
+        or (variadic and parameter.kind == inspect.Parameter.VAR_KEYWORD)
         for parameter in parameters
     )
 

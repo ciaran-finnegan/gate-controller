@@ -67,6 +67,9 @@ LOCAL_PASS_MARGIN_SECONDS = 0.05
 # GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS re-derives it; 0 disables the rule.
 DEFAULT_CLOUD_SKIP_STILLNESS = 0.005
 CLOUD_SKIP_MOVING_NO_PLATE = "moving_no_plate"
+# An early-origin frame (the early trigger started its sweep) for whose passage
+# the camera has not raised a vehicle event. Journal only.
+CLOUD_SKIP_NO_CAMERA_EVENT = "no_camera_event"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -131,6 +134,15 @@ class PreparedBurst:
     #: This burst is recognisably farm machinery waiting at the gate, and the
     #: policy is `on`: it will be admitted on that, so it needs no plate read.
     appearance_admits: bool = False
+    #: Only on a frame of an early-origin passage (one the early trigger
+    #: started ahead of the camera's alarm): a callable that says whether the
+    #: camera's own vehicle event for the passage has arrived. While it says
+    #: no, this burst is never sent to the cloud plate reader.
+    cloud_permit: Callable | None = field(default=None, repr=False)
+
+    @property
+    def cloud_allowed(self) -> bool:
+        return _permits(self.cloud_permit)
 
     @property
     def decided(self) -> bool:
@@ -142,7 +154,7 @@ class PreparedBurst:
         """Whether finishing this burst may have to wait on a cloud request."""
         return (
             self.duplicate is None and not self.decided and self.cloud_skip is None
-            and not self.appearance_admits
+            and not self.appearance_admits and self.cloud_allowed
         )
 
     def recognise_options(self, sequence: int) -> dict:
@@ -229,6 +241,11 @@ class GateProcessor:
         self._recognizer_accepts_attempt = _accepts_keyword(
             self._recognise_call, "attempt"
         )
+        # Named exactly: a recogniser whose `**kwargs` would swallow the permit
+        # is not one that honours it.
+        self._recognizer_accepts_cloud_permit = _accepts_keyword(
+            self._recognise_call, "cloud_permit", variadic=False,
+        )
         # The on-device read, off the serial cloud slot. A recogniser without
         # it (every existing fake, and any build with local OCR off) keeps the
         # single-phase path exactly as it was. Both halves are required: a
@@ -253,6 +270,11 @@ class GateProcessor:
         # answer is only ever used for a burst no plate has opened the gate for.
         self._farm_machinery = farm_machinery
 
+    @property
+    def farm_machinery(self):
+        """The farm-machinery policy this processor consults, or None."""
+        return self._farm_machinery
+
     def prepare(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
                 processing_started_at: datetime | None = None, *,
@@ -260,7 +282,7 @@ class GateProcessor:
                 idempotency_key: str | None = None,
                 stillness: float | None = None,
                 local_pass: bool = True,
-                sweep_read=None) -> PreparedBurst:
+                sweep_read=None, cloud_permit=None) -> PreparedBurst:
         """Take a burst as far as the on-device read without touching the network.
 
         This is the fast lane's half of a decision: the burst's identity, its
@@ -326,7 +348,7 @@ class GateProcessor:
         prepared = PreparedBurst(
             paths=paths, digests=digests, idempotency_key=idempotency_key,
             received_at=received_at, started=started, trace=trace, trigger=trigger,
-            discard_hook=self._discard_prepared,
+            discard_hook=self._discard_prepared, cloud_permit=cloud_permit,
         )
         if not local_pass or not paths:
             return prepared
@@ -477,6 +499,7 @@ class GateProcessor:
                 observation = self._recognise(
                     path, deadline, mark_ocr_start, first_attempt=sequence == 0,
                     trace_id=trace.trace_id, on_post_started=mark_post_started,
+                    cloud_permit=prepared.cloud_permit,
                     **prepared.recognise_options(sequence),
                 )
             except _OcrBusy:
@@ -1217,7 +1240,8 @@ class GateProcessor:
                    first_attempt: bool = False, trace_id: str | None = None,
                    on_post_started=None, prepared_attempt=_NOT_PREPARED,
                    local_pass_started: float | None = None,
-                   cloud_skip: str | None = None, stillness: float | None = None):
+                   cloud_skip: str | None = None, stillness: float | None = None,
+                   cloud_permit=None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
@@ -1280,6 +1304,23 @@ class GateProcessor:
                 if on_start is not None:
                     on_start(started)
                 return attempt.observation
+        if (
+            cloud_permit is not None and not self._recognizer_accepts_cloud_permit
+            and not _permits(cloud_permit)
+        ):
+            # An early-origin frame, the camera has not yet raised its own
+            # event for the passage, and this recogniser cannot be handed the
+            # permit to refuse the request itself: nothing is asked of it.
+            if attempt is not None:
+                attempt.abandon()
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skipped reason=%s", CLOUD_SKIP_NO_CAMERA_EVENT,
+            )
+            if on_start is not None:
+                on_start()
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
         remaining = deadline - self._decision_clock()
         if remaining < self._min_cloud_request_seconds:
             # Skipping is what keeps the lookup unbilled; a request posted
@@ -1303,6 +1344,13 @@ class GateProcessor:
         )
         if self._recognizer_reports_post_start and on_post_started is not None:
             extra["on_post_started"] = on_post_started
+        if cloud_permit is not None and self._recognizer_accepts_cloud_permit:
+            # The recogniser asks it again at the last moment before a request
+            # would leave (`PlateRecognizerClient._recognise_once`): that is
+            # the one place every route to the network passes through, and in
+            # `GATE_LOCAL_OCR_CLOUD=always` it is also where the on-device
+            # answer is taken, which an early-origin frame must still get.
+            extra["cloud_permit"] = cloud_permit
         # The budget is read when the operation actually runs, not now: the
         # OCR slot may still be held by an abandoned request, and a recogniser
         # that guards the decision with an on-device read has to bound that
@@ -1779,6 +1827,21 @@ def _bounded_min_cloud_request(value, decision_timeout: float) -> float:
             if DEFAULT_MIN_CLOUD_REQUEST_SECONDS < decision_timeout else 0.0
         )
     return seconds
+
+
+def _permits(cloud_permit) -> bool:
+    """Whether a frame may be sent to the cloud reader. No permit means yes.
+
+    Only an early-origin frame carries one. It is asked, not remembered, so a
+    frame that waited while the camera's alarm arrived is allowed the moment
+    it has; and a permit that cannot answer has answered no.
+    """
+    if cloud_permit is None:
+        return True
+    try:
+        return cloud_permit() is True
+    except Exception:
+        return False
 
 
 def _accepts_keyword(callable_object, keyword: str, *, variadic: bool = True) -> bool:
