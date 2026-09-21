@@ -14,6 +14,7 @@ from .audio import PromptPlayer
 from .actuation import (
     DEFAULT_AUTOMATIC_COOLDOWN, DEFAULT_COMMAND_COOLDOWN, ActuationCoordinator,
 )
+from .agricultural import build_policy as build_farm_machinery_policy
 from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_seconds
 from .authorisation import (
     AuthorisationRefreshWorker, AuthorisedPlateCache, CloudflarePlateFetcher,
@@ -270,6 +271,10 @@ def main() -> None:
         match_policy=match_policy.get,
         min_cloud_request_seconds=_min_cloud_request_seconds(os.environ),
         cloud_skip_stillness=_cloud_skip_stillness(os.environ),
+        # GATE_AGRI_ADMIT=off|shadow|on. `off`, the default, builds nothing and
+        # hands the processor None; the image tower is otherwise loaded here,
+        # once, so no decision ever pays for it.
+        farm_machinery=build_farm_machinery_policy(os.environ),
     )
 
     def prepare(paths, received_at=None, decision_started_at=None,

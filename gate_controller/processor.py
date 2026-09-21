@@ -14,6 +14,8 @@ from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
 from .actuation import DEFAULT_AUTOMATIC_COOLDOWN, ActuationCoordinator
+from .agricultural import EVENT_REASON as FARM_MACHINERY_REASON
+from .agricultural import EVENT_SOURCE as APPEARANCE_SOURCE
 from .direction import passage_key
 from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
@@ -121,6 +123,14 @@ class PreparedBurst:
     duplicate: ProcessingResult | None = None
     consumed: bool = False
     discard_hook: Callable | None = field(default=None, repr=False)
+    #: The farm-machinery reading begun for this burst when it arrived, to be
+    #: collected once the plate path has had its say; and, in `on` mode only,
+    #: its answer, settled before the burst is routed.
+    appearance_pending: object | None = field(default=None, repr=False)
+    appearance: object | None = None
+    #: This burst is recognisably farm machinery waiting at the gate, and the
+    #: policy is `on`: it will be admitted on that, so it needs no plate read.
+    appearance_admits: bool = False
 
     @property
     def decided(self) -> bool:
@@ -130,7 +140,10 @@ class PreparedBurst:
     @property
     def needs_cloud(self) -> bool:
         """Whether finishing this burst may have to wait on a cloud request."""
-        return self.duplicate is None and not self.decided and self.cloud_skip is None
+        return (
+            self.duplicate is None and not self.decided and self.cloud_skip is None
+            and not self.appearance_admits
+        )
 
     def recognise_options(self, sequence: int) -> dict:
         """What `_recognise` is told about the pass the fast lane already ran."""
@@ -159,7 +172,8 @@ class GateProcessor:
                  decision_clock=None,
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
                  match_policy=None, min_cloud_request_seconds: float | None = None,
-                 cloud_skip_stillness: float | None = None):
+                 cloud_skip_stillness: float | None = None,
+                 farm_machinery=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -233,6 +247,11 @@ class GateProcessor:
             min_cloud_request_seconds, decision_timeout,
         )
         self._cloud_skip_stillness = _bounded_cloud_skip_stillness(cloud_skip_stillness)
+        # The appearance credential for farm machinery (`agricultural.py`), or
+        # None when it is off -- and then nothing below does anything. A frame
+        # the device's own plate read decided is never shown to it, and its
+        # answer is only ever used for a burst no plate has opened the gate for.
+        self._farm_machinery = farm_machinery
 
     def prepare(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
@@ -309,7 +328,7 @@ class GateProcessor:
             received_at=received_at, started=started, trace=trace, trigger=trigger,
             discard_hook=self._discard_prepared,
         )
-        if not local_pass or self._local_pass is None or not paths:
+        if not local_pass or not paths:
             return prepared
         deadline = started + self._decision_timeout
         if deadline - self._decision_clock() <= 0:
@@ -317,6 +336,19 @@ class GateProcessor:
             return prepared
         if not _is_fresh(self._clock(), received_at, self._max_image_age):
             return prepared
+        if self._local_pass is not None:
+            self._prepare_local_pass(prepared, deadline, stillness)
+        if not prepared.decided:
+            # A frame the device could not decide may be a machine with no
+            # plate to read. The reading is begun now, while the frame is new,
+            # and costs this thread nothing unless the policy is `on`.
+            self._begin_farm_machinery(prepared, deadline)
+        return prepared
+
+    def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
+                            stillness: float | None) -> None:
+        """The on-device read for the first frame, recorded on ``prepared``."""
+        paths, trace = prepared.paths, prepared.trace
         pass_started = self._decision_clock()
         attempt = self._adopt_sweep_read(
             paths[0], digests[0], sweep_read, deadline, trace.trace_id,
@@ -347,7 +379,6 @@ class GateProcessor:
             and bool(getattr(attempt, "saw_no_plate", False))
         ):
             prepared.cloud_skip = CLOUD_SKIP_MOVING_NO_PLATE
-        return prepared
 
     def process(self, paths: Iterable[Path], received_at: datetime | None = None,
                 decision_started_at: float | None = None,
@@ -372,29 +403,36 @@ class GateProcessor:
         now = self._clock()
         if self._decision_clock() - started >= self._decision_timeout:
             self._abandon_local(prepared)
-            return self.record_skipped(
-                paths, "decision_timeout", received_at, trace=trace,
-                idempotency_key=idempotency_key,
-            )
+            return self._keep_appearance(
+                self._farm_machinery_if_ready(prepared, trace), self.record_skipped(
+                    paths, "decision_timeout", received_at, trace=trace,
+                    idempotency_key=idempotency_key,
+                ))
         if not _is_fresh(now, received_at, self._max_image_age):
             self._abandon_local(prepared)
-            return self.record_skipped(
-                paths, "stale_burst", received_at, trace=trace,
-                idempotency_key=idempotency_key,
-            )
+            return self._keep_appearance(
+                self._farm_machinery_if_ready(prepared, trace), self.record_skipped(
+                    paths, "stale_burst", received_at, trace=trace,
+                    idempotency_key=idempotency_key,
+                ))
         try:
             authorised = self._authorised()
         except Exception:
             self._abandon_local(prepared)
-            return self.record_skipped(
-                paths, "authorisation_error", received_at, trace=trace,
-                idempotency_key=idempotency_key,
-            )
+            return self._keep_appearance(
+                self._farm_machinery_if_ready(prepared, trace), self.record_skipped(
+                    paths, "authorisation_error", received_at, trace=trace,
+                    idempotency_key=idempotency_key,
+                ))
         observations = []
         ocr_failure_reason = None
         decision = None
         timed_out = False
-        for sequence, path in enumerate(paths[:MAX_OCR_FRAMES]):
+        # A burst the fast lane already found to be farm machinery waiting at
+        # the gate (policy `on`) is admitted on that: no plate is looked for,
+        # and no cloud lookup is bought, for a vehicle that carries none.
+        plate_frames = () if prepared.appearance_admits else paths[:MAX_OCR_FRAMES]
+        for sequence, path in enumerate(plate_frames):
             remaining = self._decision_timeout - (self._decision_clock() - started)
             if remaining <= 0:
                 timed_out = True
@@ -519,43 +557,77 @@ class GateProcessor:
             # The loop never reached the first frame: settle the read the
             # fast lane took, so its journal line is not left pending.
             self._abandon_local(prepared)
-        if decision is None:
+        # The plate path has said everything it is going to say. Only if it
+        # has not opened the gate is the farm-machinery reading waited for, so
+        # a plate grant never waits on it. `appearance` is None whenever the
+        # policy is off or was not consulted.
+        if decision is not None and decision.allowed:
+            # A plate opened the gate. The reading is not waited for.
+            appearance = self._farm_machinery_if_ready(prepared, trace)
+        elif timed_out:
+            appearance = self._farm_machinery_if_ready(prepared, trace)
+        else:
+            appearance = self._assess_farm_machinery(
+                prepared, activation_deadline, trace,
+            )
+        admitted_by_appearance = (
+            appearance is not None and appearance.would_admit
+            and not timed_out and not (decision is not None and decision.allowed)
+            and self._farm_machinery is not None and self._farm_machinery.admits
+        )
+        if decision is None and not admitted_by_appearance:
             # A burst that spent its whole deadline waiting for a busy OCR slot
             # never tried the frame; say so rather than blaming the clock.
             if ocr_failure_reason == "ocr_busy":
                 reason = "ocr_busy"
             else:
                 reason = "decision_timeout" if timed_out else (ocr_failure_reason or "no_match")
-            return self.record_skipped(
+            return self._keep_appearance(appearance, self.record_skipped(
                 paths, reason, received_at, trace=trace,
                 idempotency_key=idempotency_key,
-            )
-        trace.set_match_policy(MatchPolicyTelemetry.from_decision(decision))
+            ))
+        if decision is not None:
+            trace.set_match_policy(MatchPolicyTelemetry.from_decision(decision))
         decision_at = self._clock()
         if timed_out:
             trace.mark_decision("denied", "decision_timeout")
             event = _denied_event(idempotency_key, received_at, decision_at, "decision_timeout",
                                   decision)
             event_id = self._record(event, paths)
-            return self._finish_result(
+            return self._keep_appearance(appearance, self._finish_result(
                 trace, ProcessingResult(False, "decision_timeout", event_id, decision)
-            )
+            ))
         if not _is_fresh(decision_at, received_at, self._max_image_age):
             trace.mark_decision("denied", "stale_burst")
             event = _denied_event(idempotency_key, received_at, decision_at, "stale_burst",
                                   decision)
             event_id = self._record(event, paths)
-            return self._finish_result(
+            return self._keep_appearance(appearance, self._finish_result(
                 trace, ProcessingResult(False, "stale_burst", event_id, decision)
+            ))
+        if admitted_by_appearance:
+            # An appearance credential, and recorded as one: its own source and
+            # reason, and no authorised plate, because no plate was matched. A
+            # plate a reader did see stays on the record as what was observed.
+            event = GateEvent(
+                source=APPEARANCE_SOURCE, reason=FARM_MACHINERY_REASON,
+                opened=False, idempotency_key=idempotency_key,
+                received_at=received_at, decision_at=decision_at,
+                observed_plate=decision.observed_plate if decision else None,
+                ocr_confidence=_measured_confidence(decision),
             )
-        event = GateEvent(
-            source=_decision_source(observations, decision), reason=decision.reason,
-            opened=False, idempotency_key=idempotency_key,
-            received_at=received_at, decision_at=decision_at,
-            authorised_plate=decision.authorised_plate, observed_plate=decision.observed_plate,
-            ocr_confidence=_measured_confidence(decision),
-        )
-        if not decision.allowed:
+        else:
+            event = GateEvent(
+                source=_decision_source(observations, decision), reason=decision.reason,
+                opened=False, idempotency_key=idempotency_key,
+                received_at=received_at, decision_at=decision_at,
+                authorised_plate=decision.authorised_plate,
+                observed_plate=decision.observed_plate,
+                ocr_confidence=_measured_confidence(decision),
+            )
+        if admitted_by_appearance:
+            trace.mark_decision("allowed", FARM_MACHINERY_REASON)
+        elif not decision.allowed:
             # A frame that failed must not hide a plate another frame read:
             # the denial is only an OCR error when nothing was recognised.
             if ocr_failure_reason == "ocr_error" and not any(
@@ -567,34 +639,38 @@ class GateProcessor:
         else:
             trace.mark_decision("allowed", decision.reason)
         outbox_payload = self._outbox_payload(paths, await_telemetry=True)
-        if not decision.allowed:
+        if not admitted_by_appearance and not decision.allowed:
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
-            return self._finish_result(
+            return self._keep_appearance(appearance, self._finish_result(
                 trace, ProcessingResult(False, event.reason, event_id, decision)
-            )
+            ))
         actuation_at = self._clock()
         if not _is_fresh(actuation_at, received_at, self._max_image_age):
             event = _denied_event(
                 idempotency_key, received_at, actuation_at, "stale_burst", decision
             )
             event_id = self._store.record_event_with_outbox(event, outbox_payload)
-            return self._finish_result(
+            return self._keep_appearance(appearance, self._finish_result(
                 trace, ProcessingResult(False, "stale_burst", event_id, decision)
-            )
+            ))
         def activation_inhibition():
             with self._ocr_slot_lock:
                 if self._closed:
                     return "failed", "processor_closed"
             if not _is_fresh(self._clock(), received_at, self._max_image_age):
                 return "failed", "stale_burst"
-            try:
-                current_authorised = {
-                    normalise_plate(plate) for plate in self._authorised()
-                }
-            except Exception:
-                return "failed", "authorisation_error"
-            if normalise_plate(decision.authorised_plate) not in current_authorised:
-                return "failed", "authorisation_revoked"
+            if not admitted_by_appearance:
+                # The one check that is about a plate. An appearance grant
+                # matched none, so there is none to have been withdrawn; every
+                # other bar on this path it clears like any other grant.
+                try:
+                    current_authorised = {
+                        normalise_plate(plate) for plate in self._authorised()
+                    }
+                except Exception:
+                    return "failed", "authorisation_error"
+                if normalise_plate(decision.authorised_plate) not in current_authorised:
+                    return "failed", "authorisation_revoked"
             if self._decision_clock() >= activation_deadline:
                 return "failed", "decision_timeout"
             return None
@@ -612,10 +688,122 @@ class GateProcessor:
         if execution.reason in FINAL_INHIBITION_REASONS:
             trace.revise_decision("denied", execution.reason)
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
-        return self._finish_result(
+        return self._keep_appearance(appearance, self._finish_result(
             trace,
             ProcessingResult(execution.opened, execution.reason, execution.event_id, decision),
+        ))
+
+    def _begin_farm_machinery(self, prepared: PreparedBurst, deadline: float) -> None:
+        """Start asking whether this burst is farm machinery. Never raises.
+
+        The fast lane calls this for a frame the device could not decide. The
+        reading runs on its own thread, so in `shadow` this returns at once
+        and the answer is collected after the plate path has finished. In `on`
+        the answer decides where the burst goes next -- a machine waiting at
+        the gate is admitted here and now rather than queued for a cloud
+        lookup on a plate it does not have -- so it is waited for, bounded by
+        the policy's own ceiling: about 140 ms on the Pi.
+        """
+        policy = self._farm_machinery
+        if policy is None:
+            return
+        try:
+            if not policy.consulted:
+                return
+            prepared.appearance_pending = policy.begin(
+                prepared.paths, at=prepared.received_at,
+            )
+            if not policy.admits:
+                return
+            appearance = self._assess_farm_machinery(
+                prepared, deadline - self._activation_guard_seconds, prepared.trace,
+            )
+            prepared.appearance_admits = bool(appearance and appearance.would_admit)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "gate_agri stage=begin_failed", exc_info=True,
+            )
+
+    def _assess_farm_machinery(self, prepared: PreparedBurst, activation_deadline, trace):
+        """This burst's farm-machinery assessment, or None when nobody is asked.
+
+        On the plate path this is reached only after that path has declined to
+        open, so nothing here is ever on the way to a plate grant. The budget
+        is what is left before the relay's own deadline: an answer that arrives
+        after it could not be acted on, so it is not waited for. Never raises
+        -- whatever goes wrong in here, the plate path's answer stands.
+        """
+        policy = self._farm_machinery
+        if policy is None:
+            return None
+        if prepared.appearance is not None:
+            return prepared.appearance
+        try:
+            if not policy.consulted:
+                return None
+            if not _is_fresh(self._clock(), prepared.received_at, self._max_image_age):
+                return None
+            pending = prepared.appearance_pending
+            if pending is None:
+                # No fast lane ran ahead of this burst: begin the reading now.
+                pending = policy.begin(prepared.paths, at=prepared.received_at)
+                prepared.appearance_pending = pending
+            budget = activation_deadline - self._decision_clock()
+            return self._settle_farm_machinery(prepared, pending.result(budget), trace)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "gate_agri stage=assessment_failed", exc_info=True,
+            )
+            return None
+
+    def _farm_machinery_if_ready(self, prepared: PreparedBurst, trace):
+        """The assessment if it has already finished; it is never waited for.
+
+        For a burst the plate path opened the gate for, or one that ran out of
+        time: the answer can change nothing, but it is what shadow mode is
+        measuring, so it is kept when it is there to be kept.
+        """
+        if prepared.appearance is not None:
+            return prepared.appearance
+        pending = prepared.appearance_pending
+        if pending is None or self._farm_machinery is None:
+            return None
+        try:
+            return self._settle_farm_machinery(prepared, pending.result(0.0), trace)
+        except Exception:
+            return None
+
+    def _settle_farm_machinery(self, prepared: PreparedBurst, assessment, trace):
+        prepared.appearance = assessment
+        logging.getLogger(__name__).info(
+            "gate_agri trace_id=%s mode=%s %s",
+            getattr(trace, "trace_id", None), self._farm_machinery.mode,
+            assessment.journal(),
         )
+        return assessment
+
+    def _keep_appearance(self, appearance, result: ProcessingResult) -> ProcessingResult:
+        """Keep the assessment beside the event it was made for. Best effort.
+
+        This is the record shadow mode exists to produce: what the model made
+        of each vehicle, and whether it would have opened the gate, joined to
+        what the gate actually did. It is local only -- the ingest contract
+        has no block for it and would refuse the event whole.
+        """
+        if appearance is None or result.event_id is None or self._farm_machinery is None:
+            return result
+        keep = getattr(self._store, "record_appearance", None)
+        if not callable(keep):
+            return result
+        try:
+            keep(
+                result.event_id, mode=self._farm_machinery.mode,
+                opened=bool(result.opened and result.reason == FARM_MACHINERY_REASON),
+                assessment=appearance.to_record(), assessed_at=self._clock(),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("gate_agri stage=record_failed")
+        return result
 
     def _current_match_policy(self):
         """Return the matching policy in force, falling back to the default."""

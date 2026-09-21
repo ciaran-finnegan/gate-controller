@@ -107,6 +107,7 @@ recorded, and the nine cooldown rows are the ones this change moves.
 | `reason` | Rows | Reader ran? | What it is |
 |---|---|---|---|
 | `exact_match` / `two_frame_ocr_confusion` | 8 | yes | granted; the relay pulsed |
+| `farm_machinery` (`source=appearance`) | — | model, not reader | granted on appearance, not on a plate: recognisable agricultural machinery standing at the gate. `authorised_plate` is always null. Only with `GATE_AGRI_ADMIT=on`; see `docs/agricultural-admit.md` |
 | `exact_match` **during cooldown** | 9 | yes | **granted**; the gate was already open, so the relay was not pulsed again. Recorded as `denied / cooldown` before this change |
 | `no_match` | 80 | yes | a genuine no-read, or a correct refusal of a plate that is not authorised |
 | `decision_timeout` | 19 | sometimes | the frame spent its whole decision budget queued behind the Plate Recognizer 1 req/s throttle |
