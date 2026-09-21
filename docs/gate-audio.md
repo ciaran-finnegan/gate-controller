@@ -64,7 +64,7 @@ the camera's own AAC untouched.
 ```
 GATE_AUDIO_SEGMENTS_ENABLED=true
 GATE_AUDIO_SEGMENTS_DIR=/var/lib/gate-controller/audio-segments
-GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/clear
+GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/camera   # see 2g: not `clear`
 GATE_AUDIO_SEGMENTS_SECONDS=300
 GATE_AUDIO_SEGMENTS_RETENTION_HOURS=48
 GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING=true
@@ -747,6 +747,190 @@ The heartbeat's `gate` block gains `confirmed_24h`, `unconfirmed_24h`,
 count**, and a dashboard should be showing the confirmed figure with the rest
 available behind it.
 
+## 2g. Listening, And Not Listening
+
+The complaint was that closings were not heard reliably. 2e found the latch
+detector hears 8 of the 9 closings that *were recorded*. This section is about
+the ones that were not, measured on the Pi on 2026-09-21 over every segment on
+the card (627 of them, 2026-09-19 04:00 to 2026-09-21 04:00 UTC) against the
+recorder's, MediaMTX's and systemd's journals for the same hours.
+
+**45.73 h of audio in 48.08 h of wall clock: 8,483 s (4.9%) not heard.** The
+journals cover the last 44.2 h of that, and within them the loss divides like
+this:
+
+| Cause | Events | Seconds lost | Of which avoidable here |
+| --- | ---: | ---: | ---: |
+| The camera delivered less audio than real time; recorder running throughout | 108 segments | 7,356 | 0 -- but see "the source" below |
+| MediaMTX reset the 4K session (`buffer length exceeds 64`, `TCP timeout`, a garbled reply) | 24 | 619 | 457 (backoff) |
+| The controller was restarted (deploys) | 11 | 247 | 229 (ffmpeg's buffer) + 18 |
+| The camera rebooted (03:00 IST daily, and once at 08:50) | 2 | 240 | 113 (backoff) |
+| MediaMTX restarted: the TURN credential refresh every 4 h (10), a deploy's media publish (2), undetermined (1) | 13 | 77 | 77 |
+| Unexplained | 1 | 5 | 5 |
+| Before the journal's horizon, unclassifiable | -- | 133 | -- |
+
+So 86% of what was lost was lost with the recorder up and nothing in any
+journal, and of the 1,188 s the recorder *was* down, the stream was genuinely
+unavailable for only 289 s. The other 899 s were the recorder's own doing.
+
+What was checked and found **not** to be a cause:
+
+* **`clear` is not an on-demand path.** `pathDefaults.sourceOnDemand: false`;
+  MediaMTX holds the camera session permanently. The `DESCRIBE failed: 404` in
+  the recorder's journal is MediaMTX's "no stream is available on path" during
+  the ~5 s it takes to re-dial a camera session it has just dropped. There
+  were 7 such failed starts, in 5 of the 51 outages, each a retry that landed
+  inside that window -- and each then cost the better part of a minute.
+* **The per-alarm session decoder and the recorder do not kill each other.**
+  Sessions open and are torn down by their own client throughout
+  (`destroyed: torn down by 127.0.0.1:...`) with the recorder's session
+  untouched. Every reader is terminated together only when the *source* goes.
+* **Ordinary rotation loses nothing.** 444 clock-aligned boundaries with no
+  restart near them: mean +0.041 s, under one 64 ms frame. The 1.0 s "gaps" and
+  the -1 to -4 s "overlaps" in a naive reading are file names, which are whole
+  seconds and are sometimes stamped `...1459Z` for the `15:00` boundary. Of 126
+  apparent gaps over 1 s, 51 were restarts and the rest were this or the
+  shortfall below.
+* **LAN loss.** `gate_net_probe` reported `lan_loss_pct=0` and p95 under 5 ms
+  through the worst hour.
+
+### The shortfall: segments shorter than the time they cover
+
+On 2026-09-20 from 10:45 to 11:40 UTC every five-minute segment held 153-208 s
+of audio. The recorder did not restart (its journal is silent from 10:39:43 to
+14:40:44), ffmpeg logged no error, MediaMTX logged *no* packet loss, and the
+files start on the clock. This is the hour that contains the relay-commanded
+cycle at 10:47 whose whole auto-close was missing: not a restart, as first
+reported, but 141 s absent from a segment that was being written throughout.
+
+Two things place the loss upstream of the recorder:
+
+* The per-event clip recorder -- a different ffmpeg, on its own RTSP session --
+  captured that same passage: `gate_audio_capture outcome=captured
+  label=actuated bytes=137535 seconds=40.3` at 11:47:39 IST. Every other clip
+  that day is 324,375-325,413 bytes for the same 40.3 s. It lost 58% of its
+  audio; the segment beside it lost 47%.
+* The Pi's receive rate from the LAN, steady at ~900 kB/s all day, fell to
+  545-850 kB/s for exactly those minutes (`gate_net_probe rx_bytes_per_s`).
+  Across 396 clean five-minute windows, 12 of the 25 short ones had a mean
+  receive rate under 850 kB/s, against 2 of the 371 full ones.
+
+The camera was sending less than it was encoding. On 2026-09-19 09:00-12:30 UTC
+the same thing happened with MediaMTX counting it: 3,000-37,000 RTP packets an
+hour lost *on a TCP session*, which can only be the camera discarding at its
+own socket. That morning is 5,774 of the 7,356 s; the hour on 09-20 is 1,336.
+
+**Where in a short segment the missing audio falls is not knowable** from an
+ADTS file, which carries no timestamps. The scanner places every event at
+`segment start + samples decoded`, so inside a short segment its times run
+early by however much had been dropped before them. Nothing here corrects for
+that; it is now at least flagged.
+
+### The source: `camera`, not `clear`
+
+MediaMTX holds two sessions to the camera: `clear` (4K main stream) and
+`camera` (sub-stream). Over the 44 hours:
+
+| | `clear` | `camera` |
+| --- | ---: | ---: |
+| RTP packets lost | 86,977 | 0 |
+| Source resets (`buffer length exceeds 64`, garbled reply) | 29 | 0 |
+| Resets shared by both (camera reboot, `TCP timeout`) | 5 | 5 |
+
+They carry the same audio. Read side by side for eight seconds on 2026-09-21,
+**126 of 126 AAC frames were byte-identical** (16 kHz, mono, AAC-LC, 65,394
+bytes each): it is one encoder feeding two sessions, so the motor classifier
+and the latch rule see exactly the bytes they were trained on.
+
+Recording from `camera` would have avoided all 24 session resets and every
+packet-loss hour on 09-19. **What it would have done on 09-20 is not known**:
+MediaMTX counted no loss on either path that hour, so the sub-stream's
+cleanliness then is inferred, not measured. This is a change to
+`/etc/gate-controller.env` on the Pi and is *not* made by a release; see
+Operations.
+
+### What the recorder now does about the part that was its own
+
+* **Retry follows what the child did, not how many children there have been.**
+  The old delay was `5 s x (1 + restarts)` capped at 60, and `restarts` never
+  went down: from the twelfth restart of a process's life, any child that had
+  run under a minute waited a full minute. 57 gaps were over 60 s. Now a child
+  that recorded and lost its stream is retried after 0.5 s; one that never
+  wrote a byte backs off 1, 2, 5, 10, 30 s.
+* **No ffmpeg is spawned to be told 404.** While MediaMTX answers DESCRIBE with
+  "no stream", one loopback socket a second asks again
+  (`stage=waiting reason=no_stream`). Recording resumes within ~2.5 s of the
+  stream's return. Anything other than an outright 404 -- including no answer
+  at all -- does not hold a spawn back.
+* **Every frame is written as it arrives** (`-fflags +flush_packets`). ffmpeg's
+  `file` protocol buffers 256 KiB, which is 32 s of this audio, and a child
+  that is stopped loses it: every segment a deploy cut short was an exact
+  multiple of 262,144 bytes ending mid-frame (262144, 524288, 1048576, 1572864,
+  2097152). 229 s over 11 restarts, and the open segment is also now readable
+  to the second rather than half a minute late. `-flush_packets 1` does *not*
+  work here -- it is not passed to the muxer the segmenter opens. Both were
+  tried on the Pi's ffmpeg 5.1.5: 0 bytes on the card after 6 s with it,
+  48,267 with `-fflags`.
+* **Only the audio is asked for** (`-allowed_media_types audio`). `-vn` discards
+  video after MediaMTX has sent it; the recorder was pulling 900 kB/s of 4K to
+  throw away. MediaMTX now reports `1 track (MPEG-4 Audio)` for this reader.
+* **Release and pruning run on their own timer.** They ran only *between*
+  children, so on the gate 49 segments were released and 49 pruned at once,
+  every four hours, whenever the TURN refresh happened to restart MediaMTX --
+  and a recorder that never restarted would never have pruned. They also ran
+  before the first child was started; the child now comes first.
+* **A stall guard.** A child that writes nothing for 60 s is stopped and
+  replaced. None was seen in 44 hours. It is deliberately longer than the 32 s
+  an unflushed ffmpeg goes between writes, so a build that ignored the flag
+  would be slow to notice a stall rather than killed before its first write.
+
+What is left is what cannot be avoided from here: ~5 s per MediaMTX restart
+(six a day from the TURN refresh alone), ~70 s per camera reboot, and ~5 s of
+process start per deploy.
+
+### Not listening, as data
+
+Silence in `gate_movements` has meant one thing until now: the gate did not
+move. It now has to be read beside two tables the scanner fills in the same
+transaction as the movements:
+
+* `gate_listening` -- one row per scanned segment: the span it covers (to the
+  next segment's start), the audio in it measured from its frames, and the
+  difference.
+* `gate_listening_gaps` -- `started_at`, `ended_at`, `missing_seconds`, `cause`,
+  `detail`. The recorder writes its own gaps, with exact times, to
+  `listening-gaps.jsonl` beside the segments (`service_restart`,
+  `recorder_off`, `source_unavailable`, `stream_ended`, `stalled`, `low_disk`,
+  `spawn_failed`); the scanner copies the ones inside the segments it has just
+  read. Whatever a segment is still missing beyond those is a
+  `stream_shortfall` row against the *whole span*, because that is all that is
+  known about where it fell. For audio recorded before this release there is
+  no ledger, so restarts from then appear as shortfall too.
+
+The scanner journals each one as `gate_sound stage=not_listening from=... to=...
+missing_seconds=... cause=...`, and the recorder journals
+`gate_audio_segments stage=resumed not_listening_from=... to=... seconds=...
+cause=...` when it comes back.
+
+The heartbeat's `capabilities.gate` gains, additively:
+
+| Field | Meaning |
+| --- | --- |
+| `listening_24h_seconds` | Audio actually on the card for segments started in the window |
+| `not_listening_24h_seconds` | The span those segments cover, less that audio |
+| `listening_gaps_24h` | Rows in `gate_listening_gaps` in the window |
+| `longest_gap_24h_seconds` | The largest `missing_seconds` among them |
+| `last_gap_at`, `last_gap_until`, `last_gap_cause` | The most recent one |
+
+The first two add up to what has been *scanned*, not to 86,400, so a scanner
+two hours old does not read as 92% deaf. All are absent until something has
+been measured, which must render as unknown. The dashboard's ingest
+(`narrowedGateCapabilities` in access-gate-ui) keeps only the numeric keys
+named in its `GATE_CEILINGS` and drops the rest without rejecting the
+heartbeat, so these are safe to send today and invisible there until that list
+names them (suggested ceilings: 86,400 for the three durations, 10,000 for the
+count).
+
 ## 3. What Is Proposed
 
 The detector above exists and is tested. What does **not** exist yet is the
@@ -802,6 +986,27 @@ a vehicle leaving is currently only ever seen as a rear plate, motion-blurred,
 outside the crop band.
 
 ## Operations
+
+**Moving the recorder to the sub-stream (2g).** Not done by a release: the Pi's
+`/etc/gate-controller.env` is the operator's file and the updater never writes
+it. `.env.example` carries the new value for a fresh install.
+
+```sh
+# change: GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/clear  ->  .../camera
+sudo sed -i.bak-audio-source \
+  's#^GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/clear$#GATE_AUDIO_SEGMENTS_SOURCE=rtsp://127.0.0.1:8554/camera#' \
+  /etc/gate-controller.env
+sudo systemctl restart file-monitor.service     # at a quiet moment: ~7 s not listening
+
+# verify: the recorder names the new source, and MediaMTX serves it one track
+sudo journalctl -u file-monitor.service -o cat --since -1min | grep 'stage=recording'
+sudo journalctl -u gate-media-gateway.service -o cat --since -1min | grep "path 'camera'.*1 track"
+# ...and after the next scan, the heartbeat's gate.not_listening_24h_seconds stops climbing
+
+# roll back
+sudo mv /etc/gate-controller.env.bak-audio-source /etc/gate-controller.env
+sudo systemctl restart file-monitor.service
+```
 
 ```sh
 # Is the recorder running, and what has it got?
