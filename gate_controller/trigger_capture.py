@@ -65,6 +65,50 @@ DEFAULT_SWEEP_CLOUD_SPACING_SECONDS = 1.0
 MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
+# The waiting phase: once the full-rate window has closed with the gate still
+# shut and a vehicle still in the picture, the on-device reader keeps looking,
+# slowly, until the gate opens, the vehicle leaves, the camera raises a new
+# alarm, or the cap below runs out.
+#
+# On 2026-09-20 at 19:15:43 nothing did. The window closed at +10.1 s with the
+# plate unread, and for the next 15.5 s -- until the *camera* happened to
+# raise a second alarm at +25.9 s -- no frame of a car sitting at the gate was
+# read by anything. The read that opened it came at +30.8 s and the driver
+# waited 41 s.
+#
+# 30 s is the cap because of what it has to cover and what it rides on. It
+# covers that passage (first authorisable read at +30.8 s; window + waiting
+# reaches +40 s). And it stays inside the live decoder session the alarm
+# already started (`session_seconds`, 45 s), so waiting never starts a decoder
+# of its own: the sweep stops at whichever of the two ends first.
+#
+# One read a second because the car is not moving: a waiting vehicle gives the
+# same picture again, and what changes between reads is sensor noise, which is
+# exactly what moves a borderline weakest-character score across its bar. At
+# ~0.2 s a read that is a fifth of one of the Pi's four cores for at most
+# 30 s (about 6 s of inference a passage), against roughly 90% of a core for
+# the 10 s window itself. It spends nothing on the cloud: handovers stay under
+# the per-passage ceiling the window already had, and none of them is blind.
+DEFAULT_SWEEP_WAITING_SECONDS = 30.0
+MAX_SWEEP_WAITING_SECONDS = 60.0
+DEFAULT_SWEEP_WAITING_FPS = 1.0
+MIN_SWEEP_WAITING_FPS, MAX_SWEEP_WAITING_FPS = 0.2, 2.0
+# Consecutive frames showing the idle scene before the waiting phase concludes
+# the vehicle has gone. One could be a decoder hiccup; three at one a second
+# is three seconds of empty drive.
+SWEEP_DEPARTED_FRAMES = 3
+# How finely a paced wait is sliced, so a new alarm, an open or a shutdown is
+# noticed within this long however slow the cadence.
+SWEEP_PACE_SLICE_SECONDS = 0.25
+# Frames one sweep may inject on the strength of an authorised on-device read.
+# One is the normal case. A second or third exists for the read that was right
+# but whose frame was lost on the way -- coalesced out of the queue, timed out
+# behind other work, gone stale -- so the vehicle is not left to the camera's
+# next alarm. It is a ceiling, not a retry policy: each is a recorded event,
+# and a denial that another frame cannot change (`final_*`, `plate_denied`)
+# ends the sweep before the ceiling matters. Never more than one is
+# outstanding at a time, so one passage cannot put two opens in flight.
+MAX_SWEEP_AUTHORISED_INJECTIONS = 3
 # One keyframe per second at the camera's 1x interval; the ring only has to
 # outlive the next keyframe plus its decode.
 KEYFRAME_RING_FRAMES = 4
@@ -119,6 +163,15 @@ DEFAULT_MAX_FLAT_FRACTION = 0.8
 PRESENCE_RETRY_REASONS = frozenset({
     "ocr_error", "ocr_busy", "decision_timeout", "stale_burst", "no_match",
     "processing_error", "queue_coalesced", "upload_incomplete",
+    # "The store already holds an event for these exact bytes." That is a fact
+    # about the *file*, not about the vehicle: the earlier copy's own verdict
+    # is what speaks for it, and it reaches this session by its own path. On
+    # 2026-09-20 at 19:15:54 the sweep's fallback re-injected the very frame
+    # it had already handed to the cloud ten seconds earlier, the pipeline
+    # answered `duplicate_event`, and because that was not listed here the
+    # session settled as `final_duplicate_event` and stopped looking with the
+    # car still at the gate.
+    "duplicate_event",
     # A frame lost to shutdown never read the plate either; the loop leaves
     # on its own stop_event rather than treating this as a final answer.
     "service_stopping",
@@ -234,6 +287,11 @@ class TriggerCaptureConfig:
     # gate. 0 keeps the cloud out of the window entirely.
     sweep_cloud_frames: int = DEFAULT_SWEEP_CLOUD_FRAMES
     sweep_cloud_spacing_seconds: float = DEFAULT_SWEEP_CLOUD_SPACING_SECONDS
+    # After the window: keep reading on the device, slowly, while a vehicle is
+    # still in the picture and the gate has not opened. 0 seconds disables it.
+    # See DEFAULT_SWEEP_WAITING_SECONDS for where the numbers come from.
+    sweep_waiting_seconds: float = DEFAULT_SWEEP_WAITING_SECONDS
+    sweep_waiting_fps: float = DEFAULT_SWEEP_WAITING_FPS
 
 
 def load_trigger_capture_config(
@@ -363,6 +421,18 @@ def load_trigger_capture_config(
         ),
         MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS,
     )
+    sweep_waiting_seconds = _number(
+        environment.get(
+            "GATE_LOCAL_SWEEP_WAITING_SECONDS", str(DEFAULT_SWEEP_WAITING_SECONDS),
+        ),
+        0.0, MAX_SWEEP_WAITING_SECONDS,
+    )
+    sweep_waiting_fps = _number(
+        environment.get(
+            "GATE_LOCAL_SWEEP_WAITING_FPS", str(DEFAULT_SWEEP_WAITING_FPS),
+        ),
+        MIN_SWEEP_WAITING_FPS, MAX_SWEEP_WAITING_FPS,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
@@ -396,6 +466,8 @@ def load_trigger_capture_config(
         sweep_fallback_frames=sweep_fallback_frames,
         sweep_cloud_frames=sweep_cloud_frames,
         sweep_cloud_spacing_seconds=sweep_cloud_spacing,
+        sweep_waiting_seconds=sweep_waiting_seconds,
+        sweep_waiting_fps=sweep_waiting_fps,
     )
 
 
@@ -539,6 +611,7 @@ class TriggerFrameCapture:
         self._sweep_injected = 0
         self._sweep_fallbacks = 0
         self._sweep_cloud_handovers = 0
+        self._sweep_waiting_reads = 0
         self._sweep_last_read_ms: float | None = None
         self.output_directory = config.output_directory
         self._popen = popen
@@ -551,6 +624,7 @@ class TriggerFrameCapture:
         self._queue: Queue = Queue(maxsize=1)
         self._inject = None
         self._inject_accepts_stillness = False
+        self._inject_accepts_sweep_read = False
         self._lock = Lock()
         self._process = None
         self._closed = False
@@ -577,6 +651,9 @@ class TriggerFrameCapture:
         self._session_pending = 0
         self._session_pending_since: float | None = None
         self._session_settled: str | None = None
+        # True from the first frame of a camera event to the end of its
+        # presence session: the only time another burst's open may end it.
+        self._session_active = False
         # Whether any frame of this session put characters on the vehicle.
         self._session_read_a_plate = False
         self._session_changed = Event()
@@ -607,6 +684,8 @@ class TriggerFrameCapture:
         # injector without the parameter -- every older fake -- is called
         # exactly as before.
         self._inject_accepts_stillness = _accepts_keyword(inject, "stillness")
+        # Likewise the sweep's own read of the frame it injects.
+        self._inject_accepts_sweep_read = _accepts_keyword(inject, "sweep_read")
 
     def on_camera_event(self, event) -> str:
         """Schedule a capture from the webhook thread without blocking it."""
@@ -653,11 +732,15 @@ class TriggerFrameCapture:
             # One span over both halves: a vehicle is at the gate for the
             # whole of it, including the quiet gaps between frames.
             with self._activity.activity("camera_event"):
-                if self._sweep_ready():
-                    self.local_sweep(event, scheduled_at, stop_event)
-                else:
-                    self.capture_series(event, scheduled_at, stop_event)
-                self.presence_session(event, scheduled_at, stop_event)
+                try:
+                    if self._sweep_ready():
+                        self.local_sweep(event, scheduled_at, stop_event)
+                    else:
+                        self.capture_series(event, scheduled_at, stop_event)
+                    self.presence_session(event, scheduled_at, stop_event)
+                finally:
+                    with self._session_lock:
+                        self._session_active = False
 
     def _sweep_ready(self) -> bool:
         """Sweep only when configured *and* the local reader can decide.
@@ -674,6 +757,7 @@ class TriggerFrameCapture:
 
     def _reset_session(self) -> None:
         with self._session_lock:
+            self._session_active = True
             self._session_paths.clear()
             self._session_pending_paths.clear()
             self._session_pending = 0
@@ -691,52 +775,87 @@ class TriggerFrameCapture:
         **On the device.** Every new session frame (newest first, never one
         twice) goes to the local reader at up to ``sweep_max_fps``. When its
         own answer is an authorised plate under the band in force, that frame
-        is injected into the ordinary pipeline, which re-reads it and applies
-        every existing safeguard before the relay moves. The sweep then waits
-        for that verdict and stops on an open.
+        is injected into the ordinary pipeline *with the read*, so the
+        pipeline judges the read the sweep took instead of taking another
+        (see ``GateProcessor._adopt_sweep_read``), and applies every existing
+        safeguard before the relay moves. The sweep **keeps reading** while
+        that verdict is outstanding. It used to stop, and on 2026-09-20 that
+        cost 5.2 s of a 10 s window looking at nothing while the injected
+        frame sat in a queue and was then refused. At most one authorised
+        frame is outstanding at a time, and at most
+        ``MAX_SWEEP_AUTHORISED_INJECTIONS`` a sweep: if the first is lost or
+        refused for a reason another frame can change, the next authorised
+        read goes in; an open ends the sweep.
 
         **In the cloud.** Every ``sweep_cloud_spacing_seconds``, up to
         ``sweep_cloud_frames`` times, the newest frame the local reader could
-        not authorise is handed to the same pipeline. Its local pass fails
-        again and the frame goes to the cloud reader, which is exactly where
-        a frame the on-device model cannot read -- a plate inside a headlight
-        blaze, say -- gets its second opinion. The sweep does not wait for
-        these: it keeps reading while they are in flight. The cap is a spend
-        ceiling, because every cloud lookup is billed and the service permits
-        one request a second.
+        not authorise is handed to the same pipeline, again with its read, so
+        the pipeline does not spend the on-device reader on a frame already
+        read. The sweep does not wait for these. The cap is a spend ceiling,
+        because every cloud lookup is billed and the service permits one
+        request a second.
 
-        When the window ends with nothing authorised, up to
-        ``sweep_fallback_frames`` of the best frames seen (highest local
-        score, else the newest) are injected so the passage is still
-        recorded. Returns the frames injected.
+        **Waiting.** When the window closes with the gate still shut, the best
+        frames seen (up to ``sweep_fallback_frames``, never one already
+        injected) are handed on so the passage is recorded, and -- while the
+        picture still shows something other than the empty drive -- the local
+        reader goes on looking at ``sweep_waiting_fps`` for up to
+        ``sweep_waiting_seconds``. A waiting vehicle is the one case where the
+        next frame is as good as this one and the read is free. It ends on an
+        open (by anything: `note_result` hears every burst), a conclusive
+        denial, a new alarm, a shutdown, ``SWEEP_DEPARTED_FRAMES`` empty
+        frames in a row, or the cap.
+
+        Returns the frames injected.
         """
         config = self.config
         self._reset_session()
         self._sweep_runs += 1
         self._start_live_session()
-        deadline = scheduled_at + config.sweep_seconds
-        min_gap = 1.0 / config.sweep_max_fps if config.sweep_max_fps > 0 else 0.0
+        window_deadline = scheduled_at + config.sweep_seconds
+        final_deadline = window_deadline + max(0.0, config.sweep_waiting_seconds)
+        if config.sweep_waiting_seconds > 0 and config.session_seconds > config.sweep_seconds:
+            # Never outlive the decoder session the alarm started.
+            final_deadline = min(final_deadline, scheduled_at + config.session_seconds)
+        window_gap = 1.0 / config.sweep_max_fps if config.sweep_max_fps > 0 else 0.0
+        waiting_gap = (
+            1.0 / config.sweep_waiting_fps if config.sweep_waiting_fps > 0 else 1.0
+        )
+        min_gap = window_gap
         trace_id = f"sweep-{self._sweep_runs}-{int(scheduled_at * 1000) & 0xFFFFFFFF:x}"
         after = None
         frames = reads = busy = authorised = injected = handovers = 0
+        waiting_reads = 0
         last_read_at: float | None = None
         last_handover_at: float | None = None
-        best: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
-        newest: tuple[bytes, float] | None = None
-        unread: tuple[bytes, float] | None = None  # newest the local reader could not authorise
+        # (score, frame, captured_at, digest, read)
+        best: tuple | None = None
+        newest: tuple | None = None  # (frame, captured_at, digest, read)
+        unread: tuple | None = None  # newest the local reader could not authorise
         # The best frame to spend a paid lookup on: one the on-device detector
         # actually found a plate in. A frame it found none in is a picture
         # problem rather than a reading problem, and the cloud is very likely
         # to answer "no plate found" -- which still costs a lookup and, at one
         # request a second with answers taking five or six, still delays every
         # later answer including the one that opens the gate.
-        candidate: tuple[float, bytes, float] | None = None  # (score, frame, captured_at)
+        candidate: tuple | None = None  # (score, frame, captured_at, digest, read)
         handover_blind = 0
         best_plate: str | None = None
         last_frame_digest: bytes | None = None
         duplicates = 0
         reason = "window"
-        awaiting_local_verdict = False
+        waiting = False
+        fallback = 0
+        fallback_done = False
+        consecutive_empty = 0
+        # Every frame this sweep has handed to the pipeline, by content. The
+        # pipeline's identity for a frame *is* its content, so handing the
+        # same bytes over twice can only ever come back `duplicate_event`.
+        handed: set[bytes] = set()
+        # The authorised frame whose verdict is still outstanding, if any, and
+        # when it went in.
+        authorised_path: Path | None = None
+        authorised_since = 0.0
         batch: list[tuple[bytes, float]] = []
 
         def halted() -> str | None:
@@ -749,30 +868,75 @@ class TriggerFrameCapture:
                 settled = self._session_settled
             if settled is not None:
                 return settled
-            if self._clock() >= deadline:
-                return "window"
+            if self._clock() >= final_deadline:
+                return "wait_cap" if waiting else "window"
             return None
+
+        def hand_over(frame, captured_at, digest, read, *, source) -> Path | None:
+            if digest in handed:
+                return None
+            path = self._inject_bytes(
+                frame, captured_at, event, scheduled_at, source=source, read=read,
+            )
+            if path is not None:
+                handed.add(digest)
+            return path
+
+        def run_fallback() -> None:
+            nonlocal fallback, fallback_done
+            fallback_done = True
+            if injected or config.sweep_fallback_frames <= 0:
+                return
+            candidates = []
+            if best is not None:
+                candidates.append(best[1:])
+            if newest is not None and (best is None or newest[1] != best[2]):
+                candidates.append(newest)
+            # A frame the cloud has already been handed is already on record.
+            candidates = [item for item in candidates if item[2] not in handed]
+            for frame, captured_at, digest, read in candidates[:config.sweep_fallback_frames]:
+                if hand_over(frame, captured_at, digest, read, source="sweep_fallback"):
+                    fallback += 1
 
         while True:
             reason = halted()
             if reason is not None:
                 break
-            if awaiting_local_verdict:
-                # Only a frame the local reader authorised is worth waiting
-                # on: its verdict is the open. A frame handed over for the
-                # cloud is deliberately not waited for -- that is what makes
-                # the two readers parallel rather than one behind the other.
+            if not waiting and self._clock() >= window_deadline:
+                # The window has closed with the gate still shut. Put the
+                # passage on record now rather than when the waiting ends, and
+                # carry on only if something is still in the picture.
+                run_fallback()
+                if consecutive_empty >= SWEEP_DEPARTED_FRAMES:
+                    reason = "departed"
+                    break
+                waiting = True
+                min_gap = waiting_gap
+                batch = []
+                LOGGER.info(
+                    "gate_local_sweep stage=waiting event_type=%s fps=%.1f cap_seconds=%d",
+                    getattr(event, "event_type", "unknown"), config.sweep_waiting_fps,
+                    round(max(0.0, final_deadline - self._clock())),
+                )
+            if authorised_path is not None:
                 with self._session_lock:
-                    pending = self._session_pending
-                if pending > 0:
-                    self._session_changed.clear()
-                    self._session_changed.wait(SWEEP_POLL_SECONDS * 5)
-                    continue
-                awaiting_local_verdict = False
+                    outstanding = authorised_path in self._session_pending_paths
+                if not outstanding or (
+                    self._clock() - authorised_since >= self._verdict_deadline_seconds()
+                ):
+                    # Its verdict is in and the session has not settled, so it
+                    # was lost or refused for a reason another frame can
+                    # change -- or no verdict is coming at all (the same guard
+                    # the presence session keeps). The next authorised read
+                    # may go in.
+                    authorised_path = None
             if (
                 config.sweep_cloud_frames > 0
                 and handovers < config.sweep_cloud_frames
-                and (candidate is not None or unread is not None)
+                # While waiting, only a frame with a plate in it is worth a
+                # paid lookup: the fallback has already given the cloud its
+                # look at a frame the device found nothing in.
+                and (candidate is not None or (unread is not None and not waiting))
                 and (
                     last_handover_at is None
                     or self._clock() - last_handover_at >= config.sweep_cloud_spacing_seconds
@@ -784,17 +948,15 @@ class TriggerFrameCapture:
                 # the cloud would have found is exactly the case a second
                 # opinion is being paid for.
                 if candidate is not None:
-                    _score, frame, captured_at = candidate
+                    _score, frame, captured_at, digest, read = candidate
                     candidate = None
                     blind = False
                 else:
-                    frame, captured_at = unread
+                    frame, captured_at, digest, read = unread
                     blind = True
                 unread = None
                 last_handover_at = self._clock()
-                if self._inject_bytes(
-                    frame, captured_at, event, scheduled_at, source="sweep_cloud",
-                ):
+                if hand_over(frame, captured_at, digest, read, source="sweep_cloud"):
                     handovers += 1
                     handover_blind += 1 if blind else 0
                     LOGGER.info(
@@ -802,7 +964,19 @@ class TriggerFrameCapture:
                         handovers, config.sweep_cloud_frames, not blind,
                     )
             if not batch:
+                if waiting and last_read_at is not None:
+                    # Paced *before* the fetch while waiting, in slices, so
+                    # the frame read is the newest there is and a new alarm or
+                    # an open is noticed within a slice.
+                    gap = min_gap - (self._clock() - last_read_at)
+                    if gap > 0:
+                        if self._pause(stop_event, min(gap, SWEEP_PACE_SLICE_SECONDS)):
+                            reason = "stopping"
+                            break
+                        continue
                 batch = self._unread_frames(after)
+                if waiting:
+                    batch = batch[-1:]
                 if not batch:
                     if self._pause(stop_event, SWEEP_POLL_SECONDS):
                         reason = "stopping"
@@ -830,7 +1004,16 @@ class TriggerFrameCapture:
                 and scene_difference < config.empty_scene_threshold
             ):
                 self._skipped_empty += 1
+                consecutive_empty += 1
+                if waiting:
+                    # Looked at, even though it was not read: pace the next
+                    # look the same way.
+                    last_read_at = self._clock()
+                    if consecutive_empty >= SWEEP_DEPARTED_FRAMES:
+                        reason = "departed"
+                        break
                 continue
+            consecutive_empty = 0
             # The session decoder resamples to a fixed rate. When the camera is
             # delivering less than that -- measured at 4.5 fps against a
             # configured 6 -- the resampler makes the difference up by
@@ -841,14 +1024,18 @@ class TriggerFrameCapture:
                 duplicates += 1
                 continue
             last_frame_digest = digest
-            newest = (frame, captured_at)
+            # Newest *seen*, read or not: a frame the busy reader could not
+            # take is still the freshest picture there is to fall back on.
+            newest = (frame, captured_at, digest, None)
             last_read_at = self._clock()
             read = self._sweep.read(frame, trace_id=trace_id)
             reads += 1
+            waiting_reads += 1 if waiting else 0
             self._sweep_last_read_ms = read.read_ms
             if read.status == "unavailable":
                 busy += 1
                 continue
+            newest = (frame, captured_at, digest, read)
             if read.recognised:
                 LOGGER.info(
                     "gate_local_sweep stage=read plate=%s score=%.3f authorised=%s "
@@ -856,31 +1043,30 @@ class TriggerFrameCapture:
                     read.plate, read.score, read.authorised, round(read.read_ms), frames,
                 )
                 if best is None or read.score > best[0]:
-                    best = (read.score, frame, captured_at)
+                    best = (read.score, frame, captured_at, digest, read)
                     best_plate = read.plate
             if not read.authorised:
                 # The freshest view the on-device reader could not settle, and
                 # so the one worth a paid second opinion.
-                unread = (frame, captured_at)
+                unread = (frame, captured_at, digest, read)
                 if read.recognised and (candidate is None or read.score > candidate[0]):
-                    candidate = (read.score, frame, captured_at)
+                    candidate = (read.score, frame, captured_at, digest, read)
                 continue
             authorised += 1
-            if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep"):
+            if authorised_path is not None or injected >= MAX_SWEEP_AUTHORISED_INJECTIONS:
+                # One open in flight at a time, and a ceiling on the whole
+                # sweep. The read is not lost: it is counted, and if the
+                # outstanding frame is refused the next one goes in.
+                continue
+            path = hand_over(frame, captured_at, digest, read, source="sweep")
+            if path is not None:
                 injected += 1
-                awaiting_local_verdict = True
+                authorised_path = path
+                authorised_since = self._clock()
                 # The rest of this clump is older than the frame just sent.
                 batch = []
-        fallback = 0
-        if injected == 0 and reason in ("window", "new_event") and config.sweep_fallback_frames > 0:
-            candidates = []
-            if best is not None:
-                candidates.append((best[1], best[2]))
-            if newest is not None and (best is None or newest[1] != best[2]):
-                candidates.append(newest)
-            for frame, captured_at in candidates[:config.sweep_fallback_frames]:
-                if self._inject_bytes(frame, captured_at, event, scheduled_at, source="sweep_fallback"):
-                    fallback += 1
+        if not fallback_done and reason in ("window", "new_event"):
+            run_fallback()
         self._sweep_frames += frames
         self._sweep_reads += reads
         self._sweep_busy += busy
@@ -888,17 +1074,18 @@ class TriggerFrameCapture:
         self._sweep_injected += injected
         self._sweep_fallbacks += fallback
         self._sweep_cloud_handovers += handovers
+        self._sweep_waiting_reads += waiting_reads
         LOGGER.log(
             logging.INFO if injected or fallback else logging.WARNING,
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
             "busy=%d duplicates=%d read_fps=%.1f authorised=%d injected=%d "
             "cloud_handovers=%d blind_handovers=%d fallback=%d "
-            "best_plate=%s best_score=%s elapsed_ms=%d",
+            "best_plate=%s best_score=%s elapsed_ms=%d waiting_reads=%d",
             reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
             duplicates, reads / max(1e-6, self._clock() - scheduled_at),
             authorised, injected, handovers, handover_blind, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",
-            round(max(0.0, self._clock() - scheduled_at) * 1000),
+            round(max(0.0, self._clock() - scheduled_at) * 1000), waiting_reads,
         )
         return injected + fallback + handovers
 
@@ -925,8 +1112,13 @@ class TriggerFrameCapture:
         return picked
 
     def _inject_bytes(self, frame: bytes, captured_at: float, event, scheduled_at,
-                      *, source: str) -> bool:
-        """Write ``frame`` privately and hand it to the burst pipeline."""
+                      *, source: str, read=None) -> Path | None:
+        """Write ``frame`` privately and hand it to the burst pipeline.
+
+        ``read`` is the sweep's own on-device read of this frame. It travels
+        with the frame so the pipeline judges that read instead of taking
+        another of a re-encoded copy. Returns the injected path, or None.
+        """
         started = self._clock()
         try:
             path = write_private_frame(
@@ -935,22 +1127,23 @@ class TriggerFrameCapture:
         except Exception:
             self._failure_count += 1
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
-            return False
+            return None
         try:
-            injected = self._inject_path(path, event, scheduled_at, started)
+            injected = self._inject_path(path, event, scheduled_at, started, sweep_read=read)
         except Exception:
             self._failure_count += 1
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
-            return False
-        if injected:
-            LOGGER.info(
-                "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
-                "source=%s frame_age_ms=%d",
-                getattr(event, "event_type", "unknown"),
-                round((self._clock() - started) * 1000), source,
-                max(0, round((self._clock() - captured_at) * 1000)),
-            )
-        return injected
+            return None
+        if not injected:
+            return None
+        LOGGER.info(
+            "gate_trigger_capture outcome=captured event_type=%s capture_ms=%d "
+            "source=%s frame_age_ms=%d",
+            getattr(event, "event_type", "unknown"),
+            round((self._clock() - started) * 1000), source,
+            max(0, round((self._clock() - captured_at) * 1000)),
+        )
+        return path
 
     def note_result(self, paths, result) -> bool:
         """Learn how a frame this capture injected was decided.
@@ -983,6 +1176,20 @@ class TriggerFrameCapture:
         with self._session_lock:
             matched = [Path(path) for path in paths if Path(path) in self._session_paths]
             if not matched:
+                # Somebody else's frame -- normally the camera's own FTP still
+                # of the very same vehicle. It says nothing about this
+                # session's frames, with one exception: if it *opened the
+                # gate*, the vehicle this session is watching is being let in,
+                # and going on reading it (and paying for lookups on frames
+                # still queued) buys nothing. On 2026-09-20 that is how the
+                # gate did open, at 19:16:25, while the session knew nothing
+                # about it.
+                if (
+                    self._session_active and self._session_settled is None
+                    and getattr(result, "opened", False)
+                ):
+                    self._session_settled = "opened"
+                    self._session_changed.set()
                 return False
             outstanding = [path for path in matched if path in self._session_pending_paths]
             for path in matched:
@@ -1290,12 +1497,17 @@ class TriggerFrameCapture:
         )
         return (path,)
 
-    def _inject_path(self, path: Path, event, scheduled_at, started) -> bool:
+    def _inject_path(self, path: Path, event, scheduled_at, started, *,
+                     sweep_read=None) -> bool:
         """Hand a written frame to the burst pipeline with its trigger telemetry.
 
         Returns False, having removed the file, when no injector is attached.
         Session bookkeeping is updated before the call and rolled back if the
         injector raises, so a failed hand-off never leaves a frame pending.
+
+        ``sweep_read`` goes to an injector that takes it (the worker's does);
+        one that does not -- every older fake -- is called exactly as before
+        and the pipeline simply reads the frame for itself.
         """
         captured_at = self._wall_clock()
         origin = started if scheduled_at is None else scheduled_at
@@ -1326,6 +1538,11 @@ class TriggerFrameCapture:
             if self._inject_accepts_stillness and self._last_stillness is not None
             else {}
         )
+        if (
+            sweep_read is not None and self._inject_accepts_sweep_read
+            and getattr(sweep_read, "carried", False)
+        ):
+            extra["sweep_read"] = sweep_read
         try:
             inject((path,), captured_at, trigger, **extra)
         except Exception:
@@ -1457,6 +1674,9 @@ class TriggerFrameCapture:
                 "fallbacks": self._sweep_fallbacks,
                 "cloud_frames": self.config.sweep_cloud_frames,
                 "cloud_handovers": self._sweep_cloud_handovers,
+                "waiting_seconds": self.config.sweep_waiting_seconds,
+                "waiting_fps": self.config.sweep_waiting_fps,
+                "waiting_reads": self._sweep_waiting_reads,
                 "last_read_ms": (
                     None if self._sweep_last_read_ms is None
                     else round(self._sweep_last_read_ms)

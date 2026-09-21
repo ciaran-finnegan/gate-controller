@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 
@@ -118,6 +119,24 @@ class SweepConfigTests(unittest.TestCase):
         self.assertEqual(config.sweep_fallback_frames, 1)
         self.assertEqual(config.sweep_cloud_frames, 5)
         self.assertEqual(config.sweep_cloud_spacing_seconds, 1.0)
+        # Once the sweep is on, a waiting vehicle is looked at by default.
+        self.assertEqual((config.sweep_waiting_seconds, config.sweep_waiting_fps), (30.0, 1.0))
+
+    def test_the_waiting_phase_is_bounded_from_the_environment(self):
+        config = load_trigger_capture_config(
+            {"GATE_LOCAL_SWEEP_WAITING_SECONDS": "0", "GATE_LOCAL_SWEEP_WAITING_FPS": "2"},
+            Path("/tmp"), webhook_enabled=True,
+        )
+        self.assertEqual((config.sweep_waiting_seconds, config.sweep_waiting_fps), (0.0, 2.0))
+        for key, value in (
+            ("GATE_LOCAL_SWEEP_WAITING_SECONDS", "-1"),
+            ("GATE_LOCAL_SWEEP_WAITING_SECONDS", "61"),
+            ("GATE_LOCAL_SWEEP_WAITING_FPS", "0.1"),
+            ("GATE_LOCAL_SWEEP_WAITING_FPS", "2.5"),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ValueError):
+                    load_trigger_capture_config({key: value}, Path("/tmp"), webhook_enabled=True)
 
     def test_environment_bounds_are_enforced(self):
         environment = {
@@ -200,6 +219,32 @@ class LocalSweepReaderTests(unittest.TestCase):
         self.assertEqual(trace_id, "sweep-1")
         self.assertIs(given_authorised, authorised)
 
+    def test_a_completed_read_travels_with_the_digest_of_the_frame_it_came_from(self):
+        recognition = LocalRecognition(plate="131D2696", score=0.877, status="recognized")
+        region = PlateRegion(0.25, 0.0, 0.75, 0.6)
+        reader = LocalSweepReader(FakeRecognizer(recognition, decides=True), plate_region=region)
+        frame = jpeg((200, 100))
+        read = reader.read(frame)
+        self.assertTrue(read.carried)
+        self.assertIs(read.recognition, recognition, "the recogniser's own answer, unaltered")
+        self.assertEqual(read.frame_digest, sha256(frame).hexdigest(),
+                         "the whole frame's identity, which is what the pipeline keys on")
+        self.assertEqual(read.image, crop_to_region(frame, region), "the bytes the model saw")
+        geometry = read.geometry
+        self.assertEqual(
+            (geometry.frame_width, geometry.frame_height, geometry.crop_left, geometry.crop_top,
+             geometry.crop_width, geometry.crop_height),
+            (200, 100, 50, 0, 150, 60),
+        )
+
+    def test_a_read_that_never_completed_carries_nothing(self):
+        for status in ("unavailable", "error"):
+            with self.subTest(status=status):
+                reader = LocalSweepReader(FakeRecognizer(LocalRecognition(status=status)))
+                read = reader.read(jpeg())
+                self.assertFalse(read.carried)
+                self.assertIsNone(read.recognition)
+
     def test_the_band_is_cropped_before_the_reader_sees_it(self):
         recognizer = FakeRecognizer(LocalRecognition(status="no_plate"))
         reader = LocalSweepReader(recognizer, plate_region=PlateRegion(0.25, 0.0, 0.75, 0.6))
@@ -235,15 +280,19 @@ class LocalSweepTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _capture(self, source, sweep, *, seconds=10.0, fallback=1, presence_frames=0,
-                 inject=None, max_fps=5.0, cloud=0, cloud_spacing=1.0):
+                 inject=None, max_fps=5.0, cloud=0, cloud_spacing=1.0, waiting=0.0,
+                 waiting_fps=1.0, empty_scene=0.0):
         # cloud=0 by default so each test says for itself whether the paid
-        # reader takes part; the shipped default is 5.
+        # reader takes part; the shipped default is 5. Likewise waiting=0: the
+        # tests written for the window keep testing the window, and the ones
+        # about the waiting phase that follows it ask for one (shipped: 30 s).
         config = TriggerCaptureConfig(
             enabled=True, output_directory=self.root / ".trigger-capture",
             sweep_enabled=True, sweep_seconds=seconds, sweep_max_fps=max_fps,
             sweep_fallback_frames=fallback, presence_max_frames=presence_frames,
-            empty_scene_threshold=0.0, max_flat_fraction=0.0,
+            empty_scene_threshold=empty_scene, max_flat_fraction=0.0,
             sweep_cloud_frames=cloud, sweep_cloud_spacing_seconds=cloud_spacing,
+            sweep_waiting_seconds=waiting, sweep_waiting_fps=waiting_fps,
         )
         capture = TriggerFrameCapture(
             config, popen=lambda *a, **k: None, clock=self.clock,
@@ -304,6 +353,117 @@ class LocalSweepTests(unittest.TestCase):
         self.assertIn("injected=0 cloud_handovers=0 blind_handovers=0 fallback=1 best_plate=11WH257 best_score=0.700", ended[0])
         self.assertIn("source=sweep_fallback", "\n".join(logs.output))
         self.assertGreaterEqual(self.clock.now, 103.0)
+
+    def test_the_fallback_never_hands_over_a_frame_the_cloud_already_has(self):
+        """19:15:53.99 on 2026-09-20. The best read of the window (0.162) was
+        the first frame, which had gone to the cloud at 19:15:44.65. The
+        fallback injected the same bytes again; the pipeline keys a frame by
+        its content, answered `duplicate_event`, and the session ended."""
+        first, second, third = jpeg(seed=1), jpeg(seed=2), jpeg(seed=3)
+        source = FrameSource(self.clock, [(100.0, first), (100.4, second), (100.8, third)])
+        sweep = ScriptedSweep({
+            first: SweepRead(status="recognized", plate="12C68171", score=0.162, read_ms=170.0),
+        })
+        capture = self._capture(source, sweep, seconds=3.0, fallback=1, cloud=1)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        handed = [paths[0].read_bytes() for paths, _trigger in self.injected]
+        self.assertEqual(handed[0], first, "the cloud handover took the frame with a plate in it")
+        self.assertEqual(len(handed), len(set(handed)), "the same bytes were injected twice")
+        self.assertEqual(handed[1], third, "the fallback moved on to the newest frame instead")
+        self.assertIn("cloud_handovers=1 blind_handovers=0 fallback=1", "\n".join(logs.output))
+
+    def test_the_sweeps_read_goes_with_the_frame_to_an_injector_that_takes_it(self):
+        winner = jpeg(seed=2)
+        source = FrameSource(self.clock, [(100.0, winner)])
+        read = SweepRead(
+            status="recognized", plate="131D2696", score=0.877, authorised=True,
+            recognition=LocalRecognition(plate="131D2696", score=0.877, status="recognized"),
+            frame_digest=sha256(winner).hexdigest(),
+        )
+        carried = []
+        capture = None
+
+        def inject(paths, received_at, trigger, sweep_read=None):
+            carried.append(sweep_read)
+            capture.note_result(paths, ProcessingResult(True, "exact_match"))
+
+        capture = self._capture(source, ScriptedSweep({winner: read}), seconds=2.0, inject=inject)
+        capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertEqual(carried, [read])
+
+    def test_waiting_reads_slowly_and_stops_at_its_cap(self):
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(80)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({})
+        capture = self._capture(source, sweep, seconds=2.0, fallback=1, waiting=5.0, waiting_fps=1.0)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("gate_local_sweep stage=waiting", output)
+        self.assertIn("reason=wait_cap", output)
+        self.assertLessEqual(self.clock.now, 107.6)
+        waiting_reads = capture.status()["sweep"]["waiting_reads"]
+        self.assertGreaterEqual(waiting_reads, 4)
+        self.assertLessEqual(waiting_reads, 6, "one a second for five seconds")
+        # The passage was put on record when the window closed, not 5 s later.
+        self.assertLess(output.index("source=sweep_fallback"), output.index("stage=waiting"))
+
+    def test_waiting_never_outlives_the_decoder_session(self):
+        frames = [(100.0 + index * 0.5, jpeg(seed=index)) for index in range(200)]
+        source = FrameSource(self.clock, frames)
+        capture = self._capture(source, ScriptedSweep({}), seconds=2.0, fallback=0, waiting=60.0)
+        object.__setattr__(capture.config, "session_seconds", 8.0)
+        capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertLessEqual(self.clock.now, 108.6)
+
+    def test_an_empty_drive_at_the_end_of_the_window_is_not_waited_on(self):
+        class EmptyDrive(FrameSource):
+            def scene_difference(self, frame):
+                return 0.001
+
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(60)]
+        source = EmptyDrive(self.clock, frames)
+        sweep = ScriptedSweep({})
+        capture = self._capture(source, sweep, seconds=2.0, fallback=0, waiting=30.0,
+                                empty_scene=0.03)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertIn("reason=departed", "\n".join(logs.output))
+        self.assertLess(self.clock.now, 103.0)
+        self.assertEqual(sweep.reads, [], "an empty drive is never worth a read")
+
+    def test_no_more_than_one_authorised_frame_is_ever_outstanding(self):
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(12)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({
+            data: SweepRead(status="recognized", plate="131D2696", score=0.95, authorised=True)
+            for _at, data in frames
+        })
+        # Verdicts never arrive: every authorised frame after the first is held back.
+        capture = self._capture(source, sweep, seconds=2.0, fallback=0)
+        capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertEqual(len(self.injected), 1)
+        status = capture.status()["sweep"]
+        self.assertGreater(status["authorised"], 1)
+        self.assertEqual(status["injected"], 1)
+
+    def test_a_refused_authorised_frame_lets_the_next_one_in_up_to_the_ceiling(self):
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(40)]
+        source = FrameSource(self.clock, frames)
+        sweep = ScriptedSweep({
+            data: SweepRead(status="recognized", plate="131D2696", score=0.95, authorised=True)
+            for _at, data in frames
+        })
+        capture = None
+
+        def inject(paths, received_at, trigger):
+            self.injected.append(paths)
+            capture.note_result(paths, ProcessingResult(False, "decision_timeout"))
+
+        capture = self._capture(source, sweep, seconds=6.0, fallback=0, inject=inject)
+        capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertEqual(len(self.injected), 3, "MAX_SWEEP_AUTHORISED_INJECTIONS")
 
     def test_zero_fallback_frames_keeps_every_sweep_frame_off_the_pipeline(self):
         frame = jpeg(seed=1)

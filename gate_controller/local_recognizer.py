@@ -1030,6 +1030,35 @@ class LocalRecognizer:
         future.set_result(unavailable_recognition())
         return LocalFrame(self, trace_id, future, plates, policy, now)
 
+    def adopt(self, recognition: LocalRecognition, *, trace_id=None,
+              authorised=None, policy=None) -> LocalFrame:
+        """A pairing handle for a read this recogniser has *already* taken.
+
+        The sweep reads a session frame and, when it hands that frame to the
+        pipeline, hands the read along with it. Reading the frame a second
+        time is not a second opinion: the pipeline re-encodes the plate band
+        at a different JPEG quality, and the weakest-character score of the
+        very same picture moved from 0.877 to 0.723 on 2026-09-20 -- across
+        the 0.75 bar -- on nothing but that. So the read is adopted as it
+        stands: no inference, no place in the one-read-at-a-time slot, and
+        everything after it (the confidence gate, the shared matching under
+        the band in force *now*, the journal line, the telemetry block) runs
+        exactly as it does for a read taken here.
+
+        Only a :class:`LocalRecognition` this process produced is accepted;
+        anything else gets the null handle and the caller reads the frame
+        itself.
+        """
+        if not self._config.enabled or self._closed:
+            return NULL_FRAME
+        if not isinstance(recognition, LocalRecognition):
+            return NULL_FRAME
+        plates = _authorised_set(authorised)
+        resolved, now = resolve_policy(policy), self._wall_clock()
+        future: Future = Future()
+        future.set_result(recognition)
+        return LocalFrame(self, trace_id, future, plates, resolved, now)
+
     def recognise(self, image: bytes, *, trace_id=None, geometry=None,
                   authorised=None, policy=None,
                   timeout: float | None = None) -> LocalRecognition:

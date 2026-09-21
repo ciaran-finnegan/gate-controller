@@ -213,6 +213,151 @@ re-encodes the JPEG once and hands the bytes to the cloud request that
 follows, so splitting the work does not double it on a board that cannot spare
 the cycles.
 
+### The sweep's read travels with its frame
+
+The local sweep (`GATE_LOCAL_SWEEP_ENABLED`, see
+[the camera guide](reolink-rlc-810a.md)) reads every live session frame on the
+device and injects the first one whose read authorises. Until 2026-09-21 the
+pipeline then **read that frame again**, and that second read was not a second
+opinion. It was the same picture through a different JPEG encoder setting.
+
+**What happened.** 2026-09-20, an authorised driver, 41 s at the gate:
+
+| time (IST) | what | |
+| --- | --- | --- |
+| 19:15:43.8 | first vehicle alarm; the sweep's only plate-like read in 10 s is 0.162 | plate blurred, then below the crop band |
+| 19:15:53.99 | sweep ends `reason=window`; its fallback re-injects the frame it had already handed to the cloud at 19:15:44.65 | same bytes, same content key |
+| 19:15:54.12 | `presence_ended reason=final_duplicate_event extra_frames=0` | **nothing reads a frame for 15.5 s** |
+| 19:16:09.7 | the *camera* raises a second alarm | |
+| 19:16:14.63 | sweep reads `10CE1990` **0.877**, `authorised=True`, injects the frame, and stops reading to wait for the verdict | blind for the remaining 5.2 s of its window |
+| 19:16:14.84 | pipeline re-reads the same frame: `10CE1990` **0.723**, under the 0.75 bar, `decided=false` | |
+| 19:16:20.65 | after 5.8 s in the cloud lane behind three frames with no plate in them: `cloud_skipped reason=insufficient_budget remaining_ms=974`, `denied reason=decision_timeout` | |
+| 19:16:25.5 | the camera's own FTP still reads 0.954 and opens the gate | +41.7 s |
+
+**Why the two reads differ.** Both paths decode the frame with Pillow and cut
+the identical plate band (`480,0,1920,648` on a 1920-wide frame, no resize).
+The sweep then encodes that band at JPEG quality **90**
+(`local_sweep.SWEEP_JPEG_QUALITY`) and the pipeline's upload at **85**
+(`ocr.UPLOAD_JPEG_QUALITY`). Reproduced on the Mac with the Pi's own model
+files (SHA-256 checked against `/var/lib/gate-controller/models`), through
+`crop_to_region` and `PlateRecognizerClient._open_upload` as they stand:
+
+- the engine is deterministic: the same bytes read twice give 0.853833 twice;
+- the two byte strings differ (314,245 against 272,312 bytes for one frame),
+  the decoded pixels by a mean of 1.87 levels and at most 33;
+- set the pipeline's quality to 90 and the two are **byte-identical** -
+  quality is the whole difference;
+- that is enough. The injected frame's original bytes were not kept (frames
+  are deleted once decided), so the dashboard's 1280x720 copy of event 3143
+  was brought back to 1920x1080 in 24 plausible ways (three resamplers, eight
+  session JPEG qualities). Across them the sweep path scored 0.549-0.922 and
+  the pipeline path 0.588-0.861; the difference for one and the same frame ran
+  from **-0.214 to +0.148**, and in **7 of 24** the two reads fell on opposite
+  sides of 0.75. The worst case was 0.811 by the sweep and 0.597 by the
+  pipeline - the shape of the measured 0.877 and 0.723. The FTP still (event
+  3144) did the same in 10 of 24. The text never differed on a legible plate;
+  only the weakest character's probability moved.
+
+The weakest-character score is the right statistic for the gate (see "The
+confidence gate" above), and it is exactly the statistic a change of 1.9 grey
+levels can push across a bar.
+
+**What changed.** A `SweepRead` now carries the recogniser's own
+`LocalRecognition`, the SHA-256 of the *whole frame* it was taken from, and
+the band bytes and geometry the model saw. The sweep hands it to the worker's
+injector with the frame; it rides on the `BurstIdentity` to
+`GateProcessor.prepare(sweep_read=...)`, which calls
+`PlateRecognizerClient.adopt_local_read` in place of the local pass. That
+replaces the **inference and nothing after it**:
+
+- the digest must equal the pipeline's own content identity for the file, or
+  the read is refused (`gate_ocr stage=sweep_read_refused
+  reason=digest_mismatch`) and the frame is read as it always was - a read can
+  only speak for the pixels it came from;
+- it must be a `LocalRecognition` from this process's recogniser; anything
+  else is ignored;
+- it goes through the very same `_local_decision` a fresh read goes through:
+  `GATE_LOCAL_OCR_MIN_CONFIDENCE`, then `decide_access` under the plate list
+  and the policy band in force **when it is judged**, on the strength of this
+  frame's own plate. The sweep's `authorised` flag is never consulted;
+- `process` then runs `decide_access` itself, the freshness checks, the
+  authorisation re-check under the relay lock, the cooldown and the claim -
+  once, as for any frame. A read that does not decide leaves the frame to the
+  cloud exactly as before, uploaded exactly as before.
+
+It cannot make an unauthorised open easier. No bar moved and no match
+widened: a carried 0.74 is denied by day, a carried 0.877 is denied overnight
+under `strict`, a carried 0.99 of a plate that is not listed is denied, a NaN
+opens nothing. What is gone is an accidental requirement that *two encodings
+of one frame* both clear the bar, which never guarded against a wrong plate
+(the text does not change between encodings) and only ever refused right ones.
+A single on-device read at or above the bar of an exactly listed plate is what
+has always opened the gate for the camera's FTP still; the sweep's frames now
+meet the same test, not a stricter one by accident. `GATE_LOCAL_OCR_CLOUD=always`
+and `shadow` adopt nothing.
+
+The record says what happened: `source=local`, `observed_plate` and
+`ocr_confidence` are the sweep's read, and the event's `local_ocr` block has
+the same plate and score with `decision_source=local`. (The wire vocabulary
+is closed - ingest rejects an unknown token - and `PlateObservation.source`
+also selects the agreement rule's bar, so there is deliberately no third
+"sweep" value.) The journal names the sweep: `gate_ocr stage=sweep_read_adopted
+trace_id=... plate=... score=... decided=...` and `gate_ocr stage=local_pass
+... lane=fast read=sweep` (`read=pipeline` when the frame was read here).
+
+Cloud handovers and the fallback carry their reads too, so the pipeline no
+longer spends the one-at-a-time on-device reader re-reading frames the sweep
+has read. Those re-reads, with the FTP still's own pass, are what the sweep
+collided with in that first window (`busy=4`: four frames it could not read
+because the reader was re-reading one it already had).
+
+**The sweep no longer goes blind.** It keeps reading while an authorised
+frame's verdict is outstanding. At most one such frame is outstanding at a
+time and at most three are injected per sweep; an open - by this session's
+frame or by anyone else's, the FTP still included - ends it, and the
+coordinator's cooldown refuses a second pulse regardless.
+
+**A waiting vehicle is looked at.** When the 10 s window closes with the gate
+shut, the passage is put on record (the fallback, which never again re-injects
+a frame already handed over - and `duplicate_event` no longer ends a session:
+it is a fact about a file, not about a vehicle) and the reader goes on at
+`GATE_LOCAL_SWEEP_WAITING_FPS` (1 a second) for up to
+`GATE_LOCAL_SWEEP_WAITING_SECONDS` (30), never past the decoder session the
+alarm started (`GATE_SESSION_SECONDS`, 45). It stops on an open, a conclusive
+denial, a new alarm, three consecutive frames of empty drive, or the cap:
+`gate_local_sweep stage=waiting ...`, then `outcome=ended
+reason=opened|departed|wait_cap|new_event|... waiting_reads=N`. The cap covers
+the passage above (first authorisable read at +30.8 s, window plus waiting
+reaches +40 s). The cost is about a fifth of one core for at most 30 s - some
+6 s of inference - against roughly 90% of a core for the window itself, and
+nothing on the cloud: handovers stay under the per-passage ceiling and, while
+waiting, none is sent for a frame the device found no plate in. Note that on
+the Pi `GATE_PRESENCE_WINDOW_SECONDS=12` is measured from the alarm, so after
+a 10 s sweep the presence session had 2 s left against a 3 s spacing and never
+took a frame; the waiting phase is what reads now.
+
+**The cloud lane is not first come, first served.** A frame the device found
+a plate in goes ahead of any it found nothing in (`worker.CloudLane`). In that
+passage 6 of the 8 frames the sweep handed to the cloud had no plate the
+device could see, the cloud found none in any of them either, answers took
+1.2-4.2 s each, and the one frame carrying the plate reached the front with
+974 ms left.
+
+Replayed against that journal under the crop band then in force: the session
+would not have ended at 19:15:54, and the waiting phase would have read about
+once a second from 19:15:54 until the camera's second alarm at 19:16:09.7 took
+over. In *this* passage those reads would have found nothing - the stopped
+car's plate sat below the old band until about 19:16:13.9, which is a framing
+fault fixed separately - so the first authorisable read is still the 0.877 at
+19:16:14.63. Carried instead of re-read, it is decided within milliseconds of
+injection (the adopted pass costs ~1 ms against the 206 ms re-read) and the
+relay follows a decision by ~140 ms here, so the gate opens at about
+**19:16:14.9** rather than 19:16:25.5: some **10.6 s sooner, 31 s after the
+first alarm instead of 41.7 s**. Where the waiting phase earns its keep is the
+passage whose plate *is* in the band and merely reads late; with the band as
+re-fitted on 2026-09-21 this one reads 0.971 within a second of the first
+alarm.
+
 ### Frames not worth a lookup
 
 A frame the on-device detector finds **no plate in at all**, taken while the
@@ -318,6 +463,8 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
 | `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.5` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision *and* admission to the corroboration pool, so it is the floor under `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` too. 0.95 is the shadow-mode measurement threshold and is too high to be the admission gate: it would keep the agreement rule from ever running on the shipped 0.50 agreement bar. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
+| `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `30` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-60 and by `GATE_SESSION_SECONDS`; `0` disables. See "The sweep's read travels with its frame". |
+| `GATE_LOCAL_SWEEP_WAITING_FPS` | `1` | Reads a second while waiting (0.2-2). |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
 | `GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` | `0.005` | A session frame the device found no plate in still goes to the cloud when its stillness is at or below this; one moving more than this is decided `no_match` on the device's answer, unbilled. `0` disables the rule. See "Frames not worth a lookup". |
 

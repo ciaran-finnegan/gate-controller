@@ -240,7 +240,8 @@ class GateProcessor:
                 trigger: TriggerTelemetry | dict | None = None,
                 idempotency_key: str | None = None,
                 stillness: float | None = None,
-                local_pass: bool = True) -> PreparedBurst:
+                local_pass: bool = True,
+                sweep_read=None) -> PreparedBurst:
         """Take a burst as far as the on-device read without touching the network.
 
         This is the fast lane's half of a decision: the burst's identity, its
@@ -262,6 +263,11 @@ class GateProcessor:
         for it either (``cloud_skip``): a vehicle that is still turning in
         shows an oblique, smeared plate that neither reader has ever read, and
         the frame that will read is the one taken once it stops.
+
+        ``sweep_read`` is the on-device read the local sweep already took of
+        this very frame. It replaces the *inference* and nothing after it: see
+        :meth:`_adopt_sweep_read`. A read that cannot be adopted is ignored
+        and the frame is read here as it always was.
         """
         trigger = _trigger_telemetry(trigger)
         started = self._decision_clock() if decision_started_at is None else decision_started_at
@@ -312,14 +318,20 @@ class GateProcessor:
         if not _is_fresh(self._clock(), received_at, self._max_image_age):
             return prepared
         pass_started = self._decision_clock()
-        attempt = self._run_local_pass(paths[0], deadline, trace.trace_id)
+        attempt = self._adopt_sweep_read(
+            paths[0], digests[0], sweep_read, deadline, trace.trace_id,
+        )
+        adopted = attempt is not None
+        if not adopted:
+            attempt = self._run_local_pass(paths[0], deadline, trace.trace_id)
         elapsed_ms = max(0.0, self._decision_clock() - pass_started) * 1000.0
         decided = attempt is not None and attempt.decided
         # Journal only, as in `_recognise`: `stage_durations` is an allow-list
         # on the app's side.
         logging.getLogger(__name__).info(
-            "gate_ocr stage=local_pass local_pass_ms=%d decided=%s lane=fast",
+            "gate_ocr stage=local_pass local_pass_ms=%d decided=%s lane=fast read=%s",
             round(elapsed_ms), "true" if decided else "false",
+            "sweep" if adopted else "pipeline",
         )
         prepared.local_pass_ran = True
         prepared.local_attempt = attempt
@@ -883,6 +895,39 @@ class GateProcessor:
             return tuple(self._local_observations(trace_id))
         except Exception:
             return ()
+
+    def _adopt_sweep_read(self, path: Path, digest: str, sweep_read, deadline: float,
+                          trace_id):
+        """The local pass for a frame the sweep already read, or None.
+
+        The sweep read this frame with the same recogniser, and the pipeline
+        reading it again is not a second opinion -- it is the same picture
+        re-encoded at another JPEG quality, which on 2026-09-20 turned a 0.877
+        read into a 0.723 one and refused an authorised driver. So the read is
+        handed to the recogniser to stand in for the inference, and *only* for
+        the inference: the recogniser still applies its confidence gate and the
+        shared matching under the band in force now, and `process` still runs
+        `decide_access`, the freshness checks, the authorisation re-check
+        under the relay lock, the cooldown and the claim -- once, here, as for
+        any other frame. ``digest`` is this file's content identity; a read
+        taken from any other bytes is refused by the recogniser.
+
+        None -- no read, a recogniser that cannot adopt, a refusal, or any
+        failure at all -- means the ordinary local pass runs instead.
+        """
+        if sweep_read is None or self._local_pass is None:
+            return None
+        adopt = _optional_callable(self._recognizer, "adopt_local_read")
+        if adopt is None:
+            return None
+        try:
+            return adopt(
+                path, sweep_read, trace_id=trace_id, digest=digest,
+                budget=max(0.0, deadline - self._decision_clock()),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("gate_ocr stage=sweep_read_adopt_failed")
+            return None
 
     def _local_pass_deadline(self, deadline: float) -> float:
         """When the local pass must be settled by, so the cloud keeps its reserve.
