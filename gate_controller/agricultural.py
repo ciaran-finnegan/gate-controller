@@ -351,6 +351,14 @@ class PromptScorer:
         )
 
 
+    def shares(self, embedding) -> dict[str, float]:
+        """Every label's share for one embedding, ``empty`` and the road kinds included."""
+        embedding = tuple(float(value) for value in embedding)
+        if len(embedding) != len(self._text[0]) or not all(map(math.isfinite, embedding)):
+            raise ValueError("not an image embedding")
+        return _softmax_by_label(self._text, self._labels, embedding, self._scale)
+
+
 def _softmax_by_label(text, labels, embedding, scale: float) -> dict[str, float]:
     logits = [
         scale * sum(weight * value for weight, value in zip(row, embedding))
@@ -647,6 +655,35 @@ class FarmMachineryPolicy:
             self._running.release()
             return PendingAssessment(self._refusal(VERDICT_ERROR))
         return PendingAssessment(None, answer, self._refusal)
+
+    def look(self, jpeg: bytes) -> dict:
+        """What is in one picture, for a caller that decides nothing. Never raises.
+
+        The early trigger's shadow record asks this of the frame that made it
+        fire: label shares, ``empty`` against every kind of vehicle. It takes
+        the same one-at-a-time lock as a reading and never waits for it, so it
+        cannot queue in front of one, and it touches neither the rate the
+        readings are capped at nor the standing-still memory.
+        """
+        if self._unavailable_reason is not None or self._embed is None:
+            return {"status": "unavailable"}
+        if not self._running.acquire(blocking=False):
+            return {"status": "skipped_busy"}
+        try:
+            embedding = self._embed(jpeg)
+            if embedding is None:
+                return {"status": "unreadable"}
+            shares = self._scorer.shares(embedding)
+            return {
+                "status": "ok",
+                "shares": {label: round(share, 4) for label, share in shares.items()},
+                "top": max(shares, key=shares.get),
+                "empty": round(shares.get("empty", 0.0), 4),
+            }
+        except Exception:
+            return {"status": "error"}
+        finally:
+            self._running.release()
 
     def _within_rate(self) -> bool:
         """Whether another reading may start this minute. Holds ``_running``."""
