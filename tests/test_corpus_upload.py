@@ -15,6 +15,7 @@ from gate_controller.backpressure import (
 )
 from gate_controller.corpus import TrainingCorpus
 from gate_controller.corpus_upload import (
+    ABORT_OUTBOX_SENDING, ATTEMPT_NETWORK_DOWN_PROBE, BLOCKED_NETWORK_DOWN,
     CloudflareCorpusSender, CorpusUploadAborted, CorpusUploadConfig,
     CorpusUploadError, CorpusUploadUnshippable, CorpusUploadWorker, PacedBody,
     load_corpus_upload_config,
@@ -665,6 +666,468 @@ class RefusalTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             self.send(error)
         self.assertNotIsInstance(raised.exception, CorpusUploadUnshippable)
+
+
+class FakeOutbox:
+    """What the corpus reads off the outbox worker, under test control."""
+
+    def __init__(self, *, pending=0, failing=0, unreachable=False,
+                 stuck_for=None, sending=False, last_error_type=None):
+        self.pending = pending
+        self.failing = failing
+        self.unreachable = unreachable
+        self.stuck_for = stuck_for
+        self.is_sending = sending
+        self.last_error_type = last_error_type
+
+    def delivery_health(self):
+        return {
+            "pending": self.pending,
+            "sending": self.is_sending,
+            "failing": self.failing,
+            "unreachable": self.unreachable,
+            "stuck_for_s": self.stuck_for,
+            "oldest_pending_age_s": self.stuck_for,
+            "last_error_type": self.last_error_type,
+        }
+
+    def sending(self):
+        return self.is_sending
+
+
+class FakeProbe:
+    def __init__(self, state="failed", age=10.0, hops=True):
+        self.state = state
+        self.age = age
+        self.hops = hops
+
+    def status(self):
+        measured = {"enabled": True, "probed": True, "age_seconds": self.age}
+        if self.hops:
+            measured["hops"] = {"internet": {"state": self.state}}
+        return measured
+
+
+class TickingEvent:
+    """A stop event whose wait advances the fake clock and ends after N ticks."""
+
+    def __init__(self, clock, ticks):
+        self.clock = clock
+        self.ticks = ticks
+        self.waits = []
+
+    def is_set(self):
+        return self.ticks <= 0
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        self.clock.advance(timeout or 0)
+        self.ticks -= 1
+        return self.is_set()
+
+
+class NetworkDownTests(CorpusUploadTestCase):
+    """The outbox outranks the corpus while it is being delivered, not for ever.
+
+    On 2026-09-22 the farm router dropped most packets for a day. Seven
+    telemetry items sat in the outbox on attempt 18, every failure a
+    ``ConnectionError``, and the corpus -- 51 audio segments behind them --
+    deferred for ``event_delivery`` every five minutes towards the 48-hour
+    horizon. Yielding to a queue nothing can deliver achieves nothing.
+    """
+
+    T = 900.0
+
+    def stuck(self, **overrides):
+        settings = dict(pending=7, failing=7, unreachable=True,
+                        stuck_for=self.T, last_error_type="ConnectionError")
+        settings.update(overrides)
+        return FakeOutbox(**settings)
+
+    def outage_worker(self, send, outbox, *, net_probe=None, **config):
+        gate = self.gate(pending_events=lambda: outbox.pending)
+        return CorpusUploadWorker(
+            self.corpus, send, gate,
+            config=CorpusUploadConfig(
+                enabled=True, outage_seconds=self.T, outage_probe_seconds=600.0,
+                **config,
+            ),
+            clock=lambda: self.wall[0], monotonic_clock=self.clock,
+            sleep=lambda seconds: self.clock.advance(seconds),
+            jitter=lambda: 1.0, outbox=outbox, net_probe=net_probe,
+        )
+
+    def test_an_outbox_that_is_being_delivered_still_blocks_the_corpus(self):
+        self.record()
+        sender = RecordingSender()
+        for description, outbox in (
+            ("an item is on the wire",
+             self.stuck(sending=True)),
+            ("an item has not been tried yet",
+             self.stuck(pending=8, failing=7)),
+            ("the cloud is answering, if only with a 500",
+             self.stuck(unreachable=False, last_error_type="OutboxSyncError")),
+            ("nothing has failed at all",
+             self.stuck(failing=0, unreachable=False)),
+            ("the queue has not been stuck for T yet",
+             self.stuck(stuck_for=self.T - 1)),
+            ("the outbox cannot say how long it has been stuck",
+             self.stuck(stuck_for=None)),
+        ):
+            with self.subTest(description):
+                worker = self.outage_worker(sender, outbox)
+                self.assertEqual(worker.run_once(), 0)
+                self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_EVENT_DELIVERY)
+                self.assertEqual(worker.status()["outage_probes"], 0)
+        self.assertEqual(sender.sent, [])
+
+    def test_without_an_outbox_to_read_the_block_is_absolute_as_before(self):
+        self.record()
+        sender = RecordingSender()
+        worker = self.worker(sender, self.gate(pending_events=lambda: 7))
+        self.clock.advance(self.T * 10)
+
+        self.assertEqual(worker.run_once(), 0)
+
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_EVENT_DELIVERY)
+        self.assertEqual(sender.sent, [])
+
+    def test_an_outbox_stuck_on_the_link_for_t_lets_the_corpus_probe_oldest_first(self):
+        first = self.record()
+        second = self.record(jpeg("red"))
+        third = self.record(jpeg("green"))
+        sender = RecordingSender()
+        worker = self.outage_worker(sender, self.stuck())
+
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 3,
+                             "a link that answers is used while it answers")
+
+        self.assertIn(
+            f"gate_corpus stage=attempting reason={ATTEMPT_NETWORK_DOWN_PROBE} "
+            "pending=3", logs.output[0],
+        )
+        self.assertEqual(
+            [artefact_id for artefact_id, _ in sender.sent],
+            [hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in ()] + [
+                hashlib.sha256(image).hexdigest() for image in (
+                    jpeg(), jpeg("red"), jpeg("green"))],
+            "oldest first",
+        )
+        for path in (first, second, third):
+            self.assertFalse(path.exists())
+        status = worker.status()
+        self.assertEqual(status["outage_probes"], 1)
+        self.assertEqual(status["last_attempt_reason"], ATTEMPT_NETWORK_DOWN_PROBE)
+        self.assertIsNone(status["retention_hold"], "the corpus is draining")
+
+    def test_a_failed_probe_waits_the_probe_interval_not_the_backoff(self):
+        self.record()
+        self.record(jpeg("red"))
+        sender = RecordingSender(error=ConnectionError("connection refused"))
+        worker = self.outage_worker(sender, self.stuck())
+
+        with self.assertLogs("gate_controller.corpus_upload", level="WARNING") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(len(sender.sent), 1, "one artefact per probe, then nothing")
+        self.assertIn("stage=upload_failed", logs.output[0])
+        self.assertIn("retry_in_s=600", logs.output[0])
+        self.assertIn(f"reason={ATTEMPT_NETWORK_DOWN_PROBE}", logs.output[0])
+        self.assertEqual(worker.status()["retention_hold"], "upload_failed")
+
+        for _ in range(3):
+            self.clock.advance(150)
+            self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(len(sender.sent), 1, "inside the probe interval nothing is tried")
+
+        self.clock.advance(150)
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            worker.run_once()
+        self.assertEqual(len(sender.sent), 2)
+        self.assertIn(f"reason={ATTEMPT_NETWORK_DOWN_PROBE}", logs.output[0])
+        self.assertEqual(worker.status()["outage_probes"], 2)
+        self.assertEqual(worker.status()["consecutive_failures"], 2,
+                         "the heartbeat still counts every failure")
+
+    def test_between_probes_the_deferral_says_network_down(self):
+        path = self.record(noisy_jpeg())
+        outbox = self.stuck()
+        gate = self.gate(pending_events=lambda: outbox.pending)
+
+        def interrupted(artefact_id, chunks):
+            for index, _ in enumerate(chunks):
+                if index == 1:
+                    gate.begin("camera_event")
+
+        worker = CorpusUploadWorker(
+            self.corpus, interrupted, gate,
+            config=CorpusUploadConfig(enabled=True, outage_seconds=self.T,
+                                      outage_probe_seconds=600.0, bytes_per_second=4096),
+            clock=lambda: self.wall[0], monotonic_clock=self.clock,
+            sleep=lambda seconds: self.clock.advance(seconds),
+            jitter=lambda: 1.0, outbox=outbox,
+        )
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.status()["aborted"], 1)
+        gate.end("camera_event")
+        self.clock.advance(61)
+
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 0)
+
+        self.assertIn(f"stage=deferred reason={BLOCKED_NETWORK_DOWN}", logs.output[0])
+        self.assertIn("next_probe_in_s=", logs.output[0])
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_NETWORK_DOWN)
+        self.assertEqual(worker.status()["retention_hold"], BLOCKED_NETWORK_DOWN)
+        self.assertTrue(path.exists())
+
+    def test_the_net_probe_can_shorten_t_but_never_override_the_outbox(self):
+        self.record()
+        young = dict(stuck_for=60.0)
+        for description, outbox, probe, expected in (
+            ("the probe saw the internet fail",
+             self.stuck(**young), FakeProbe("failed"), 1),
+            ("the probe's failure is stale",
+             self.stuck(**young), FakeProbe("failed", age=1801.0), 0),
+            ("the probe saw the internet answer",
+             self.stuck(**young), FakeProbe("ok"), 0),
+            ("the probe ran in ping mode and has no internet hop",
+             self.stuck(**young), FakeProbe("failed", hops=False), 0),
+            ("the probe is not there",
+             self.stuck(**young), None, 0),
+            ("the probe says failed but the cloud is answering the outbox",
+             self.stuck(unreachable=False, **young), FakeProbe("failed"), 0),
+            ("the probe says failed but an item is on the wire",
+             self.stuck(sending=True, **young), FakeProbe("failed"), 0),
+        ):
+            with self.subTest(description):
+                sender = RecordingSender()
+                worker = self.outage_worker(sender, outbox, net_probe=probe)
+                self.assertEqual(worker.run_once(), expected)
+                if expected:
+                    self.record()
+
+    def test_a_probe_stands_down_the_instant_the_outbox_starts_sending(self):
+        path = self.record(noisy_jpeg())
+        outbox = self.stuck()
+
+        def interrupted(artefact_id, chunks):
+            for index, _ in enumerate(chunks):
+                if index == 1:
+                    outbox.is_sending = True
+
+        worker = self.outage_worker(interrupted, outbox, bytes_per_second=4096)
+
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 0)
+
+        self.assertTrue(any(
+            f"stage=aborted" in line and f"reason={ABORT_OUTBOX_SENDING}" in line
+            for line in logs.output
+        ), logs.output)
+        self.assertTrue(path.exists(), "the card is untouched")
+        status = worker.status()
+        self.assertEqual(status["aborted"], 1)
+        self.assertEqual(status["consecutive_failures"], 0,
+                         "standing down for the outbox is not a failure")
+        # While the outbox is on the wire the ordinary rule applies again.
+        self.clock.advance(601)
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_EVENT_DELIVERY)
+
+    def test_a_send_that_starts_before_the_first_byte_stands_the_probe_down(self):
+        self.record()
+        outbox = self.stuck()
+        sender = RecordingSender()
+        gate = self.gate(pending_events=lambda: outbox.pending)
+        original = outbox.delivery_health
+
+        def health_then_send():
+            # The verdict is read, then the outbox picks its moment.
+            health = original()
+            outbox.is_sending = True
+            return health
+
+        outbox.delivery_health = health_then_send
+        worker = CorpusUploadWorker(
+            self.corpus, sender, gate,
+            config=CorpusUploadConfig(enabled=True, outage_seconds=self.T),
+            clock=lambda: self.wall[0], monotonic_clock=self.clock,
+            sleep=lambda seconds: self.clock.advance(seconds),
+            jitter=lambda: 1.0, outbox=outbox,
+        )
+
+        self.assertEqual(worker.run_once(), 0)
+
+        self.assertEqual(sender.sent, [], "not a byte went out")
+        self.assertEqual(worker.status()["aborted"], 1)
+
+    def test_recovery_returns_the_corpus_to_the_ordinary_rules(self):
+        self.record()
+        self.record(jpeg("red"))
+        outbox = self.stuck()
+        sender = RecordingSender(error=ConnectionError("no route to host"))
+        worker = self.outage_worker(sender, outbox)
+        self.assertEqual(worker.run_once(), 0)
+
+        # The link comes back: the outbox drains first, as it should.
+        outbox.pending = outbox.failing = 0
+        outbox.unreachable = False
+        outbox.oldest_age = None
+        sender.error = None
+        self.clock.advance(601)
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 2)
+
+        self.assertFalse(any("stage=attempting" in line for line in logs.output),
+                         "no probe: the outbox is empty and the ordinary rule lets it run")
+        self.assertEqual(worker.status()["outage_probes"], 1)
+        self.assertEqual(worker.status()["consecutive_failures"], 0)
+        self.assertIsNone(worker.status()["retention_hold"])
+
+    def test_the_retention_hold_is_the_reason_the_corpus_is_not_draining(self):
+        outbox = FakeOutbox()
+        sender = RecordingSender()
+        worker = self.outage_worker(sender, outbox)
+        self.assertIsNone(worker.retention_hold(), "nothing to hold")
+
+        self.record()
+        outbox.pending = 1
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.retention_hold(), BLOCKED_EVENT_DELIVERY)
+
+        # A gate event is momentary and does not change the answer.
+        gate = worker._gate
+        with gate.activity("camera_event"):
+            self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.retention_hold(), BLOCKED_EVENT_DELIVERY)
+
+        outbox.pending = 0
+        self.assertEqual(worker.run_once(), 0, "the quiet window after the event")
+        self.clock.advance(61)
+        self.assertEqual(worker.run_once(), 1)
+        self.assertIsNone(worker.retention_hold())
+
+    def test_the_loop_probes_at_the_bounded_rate_and_no_faster(self):
+        """Through ``run_forever``: three probes in half an hour, not six."""
+        for _ in range(3):
+            self.record()
+        sender = RecordingSender(error=ConnectionError("no route to host"))
+        worker = self.outage_worker(sender, self.stuck(), poll_interval=300.0)
+        stop = TickingEvent(self.clock, ticks=6)
+
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            worker.run_forever(stop)
+
+        self.assertEqual(stop.waits, [300.0] * 6)
+        self.assertEqual(len(sender.sent), 3,
+                         "t=0, t=600 and t=1200: one artefact per probe interval")
+        attempts = [line for line in logs.output if "stage=attempting" in line]
+        failures = [line for line in logs.output if "stage=upload_failed" in line]
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(len(logs.output), 6,
+                         "the ticks inside a probe's retry say nothing at all")
+        self.assertEqual(len(self.corpus.pending()), 3, "nothing was lost or dropped")
+
+    def test_the_real_outbox_tells_the_corpus_when_it_is_stuck(self):
+        """The production chain: LocalStore, OutboxWorker, ActivityGate, uploader."""
+        from gate_controller.models import GateEvent
+        from gate_controller.outbox import OutboxWorker
+        from gate_controller.store import LocalStore
+        import requests
+
+        store = LocalStore(Path(self.temporary.name) / "gate.db")
+        event_id = store.record_event(GateEvent(
+            source="ocr", reason="exact_match", opened=True, idempotency_key="event-1",
+            received_at=self.wall[0],
+        ))
+        link = {"up": False}
+
+        def send(payload, evidence=None):
+            if not link["up"]:
+                raise requests.ConnectionError("connection refused")
+
+        outbox = OutboxWorker(
+            store, send=send, controller_id="primary",
+            clock=lambda: self.wall[0], jitter=lambda: 1.0,
+        )
+        outbox.enqueue(event_id)
+        self.record()
+        self.record(jpeg("red"))
+        sender = RecordingSender(error=ConnectionError("connection refused"))
+        gate = ActivityGate(
+            quiet_seconds=60.0, pending_events=store.pending_outbox_count,
+            clock=self.clock,
+        )
+        self.clock.advance(61)
+        worker = CorpusUploadWorker(
+            self.corpus, sender, gate,
+            config=CorpusUploadConfig(enabled=True, outage_seconds=self.T,
+                                      outage_probe_seconds=600.0),
+            clock=lambda: self.wall[0], monotonic_clock=self.clock,
+            sleep=lambda seconds: self.clock.advance(seconds),
+            jitter=lambda: 1.0, outbox=outbox,
+        )
+
+        def tick(seconds):
+            from datetime import timedelta
+            self.wall[0] += timedelta(seconds=seconds)
+            self.clock.advance(seconds)
+
+        # The outbox fails on the link; the corpus yields, for now.
+        self.assertEqual(outbox.run_once(), 0)
+        self.assertEqual(worker.run_once(), 0)
+        self.assertEqual(worker.status()["last_blocked_by"], BLOCKED_EVENT_DELIVERY)
+        self.assertEqual(worker.retention_hold(), BLOCKED_EVENT_DELIVERY)
+
+        # T passes with the outbox still failing before anything answers.
+        for _ in range(4):
+            tick(301)
+            self.assertEqual(outbox.run_once(), 0)
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 0)
+        self.assertIn(f"stage=attempting reason={ATTEMPT_NETWORK_DOWN_PROBE}", logs.output[0])
+        self.assertEqual(len(sender.sent), 1, "one probe, oldest first")
+
+        # An intermittent link: the corpus probe gets through before the
+        # outbox's next retry does.
+        sender.error = None
+        tick(601)
+        self.assertEqual(worker.run_once(), 2)
+        self.assertEqual(len(self.corpus.pending()), 0)
+
+        # Then the outbox drains and the ordinary rule is back.
+        link["up"] = True
+        tick(301)
+        self.assertEqual(outbox.run_once(), 1)
+        self.assertEqual(store.pending_outbox_count(), 0)
+        self.record(jpeg("navy"))
+        tick(61)
+        with self.assertLogs("gate_controller.corpus_upload", level="INFO") as logs:
+            self.assertEqual(worker.run_once(), 1)
+        self.assertFalse(any("stage=attempting" in line for line in logs.output))
+        self.assertIsNone(worker.retention_hold())
+
+    def test_the_outage_settings_are_bounded(self):
+        config = load_corpus_upload_config({})
+        self.assertEqual(config.outage_seconds, 900.0)
+        self.assertEqual(config.outage_probe_seconds, 600.0)
+        for name, value in (
+            ("GATE_CORPUS_OUTAGE_SECONDS", "59"),
+            ("GATE_CORPUS_OUTAGE_SECONDS", "86401"),
+            ("GATE_CORPUS_OUTAGE_SECONDS", "soon"),
+            ("GATE_CORPUS_OUTAGE_PROBE_SECONDS", "59"),
+            ("GATE_CORPUS_OUTAGE_PROBE_SECONDS", "86401"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                load_corpus_upload_config({name: value})
+        config = load_corpus_upload_config({
+            "GATE_CORPUS_OUTAGE_SECONDS": "1800",
+            "GATE_CORPUS_OUTAGE_PROBE_SECONDS": "300",
+        })
+        self.assertEqual((config.outage_seconds, config.outage_probe_seconds), (1800.0, 300.0))
 
 
 if __name__ == "__main__":
