@@ -56,6 +56,12 @@ class ThePass(unittest.TestCase):
                 self.connection.execute(
                     "INSERT INTO events (id, received_at, source, reason, opened, idempotency_key)"
                     " VALUES (?, '2026-09-20T08:00:00+00:00', 'ocr', 'no_match', 0, ?)", (event_id, key))
+                # Delivered by the Pi's own outbox, so the dashboard has the
+                # photo: until it does, the scan does not ask for it at all.
+                self.connection.execute(
+                    "INSERT INTO outbox (event_id, payload, created_at, completed_at, send_state)"
+                    " VALUES (?, '{}', '2026-09-20T08:00:00+00:00', '2026-09-20T08:00:05+00:00', 'ready')",
+                    (event_id,))
 
     def test_only_decisive_verdicts_are_sent(self):
         """An unknown is kept locally but never sent as a verdict: it could only

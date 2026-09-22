@@ -72,12 +72,17 @@ class MissingModel:
 
 
 class FakeDashboard:
-    """The two routes the scan uses, as ``urlopen``. Records every POST."""
+    """The two routes the scan uses, as ``urlopen``. Records every POST.
+
+    It also records every photo asked for, in order: an event the Pi has not
+    delivered yet must not be asked for at all, and that is only visible here.
+    """
 
     def __init__(self, photos, understands_retract=False):
         self.photos = photos
         self.understands_retract = understands_retract
         self.posts = []
+        self.fetched = []
 
     def __call__(self, req, timeout=None):
         if req.get_method() == "POST":
@@ -88,6 +93,7 @@ class FakeDashboard:
                 answer["retracted"] = sum(1 for d in body["directions"] if d.get("retract"))
             return io.BytesIO(json.dumps(answer).encode())
         event_id = int(req.full_url.split("event_id=")[1].split("&")[0])
+        self.fetched.append(event_id)
         if event_id not in self.photos:
             raise scan_direction.error.HTTPError(req.full_url, 404, "Not found", {}, None)
         return io.BytesIO(self.photos[event_id])
@@ -114,7 +120,8 @@ class TheScan(unittest.TestCase):
     def at(self, seconds):
         return (self.base + timedelta(seconds=seconds)).isoformat()
 
-    def event(self, event_id, seconds, photo=None, relay_after=None, source="ocr", box_width=None):
+    def event(self, event_id, seconds, photo=None, relay_after=None, source="ocr", box_width=None,
+              delivered=True):
         with self.connection:
             self.connection.execute(
                 "INSERT INTO events (id, received_at, relay_activated_at, source, reason, opened, idempotency_key)"
@@ -125,8 +132,29 @@ class TheScan(unittest.TestCase):
                 self.connection.execute(
                     "INSERT INTO event_telemetry (event_id, trace_id, payload, created_at) VALUES (?, ?, ?, ?)",
                     (event_id, f"t{event_id}", json.dumps({"direction": box_width}), self.at(seconds)))
+        self.queued(event_id, seconds, delivered=delivered)
         if photo is not None:
             self.photos[event_id] = photo
+
+    def queued(self, event_id, seconds=0.0, *, delivered=True, at=None):
+        """The event's own outbox row, as ``LocalStore`` leaves it.
+
+        The dashboard has no photo for an event the Pi has not delivered, so
+        ``completed_at`` -- which ``complete_outbox_item`` writes once the
+        ingest is acknowledged -- is what says a photo can be asked for.
+        """
+        created = at or self.at(seconds)
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO outbox (event_id, payload, created_at, completed_at, send_state)"
+                " VALUES (?, '{}', ?, ?, 'ready')",
+                (event_id, created, created if delivered else None))
+
+    def delivered(self, event_id, seconds=0.0):
+        """What the outbox worker does when an attempt finally gets through."""
+        with self.connection:
+            self.connection.execute("UPDATE outbox SET completed_at = ? WHERE event_id = ?",
+                                    (self.at(seconds), event_id))
 
     def movement(self, seconds, length=20.0, clang=False):
         with self.connection:
@@ -334,6 +362,94 @@ class TheScan(unittest.TestCase):
 
         self.assertEqual(self.run_scan().sent[1]["direction"], "exiting")
 
+    # -- the photo the dashboard does not have yet ----------------------------
+    def status_of(self):
+        return dict(self.connection.execute("SELECT event_id, status FROM event_directions"))
+
+    def test_an_event_the_pi_has_not_delivered_yet_is_not_asked_for(self):
+        """The bug of 2026-09-21. Event 3161 was asked for 29 s after it
+        happened, while its own outbox was still failing under the router
+        outage; the 404 was written down as ``no_image``, the row then hid the
+        event from ``pending`` for good, and the passage stayed ``unknown``
+        even though the event was delivered on attempt 13."""
+        self.event(1, 0, b"rear", delivered=False)
+
+        dashboard = self.run_scan()
+
+        self.assertEqual(dashboard.fetched, [], "asked for a photo the dashboard cannot have")
+        self.assertEqual(self.status_of(), {}, "recorded a verdict for a photo never seen")
+        self.assertEqual(dashboard.posts, [])
+
+    def test_the_photo_is_read_on_the_pass_after_delivery(self):
+        self.event(1, 0, b"rear", delivered=False)
+        self.run_scan()
+
+        self.delivered(1, 600)  # the outbox got through, several attempts later
+        dashboard = self.run_scan()
+
+        self.assertEqual(dashboard.fetched, [1])
+        self.assertEqual(self.status_of(), {1: "read"})
+        self.assertEqual(dashboard.sent[1]["direction"], "exiting")
+
+    def test_a_no_image_left_by_the_outage_is_asked_for_again_and_shipped(self):
+        """The rows already on the Pi: recorded before delivery, delivered
+        since. The retry replaces the row and the passage is judged again."""
+        self.event(1, 0, b"rear")
+        scan_direction.record(self.connection, 1, status="no_image", now=self.at(29))
+
+        dashboard = self.run_scan()
+
+        self.assertEqual(dashboard.fetched, [1])
+        self.assertEqual(self.status_of(), {1: "read"})
+        self.assertEqual(dashboard.sent[1]["direction"], "exiting")
+        self.assertEqual(self.kept()["e1"]["verdict"], "exiting")
+        self.assertEqual(self.run_scan().fetched, [], "read, and asked for again anyway")
+
+    def test_a_delivered_event_whose_photo_is_really_gone_is_tried_again(self):
+        """Delivered and still 404: that is a photo the dashboard does not
+        have, and the row says so -- but it stays retryable while it is young,
+        because one missing fetch is not proof the next one fails."""
+        self.event(1, 0)  # delivered, no photo on the dashboard
+
+        self.assertEqual(self.run_scan().fetched, [1])
+        self.assertEqual(self.status_of(), {1: "no_image"})
+        self.assertEqual(self.run_scan().fetched, [1])
+
+    def test_after_two_days_undelivered_the_wait_ends(self):
+        """The outbox never gives up by itself -- it backs off to 300 s and
+        retries forever -- so the giving up is here, and it is visible."""
+        self.event(1, -2.5 * 86400, b"rear", delivered=False)
+        self.event(2, -3600, b"rear", delivered=False)
+
+        dashboard = self.run_scan("--days", "4")
+
+        self.assertEqual(dashboard.fetched, [])
+        self.assertEqual(self.status_of(), {1: "unshippable"},
+                         "the young one was written off, or the old one was not")
+
+    def test_a_no_image_older_than_two_days_is_left_alone(self):
+        self.event(1, -2.5 * 86400, b"rear")
+        scan_direction.record(self.connection, 1, status="no_image", now=self.at(-2.5 * 86400 + 29))
+
+        dashboard = self.run_scan("--days", "4")
+
+        self.assertEqual(dashboard.fetched, [])
+        self.assertEqual(self.status_of(), {1: "no_image"})
+
+    def test_a_backlog_is_worked_oldest_first_and_capped_per_pass(self):
+        """Nothing here may answer a long outage with a fetch storm, and a
+        pile of retries may not starve the events arriving now."""
+        for event_id in range(1, 21):
+            self.event(event_id, event_id * 60, b"rear")
+            scan_direction.record(self.connection, event_id, status="no_image",
+                                  now=self.at(event_id * 60 + 29))
+        for event_id in range(21, 41):
+            self.event(event_id, 3000 + event_id * 60, b"rear")
+
+        dashboard = self.run_scan("--limit", "8")
+
+        self.assertEqual(dashboard.fetched, [1, 2, 21, 22, 23, 24, 25, 26])
+
     # -- what is kept ------------------------------------------------------------
     def test_every_signal_is_kept_beside_the_verdict(self):
         self.gate_was_heard()
@@ -393,11 +509,12 @@ class TheScan(unittest.TestCase):
     def test_a_passage_still_arriving_waits_for_the_next_pass(self):
         """Its events may not be on the dashboard yet, and an update for a row
         that is not there changes nothing and is not reported."""
+        moment = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
         with self.connection:
             self.connection.execute(
                 "INSERT INTO events (id, received_at, source, reason, opened, idempotency_key)"
-                " VALUES (1, ?, 'ocr', 'no_match', 0, 'k1')",
-                ((datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat(),))
+                " VALUES (1, ?, 'ocr', 'no_match', 0, 'k1')", (moment,))
+        self.queued(1, at=moment)
         self.photos[1] = b"rear"
 
         dashboard = self.run_scan()
