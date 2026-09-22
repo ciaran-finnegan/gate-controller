@@ -101,6 +101,15 @@ UNSEEN_DEPARTURE_CONFIDENCE = 0.4
 #: seen in this one.
 SAME_ARRIVAL_CEILING = 0.45
 SAME_ARRIVAL_SHARE = 0.6
+#: A rear reading weaker than this, in the second sighting of a car whose first
+#: sighting was judged ``entering`` *and had the gate open for it*, is the same
+#: flank ``PASSING_DISCOUNT`` covers -- only the front that explains it was in
+#: the passage next door rather than this one. At or above it the photo is
+#: making a claim of its own and is left alone, so a confident rear still wins.
+FLANK_REAR_SCORE = 0.5
+#: What such a reading is worth: halved, the same discount and for the same
+#: reason as a wheel arch read after a front in a single passage.
+FLANK_REAR_DISCOUNT = 0.5
 
 # --- combining ---------------------------------------------------------------
 #: At or above this a signal is strong. Two strong signals that disagree are
@@ -453,6 +462,37 @@ def from_same_arrival(neighbour, gap_seconds) -> Opinion:
     )
 
 
+def passing_the_lens_again(vision: Opinion) -> Opinion:
+    """Discount a weak rear reading that is the same car's flank going by.
+
+    ``from_vision`` already does this *within* one passage: once a confident
+    front has been seen, a later rear is a wheel arch a foot from the lens and
+    is halved rather than allowed to cancel the front. An arriving car is
+    often seen as two passages, though -- waiting at the shut gate, then
+    driving through it -- and then the front is in the passage next door and
+    this one holds nothing but flank.
+
+    2026-09-22 10:00, an Audi driving in: the first passage read front 0.93,
+    the gate had been still and opened on our relay, and it was judged
+    ``entering`` at 0.95. Twenty-one seconds later the same car, side-on and
+    filling the frame, read rear 0.42 -- and 0.36 of vision against 0.45 lent
+    by the neighbour left 0.09, under the bar, so a passage nothing was wrong
+    with came out ``unknown``.
+
+    Only applied where the neighbour was judged ``entering`` on its own
+    evidence *and the gate actually opened for it*, and only below
+    ``FLANK_REAR_SCORE``. A rear the model is sure of is a departure through a
+    gate that opened for the car in front, which is a real thing that happens,
+    and it is left to win.
+    """
+    if vision.verdict != VERDICT_EXITING or vision.confidence >= FLANK_REAR_SCORE:
+        return vision
+    return Opinion(
+        VERDICT_EXITING, vision.confidence * FLANK_REAR_DISCOUNT, vision.method,
+        f"{vision.detail}; halved: the car that arrived next door is passing the lens",
+    )
+
+
 def unseen_departures(movements, commands_at, seen) -> list:
     """Gate cycles that no vehicle passage accounts for.
 
@@ -528,16 +568,24 @@ def combine(*opinions: Opinion) -> DirectionVerdict:
     return DirectionVerdict(verdict, confidence, kept)
 
 
-def judge(evidence: PassageEvidence, *, neighbour=None, neighbour_gap=None) -> DirectionVerdict:
+def judge(evidence: PassageEvidence, *, neighbour=None, neighbour_gap=None,
+          neighbour_opened: bool = False) -> DirectionVerdict:
     """The one place a passage's evidence becomes a verdict.
 
     Production calls this and nothing else; the opinion functions above are its
     parts, not alternatives to it. ``neighbour`` is the verdict of the nearest
     other passage *judged without a neighbour of its own*, so that a verdict
     can be lent once and never passed down a line of cars.
+    ``neighbour_opened`` says the gate really did open for that passage -- our
+    relay fired inside it -- which is what makes a weak rear here the same
+    car's flank rather than a vehicle of its own. See ``passing_the_lens_again``.
     """
+    vision = from_vision(evidence.frames)
+    same_arrival = from_same_arrival(neighbour, neighbour_gap) if neighbour is not None else None
+    if same_arrival is not None and same_arrival.decisive and neighbour_opened:
+        vision = passing_the_lens_again(vision)
     opinions = [
-        from_vision(evidence.frames),
+        vision,
         from_gate(
             evidence.first_seen_at, movements=evidence.movements,
             commands_at=evidence.commands_at, others_seen=evidence.others_seen,
@@ -545,6 +593,6 @@ def judge(evidence: PassageEvidence, *, neighbour=None, neighbour_gap=None) -> D
         ),
         from_box_width(evidence.box_width),
     ]
-    if neighbour is not None:
-        opinions.append(from_same_arrival(neighbour, neighbour_gap))
+    if same_arrival is not None:
+        opinions.append(same_arrival)
     return combine(*opinions)
