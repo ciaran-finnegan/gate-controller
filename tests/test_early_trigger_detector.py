@@ -309,12 +309,43 @@ class NightDetectorTest(unittest.TestCase):
         self.assertEqual(scene.detector.light, LIGHT_DAY, "and it is judged as day from here")
 
     def test_night_thresholds_are_separate_from_day_ones(self):
+        # The source lights the ground around it (+8): until the first shadow
+        # night this fixture had a lamp on a black patch, which is exactly the
+        # point-source false trigger of 2026-09-22 04:29 and no longer triggers.
         base = dark()
+        lit = [value + 8 for value in base]
         scene = Scene(DetectorConfig(fps=FPS, night_persistence=8)).settle(base)
-        scene.run(6, lambda _i: paint(base, 4, 6, 8, 10, 240))
+        scene.run(6, lambda _i: paint(lit, 4, 6, 8, 10, 240))
         self.assertEqual(scene.triggers, [], "six samples is not eight")
-        scene.run(4, lambda _i: paint(base, 4, 6, 8, 10, 240))
+        scene.run(4, lambda _i: paint(lit, 4, 6, 8, 10, 240))
         self.assertEqual(len(scene.triggers), 1)
+
+    def test_a_bright_point_that_lights_nothing_around_it_does_not_trigger(self):
+        """Eyeshine, a droplet on the dome, a distant lamp: a point, and black all round it."""
+        base = dark()
+        scene = Scene().settle(base)
+        scene.run(int(30 * FPS), lambda _i: paint(base, 5, 5, 7, 6, 181))   # two cells, as recorded
+        self.assertEqual(scene.triggers, [])
+        scene.run(int(30 * FPS), lambda _i: paint(base, 5, 5, 8, 7, 235))   # six cells, still no spill
+        self.assertEqual(scene.triggers, [])
+        self.assertIn("unlit", scene.verdicts)
+        # The same six cells with the ground lit around them are headlamps.
+        scene = Scene().settle(base)
+        scene.run(int(5 * FPS), lambda _i: paint([value + 8 for value in base], 5, 5, 8, 7, 235))
+        self.assertEqual(len(scene.triggers), 1)
+
+    def test_the_spill_may_arrive_a_sample_after_the_lamps_and_still_count(self):
+        base = dark()
+        scene = Scene().settle(base)
+        start = scene.index
+
+        def arriving(i):
+            lift = 8 if i - start >= 4 else 0
+            return paint([value + lift for value in base], 4, 6, 8, 10, 240)
+
+        scene.run(8, arriving)
+        self.assertEqual(len(scene.triggers), 1, scene.verdicts[-8:])
+        self.assertIn("unlit", scene.verdicts[-8:], "and the run was kept, not re-based")
 
 
 class RealFrameTest(unittest.TestCase):
@@ -372,14 +403,165 @@ class RealFrameTest(unittest.TestCase):
         self.assertEqual(len(scene.triggers), 1)
 
 
+class ShadowDayTest(unittest.TestCase):
+    """The first shadow day's own pictures, 2026-09-22, through the rules as shipped.
+
+    Each fixture is the worker's before/after pair (320x90 grey JPEG, the
+    patch two seconds apart) saved beside the row it made. Seven are the
+    morning's false day triggers: an empty gravel lane under cloud shade
+    coming and going on a gusty morning, every one a would-trigger of the
+    vision rule and every one cleared by both second looks. Two are the day's
+    one real arrival: the car's front, tiny at the far fence gap, at the
+    instant of the camera's first alarm (a candidate, persistence 1), and its
+    flank filling the patch 26 s later (a would-trigger, 0.1 s after the
+    second alarm). One is the night's point source at 04:29 UTC.
+
+    A pair replayed cold -- the before frame as the whole background, then
+    the after frame -- is not the live run: the background then had been
+    adapting through the shade's advance for two seconds. Three of the seven
+    shade pairs re-make their blob this way and are refused as light; the
+    other four make too small a blob to be a candidate at all, so all seven
+    are also run with the area floor taken away, to be sure the *illumination*
+    rule, not the area, is what stands between them and a trigger.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures" / "early_trigger"
+    SHADE = tuple(f"day-shade-{index}" for index in range(1, 8))
+
+    def pair(self, stem):
+        from PIL import Image
+
+        from gate_controller.early_trigger import grid_from_frame
+
+        path = next(self.FIXTURES.glob(f"{stem}*.jpg"))
+        with Image.open(path) as image:
+            image = image.convert("L")
+            width, height = image.size
+            before = image.crop((0, 0, width // 2, height))
+            after = image.crop((width // 2, 0, width, height))
+            return (grid_from_frame(before.tobytes(), before.size),
+                    grid_from_frame(after.tobytes(), after.size))
+
+    def replay(self, stem, config=None, after_samples=8):
+        before, after = self.pair(stem)
+        scene = Scene(config).settle(before)
+        scene.run(after_samples, lambda _i: after)
+        return scene
+
+    def test_none_of_the_seven_shade_pairs_triggers(self):
+        for stem in self.SHADE:
+            scene = self.replay(stem)
+            self.assertEqual(scene.triggers, [], stem)
+            self.assertEqual(scene.detector.light, LIGHT_DAY, stem)
+
+    def refusal(self, stem):
+        """The sample at which a pair, replayed with no area floor, is refused as light."""
+        before, after = self.pair(stem)
+        detector = PatchDetector(DetectorConfig(fps=FPS, day_min_area=0.002))
+        now = 0.0
+        for _ in range(int(12 * FPS)):
+            detector.observe(before, now)
+            now += STEP
+        for _ in range(8):
+            observation = detector.observe(after, now)
+            now += STEP
+            self.assertNotEqual(observation.verdict, "trigger", stem)
+            if observation.verdict == "illumination":
+                return observation
+        self.fail(f"{stem}: never refused as light: {observation.verdict}")
+
+    def test_every_shade_pair_is_refused_as_light_not_merely_too_small(self):
+        # Replayed cold, four of the seven re-make less of their blob than the
+        # area floor asks for (one of them a single cell), so the floor is
+        # taken away here: whatever changed, the rule has to call it light.
+        for stem in self.SHADE:
+            self.assertEqual(self.refusal(stem).verdict, "illumination", stem)
+
+    def test_the_shade_is_uniform_and_one_signed_inside_its_blob(self):
+        """The numbers the rule rests on: spread 0.00-0.17, contrast 0.22-0.40, nothing mixed."""
+        for stem in self.SHADE:
+            features = self.refusal(stem).features
+            self.assertLess(features["blob_spread"], 0.20, stem)
+            self.assertLess(abs(features["blob_contrast"]), 0.45, stem)
+            self.assertGreater(abs(features["blob_contrast"]), 0.18, stem)
+            self.assertEqual(features["blob_mixed"], 0.0, stem)
+
+    def test_the_cars_flank_filling_the_patch_triggers(self):
+        scene = self.replay("day-vehicle-flank")
+        self.assertEqual(len(scene.triggers), 1, scene.verdicts[-8:])
+        features = scene.triggers[0][1].features
+        self.assertGreater(features["blob_spread"], 0.45, "a vehicle brings its own texture")
+        self.assertGreater(features["blob_mixed"], 0.3, "light and dark bodywork, both")
+        self.assertEqual(features["peak"], 255, "white bodywork clips: a clipped frame is not a nuisance")
+
+    def test_the_cars_front_at_the_far_fence_gap_is_an_object_not_light(self):
+        scene = self.replay("day-vehicle-front")
+        self.assertEqual(len(scene.triggers), 1, scene.verdicts[-8:])
+        features = scene.triggers[0][1].features
+        self.assertLess(features["blob_contrast"], -0.6, "a dark car against sunlit gravel")
+        self.assertGreater(features["blob_spread"], 0.45)
+        self.assertNotIn("illumination", scene.verdicts)
+
+    def test_the_night_point_source_does_not_trigger(self):
+        before, after = self.pair("night-point-source")
+        self.assertLess(sum(before) / len(before), 28, "the patch was black")
+        scene = Scene().settle(before).run(int(30 * FPS), lambda _i: after)
+        self.assertEqual(scene.triggers, [])
+        self.assertEqual(scene.detector.light, LIGHT_NIGHT)
+        # With the floors of the first shadow night (two cells, no spill
+        # asked for) the same pictures do not trigger cold either: the
+        # recorded row had persistence 4 over a run the live background had
+        # not absorbed. The rule is asserted on the row's own numbers instead.
+        features = {"blob_cells": 2, "shift": 0.0, "peak": 181}
+        config = DetectorConfig()
+        self.assertLess(features["blob_cells"], config.night_min_cells)
+        self.assertLess(features["shift"], config.night_min_spill)
+
+
 class DetectorRecordTest(unittest.TestCase):
     def test_every_sample_carries_the_evidence_numbers(self):
         scene = Scene().settle(textured(), seconds=1)
         features = scene.detector.last.features
         for name in ("light", "mean_luma", "bg_luma", "luma_jump", "peak", "shift",
                      "changed_fraction", "blob_fraction", "scatter", "cx", "cy",
+                     "blob_contrast", "blob_spread", "blob_mixed",
                      "scene_difference", "stillness", "persistence", "verdict"):
             self.assertIn(name, features)
+
+    def test_the_synthetic_vehicles_are_objects_by_the_illumination_rule(self):
+        """The fixtures paint a flat body: uniform, so it is the contrast that makes it an object."""
+        base = textured()
+        scene = Scene().settle(base)
+        start = scene.index
+        scene.run(8, lambda i: paint(base, 0, 5, 2 * (i - start + 1), 14, 35))
+        features = scene.triggers[0][1].features
+        self.assertGreater(abs(features["blob_contrast"]), DetectorConfig().day_light_max_contrast)
+        self.assertNotIn("illumination", scene.verdicts)
+
+    def test_shade_of_the_measured_depth_over_a_textured_drive_is_refused_as_light(self):
+        """Synthetic, from the measured numbers: the gravel 30% darker, texture kept."""
+        base = textured()
+        scene = Scene().settle(base)
+        start = scene.index
+
+        def shade_arriving(i):
+            columns = 2 * (i - start + 1)
+            return [clamp(value * 0.7) if (cell % W) < columns and cell >= 5 * W else value
+                    for cell, value in enumerate(base)]
+
+        scene.run(8, shade_arriving)
+        self.assertEqual(scene.triggers, [], scene.verdicts[-8:])
+        self.assertIn("illumination", scene.verdicts)
+
+    def test_the_illumination_floors_are_settable(self):
+        from gate_controller.early_trigger import load_config
+
+        config = load_config({"GATE_EARLY_TRIGGER_DAY_LIGHT_MAX_SPREAD": "0.2",
+                              "GATE_EARLY_TRIGGER_DAY_LIGHT_MAX_CONTRAST": "0.7",
+                              "GATE_EARLY_TRIGGER_NIGHT_MIN_SPILL": "5",
+                              "GATE_EARLY_TRIGGER_NIGHT_MIN_CELLS": "6"}).detector
+        self.assertEqual((config.day_light_max_spread, config.day_light_max_contrast), (0.2, 0.7))
+        self.assertEqual((config.night_min_spill, config.night_min_cells), (5.0, 6))
 
     def test_a_wrongly_sized_sample_is_refused(self):
         with self.assertRaises(ValueError):

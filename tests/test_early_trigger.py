@@ -11,11 +11,12 @@ import logging
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from io import BytesIO
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from unittest.mock import patch
 
 from PIL import Image
@@ -24,7 +25,7 @@ import gate_controller.__main__ as gate_main
 from gate_controller import early_trigger
 from gate_controller.backpressure import ActivityGate
 from gate_controller.early_trigger import (
-    ConfirmationLayers, EarlyTriggerStore, EarlyTriggerWorker, ThumbnailStore,
+    Confirmation, ConfirmationLayers, EarlyTriggerStore, EarlyTriggerWorker, ThumbnailStore,
     build_worker, ensure_schema, grid_from_frame, lane_square, load_config,
 )
 from gate_controller.trigger_capture import TriggerCaptureConfig, TriggerFrameCapture
@@ -86,6 +87,46 @@ class SteppingClock:
         return self.now
 
 
+class InlineThread:
+    """A thread that runs on the caller's thread: the layers answer before the wait begins."""
+
+    def __init__(self, target=None, args=(), name=None, daemon=None):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+
+class Read:
+    def __init__(self, box=False):
+        self.status = "recognized" if box else "no_plate"
+        self.recognised = box
+        self.score = 0.9 if box else 0.0
+        self.authorised = False
+
+
+def stub_layers(*, clip_empty=None, plate_box=None, clock=None, deadline=0.5):
+    """Layers with instant answers: ``clip_empty`` the tower's empty share, ``plate_box`` the reader's.
+
+    Either given as None is left unavailable, as it is on a Pi without that model.
+    """
+    options = {"sleep": lambda seconds: None, "deadline_seconds": deadline}
+    if clock is not None:
+        options["clock"] = clock
+    if clip_empty is not None:
+        options["clip_look"] = lambda jpeg: {
+            "status": "ok", "empty": clip_empty, "top": "empty" if clip_empty > 0.5 else "car",
+            "shares": {"car": round(1 - clip_empty, 4), "empty": clip_empty}}
+        options["lane_frame"] = lambda: b"jpeg"
+    if plate_box is not None:
+        options["plate_frame"] = lambda: b"jpeg"
+        options["plate_read"] = lambda frame: Read(plate_box)
+    return ConfirmationLayers(**options)
+
+
+CONFIRMED = {"status": "confirmed", "by": "clip", "waited_ms": 120, "deadline_ms": 500}
+
+
 class SpyCapture:
     def __init__(self, outcome="scheduled"):
         self.calls = []
@@ -111,7 +152,8 @@ def arrival(config, frames_before=80, frames_after=12):
 
 
 class WorkerHarness:
-    def __init__(self, test, mode, *, capture=None, environment=None, activity=None, data=None):
+    def __init__(self, test, mode, *, capture=None, environment=None, activity=None, data=None,
+                 layers=None):
         self.directory = tempfile.TemporaryDirectory()
         test.addCleanup(self.directory.cleanup)
         self.state = Path(self.directory.name)
@@ -129,15 +171,21 @@ class WorkerHarness:
 
         self.clock = SteppingClock()
         self.worker = EarlyTriggerWorker(
-            self.config, capture=capture, activity=activity, store=self.store,
+            self.config, capture=capture, activity=activity, store=self.store, layers=layers,
             thumbnails=ThumbnailStore(self.state / "thumbs", max_files=5, max_days=1),
             popen=popen, clock=self.clock, wall_clock=lambda: 1_790_000_000.0 + self.clock.now,
         )
 
     def run(self):
-        with patch.object(Event, "wait", lambda event, timeout=None: event.is_set()):
+        # No real waiting: the loop's pauses return at once, and the layers
+        # answer on the worker's own thread before it looks for an answer.
+        with patch.object(Event, "wait", lambda event, timeout=None: event.is_set()), \
+                patch.object(early_trigger, "Thread", InlineThread):
             self.worker.run_forever(self.stop)
         return self
+
+    def layers_of(self, row):
+        return json.loads(row["layers"])
 
     def rows(self):
         with closing(sqlite3.connect(str(self.state / "early-trigger.db"))) as connection:
@@ -307,18 +355,103 @@ class ShadowTests(unittest.TestCase):
 
 
 class ActingTests(unittest.TestCase):
-    def test_on_asks_the_capture_for_a_sweep_and_records_that_it_did(self):
+    """``on``: what reaches the capture, and only after a confirming look.
+
+    Before the first shadow day the worker acted on the vision rule alone;
+    ``test_on_asks_the_capture_for_a_sweep`` used to pass with no layers at
+    all. Seven false day triggers in thirteen minutes of cloud shade, all
+    cleared by the second looks, changed that: the same test now has to give
+    the worker a look that sees a vehicle.
+    """
+
+    def test_on_asks_the_capture_for_a_sweep_once_a_look_confirms_and_records_both(self):
         capture = SpyCapture()
-        harness = WorkerHarness(self, "on", capture=capture).run()
+        harness = WorkerHarness(self, "on", capture=capture,
+                                layers=stub_layers(clip_empty=0.02, plate_box=False)).run()
         self.assertEqual(len(capture.calls), 1)
         self.assertIn("blob_fraction", capture.calls[0])
         row = harness.rows()[0]
         self.assertEqual((row["mode"], row["action"]), ("on", "scheduled"))
+        layers = harness.layers_of(row)
+        # The vision rule's own verdict, the looks and the decision, each on its own.
+        self.assertEqual(json.loads(row["features"])["verdict"], "trigger")
+        self.assertEqual((layers["decision"]["status"], layers["decision"]["by"]),
+                         ("confirmed", "clip"))
+        self.assertIn("waited_ms", layers["decision"])
+        self.assertEqual(layers["decision"]["deadline_ms"], 500)
+        self.assertTrue(layers["clip"]["vehicle"])
+        self.assertFalse(layers["plate_look"]["plate_box"])
         capture.observer({"reason": "early_abort", "upgraded": False, "reads": 0})
         self.assertEqual(json.loads(harness.rows()[0]["sweep"])["reason"], "early_abort")
 
+    def test_a_plate_box_confirms_when_the_tower_sees_nothing(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture,
+                                layers=stub_layers(clip_empty=0.99, plate_box=True)).run()
+        self.assertEqual(len(capture.calls), 1)
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "scheduled")
+        self.assertEqual(harness.layers_of(row)["decision"]["by"], "plate")
+
+    def test_an_unconfirmed_would_trigger_starts_nothing_and_says_why(self):
+        capture = SpyCapture()
+        with self.assertLogs("gate_controller.early_trigger", level="INFO") as logs:
+            harness = WorkerHarness(self, "on", capture=capture,
+                                    layers=stub_layers(clip_empty=0.9998, plate_box=False)).run()
+        self.assertEqual(capture.calls, [], "the capture was asked on vision alone")
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "skipped_unconfirmed")
+        layers = harness.layers_of(row)
+        self.assertEqual(layers["decision"]["status"], "unconfirmed")
+        self.assertIsNone(layers["decision"]["by"])
+        self.assertFalse(layers["clip"]["vehicle"])
+        self.assertEqual(json.loads(row["features"])["verdict"], "trigger",
+                         "the raw vision rule is still measurable")
+        line = next(line for line in logs.output if "stage=would_trigger" in line)
+        self.assertIn("action=skipped_unconfirmed confirmation=unconfirmed", line)
+        self.assertEqual(harness.worker.status()["unconfirmed"], 1)
+        self.assertEqual(harness.worker.status()["confirmed"], 0)
+
+    def test_without_any_look_at_all_on_starts_nothing(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture).run()
+        self.assertEqual(capture.calls, [])
+        self.assertEqual(harness.rows()[0]["action"], "skipped_unavailable")
+        harness = WorkerHarness(self, "on", capture=SpyCapture(), layers=stub_layers()).run()
+        self.assertEqual(harness.rows()[0]["action"], "skipped_unavailable")
+
+    def test_shadow_records_the_decision_too_and_still_acts_on_nothing(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "shadow", capture=capture,
+                                layers=stub_layers(clip_empty=0.02, plate_box=True)).run()
+        self.assertEqual(capture.calls, [])
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "none")
+        self.assertEqual(harness.layers_of(row)["decision"]["status"], "confirmed")
+
+    def test_looks_the_rate_cap_refuses_leave_the_trigger_unconfirmed(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture, environment={
+            "GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE": "0",
+        }, layers=ConfirmationLayers(per_minute=0, deadline_seconds=0.5)).run()
+        self.assertEqual(capture.calls, [])
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "skipped_disabled")
+        self.assertEqual(harness.layers_of(row)["clip"]["status"], "skipped_disabled")
+
     def _observation(self):
         return early_trigger.Observation("trigger", True, "day", {"blob_fraction": 0.1})
+
+    def test_the_capture_is_never_asked_on_an_unconfirmed_decision(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture)
+        for status in ("unconfirmed", "cancelled_camera_alarm", "unavailable"):
+            self.assertEqual(harness.worker._act(self._observation(), {"status": status}),
+                             f"skipped_{status}")
+        self.assertEqual(harness.worker._act(self._observation(), {"status": "skipped_rate"}),
+                         "skipped_rate")
+        self.assertEqual(capture.calls, [])
+        self.assertEqual(harness.worker._act(self._observation(), CONFIRMED), "scheduled")
 
     def test_the_minimum_interval_and_the_hourly_cap_with_backoff(self):
         capture = SpyCapture()
@@ -329,33 +462,33 @@ class ActingTests(unittest.TestCase):
         })
         worker, clock = harness.worker, harness.clock
         clock.step = 0.0
-        self.assertEqual(worker._act(self._observation()), "scheduled")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "scheduled")
         clock.now += 5
-        self.assertEqual(worker._act(self._observation()), "skipped_interval")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "skipped_interval")
         for _ in range(2):
             clock.now += 30
-            self.assertEqual(worker._act(self._observation()), "scheduled")
+            self.assertEqual(worker._act(self._observation(), CONFIRMED), "scheduled")
         clock.now += 30
         with self.assertLogs("gate_controller.early_trigger", level="WARNING") as logs:
-            self.assertEqual(worker._act(self._observation()), "skipped_backoff")
+            self.assertEqual(worker._act(self._observation(), CONFIRMED), "skipped_backoff")
         self.assertIn("stage=backoff", logs.output[0])
         clock.now += 300
-        self.assertEqual(worker._act(self._observation()), "skipped_backoff")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "skipped_backoff")
         self.assertEqual(len(capture.calls), 3, "nothing reaches the capture during a backoff")
         clock.now += 301
-        self.assertEqual(worker._act(self._observation()), "scheduled")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "scheduled")
         # The second backoff is twice the first.
         for _ in range(2):
             clock.now += 30
-            worker._act(self._observation())
+            worker._act(self._observation(), CONFIRMED)
         clock.now += 30
         with self.assertLogs("gate_controller.early_trigger", level="WARNING") as logs:
-            self.assertEqual(worker._act(self._observation()), "skipped_backoff")
+            self.assertEqual(worker._act(self._observation(), CONFIRMED), "skipped_backoff")
         self.assertIn("seconds=1200", logs.output[0])
         clock.now += 900
-        self.assertEqual(worker._act(self._observation()), "skipped_backoff")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "skipped_backoff")
         clock.now += 301
-        self.assertEqual(worker._act(self._observation()), "scheduled")
+        self.assertEqual(worker._act(self._observation(), CONFIRMED), "scheduled")
 
     def test_a_camera_alarm_forgives_the_count_because_the_triggers_were_true(self):
         capture = SpyCapture()
@@ -366,7 +499,7 @@ class ActingTests(unittest.TestCase):
         clock.step = 0.0
         for _ in range(6):
             clock.now += 30
-            self.assertEqual(worker._act(self._observation()), "scheduled")
+            self.assertEqual(worker._act(self._observation(), CONFIRMED), "scheduled")
             worker.note_camera_alarm(None)
 
     def test_outside_its_hours_it_records_and_does_not_act(self):
@@ -375,15 +508,113 @@ class ActingTests(unittest.TestCase):
             "GATE_EARLY_TRIGGER_HOURS": "10:00-10:01", "GATE_EARLY_TRIGGER_TIMEZONE": "UTC",
         })
         harness.worker._wall = lambda: 1_790_000_000.0  # 2026-09-22 21:33 UTC
+        harness.worker._layers = stub_layers(clip_empty=0.02)
         harness.run()
         self.assertEqual(capture.calls, [])
         self.assertEqual(harness.rows()[0]["action"], "skipped_hours")
 
     def test_a_capture_that_is_busy_is_recorded_as_busy_and_not_counted_against_the_cap(self):
         capture = SpyCapture(outcome="skipped_busy")
-        harness = WorkerHarness(self, "on", capture=capture).run()
+        harness = WorkerHarness(self, "on", capture=capture, layers=stub_layers(clip_empty=0.02))
+        harness.run()
         self.assertEqual(harness.rows()[0]["action"], "skipped_busy")
         self.assertEqual(len(harness.worker._unconfirmed), 0)
+
+
+class ConfirmationTests(unittest.TestCase):
+    """The wait is bounded, ends at the first yes, and ends when the camera speaks."""
+
+    def _worker(self, layers):
+        harness = WorkerHarness(self, "on", capture=SpyCapture(), layers=layers)
+        harness.worker._clock = time.monotonic
+        return harness.worker
+
+    def test_the_wait_is_bounded_by_the_deadline_however_slow_the_looks_are(self):
+        release = Event()
+
+        def slow_clip(jpeg):
+            release.wait(5.0)
+            return {"status": "ok", "empty": 0.01, "top": "car", "shares": {}}
+
+        layers = ConfirmationLayers(clip_look=slow_clip, lane_frame=lambda: b"jpeg",
+                                    deadline_seconds=0.2, sleep=lambda s: None)
+        worker = self._worker(layers)
+        records = []
+        started = time.monotonic()
+        decision = worker._confirm(records.append)
+        waited = time.monotonic() - started
+        self.assertLess(waited, 0.2 + 0.3, "the detector's thread was held past the bound")
+        self.assertEqual(decision["status"], "unconfirmed")
+        self.assertLessEqual(decision["waited_ms"], 500)
+        self.assertEqual(decision["deadline_ms"], 200)
+        self.assertEqual(records, [], "the looks are still running")
+        # When the slow look does answer, the record says it would have
+        # confirmed, and that it was late: the deadline is what stood in the way.
+        release.set()
+        for _ in range(100):
+            if records:
+                break
+            time.sleep(0.01)
+        self.assertEqual(records[0]["clip"]["vehicle"], True)
+        self.assertEqual(worker.status()["unconfirmed"], 1)
+
+    def test_the_wait_ends_at_the_first_yes_not_at_the_deadline(self):
+        layers = ConfirmationLayers(
+            clip_look=lambda jpeg: {"status": "ok", "empty": 0.01, "top": "car", "shares": {}},
+            lane_frame=lambda: b"jpeg", deadline_seconds=2.0, sleep=lambda s: None)
+        worker = self._worker(layers)
+        started = time.monotonic()
+        decision = worker._confirm(lambda layers: None)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual((decision["status"], decision["by"]), ("confirmed", "clip"))
+
+    def test_both_looks_saying_no_ends_the_wait_before_the_deadline(self):
+        layers = stub_layers(clip_empty=0.99, plate_box=False, deadline=2.0)
+        worker = self._worker(layers)
+        started = time.monotonic()
+        decision = worker._confirm(lambda layers: None)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(decision["status"], "unconfirmed")
+
+    def test_the_cameras_own_alarm_ends_the_wait_at_once(self):
+        release = Event()
+
+        def slow_clip(jpeg):
+            release.wait(5.0)
+            return {"status": "ok", "empty": 0.01, "top": "car", "shares": {}}
+
+        layers = ConfirmationLayers(clip_look=slow_clip, lane_frame=lambda: b"jpeg",
+                                    deadline_seconds=2.0, sleep=lambda s: None)
+        worker = self._worker(layers)
+
+        class Alarm:
+            event_type = "vehicle"
+
+        def alarm_soon():
+            time.sleep(0.05)
+            worker.note_camera_alarm(Alarm())
+
+        alarm = Thread(target=alarm_soon, daemon=True)
+        alarm.start()
+        started = time.monotonic()
+        decision = worker._confirm(lambda layers: None)
+        self.assertLess(time.monotonic() - started, 1.0, "the camera's alarm waited on the layers")
+        self.assertEqual(decision["status"], "cancelled_camera_alarm")
+        self.assertEqual(worker._act(early_trigger.Observation("trigger", True, "day", {}), decision),
+                         "skipped_cancelled_camera_alarm")
+        release.set()
+        alarm.join(2.0)
+
+    def test_a_late_yes_is_written_down_as_late(self):
+        confirmation = Confirmation(deadline_seconds=0.01)
+        self.assertEqual(confirmation.wait()["status"], "unconfirmed")
+        confirmation.confirm("plate")
+        self.assertEqual(confirmation.record()["by"], "plate_late")
+        self.assertFalse(confirmation.confirmed)
+        settled = Confirmation("skipped_rate", deadline_seconds=0.5)
+        started = time.monotonic()
+        self.assertEqual(settled.wait()["status"], "skipped_rate")
+        self.assertLess(time.monotonic() - started, 0.1, "a settled answer is not waited on")
 
 
 class LayerTests(unittest.TestCase):
@@ -411,7 +642,7 @@ class LayerTests(unittest.TestCase):
         done = []
         layers = self._layers(clip_look=lambda jpeg: self.fail("looked while busy"),
                               lane_frame=lambda: b"jpeg", busy=lambda: "camera_event")
-        self.assertFalse(layers.begin(done.append))
+        self.assertEqual(layers.begin(done.append).status, "skipped_busy")
         self.assertEqual(done, [{"clip": {"status": "skipped_busy"},
                                  "plate_look": {"status": "skipped_busy"}}])
 
@@ -433,12 +664,43 @@ class LayerTests(unittest.TestCase):
         done = []
         ticks = iter(range(100, 200))
         layers = self._layers(per_minute=2, clock=lambda: next(ticks))
-        with patch.object(early_trigger, "Thread") as thread:
-            thread.return_value.start.side_effect = lambda: layers._running.release()
-            self.assertTrue(layers.begin(done.append))
-            self.assertTrue(layers.begin(done.append))
-            self.assertFalse(layers.begin(done.append))
+        with patch.object(early_trigger, "Thread", InlineThread):
+            self.assertEqual(layers.begin(done.append).status, "unavailable")
+            self.assertEqual(layers.begin(done.append).status, "unavailable")
+            self.assertEqual(layers.begin(done.append).status, "skipped_rate")
         self.assertEqual(done[-1]["clip"]["status"], "skipped_rate")
+        self.assertEqual(len(done), 3)
+
+    def test_the_two_looks_run_at_the_same_time_and_the_first_yes_wins(self):
+        gate = Event()
+
+        def clip(jpeg):
+            gate.wait(2.0)   # the tower is slow today
+            return {"status": "ok", "empty": 0.01, "top": "car", "shares": {}}
+
+        done = []
+        layers = self._layers(clip_look=clip, lane_frame=lambda: b"jpeg", deadline_seconds=1.0,
+                              plate_frame=lambda: b"jpeg", plate_read=lambda frame: Read(True))
+        confirmation = layers.begin(done.append)
+        decision = confirmation.wait()
+        self.assertEqual((decision["status"], decision["by"]), ("confirmed", "plate"))
+        self.assertLess(decision["waited_ms"], 900, "the plate look waited behind the tower")
+        gate.set()
+        for _ in range(300):
+            if done:
+                break
+            time.sleep(0.01)
+        self.assertEqual(done[0]["clip"]["vehicle"], True)
+        self.assertEqual(len(done[0]["plate_look"]["reads"]), 3, "the record still gets all three")
+
+    def test_the_clip_vote_is_a_vehicle_class_over_empty(self):
+        from gate_controller.early_trigger import CLIP_EMPTY_MAX, clip_sees_vehicle
+
+        self.assertTrue(clip_sees_vehicle({"status": "ok", "empty": 0.03}))
+        self.assertFalse(clip_sees_vehicle({"status": "ok", "empty": 0.9998}))
+        self.assertIsNone(clip_sees_vehicle({"status": "skipped_busy"}))
+        self.assertIsNone(clip_sees_vehicle(None))
+        self.assertEqual(CLIP_EMPTY_MAX, 0.5)
 
     def test_without_a_model_or_a_reader_the_layers_say_unavailable(self):
         self.assertEqual(self._layers().evaluate(), {"clip": {"status": "unavailable"},
