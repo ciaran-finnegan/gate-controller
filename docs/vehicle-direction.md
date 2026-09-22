@@ -214,7 +214,8 @@ the width fit, so there is nothing to combine.
 
 Each pass:
 
-1. reads the photo of every recent event not yet read (unchanged);
+1. reads the photo of every recent event **the Pi has already delivered** and
+   not yet read (see below);
 2. `direction_passages.judge_passages` groups events into passages, gathers
    each one's evidence from `events`, `event_telemetry`, `event_directions`,
    `gate_movements` and `gate_sound_scans`, and has `direction_signals.judge`
@@ -232,6 +233,50 @@ dashboard has it, and the training corpus on this Pi holds audio, not frames;
 an earlier version of this page said the corpus "already keeps every frame",
 and it does not. Anything that needs a photo after the event fetches it from
 `GET /api/controller/events/image`, as the scan does.
+
+### Asking for a photo before it exists
+
+Because the scan fetches the photo *back*, there is a photo to fetch only once
+the Pi's own outbox has delivered the event. Asking earlier returns a 404 that
+is about the outbox, not about the vehicle — and the scan used to write that
+404 down as `no_image`, which then hid the event from the next pass for good.
+
+**That is what happened under the router outage of 2026-09-21.** Event 3161 was
+asked for 29 s after it happened, while its outbox item was still failing; it
+was delivered on attempt 13, by which time the `no_image` row was permanent.
+Events 3162–3168, 3177–3178, 3184 and 3188–3190 went the same way: no photo
+verdict ever, so the combined verdict stayed `unknown`, arrivals included.
+
+The rules now:
+
+* **Delivered first.** A photo is asked for only when the event's own row in
+  `outbox` has a `completed_at` — the one thing `complete_outbox_item` writes,
+  and only after the ingest was acknowledged. One row per event
+  (`outbox_one_per_event`), so this is one lookup. An event still in the queue
+  is left alone with **no row written**, and the pass says how many are
+  waiting: `stage=judged {... 'waiting': 13 ...}` is an outbox that is behind,
+  not photos that are missing.
+* **`no_image` is retryable.** A row that says `no_image` is asked for again on
+  later passes, while the event is under two days old and has since been
+  delivered. A photo that comes back replaces the row, and because every
+  passage is judged again on every pass the verdict then ships like any other
+  change. The rows the outage left behind need no migration and no hand-edited
+  database: those events were delivered long ago and are inside the two days,
+  so the first pass after this release picks them up — provided the release is
+  on the Pi before 2026-09-23 17:59Z, when the oldest of them turns two days
+  old and the rule stops offering them. They are a day old as this is written.
+* **Two days, then the wait ends** (`UNDELIVERED_DAYS`). The outbox sets no
+  deadline of its own — `OutboxWorker` backs off to a 300 s ceiling and then
+  retries the same item for as long as the row exists — so the giving up is
+  here. Two days is about 570 attempts at that ceiling, it is inside this
+  scan's own three-day window so it happens on an ordinary timer pass rather
+  than only under a backfill, and it is far longer than any outage measured
+  here. The event is then recorded `unshippable` and left, which is also what
+  becomes of an event that was never queued for the dashboard at all.
+* **Bounded per pass.** `--limit` (120) is the cap on fetches, retries
+  included, oldest first, with retries taking at most a quarter of it so a
+  backlog cannot starve the events arriving now. A three-day outage cannot be
+  followed by a fetch storm.
 
 ### Gate cycles nobody was seen at
 
