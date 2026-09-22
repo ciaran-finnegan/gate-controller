@@ -67,6 +67,12 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECONDS = 60.0
 DEFAULT_TLS_INTERVAL_SECONDS = 300.0
+# How many probe cycles a *failed* internet result is believed for. A failed
+# TLS open is re-measured on the very next cycle (see `_probe_internet`), so a
+# failure older than two cycles means the probe has stopped measuring -- the
+# governor withheld the hop, the floor skipped the cycle, or the thread is not
+# running -- and it says nothing about the network now.
+INTERNET_DOWN_FRESHNESS_CYCLES = 2
 DEFAULT_TLS_HOST = "api.platerecognizer.com"
 DEFAULT_MAX_TEMP_C = 80.0
 DEFAULT_MAX_LOAD = 3.0
@@ -560,6 +566,40 @@ class NetProbeWorker:
             snapshot["age_seconds"] = round(max(0.0, self._clock() - measured_at), 1)
         return snapshot
 
+    @property
+    def internet_down_freshness_seconds(self) -> float:
+        """How long a failed internet result is taken as the state of the link."""
+        return INTERNET_DOWN_FRESHNESS_CYCLES * self.config.interval_seconds
+
+    def internet_reachable(self) -> bool:
+        """False only on fresh, definite evidence that the internet is down.
+
+        This is what the recognition pipeline asks before it spends a cloud
+        lookup (a network call with a 6 s deadline that cannot be answered
+        over a dead link). It fails **open towards the cloud**: a probe that
+        is disabled, has never run, is closed, whose last internet result is
+        anything but ``failed``, or whose failure is older than
+        :attr:`internet_down_freshness_seconds`, answers True and the cloud
+        is asked exactly as it always was. It never widens what opens the
+        gate; it only removes a request that would have timed out.
+
+        The answer is asked, not remembered: the cycle after the link comes
+        back (at most one ``interval_seconds``, because a failed open is
+        re-measured every cycle) makes this True again with no restart.
+        """
+        if not self.config.enabled:
+            return True
+        with self._lock:
+            if self._closed:
+                return True
+            internet, measured_at = self._internet, self._internet_at
+        if not internet or measured_at is None:
+            return True
+        if internet.get("state") != STATE_FAILED:
+            return True
+        age = self._clock() - measured_at
+        return not 0.0 <= age <= self.internet_down_freshness_seconds
+
     def throttled_flags(self) -> dict | None:
         """The firmware throttle word from the last cycle that read it, or None.
 
@@ -709,20 +749,30 @@ class NetProbeWorker:
         against the one-request-per-second throttle.
         """
         now = self._clock()
-        if (self._internet_at is not None and self._internet is not None
-                and now - self._internet_at < self.config.tls_interval_seconds):
-            return {**self._internet,
-                    "age_seconds": round(max(0.0, now - self._internet_at), 1)}
+        with self._lock:
+            internet, measured_at = self._internet, self._internet_at
+        if (measured_at is not None and internet is not None
+                # Only a *successful* open keeps the slower cadence. A failed
+                # one is re-measured every cycle: the pipeline stops asking
+                # the cloud on the strength of it (`internet_reachable`), and
+                # a link that is back must be noticed within one interval,
+                # not five. A failed open costs the resolver and connect
+                # timeouts on this thread and nothing else; nothing is billed.
+                and internet.get("state") != STATE_FAILED
+                and now - measured_at < self.config.tls_interval_seconds):
+            return {**internet, "age_seconds": round(max(0.0, now - measured_at), 1)}
         try:
             timings = self._internet_connect(self.config.tls_host)
         except Exception:
             timings = None
         if isinstance(timings, dict) and timings.get("total_ms") is not None:
-            self._internet = {"state": STATE_OK, **timings}
+            internet = {"state": STATE_OK, **timings}
         else:
-            self._internet = {"state": STATE_FAILED}
-        self._internet_at = now
-        return {**self._internet, "age_seconds": 0.0}
+            internet = {"state": STATE_FAILED}
+        with self._lock:
+            self._internet = internet
+            self._internet_at = now
+        return {**internet, "age_seconds": 0.0}
 
     def _probe_interface(self) -> dict | None:
         """Counter *rates* over this cycle. Lifetime totals are never reported.

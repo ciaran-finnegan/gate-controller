@@ -104,6 +104,23 @@ it still goes — but it is journalled as `stage=pruned_unshipped` and never
 happens quietly. For comparison the journal
 on the same card writes about 550 MB/day.
 
+The horizon is the clock only while the uploader is draining. Before taking
+an unshipped segment past `GATE_AUDIO_SEGMENTS_RETENTION_HOURS`, the pruner
+asks the uploader why it is not draining (`CorpusUploadWorker.retention_hold`:
+`event_delivery`, `network_down`, `upload_failed`, or nothing), and while
+there is a reason the segment is kept and the free-space floor is the bound
+instead. It journals `stage=retention_extended reason=… held=… held_mb=…
+oldest=…` when what is held changes and hourly otherwise, and the recorder's
+heartbeat block carries `held_unshipped`. Shipped and never-released segments
+still go at the horizon; when the floor does bite it takes those first,
+oldest first, and only then the only copies — each one as
+`stage=pruned_unshipped`. This exists because on 2026-09-22 the farm router
+dropped most packets for a day, the uploader deferred behind seven
+undeliverable telemetry items (see the corpus backpressure rules in
+[deployment.md](deployment.md#backpressure) for why it no longer does), and
+51 unshipped segments sat waiting for a 48-hour horizon that would have taken
+them unheard.
+
 Three bounds keep it from ever being the reason something else fails:
 
 * The **pruner runs on its own timer**, not as a step of the extraction job, so

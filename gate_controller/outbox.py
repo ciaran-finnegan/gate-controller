@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import requests
 from PIL import Image, ImageOps
@@ -24,6 +24,34 @@ MAX_OUTBOX_IMAGE_DIMENSION = 1280
 OUTBOX_BACKOFF_BASE_SECONDS = 5.0
 OUTBOX_BACKOFF_MAX_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
+
+#: Failures that say nothing about the endpoint and everything about the
+#: link: the request never reached anything that could have refused it. A
+#: ``ConnectTimeout`` is both a ``ConnectionError`` and a ``Timeout`` in
+#: ``requests``; the builtin pair covers a sender that talks to a socket
+#: directly.
+CONNECTION_FAILURE_TYPES = (
+    requests.ConnectionError, requests.Timeout, ConnectionError, TimeoutError,
+)
+
+
+def is_connection_failure(error: BaseException) -> bool:
+    """Did this send fail before anything answered?
+
+    Read down the cause chain, because the Cloudflare client and ``requests``
+    both wrap what the socket raised. An HTTP status of any kind is *not* a
+    connection failure: the cloud answered, so the link is there.
+    """
+    seen = 0
+    cause: BaseException | None = error
+    while cause is not None and seen < 8:
+        if isinstance(cause, requests.HTTPError):
+            return False
+        if isinstance(cause, CONNECTION_FAILURE_TYPES):
+            return True
+        cause = cause.__cause__ or cause.__context__
+        seen += 1
+    return False
 
 
 class OutboxSyncError(RuntimeError):
@@ -331,6 +359,15 @@ class OutboxWorker:
         self._jitter = jitter or (lambda: random.uniform(0.8, 1.2))
         self._failures: dict[int, int] = {}
         self._retry_at: dict[int, datetime] = {}
+        # What the corpus uploader reads to tell "the outbox is delivering"
+        # from "nothing can reach the cloud". Written on this thread, read
+        # from another, so the two dicts and the in-flight marker share a
+        # lock rather than being iterated while they change.
+        self._health_lock = Lock()
+        self._unreachable: dict[int, bool] = {}
+        self._first_failed_at: dict[int, datetime] = {}
+        self._last_error_type: str | None = None
+        self._sending: int | None = None
         try:
             self._store.bind_pending_outbox_controller(self._controller_id)
             self._evidence_spool.cleanup(self._store.pending_evidence_digests())
@@ -379,12 +416,18 @@ class OutboxWorker:
                     telemetry.get("delivery", {}).get("outbox_attempt", "unavailable"),
                 )
                 image_digest = payload.get("image_sha256")
-                if image_digest is None:
-                    self._send(payload)
-                else:
-                    self._send(payload, self._evidence_spool.load(image_digest))
+                with self._health_lock:
+                    self._sending = item_id
+                try:
+                    if image_digest is None:
+                        self._send(payload)
+                    else:
+                        self._send(payload, self._evidence_spool.load(image_digest))
+                finally:
+                    with self._health_lock:
+                        self._sending = None
             except Exception as error:
-                delay = self._schedule_retry(item_id)
+                delay = self._schedule_retry(item_id, error)
                 LOGGER.warning(
                     "gate_pipeline stage=cloud_send_failed trace_id=%s item_id=%d "
                     "error_type=%s detail=%s retry_in_s=%d",
@@ -397,8 +440,12 @@ class OutboxWorker:
                 except Exception:
                     pass
                 continue
-            self._failures.pop(item_id, None)
-            self._retry_at.pop(item_id, None)
+            with self._health_lock:
+                self._failures.pop(item_id, None)
+                self._retry_at.pop(item_id, None)
+                self._unreachable.pop(item_id, None)
+                self._first_failed_at.pop(item_id, None)
+                self._last_error_type = None
             try:
                 acknowledged_at = self._clock()
                 self._store.complete_outbox_item(
@@ -427,10 +474,9 @@ class OutboxWorker:
             completed += 1
         return completed
 
-    def _schedule_retry(self, item_id: int) -> timedelta:
+    def _schedule_retry(self, item_id: int, error: BaseException | None = None) -> timedelta:
         """Back off exponentially per item so a dead endpoint is not hammered."""
         failures = self._failures.get(item_id, 0) + 1
-        self._failures[item_id] = failures
         # Cap the exponent: the delay is already at its ceiling long before
         # 2 ** n stops fitting in a float during a multi-day outage.
         seconds = min(self._backoff_max, self._backoff_base * (2 ** min(failures - 1, 16)))
@@ -438,8 +484,64 @@ class OutboxWorker:
         if not isinstance(jitter, (int, float)) or not 0.5 <= jitter <= 1.5:
             jitter = 1.0
         delay = timedelta(seconds=min(self._backoff_max, seconds * jitter))
-        self._retry_at[item_id] = self._clock() + delay
+        now = self._clock()
+        with self._health_lock:
+            self._failures[item_id] = failures
+            self._retry_at[item_id] = now + delay
+            self._first_failed_at.setdefault(item_id, now)
+            self._unreachable[item_id] = (
+                error is not None and is_connection_failure(error)
+            )
+            self._last_error_type = type(error).__name__ if error is not None else None
         return delay
+
+    def sending(self) -> bool:
+        """Is an item on the wire right now? Cheap enough to ask every few kilobytes."""
+        with self._health_lock:
+            return self._sending is not None
+
+    def delivery_health(self) -> dict:
+        """Whether this queue is being delivered, or cannot be delivered at all.
+
+        Read by the corpus uploader, which must yield to a queue that is
+        draining but gains nothing by yielding to one that cannot reach the
+        cloud. ``unreachable`` is true only when every item this worker has
+        tried failed before anything answered -- an HTTP status from the
+        cloud, however unwelcome, means the link is there and the queue is
+        being served. ``sending`` is the moment an item is actually on the
+        wire. ``pending`` is the store's own count, so a queue this worker
+        has not yet tried is visibly larger than ``failing``. ``stuck_for_s``
+        is how long the longest-failing item has been failing, by this
+        worker's clock: the evidence that a stuck queue has been stuck.
+        """
+        now = self._clock()
+        with self._health_lock:
+            failing = len(self._failures)
+            unreachable = failing > 0 and all(self._unreachable.get(item, False)
+                                              for item in self._failures)
+            sending = self._sending is not None
+            last_error_type = self._last_error_type
+            first_failed = [self._first_failed_at[item] for item in self._failures
+                            if item in self._first_failed_at]
+        stuck_for = None
+        if first_failed:
+            stuck_for = round(max(0.0, (now - min(first_failed)).total_seconds()), 1)
+        pending = None
+        oldest_age = None
+        try:
+            pending = self._store.pending_outbox_count()
+            oldest_age = self._store.oldest_pending_outbox_age_seconds(now=self._clock())
+        except Exception:
+            pass
+        return {
+            "pending": pending,
+            "sending": sending,
+            "failing": failing,
+            "unreachable": unreachable,
+            "stuck_for_s": stuck_for,
+            "oldest_pending_age_s": oldest_age,
+            "last_error_type": last_error_type,
+        }
 
     def _run_retention(self, now: datetime) -> None:
         if (

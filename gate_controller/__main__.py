@@ -179,6 +179,13 @@ def main() -> None:
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
     clear_keyframes = _clear_stream_source(trigger_capture_config)
+    # The network probe is built here, ahead of everything that asks it,
+    # because three things below share its one answer: the sweep asks it
+    # before handing a frame to the cloud, the processor before queueing a
+    # frame for the cloud lane, and the cloud client before the request
+    # leaves. It is started with the other background workers further down.
+    net_probe = _net_probe_worker(os.environ)
+    internet_reachable = net_probe.internet_reachable if net_probe is not None else None
     # The sweep reads session frames with the same recogniser, plate list and
     # policy band the processor uses, so what it admits is what the processor
     # will re-check. Built only when configured; None leaves capture as it was.
@@ -198,6 +205,7 @@ def main() -> None:
             # accept an early trigger at all; in `shadow` the entry point is
             # there and refuses, whoever calls it.
             early_trigger=load_early_trigger_mode(os.environ) == EARLY_TRIGGER_ON,
+            internet_reachable=internet_reachable,
         )
         if trigger_capture_config.enabled else None
     )
@@ -233,7 +241,7 @@ def main() -> None:
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=trigger_correlator,
-        corpus=corpus, activity=activity, metrics=metrics,
+        corpus=corpus, activity=activity, metrics=metrics, net_probe=net_probe,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
     # a verdict. It reaches no decision, spends no lookup and ends no
@@ -273,6 +281,16 @@ def main() -> None:
     if audio_capture is not None:
         background_workers += (audio_capture,)
     if audio_segments is not None:
+        # The pruner asks the uploader before taking an unshipped segment
+        # past the horizon: while the corpus is held off the card is the only
+        # copy, and the floor, not the clock, is what bounds it.
+        corpus_upload = next(
+            (worker for worker in background_workers
+             if isinstance(worker, CorpusUploadWorker)),
+            None,
+        )
+        if corpus_upload is not None:
+            audio_segments.store.hold_unshipped = corpus_upload.retention_hold
         background_workers += (audio_segments,)
     if hot_stream is not None:
         background_workers += (hot_stream,)
@@ -302,6 +320,10 @@ def main() -> None:
         # hands the processor None; the image tower is otherwise loaded here,
         # once, so no decision ever pays for it.
         farm_machinery=build_farm_machinery_policy(os.environ),
+        # The probe's own bound method, the same one the sweep holds: while it
+        # answers False no frame is queued for the cloud lane or posted, and
+        # the moment it answers True again the cloud is back, with no restart.
+        internet_reachable=internet_reachable,
     )
     if early_trigger is not None:
         # The image tower the processor's policy loaded is the one the early
@@ -390,11 +412,6 @@ def main() -> None:
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
 
-    net_probe = next(
-        (worker for worker in background_workers if isinstance(worker, NetProbeWorker)),
-        None,
-    )
-
     def shutdown():
         if early_trigger is not None:
             try:
@@ -434,12 +451,15 @@ def _corpus_quiet_seconds(environment) -> float:
         raise ValueError(f"GATE_CORPUS_QUIET_SECONDS is invalid: {error}") from error
 
 
-def _corpus_upload_worker(environment, corpus, client, controller_id, activity):
+def _corpus_upload_worker(environment, corpus, client, controller_id, activity,
+                          outbox=None, net_probe=None):
     """The background worker that moves the corpus into R2, or None.
 
     Built only when there is a corpus to ship and a cloud to ship it to. It
     is deliberately the last worker in the list: nothing else waits on it,
-    and its failures are its own.
+    and its failures are its own. The outbox worker and the net probe are
+    what let it tell an outbox that is busy from a network that is down for
+    everyone; either may be absent.
     """
     if corpus is None or client is None:
         return None
@@ -449,6 +469,7 @@ def _corpus_upload_worker(environment, corpus, client, controller_id, activity):
     return CorpusUploadWorker(
         corpus, CloudflareCorpusSender(client, controller_id), activity,
         config=config, controller_id=controller_id,
+        outbox=outbox, net_probe=net_probe,
     )
 
 
@@ -812,7 +833,8 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
-                             corpus=None, activity=None, metrics=None, webhook=None):
+                             corpus=None, activity=None, metrics=None, webhook=None,
+                             net_probe=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -824,8 +846,10 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     telemetry_retention_days = _telemetry_retention_days(environment)
-    net_probe_config = load_net_probe_config(environment)
-    net_probe = NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
+    # `main` builds the probe itself, so the pipeline can hold its answer;
+    # without one handed in, it is built here exactly as before.
+    if net_probe is None:
+        net_probe = _net_probe_worker(environment)
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
     if coordinator is not None:
@@ -839,12 +863,13 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             environment["GATE_CLOUDFLARE_ACCESS_CLIENT_ID"].strip(),
             environment["GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET"].strip(),
         )
-        workers.append(OutboxWorker(
+        outbox_worker = OutboxWorker(
             store,
             CloudflareOutboxSender(cloudflare_client, controller_id),
             controller_id=controller_id,
             telemetry_retention_days=telemetry_retention_days,
-        ))
+        )
+        workers.append(outbox_worker)
         plates_worker = None
         if authorised is not None:
             plates_worker = AuthorisationRefreshWorker(
@@ -862,6 +887,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             ))
         corpus_upload = _corpus_upload_worker(
             environment, corpus, cloudflare_client, controller_id, activity,
+            outbox=outbox_worker, net_probe=net_probe,
         )
         # heartbeat_worker is late-bound on purpose: the status it reports
         # includes the round trip of the POST the worker itself makes.
@@ -925,6 +951,12 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity,
     )
+
+
+def _net_probe_worker(environment) -> NetProbeWorker | None:
+    """The network probe the environment configures, or None when it is off."""
+    net_probe_config = load_net_probe_config(environment)
+    return NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
 
 
 def _telemetry_retention_days(environment) -> int:

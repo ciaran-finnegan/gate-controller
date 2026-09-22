@@ -399,15 +399,25 @@ class TrainingCorpus:
         for stem in pairs:
             if self._total_bytes <= self._max_bytes:
                 break
+            freed = 0
             for suffix in (".jpg", ".json"):
                 path = directory / (stem + suffix)
                 try:
                     size = path.stat().st_size
                     path.unlink()
                     self._total_bytes -= size
+                    freed += size
                 except FileNotFoundError:
                     continue
             self._pruned += 1
+            # Everything still at the root is unshipped -- a confirmed frame
+            # is deleted the moment the cloud has it -- so past the cap this
+            # is permanent loss, and the disk demanded it. Never quietly.
+            LOGGER.warning(
+                "gate_corpus stage=pruned_unshipped stem=%s bytes=%d "
+                "detail=frame_lost_before_upload",
+                stem, freed,
+            )
 
 
 def _write_private(directory: Path, name: str, data: bytes) -> Path:

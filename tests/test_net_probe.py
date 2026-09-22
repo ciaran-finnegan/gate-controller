@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from threading import Event, Thread
 
@@ -893,6 +894,152 @@ class ForbiddenDependencyTests(unittest.TestCase):
         self.assertIn('"vcgencmd"', host_body)
         self.assertNotIn("shell=True", body)
         self.assertNotIn("os.system", body)
+
+
+class InternetReachableTests(unittest.TestCase):
+    """The one answer the recognition pipeline takes from the probe.
+
+    2026-09-22: the router had been dropping 30-70 % of packets since the day
+    before and the probe had said ``internet=failed`` all morning, yet every
+    passage still handed frames to the cloud reader, each blocking ~6 s and
+    ending ``decision_timeout``. ``internet_reachable`` is what lets the
+    pipeline stop asking -- and only that. It must fail open towards the
+    cloud in every doubtful case, because a probe must never change what
+    opens the gate; it may only remove a request that would have timed out.
+    """
+
+    def _link(self, *, up=True, clock=None):
+        state = {"up": up}
+
+        def open_link(host):
+            if not state["up"]:
+                raise OSError("no route to host")
+            return dict(HEALTHY_INTERNET)
+
+        worker = probe(
+            clock=clock or (lambda: self.clock["value"]),
+            internet_connect=open_link,
+            # A fresh canned child per spawn, so every cycle has ping output.
+            popen=lambda command, **kwargs: FakePopen(HEALTHY_PING.encode())(
+                command, **kwargs
+            ),
+        )
+        return worker, state
+
+    def setUp(self):
+        self.clock = {"value": 1000.0}
+
+    def test_a_probe_that_is_off_or_has_never_run_leaves_the_cloud_allowed(self):
+        self.assertTrue(probe(config=NetProbeConfig(enabled=False)).internet_reachable())
+        worker, _ = self._link(up=False)
+        self.assertTrue(worker.internet_reachable(), "nothing has been measured yet")
+
+    def test_a_healthy_open_leaves_the_cloud_allowed(self):
+        worker, _ = self._link(up=True)
+        worker.run_once()
+        self.assertTrue(worker.internet_reachable())
+
+    def test_a_fresh_failed_open_is_the_one_thing_that_says_no(self):
+        worker, _ = self._link(up=False)
+        worker.run_once()
+        self.assertEqual("failed", worker.status()["hops"]["internet"]["state"])
+
+        self.assertFalse(worker.internet_reachable())
+        self.clock["value"] += worker.internet_down_freshness_seconds - 1.0
+        self.assertFalse(worker.internet_reachable(), "still within two cycles")
+
+    def test_a_failure_older_than_two_cycles_says_nothing_about_now(self):
+        worker, _ = self._link(up=False)
+        worker.run_once()
+        self.assertEqual(120.0, worker.internet_down_freshness_seconds,
+                         "two of the 60 s cycles by default")
+
+        self.clock["value"] += 121.0
+        self.assertTrue(
+            worker.internet_reachable(),
+            "the probe stopped measuring (governor, floor, or thread gone): fail open",
+        )
+
+    def test_the_freshness_follows_the_configured_cycle(self):
+        self.clock["value"] = 5000.0
+        state = {"up": False}
+        worker = NetProbeWorker(
+            NetProbeConfig(enabled=True, interval_seconds=30.0),
+            popen=lambda command, **kwargs: FakePopen(HEALTHY_PING.encode())(command, **kwargs),
+            clock=lambda: self.clock["value"], host_metrics=lambda **_: dict(HEALTHY_METRICS),
+            proc_root=Path("/nonexistent-proc"), sys_class_net=Path("/nonexistent-sys"),
+            internet_connect=lambda host: (_ for _ in ()).throw(OSError("down")),
+        )
+        worker.run_once()
+        self.assertEqual(60.0, worker.internet_down_freshness_seconds)
+        self.clock["value"] += 59.0
+        self.assertFalse(worker.internet_reachable())
+        self.clock["value"] += 2.0
+        self.assertTrue(worker.internet_reachable())
+
+    def test_a_failed_open_is_re_measured_every_cycle_so_recovery_takes_one_interval(self):
+        # A healthy open keeps its five-minute cadence (see InternetHopTests);
+        # a failed one must not, or a link that came back would be believed
+        # down for up to five minutes while the gate read plates without it.
+        worker, state = self._link(up=False)
+        worker.run_once()
+        self.assertFalse(worker.internet_reachable())
+
+        state["up"] = True
+        self.clock["value"] += 60.0
+        worker.run_once()
+
+        self.assertEqual("ok", worker.status()["hops"]["internet"]["state"])
+        self.assertTrue(worker.internet_reachable(), "the cloud is back on the next cycle")
+
+    def test_a_link_that_goes_down_is_noticed_only_when_the_open_is_next_measured(self):
+        worker, state = self._link(up=True)
+        worker.run_once()
+        state["up"] = False
+        self.clock["value"] += 60.0
+        worker.run_once()
+        self.assertTrue(worker.internet_reachable(),
+                        "the healthy result is still within its cadence; nothing new was measured")
+        self.clock["value"] += 300.0
+        worker.run_once()
+        self.assertFalse(worker.internet_reachable())
+
+    def test_cycles_the_governor_withholds_do_not_refresh_a_failure(self):
+        metrics = {"value": dict(HEALTHY_METRICS)}
+        state = {"up": False}
+        worker = probe(
+            clock=lambda: self.clock["value"], metrics=lambda **_: dict(metrics["value"]),
+            internet_connect=lambda host: (_ for _ in ()).throw(OSError("down")),
+            popen=lambda command, **kwargs: FakePopen(HEALTHY_PING.encode())(command, **kwargs),
+        )
+        worker.run_once()
+        self.assertFalse(worker.internet_reachable())
+
+        metrics["value"] = {**HEALTHY_METRICS, "load_1m": DEFAULT_MAX_LOAD}
+        for _ in range(3):
+            self.clock["value"] += 60.0
+            worker.run_once()
+        self.assertEqual("ping", worker.status()["mode"])
+        self.assertTrue(
+            worker.internet_reachable(),
+            "no internet hop was measured for three cycles: the failure is stale, fail open",
+        )
+
+    def test_a_closed_probe_leaves_the_cloud_allowed(self):
+        worker, _ = self._link(up=False)
+        worker.run_once()
+        self.assertFalse(worker.internet_reachable())
+        worker.close()
+        self.assertTrue(worker.internet_reachable())
+
+    def test_the_predicate_reads_the_measurement_not_the_heartbeat_snapshot(self):
+        # It is asked on the burst thread, so it must be cheap and must not
+        # depend on a status snapshot that a withheld cycle would have
+        # replaced with one carrying no internet hop at all.
+        worker, _ = self._link(up=False)
+        worker.run_once()
+        with mock.patch.object(worker, "status", side_effect=AssertionError("not this")):
+            self.assertFalse(worker.internet_reachable())
 
 
 if __name__ == "__main__":
