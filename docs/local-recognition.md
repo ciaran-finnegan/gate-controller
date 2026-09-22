@@ -409,6 +409,64 @@ and then each spent a paid lookup that timed out. `GATE_OCR_MIN_REQUEST_SECONDS`
 `decision_timeout`, with **no** `ocr_timeout` attempt recorded, because
 nothing was sent and nothing was billed.
 
+### When the internet is down, the cloud is not asked
+
+The controller's own [network probe](deployment.md#network-probe) opens a TLS
+connection to the plate service every cycle and reports the `internet` hop as
+`ok` or `failed`. On 2026-09-22 the farm's router had been dropping 30-70 % of
+packets since the day before, the probe had said `internet=failed` all
+morning, and still every passage handed frames to the cloud reader: each
+hand-over blocked about 6 s and ended `decision_timeout`, the 09:21 passage
+produced eight denial events (`decision_timeout` / `ocr_busy` /
+`queue_coalesced`) that were then uploaded over the same broken link, and the
+sweep's read budget went on frames that could never be answered. Meanwhile
+the on-device reads kept working: the 11:00 passage opened on a local exact
+match in 5.7 s.
+
+So the pipeline now asks the probe -- `NetProbeWorker.internet_reachable()`
+-- before it spends anything on the cloud, at the same three places the
+early-trigger permit is asked:
+
+| where | what is saved |
+| --- | --- |
+| the sweep, before a `sweep_cloud` hand-over | the burst itself: nothing is injected, journalled once per sweep as `gate_local_sweep stage=cloud_handover_skipped reason=internet_down of=5` |
+| the processor, before a burst is queued for the cloud lane (`PreparedBurst.needs_cloud`) and before a frame is queued for the OCR slot | the queue wait and the slot |
+| the cloud client, immediately before the one `session.post` | the pacing window, the upload and the 6 s wait -- and in `GATE_LOCAL_OCR_CLOUD=always` the on-device read has already been taken there and is kept |
+
+A frame skipped this way is journalled `gate_ocr stage=cloud_skipped
+reason=internet_down` and decided on the device's own answer, exactly as a
+`no_camera_event` skip is: the local read stands if it decided, and otherwise
+the frame answers "no plate" and the event ends `no_match` -- an existing
+reason, so nothing new goes on the wire. It is deliberately **not** decided on
+the refused local read itself: offered as an observation, that read could
+corroborate its own confident copy under the agreement rule, and a network
+probe must never be what opens a gate. The sweep's `sweep_fallback` frame is
+still handed on, so the passage is put on record; it is the one that ends
+`no_match`.
+
+**The rule fails open towards the cloud, never towards the gate.** The probe
+answers "unreachable" only on a *fresh, definite* `failed` result -- one no
+older than two probe cycles (`2 × GATE_NET_PROBE_INTERVAL_SECONDS`, 120 s by
+default). A probe that is switched off, has never run, is closed, whose last
+internet result is anything but `failed`, or whose failure is older than that
+(the governor withheld the hop, the floor skipped the cycle, the thread died)
+leaves the cloud path exactly as it was. A probe that raises is the same as
+no probe. Nothing about the local match policy, the bars, the cooldown or the
+relay path is consulted or changed: the rule only removes a request that
+would have timed out.
+
+**Recovery needs no restart.** The answer is asked per hand-over and per
+frame, not remembered, and a failed TLS open is re-measured on every probe
+cycle rather than on the five-minute cadence a healthy one keeps, so the
+first cycle after the link returns -- at most `GATE_NET_PROBE_INTERVAL_SECONDS`
+(60 s) later -- puts the cloud back for the next burst. Count what it saved
+the same way as the other skips:
+
+```
+journalctl -u file-monitor.service --since '-7 days' \
+  | grep -c 'stage=cloud_skipped reason=internet_down'
+```
+
 ### Corroborating the cloud read
 
 A confident local read is kept for its event, keyed by trace id, and offered to

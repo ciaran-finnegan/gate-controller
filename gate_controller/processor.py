@@ -70,6 +70,13 @@ CLOUD_SKIP_MOVING_NO_PLATE = "moving_no_plate"
 # An early-origin frame (the early trigger started its sweep) for whose passage
 # the camera has not raised a vehicle event. Journal only.
 CLOUD_SKIP_NO_CAMERA_EVENT = "no_camera_event"
+# The controller's own network probe has fresh, definite evidence that the
+# internet is unreachable (`NetProbeWorker.internet_reachable`). Measured on
+# 2026-09-22 with the router dropping 30-70 % of packets: every hand-over to
+# the cloud reader blocked ~6 s and ended `decision_timeout`, eight times per
+# passage, while the on-device reads kept working. Journal only: the event
+# ends on the device's own answer, exactly as `no_camera_event` does.
+CLOUD_SKIP_INTERNET_DOWN = "internet_down"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -139,10 +146,18 @@ class PreparedBurst:
     #: camera's own vehicle event for the passage has arrived. While it says
     #: no, this burst is never sent to the cloud plate reader.
     cloud_permit: Callable | None = field(default=None, repr=False)
+    #: The controller's network probe's answer to "is the internet reachable",
+    #: or None when there is no probe. Asked, never remembered, so a burst
+    #: routed after the link comes back goes to the cloud lane as before.
+    internet_reachable: Callable | None = field(default=None, repr=False)
 
     @property
     def cloud_allowed(self) -> bool:
         return _permits(self.cloud_permit)
+
+    @property
+    def cloud_reachable(self) -> bool:
+        return _reachable(self.internet_reachable)
 
     @property
     def decided(self) -> bool:
@@ -155,6 +170,10 @@ class PreparedBurst:
         return (
             self.duplicate is None and not self.decided and self.cloud_skip is None
             and not self.appearance_admits and self.cloud_allowed
+            # A burst the cloud cannot be asked about is finished where it is,
+            # on the burst thread, rather than queued for a lane that would
+            # only skip it.
+            and self.cloud_reachable
         )
 
     def recognise_options(self, sequence: int) -> dict:
@@ -185,7 +204,7 @@ class GateProcessor:
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
                  match_policy=None, min_cloud_request_seconds: float | None = None,
                  cloud_skip_stillness: float | None = None,
-                 farm_machinery=None):
+                 farm_machinery=None, internet_reachable=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -245,6 +264,15 @@ class GateProcessor:
         # is not one that honours it.
         self._recognizer_accepts_cloud_permit = _accepts_keyword(
             self._recognise_call, "cloud_permit", variadic=False,
+        )
+        # The network probe's `internet_reachable`, or None without a probe.
+        # Handed to a recogniser that takes it by name, so it is asked at the
+        # one place a request leaves from -- after the on-device read that
+        # `GATE_LOCAL_OCR_CLOUD=always` takes there -- and asked here, before
+        # anything is queued for the slot, for a recogniser that cannot.
+        self._internet_reachable = internet_reachable
+        self._recognizer_accepts_internet_reachable = _accepts_keyword(
+            self._recognise_call, "internet_reachable", variadic=False,
         )
         # The on-device read, off the serial cloud slot. A recogniser without
         # it (every existing fake, and any build with local OCR off) keeps the
@@ -349,6 +377,7 @@ class GateProcessor:
             paths=paths, digests=digests, idempotency_key=idempotency_key,
             received_at=received_at, started=started, trace=trace, trigger=trigger,
             discard_hook=self._discard_prepared, cloud_permit=cloud_permit,
+            internet_reachable=self._internet_reachable,
         )
         if not local_pass or not paths:
             return prepared
@@ -1321,6 +1350,28 @@ class GateProcessor:
             return PlateObservation(
                 plate=None, confidence=0.0, source="local", cloud_lookup=False,
             )
+        if (
+            self._internet_reachable is not None
+            and not self._recognizer_accepts_internet_reachable
+            and not _reachable(self._internet_reachable)
+        ):
+            # The probe says the internet is down, and this recogniser cannot
+            # be handed the predicate to refuse the request itself: nothing is
+            # asked of it, and nothing waits. The device's answer stands for
+            # the frame -- the same "no plate" the early-origin skip above
+            # gives, and deliberately not the local read itself: offered as
+            # an observation it could corroborate its own confident read
+            # under the agreement rule, and a probe must never open a gate.
+            if attempt is not None:
+                attempt.abandon()
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skipped reason=%s", CLOUD_SKIP_INTERNET_DOWN,
+            )
+            if on_start is not None:
+                on_start()
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
         remaining = deadline - self._decision_clock()
         if remaining < self._min_cloud_request_seconds:
             # Skipping is what keeps the lookup unbilled; a request posted
@@ -1351,6 +1402,10 @@ class GateProcessor:
             # `GATE_LOCAL_OCR_CLOUD=always` it is also where the on-device
             # answer is taken, which an early-origin frame must still get.
             extra["cloud_permit"] = cloud_permit
+        if self._internet_reachable is not None and self._recognizer_accepts_internet_reachable:
+            # Likewise asked at that last moment, so a link that came back
+            # while this frame queued is used, and one that went down is not.
+            extra["internet_reachable"] = self._internet_reachable
         # The budget is read when the operation actually runs, not now: the
         # OCR slot may still be held by an abandoned request, and a recogniser
         # that guards the decision with an on-device read has to bound that
@@ -1842,6 +1897,21 @@ def _permits(cloud_permit) -> bool:
         return cloud_permit() is True
     except Exception:
         return False
+
+
+def _reachable(internet_reachable) -> bool:
+    """Whether the cloud reader may be asked, as far as the network probe knows.
+
+    The opposite failure mode from :func:`_permits`. No probe means yes; so
+    does a probe that raises, or answers anything but a definite False. A
+    broken probe must cost nothing but its own journal line, never the cloud.
+    """
+    if internet_reachable is None:
+        return True
+    try:
+        return internet_reachable() is not False
+    except Exception:
+        return True
 
 
 def _accepts_keyword(callable_object, keyword: str, *, variadic: bool = True) -> bool:

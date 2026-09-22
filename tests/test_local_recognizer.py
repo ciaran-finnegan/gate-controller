@@ -1869,5 +1869,71 @@ class ShippedDefaultAgreementTests(unittest.TestCase):
         )
 
 
+class InternetDownClientTests(unittest.TestCase):
+    """The request site's half: the probe is asked before the one ``session.post``."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "frame.jpg"
+        Image.new("L", (64, 32), color=128).save(self.path, format="JPEG")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _client(self, local=None, session=None):
+        return PlateRecognizerClient(
+            "token", session=session or FakeSession([FakeResponse(cloud_payload("12D3456"))]),
+            local_recognizer=local, authorised=lambda: {"12D3456"},
+        )
+
+    def test_a_definite_no_posts_nothing_and_answers_no_plate(self):
+        session = FakeSession([FakeResponse(cloud_payload("12D3456"))])
+        client = self._client(session=session)
+
+        with self.assertLogs("gate_controller.ocr", level="INFO") as logs:
+            observation = client.recognise(
+                self.path, trace_id="trace-down", internet_reachable=lambda: False,
+            )
+
+        self.assertEqual(session.calls, [], "the request left over a dead link")
+        self.assertIsNone(observation.plate)
+        self.assertEqual(observation.source, "local")
+        self.assertFalse(observation.cloud_lookup, "nothing was billed")
+        self.assertIn("gate_ocr stage=cloud_skipped reason=internet_down", "\n".join(logs.output))
+
+    def test_in_always_mode_the_on_device_read_still_decides_and_the_label_is_not_sent(self):
+        local = recognizer([read("12D3456", 0.99)], mode="active", cloud="always")
+        self.addCleanup(local.close)
+        session = FakeSession([FakeResponse(cloud_payload("12D3456", 0.93))])
+        client = self._client(local, session)
+
+        observation = client.recognise(
+            self.path, trace_id="trace-always-down", internet_reachable=lambda: False,
+        )
+
+        self.assertEqual(observation.plate, "12D3456", "the local read was taken and kept")
+        self.assertEqual(observation.source, "local")
+        self.assertEqual(session.calls, [], "the label request went out over a dead link")
+
+    def test_without_the_predicate_or_with_a_hedging_one_the_request_goes_as_before(self):
+        def raising():
+            raise RuntimeError("probe fell over")
+
+        for name, extra in (
+            ("absent", {}), ("none", {"internet_reachable": None}),
+            ("raising", {"internet_reachable": raising}),
+            ("ok", {"internet_reachable": lambda: True}),
+            ("hedging", {"internet_reachable": lambda: 0}),
+        ):
+            with self.subTest(probe=name):
+                session = FakeSession([FakeResponse(cloud_payload("12D3456"))])
+                observation = self._client(session=session).recognise(
+                    self.path, trace_id=f"trace-{name}", **extra,
+                )
+                self.assertEqual(len(session.calls), 1)
+                self.assertEqual(observation.plate, "12D3456")
+                self.assertEqual(observation.source, "cloud")
+
+
 if __name__ == "__main__":
     unittest.main()

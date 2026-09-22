@@ -3083,3 +3083,144 @@ class AgreementCorroborationTests(unittest.TestCase):
 
             self.assertEqual(len(set(asked)), 1)
             self.assertEqual(asked[0], result.telemetry.to_wire()["trace_id"])
+
+
+class InternetDownTests(unittest.TestCase):
+    """The processor's half of "do not ask a cloud the probe says is gone".
+
+    ``internet_reachable`` is the network probe's own predicate. With a
+    recogniser that cannot take it by name (every fake here), the processor
+    asks it itself, before anything is queued for the OCR slot; with one that
+    can, it hands it on and the recogniser asks at the request site. Either
+    way a definite False costs the frame nothing but its local read.
+    """
+
+    def _jpeg(self, directory: str, name: str, colour: int = 128) -> Path:
+        path = Path(directory) / name
+        Image.new("L", (16, 8), color=colour).save(path, format="JPEG")
+        return path
+
+    def _processor(self, directory, recognizer, **kwargs):
+        options = {
+            "cooldown": timedelta(seconds=0),
+            "clock": lambda: datetime.now(timezone.utc),
+            "decision_timeout": 7.0,
+        }
+        options.update(kwargs)
+        return GateProcessor(
+            recognizer=recognizer,
+            store=LocalStore(Path(directory) / "gate.db"),
+            relay=RecordingRelay([]),
+            authorised={"12D3456"},
+            **options,
+        )
+
+    def test_a_frame_is_decided_on_the_device_alone_with_no_request_and_no_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_delay=6.0, cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            clock = MutableClock()
+            processor = self._processor(
+                directory, recognizer, decision_clock=clock,
+                internet_reachable=lambda: False,
+            )
+
+            with self.assertLogs("gate_controller.processor", level="INFO") as logs:
+                started = monotonic()
+                result = processor.process((frame,), decision_started_at=0.0)
+                elapsed = monotonic() - started
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match", "the device's answer, not a timeout")
+            self.assertEqual(recognizer.cloud_calls, [], "a request went out over a dead link")
+            self.assertEqual(len(recognizer.local_calls), 1, "the local read still ran")
+            self.assertLess(elapsed, 2.0, "the frame waited on the cloud")
+            combined = "\n".join(logs.output)
+            self.assertIn("gate_ocr stage=cloud_skipped reason=internet_down", combined)
+            self.assertNotIn("decision_timeout", combined)
+            self.assertNotIn("ocr_timeout", combined)
+
+    def test_a_local_grant_still_opens_and_never_consults_the_probe_for_it(self):
+        asked = []
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "grant.jpg")
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(
+                directory, recognizer, internet_reachable=lambda: asked.append(1) or False,
+            )
+
+            result = processor.process((frame,))
+
+            self.assertTrue(result.opened)
+            self.assertEqual(recognizer.cloud_calls, [])
+            self.assertEqual(asked, [], "a decided frame has nothing to ask the probe")
+
+    def test_a_probe_that_is_absent_raises_or_hedges_leaves_the_cloud_path_as_it_was(self):
+        def raising():
+            raise RuntimeError("probe fell over")
+
+        for name, predicate in (
+            ("absent", None), ("raising", raising), ("none", lambda: None),
+            ("truthy-string", lambda: "failed"), ("ok", lambda: True),
+        ):
+            with self.subTest(probe=name), tempfile.TemporaryDirectory() as directory:
+                frame = self._jpeg(directory, "frame.jpg")
+                recognizer = TwoPhaseRecognizer(
+                    cloud_observation=PlateObservation("12D3456", 0.99),
+                )
+                result = self._processor(
+                    directory, recognizer, internet_reachable=predicate,
+                ).process((frame,))
+
+                self.assertTrue(result.opened)
+                self.assertEqual(len(recognizer.cloud_calls), 1, "fail open towards the cloud")
+
+    def test_the_fast_lane_keeps_such_a_burst_off_the_cloud_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer()
+            down = {"value": True}
+            processor = self._processor(
+                directory, recognizer, internet_reachable=lambda: not down["value"],
+            )
+
+            prepared = processor.prepare((frame,))
+            self.assertFalse(prepared.decided)
+            self.assertFalse(prepared.needs_cloud, "queued for a lane that would only skip it")
+            down["value"] = False
+            self.assertTrue(prepared.needs_cloud, "asked, not remembered: the link is back")
+            prepared.discard("test")
+
+    def test_a_recogniser_that_takes_the_predicate_is_handed_it_and_asks_it_itself(self):
+        class RefusingRecognizer:
+            """The real client's shape: the request site asks the predicate."""
+
+            def __init__(self):
+                self.calls = []
+
+            def recognise(self, path, timeout=None, trace_id=None, budget=None,
+                          internet_reachable=None):
+                self.calls.append(internet_reachable)
+                if internet_reachable is not None and internet_reachable() is False:
+                    return PlateObservation(None, 0.0, source="local", cloud_lookup=False)
+                return PlateObservation("12D3456", 0.99)
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = RefusingRecognizer()
+            predicate = lambda: False
+            with self.assertLogs("gate_controller", level="INFO") as logs:
+                result = self._processor(
+                    directory, recognizer, internet_reachable=predicate,
+                ).process((frame,))
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(recognizer.calls, [predicate], "the very same predicate")
+            self.assertNotIn(
+                "stage=cloud_skipped", "\n".join(logs.output),
+                "the processor skipped ahead of a recogniser that would have taken "
+                "the on-device read there (GATE_LOCAL_OCR_CLOUD=always)",
+            )
