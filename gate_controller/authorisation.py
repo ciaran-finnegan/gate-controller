@@ -17,6 +17,21 @@ MAX_PLATE_SNAPSHOT_BYTES = 256 * 1024
 MAX_PLATE_ROWS = 1000
 MAX_NORMALISED_PLATE_LENGTH = 16
 
+#: The longest the CSV's mtime may lag behind the last successful refresh.
+#:
+#: The snapshot is refreshed every 30 s and the plate list changes a few times
+#: a year, so almost every refresh has nothing to write. Skipping those writes
+#: leaves one loose end: ``reload_local`` dates the snapshot by the file's
+#: mtime, which is what the staleness rule is measured from *after a restart*.
+#: An mtime frozen at the last real change would make a perfectly fresh
+#: snapshot look fourteen days old. So the inode is touched -- no data blocks,
+#: no fsync, no rename -- once it has fallen this far behind, which is 2,880
+#: rewrites a day turned into 24 metadata updates.
+MTIME_TOUCH_INTERVAL = timedelta(hours=1)
+#: ...and never more than this share of the staleness limit, so a cache
+#: configured to expire in minutes is not left an hour of drift to fall into.
+MTIME_TOUCH_FRACTION = 0.1
+
 
 class AuthorisationError(RuntimeError):
     pass
@@ -66,7 +81,19 @@ class AuthorisedPlateCache:
             return True
 
     def replace(self, plates) -> None:
+        """Record a refreshed snapshot, writing the CSV only if it changed.
+
+        The refresh runs every 30 s and the list itself changes a few times a
+        year, so the write below -- temporary file, fsync, rename, fsync of the
+        directory -- used to run about 2,880 times a day to produce a file
+        identical to the one already there. An unchanged snapshot now skips it
+        and keeps the bookkeeping only: the refresh still happened, and
+        ``_refreshed_at`` still moves, so staleness is measured from the last
+        successful *refresh* and not from the last write.
+        """
         normalized = tuple(sorted(filter(None, (normalise_plate(value) for value in plates))))
+        if self._record_unchanged(normalized):
+            return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(
             dir=self._path.parent, prefix=f".{self._path.name}.", text=True
@@ -90,6 +117,49 @@ class AuthorisedPlateCache:
             self._version = self._file_version()
             self._refreshed_at = self._clock()
             self._last_error = None
+
+    def _record_unchanged(self, normalized: tuple[str, ...]) -> bool:
+        """Book a refresh that matched the snapshot already on disk.
+
+        Content, never mtime: the file is left exactly as it is unless somebody
+        outside this process has rewritten it since we last read it, in which
+        case ours is written back over theirs as it always was.
+        """
+        with self._lock:
+            if self._plates is None or self._plates != normalized:
+                return False
+            try:
+                if self._version is None or self._file_version() != self._version:
+                    return False
+            except OSError:
+                return False
+            self._refreshed_at = self._clock()
+            self._last_error = None
+            self._touch()
+            return True
+
+    def _touch(self) -> None:
+        """Keep the CSV's mtime within ``MTIME_TOUCH_INTERVAL`` of this refresh.
+
+        Only the inode is written, and only when the mtime has actually fallen
+        behind. A failure here is not a failed refresh -- the snapshot in
+        memory is good and the file is unchanged -- so it is logged and
+        swallowed. Caller holds the lock.
+        """
+        now = self._clock()
+        try:
+            modified_at = datetime.fromtimestamp(self._path.stat().st_mtime, timezone.utc)
+            if now - modified_at <= self._touch_interval():
+                return
+            os.utime(self._path, (now.timestamp(), now.timestamp()))
+            self._version = self._file_version()
+        except (OSError, OverflowError, ValueError, TypeError) as error:
+            LOGGER.debug("stage=plates_mtime_touch_failed error=%s", error)
+
+    def _touch_interval(self) -> timedelta:
+        if self._max_staleness is None:
+            return MTIME_TOUCH_INTERVAL
+        return min(MTIME_TOUCH_INTERVAL, self._max_staleness * MTIME_TOUCH_FRACTION)
 
     def mark_refresh_error(self, error: Exception) -> None:
         with self._lock:

@@ -264,3 +264,136 @@ class AuthorisedPlateCacheTests(unittest.TestCase):
             with self.assertLogs("gate_controller.authorisation", level="INFO") as logs:
                 self.assertTrue(worker.run_once())
             self.assertIn("stage=plates_refresh_recovered failures=2", logs.output[0])
+
+
+class AnUnchangedSnapshotIsNotRewritten(unittest.TestCase):
+    """The refresh runs every 30 s; the plate list changes a few times a year.
+
+    Rewriting an identical CSV 2,880 times a day wore the SD card for nothing
+    and moved the file's mtime every 30 s. What must survive the change is the
+    staleness rule: it is measured from the last successful *refresh*, not from
+    the last write, and after a restart it is read back off the file's mtime.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "plates.csv"
+        self.path.write_text("plate\n12D3456\n", encoding="utf-8")
+        self.now = [datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)]
+        os.utime(self.path, (self.now[0].timestamp(), self.now[0].timestamp()))
+
+    def cache(self, **kwargs):
+        return AuthorisedPlateCache(self.path, clock=lambda: self.now[0], **kwargs)
+
+    def writes(self):
+        """Every atomic rename onto the CSV -- the write this fix is about."""
+        renames = []
+        real = os.replace
+        return patch(
+            "gate_controller.authorisation.os.replace",
+            side_effect=lambda src, dst: (renames.append(dst), real(src, dst))[1],
+        ), renames
+
+    def test_a_refresh_that_changes_nothing_does_not_touch_the_card(self):
+        cache = self.cache()
+        worker = AuthorisationRefreshWorker(cache, fetch=lambda: [{"plate": "12D3456"}])
+        before = self.path.stat()
+        spy, renames = self.writes()
+
+        with spy:
+            self.now[0] += timedelta(seconds=30)
+            self.assertTrue(worker.run_once())
+            self.now[0] += timedelta(seconds=30)
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(renames, [], "an identical snapshot was written back to the card")
+        self.assertEqual(self.path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "plate\n12D3456\n")
+        self.assertEqual(cache.get(), ("12D3456",))
+
+    def test_a_snapshot_that_did_change_is_still_written(self):
+        cache = self.cache()
+        worker = AuthorisationRefreshWorker(cache, fetch=lambda: [{"plate": "12E3456"}])
+        spy, renames = self.writes()
+
+        with spy:
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(renames, [self.path])
+        self.assertEqual(cache.get(), ("12E3456",))
+        self.assertIn("12E3456", self.path.read_text(encoding="utf-8"))
+
+    def test_a_csv_rewritten_underneath_us_is_written_back(self):
+        """The skip is a content comparison against what we put there. If
+        somebody else has replaced the file, ours goes back over it."""
+        cache = self.cache()
+        worker = AuthorisationRefreshWorker(cache, fetch=lambda: [{"plate": "12D3456"}])
+        self.assertTrue(worker.run_once())
+        self.path.write_text("plate\n99Z9999\n", encoding="utf-8")
+        spy, renames = self.writes()
+
+        with spy:
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(renames, [self.path])
+        self.assertEqual(cache.get(), ("12D3456",))
+
+    def test_staleness_is_measured_from_the_last_refresh_not_the_last_write(self):
+        cache = self.cache(max_staleness=timedelta(minutes=5))
+        worker = AuthorisationRefreshWorker(cache, fetch=lambda: [{"plate": "12D3456"}])
+        spy, renames = self.writes()
+
+        with spy:
+            for _ in range(40):  # twenty minutes of refreshes that change nothing
+                self.now[0] += timedelta(seconds=30)
+                self.assertTrue(worker.run_once())
+                self.assertEqual(cache.get(), ("12D3456",))
+
+        self.assertEqual(renames, [])
+        self.assertEqual(cache.status()["refreshed_at"], self.now[0].isoformat())
+        self.now[0] += timedelta(minutes=6)
+        with self.assertRaisesRegex(AuthorisationError, "stale"):
+            cache.get()
+
+    def test_a_restart_reads_the_age_of_the_last_refresh_not_the_last_change(self):
+        """``reload_local`` dates the snapshot by the file's mtime. Skipping the
+        write must not leave that mtime at the last time the list changed, or a
+        fresh snapshot would fail closed the moment the service restarted."""
+        cache = self.cache(max_staleness=timedelta(minutes=5))
+        worker = AuthorisationRefreshWorker(cache, fetch=lambda: [{"plate": "12D3456"}])
+        spy, renames = self.writes()
+
+        with spy:
+            for _ in range(40):
+                self.now[0] += timedelta(seconds=30)
+                self.assertTrue(worker.run_once())
+
+        self.assertEqual(renames, [], "the mtime is kept honest by a touch, not by a rewrite")
+        restarted = self.cache(max_staleness=timedelta(minutes=5))
+        self.assertEqual(restarted.get(), ("12D3456",))
+        self.assertFalse(restarted.status()["stale"])
+
+    def test_a_refresh_after_a_failure_still_recovers_when_nothing_changed(self):
+        cache = self.cache()
+        state = {"fail": True}
+
+        def fetch():
+            if state["fail"]:
+                raise TimeoutError("offline")
+            return [{"plate": "12D3456"}]
+
+        worker = AuthorisationRefreshWorker(cache, fetch=fetch)
+        with self.assertLogs("gate_controller.authorisation", level="WARNING"):
+            self.assertFalse(worker.run_once())
+        self.assertIn("offline", cache.status()["last_error"])
+
+        state["fail"] = False
+        spy, renames = self.writes()
+        with spy, self.assertLogs("gate_controller.authorisation", level="INFO") as logs:
+            self.now[0] += timedelta(seconds=30)
+            self.assertTrue(worker.run_once())
+
+        self.assertEqual(renames, [])
+        self.assertIn("stage=plates_refresh_recovered failures=1", logs.output[0])
+        self.assertIsNone(cache.status()["last_error"])

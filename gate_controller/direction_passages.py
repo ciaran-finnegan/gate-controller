@@ -222,23 +222,29 @@ def judge_passages(connection, since: str) -> list:
     # nearest passage's *own* verdict beside it. Never a third time -- a
     # verdict is lent by the passage that earned it, not passed down a queue.
     alone = {index: judge(evidence) for index, evidence in evidence_of.items()}
+    # Whether the gate really opened for each passage, rather than merely
+    # having been asked to: our relay fired on one of its own events. A
+    # neighbour that got in is what makes the flank filling this frame the
+    # same car rather than a second vehicle.
+    opened = [any(row["relay_at"] is not None for row in group) for group in grouped]
 
     judged = []
     for index, group in enumerate(grouped):
         if group[0]["at"] < since_at or index not in evidence_of:
             continue
-        neighbour, gap = None, None
+        neighbour, gap, neighbour_opened = None, None, False
         for other in (index - 1, index + 1):
             if other not in alone or seen[index] is None or seen[other] is None:
                 continue
             distance = max(seen[index][0] - seen[other][1], seen[other][0] - seen[index][1])
             if alone[other].decisive and (gap is None or distance < gap):
-                neighbour, gap = alone[other], distance
+                neighbour, gap, neighbour_opened = alone[other], distance, opened[other]
         judged.append(Passage(
             key=f"e{group[0]['id']}", kind=KIND_VEHICLE,
             started_at=group[0]["at"], ended_at=group[-1]["at"],
             events=tuple(PassageEvent(row["id"], row["key"], row["at"], row["source"]) for row in group),
-            verdict=judge(evidence_of[index], neighbour=neighbour, neighbour_gap=gap),
+            verdict=judge(evidence_of[index], neighbour=neighbour, neighbour_gap=gap,
+                          neighbour_opened=neighbour_opened),
         ))
 
     every_seen = tuple(span for span in seen if span is not None)

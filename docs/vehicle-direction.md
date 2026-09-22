@@ -164,6 +164,29 @@ evidence** is lent that verdict — at 0.6 of its confidence, never above 0.45,
 and so never strongly enough to veto what was seen in the passage itself.
 Arrivals only: a departing car does not stop in view.
 
+Being lent at a discount was not enough on its own. On 2026-09-22 at 10:00 an
+Audi drove in: the first passage read front 0.93, the gate had been still and
+opened on our relay, and it was judged `entering` at 0.95. Twenty-one seconds
+later the same car filled the frame side-on and the model read the flank as a
+rear at 0.42 — vision `exiting` 0.36 against the 0.45 lent, leaving 0.09, under
+the bar. The second passage came out `unknown`.
+
+`from_vision` already handles this *inside* one passage: once a confident front
+has been seen, a later rear is a wheel arch a foot from the lens and is halved
+rather than allowed to cancel the front. The pair above is the same thing with
+the front in the passage next door. So when the neighbour was judged `entering`
+on its own evidence **and the gate actually opened for it** — our relay fired
+on one of its events — a vision `exiting` **below 0.5** is halved by the same
+`PASSING_DISCOUNT` reasoning. e3184 becomes `entering` at 0.27.
+
+Deliberately narrow. The discount needs the relay, so an arrival nobody was let
+in for lends nothing extra. It stops at 0.5, so a rear the model means keeps its
+full weight: a car leaving through a gate that opened for the car arriving is a
+real thing that happens, and at 0.65 and above the photo still wins outright.
+`same_arrival`'s own ceiling is untouched at 0.45 — below `STRONG`, so what was
+inferred from the passage next door still cannot raise a conflict or veto
+anything.
+
 ### 5. The width fit
 
 Kept as one vote, halved, capped at 0.45. Its thresholds are deliberately
