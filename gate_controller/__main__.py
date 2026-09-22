@@ -179,6 +179,13 @@ def main() -> None:
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
     clear_keyframes = _clear_stream_source(trigger_capture_config)
+    # The network probe is built here, ahead of everything that asks it,
+    # because three things below share its one answer: the sweep asks it
+    # before handing a frame to the cloud, the processor before queueing a
+    # frame for the cloud lane, and the cloud client before the request
+    # leaves. It is started with the other background workers further down.
+    net_probe = _net_probe_worker(os.environ)
+    internet_reachable = net_probe.internet_reachable if net_probe is not None else None
     # The sweep reads session frames with the same recogniser, plate list and
     # policy band the processor uses, so what it admits is what the processor
     # will re-check. Built only when configured; None leaves capture as it was.
@@ -198,6 +205,7 @@ def main() -> None:
             # accept an early trigger at all; in `shadow` the entry point is
             # there and refuses, whoever calls it.
             early_trigger=load_early_trigger_mode(os.environ) == EARLY_TRIGGER_ON,
+            internet_reachable=internet_reachable,
         )
         if trigger_capture_config.enabled else None
     )
@@ -233,7 +241,7 @@ def main() -> None:
         hot_stream=hot_stream, match_policy=match_policy,
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=trigger_correlator,
-        corpus=corpus, activity=activity, metrics=metrics,
+        corpus=corpus, activity=activity, metrics=metrics, net_probe=net_probe,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
     # a verdict. It reaches no decision, spends no lookup and ends no
@@ -302,6 +310,10 @@ def main() -> None:
         # hands the processor None; the image tower is otherwise loaded here,
         # once, so no decision ever pays for it.
         farm_machinery=build_farm_machinery_policy(os.environ),
+        # The probe's own bound method, the same one the sweep holds: while it
+        # answers False no frame is queued for the cloud lane or posted, and
+        # the moment it answers True again the cloud is back, with no restart.
+        internet_reachable=internet_reachable,
     )
     if early_trigger is not None:
         # The image tower the processor's policy loaded is the one the early
@@ -389,11 +401,6 @@ def main() -> None:
             )
         except Exception:
             logging.getLogger(__name__).exception("processing_error_event_failed")
-
-    net_probe = next(
-        (worker for worker in background_workers if isinstance(worker, NetProbeWorker)),
-        None,
-    )
 
     def shutdown():
         if early_trigger is not None:
@@ -812,7 +819,8 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              coordinator=None, authorised=None, camera_directory=None,
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
-                             corpus=None, activity=None, metrics=None, webhook=None):
+                             corpus=None, activity=None, metrics=None, webhook=None,
+                             net_probe=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -824,8 +832,10 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     telemetry_retention_days = _telemetry_retention_days(environment)
-    net_probe_config = load_net_probe_config(environment)
-    net_probe = NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
+    # `main` builds the probe itself, so the pipeline can hold its answer;
+    # without one handed in, it is built here exactly as before.
+    if net_probe is None:
+        net_probe = _net_probe_worker(environment)
     workers = []
     controller_id = environment.get("GATE_CONTROLLER_ID") or "primary"
     if coordinator is not None:
@@ -925,6 +935,12 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity,
     )
+
+
+def _net_probe_worker(environment) -> NetProbeWorker | None:
+    """The network probe the environment configures, or None when it is off."""
+    net_probe_config = load_net_probe_config(environment)
+    return NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
 
 
 def _telemetry_retention_days(environment) -> int:

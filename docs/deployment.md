@@ -732,6 +732,32 @@ at 10 s. ffmpeg, image or video decode, numpy, onnxruntime, model loads,
 `tests/test_net_probe.py` asserts it along with the measured ceilings: under
 5 MB of steady-state growth and under 0.5 % of one core.
 
+#### What the pipeline does with the `internet` hop
+
+The probe is not only for reading afterwards. `NetProbeWorker.internet_reachable()`
+answers False on a *fresh, definite* `internet=failed` -- no older than two
+cycles, `2 × GATE_NET_PROBE_INTERVAL_SECONDS` (120 s) -- and while it does,
+the recognition pipeline hands nothing to the cloud plate reader: the sweep
+makes no `sweep_cloud` hand-overs, the processor queues nothing for the cloud
+lane, and the cloud client posts nothing. Local reads carry on unchanged and
+a passage ends on the device's own answer instead of eight `decision_timeout`
+events, which is what 2026-09-22 looked like with the router dropping 30-70 %
+of packets. Every other answer -- probe off, never run, closed, `ok`, or a
+failure older than two cycles because the governor withheld the hop -- leaves
+the cloud path exactly as it was. The full rule, and why it fails open towards
+the cloud and never towards the gate, is in
+[local-recognition.md](local-recognition.md#when-the-internet-is-down-the-cloud-is-not-asked).
+
+So that the cloud comes back promptly, a **failed** TLS open is re-measured on
+every cycle (the healthy five-minute cadence above is kept only for a
+successful one): the first cycle after the link returns, at most
+`GATE_NET_PROBE_INTERVAL_SECONDS` later, restores cloud lookups with no
+restart. A failed open costs the probe thread the resolver and connect
+timeouts and nothing else; nothing is billed. `main` builds the probe before
+the capture and the processor and hands each the probe's own bound method, so
+there is one probe and one answer; `GATE_NET_PROBE_ENABLED=false` hands them
+nothing and the pipeline behaves as it did before the probe existed.
+
 #### The journal line
 
 Every cycle writes exactly one `key=value` line at `INFO`, successes included,
