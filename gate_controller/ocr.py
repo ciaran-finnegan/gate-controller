@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 from collections.abc import Callable, Mapping
 from io import BytesIO
@@ -17,6 +17,7 @@ from .direction import (
 )
 from .local_recognizer import CLOUD_ALWAYS, NULL_FRAME, STATUS_NO_PLATE, box_to_frame
 from .matching import normalise_plate
+from .outbox import is_connection_failure
 from .plate_region import PlateRegion
 from .models import PlateObservation
 
@@ -132,6 +133,32 @@ CAUSE_INVALID_HTTP_STATUS = "http_invalid_status"
 CAUSE_REQUEST_ABANDONED = "request_abandoned"
 CAUSE_CLIENT_CLOSED = "client_closed"
 CAUSE_UNCLASSIFIED = "unclassified"
+
+# Why a frame was not handed to the cloud reader (`gate_ocr stage=cloud_skipped
+# reason=...`). `internet_down` is the network probe's fresh, definite
+# `failed`; `cloud_unreachable` is this client's own circuit breaker, open
+# because its last requests died on the link without an answer.
+REASON_INTERNET_DOWN = "internet_down"
+REASON_CLOUD_UNREACHABLE = "cloud_unreachable"
+
+# The circuit breaker on the cloud plate reader. Measured on the Pi on
+# 2026-09-22 at 40 % packet loss: the probe's single TLS open succeeded, so
+# `internet_reachable` said yes, and every passage still handed up to five
+# frames to the cloud reader, each dying after ~6 s with `connection_error` or
+# `ReadTimeout` (220 ConnectionError + 19 ReadTimeout in the outbox alone over
+# three hours). Three such deaths in a row, within five minutes, are taken as
+# the state of the link: the breaker opens for a minute, and every doubling
+# after a failed trial is capped at ten minutes. A passage is ~5 requests, so
+# a lossy link opens it inside one passage; a healthy link with one blip does
+# not, because any answer at all -- a plate, an empty result, a 4xx or a 5xx --
+# resets the count.
+BREAKER_FAILURE_THRESHOLD = 3
+BREAKER_FAILURE_WINDOW_SECONDS = 300.0
+BREAKER_OPEN_SECONDS = 60.0
+BREAKER_OPEN_MAX_SECONDS = 600.0
+BREAKER_CLOSED = "closed"
+BREAKER_OPEN = "open"
+BREAKER_HALF_OPEN = "half_open"
 
 _FAILURE_CAUSE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _LOGGER = logging.getLogger(__name__)
@@ -356,6 +383,281 @@ def _internet_reachable(internet_reachable) -> bool:
         return True
 
 
+def _unavailable_reason(internet_reachable) -> str:
+    """Why the predicate answered False, as it names it, or ``internet_down``.
+
+    The probe's own bound method has no opinion and gets the reason #183
+    gave it. :class:`CloudAvailability` says which of its two halves refused,
+    so the journal never blames the link for the breaker. Bounded to the same
+    token shape as a failure cause, and never raising.
+    """
+    try:
+        reason = getattr(internet_reachable, "reason", None)
+    except Exception:
+        return REASON_INTERNET_DOWN
+    if isinstance(reason, str) and _FAILURE_CAUSE.fullmatch(reason):
+        return reason
+    return REASON_INTERNET_DOWN
+
+
+class CloudBreaker:
+    """A circuit breaker on the cloud plate reader, fed by this client alone.
+
+    It counts one thing: consecutive requests that died on the link without
+    any answer -- ``ConnectionError``, ``ConnectTimeout``, ``ReadTimeout``,
+    classified exactly as the outbox classifies its own sends
+    (:func:`outbox.is_connection_failure`). ``BREAKER_FAILURE_THRESHOLD`` of
+    them inside ``BREAKER_FAILURE_WINDOW_SECONDS`` **open** it: no request is
+    attempted for ``BREAKER_OPEN_SECONDS``. When that runs out it is
+    **half-open**: exactly one real request is let through as a trial. Any
+    answer from the cloud -- a plate, no plate, a 4xx, a 5xx -- means the link
+    carried a request, and **closes** it with the count and the open time
+    reset; a trial that dies on the link re-opens it for twice as long, up to
+    ``BREAKER_OPEN_MAX_SECONDS``. The network probe noticing the link come
+    back (``failed`` to ``ok``) closes it at once, whatever its timer says.
+
+    It fails open towards the cloud, never towards the gate. An open breaker
+    only removes a request that would have died the same way; the local
+    reads, the match policy, the cooldown and the relay path are not consulted
+    and not changed. Every reader wraps it so that a breaker that raises
+    counts as closed, and a trial that is claimed but never resolved (the
+    request was abandoned before it left) is released, not kept.
+
+    Thread-safe. ``clock`` is the monotonic clock the timer runs on;
+    ``wall_clock`` is only for reporting ``until`` to the heartbeat.
+    """
+
+    def __init__(self, *, clock=monotonic, wall_clock=None,
+                 failure_threshold: int = BREAKER_FAILURE_THRESHOLD,
+                 failure_window_seconds: float = BREAKER_FAILURE_WINDOW_SECONDS,
+                 open_seconds: float = BREAKER_OPEN_SECONDS,
+                 max_open_seconds: float = BREAKER_OPEN_MAX_SECONDS):
+        if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int):
+            raise ValueError("failure_threshold must be an integer")
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be at least one")
+        for name, value in (("failure_window_seconds", failure_window_seconds),
+                            ("open_seconds", open_seconds),
+                            ("max_open_seconds", max_open_seconds)):
+            if not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive, finite number of seconds")
+        if max_open_seconds < open_seconds:
+            raise ValueError("max_open_seconds must be at least open_seconds")
+        self._clock = clock
+        self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
+        self._threshold = failure_threshold
+        self._window = float(failure_window_seconds)
+        self._base_open_seconds = float(open_seconds)
+        self._max_open_seconds = float(max_open_seconds)
+        self._lock = Lock()
+        self._state = BREAKER_CLOSED
+        # Consecutive connection-level deaths inside the window; any answer
+        # resets it.
+        self._failures = 0
+        self._last_failure_at: float | None = None
+        # How long the next open lasts: the base, doubled per failed trial.
+        self._open_seconds = self._base_open_seconds
+        self._opened_at: float | None = None
+        self._until: float | None = None
+        self._opened_after = 0
+        # Half-open: whether the one trial request is out.
+        self._trial = False
+
+    # -- what the pipeline asks -------------------------------------------
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def available(self) -> bool:
+        """Whether a request could be admitted now. Read-only: claims nothing.
+
+        The sweep asks it before a hand-over and the processor before queueing
+        a burst for the cloud lane; only :meth:`admit` at the request site
+        claims the half-open trial, so a frame that is routed and then not
+        posted never uses the trial up.
+        """
+        with self._lock:
+            if self._state == BREAKER_CLOSED:
+                return True
+            if self._state == BREAKER_OPEN:
+                return self._until is not None and self._clock() >= self._until
+            return not self._trial
+
+    def admit(self) -> bool:
+        """Whether *this* request may leave; claims the half-open trial if so.
+
+        Every ``True`` from a half-open breaker must be answered with one of
+        :meth:`record_outcome` or :meth:`abandon_trial`, or the trial stays
+        claimed; the client does that in a ``finally``.
+        """
+        message = None
+        with self._lock:
+            if self._state == BREAKER_CLOSED:
+                return True
+            now = self._clock()
+            if self._state == BREAKER_OPEN:
+                if self._until is None or now < self._until:
+                    return False
+                self._state = BREAKER_HALF_OPEN
+                self._trial = True
+                message = self._transition_line(now)
+            elif self._trial:
+                return False
+            else:
+                self._trial = True
+        if message is not None:
+            _LOGGER.info(message)
+        return True
+
+    # -- what the client reports ------------------------------------------
+
+    def record_outcome(self, error: BaseException | None = None) -> None:
+        """The one ``session.post`` this client made came back, or died.
+
+        ``None`` is a response of any status; an exception is classified with
+        the outbox's rule. Anything that is not a connection failure -- an
+        HTTP error, a malformed body, a bug in the caller -- says nothing
+        about the link and only releases the trial.
+        """
+        if error is None:
+            self._close("response")
+            return
+        try:
+            died = is_connection_failure(error)
+        except Exception:
+            died = False
+        if died:
+            self._record_failure()
+        else:
+            self.abandon_trial()
+
+    def abandon_trial(self) -> None:
+        """Release a claimed trial that produced no outcome. No transition."""
+        with self._lock:
+            self._trial = False
+
+    def internet_restored(self) -> None:
+        """The network probe measured ``ok`` after ``failed``: the link is back."""
+        self._close("internet_restored")
+
+    def status(self) -> dict:
+        """State for the heartbeat: ``state``, ``until`` (wall time, ISO 8601,
+        only while open), the consecutive failures and the current open length."""
+        with self._lock:
+            state, until, failures = self._state, self._until, self._failures
+            open_seconds = self._open_seconds
+            now = self._clock()
+        until_at = None
+        if state == BREAKER_OPEN and until is not None:
+            until_at = (
+                self._wall_clock() + timedelta(seconds=max(0.0, until - now))
+            ).isoformat()
+        return {
+            "state": state, "until": until_at, "failures": failures,
+            "open_seconds": open_seconds,
+        }
+
+    # -- transitions ------------------------------------------------------
+
+    def _record_failure(self) -> None:
+        message = None
+        with self._lock:
+            now = self._clock()
+            if self._last_failure_at is not None and now - self._last_failure_at > self._window:
+                self._failures = 0
+            self._failures += 1
+            self._last_failure_at = now
+            if self._state == BREAKER_HALF_OPEN:
+                # The trial died: open again, for longer.
+                self._trial = False
+                self._open_seconds = min(self._open_seconds * 2.0, self._max_open_seconds)
+                message = self._open(now)
+            elif self._state == BREAKER_CLOSED and self._failures >= self._threshold:
+                message = self._open(now)
+        if message is not None:
+            _LOGGER.info(message)
+
+    def _open(self, now: float) -> str:
+        self._state = BREAKER_OPEN
+        self._opened_at = now
+        self._until = now + self._open_seconds
+        self._opened_after = self._failures
+        return self._transition_line(now)
+
+    def _close(self, reason: str) -> None:
+        message = None
+        with self._lock:
+            now = self._clock()
+            was = self._state
+            if was != BREAKER_CLOSED:
+                self._state = BREAKER_CLOSED
+                message = self._transition_line(now, reason=reason)
+            self._trial = False
+            self._failures = 0
+            self._last_failure_at = None
+            self._open_seconds = self._base_open_seconds
+            self._opened_at = None
+            self._until = None
+            self._opened_after = 0
+        if message is not None:
+            _LOGGER.info(message)
+
+    def _transition_line(self, now: float, *, reason: str | None = None) -> str:
+        """One ``gate_ocr stage=cloud_breaker`` line per transition, under the lock."""
+        if self._state == BREAKER_OPEN:
+            for_seconds = self._open_seconds
+        elif self._opened_at is not None:
+            for_seconds = max(0.0, now - self._opened_at)
+        else:
+            for_seconds = 0.0
+        line = (
+            f"gate_ocr stage=cloud_breaker state={self._state} "
+            f"after={self._opened_after} failures for_s={for_seconds:.0f}"
+        )
+        return line if reason is None else f"{line} reason={reason}"
+
+
+def _breaker_available(breaker) -> bool:
+    """The breaker's read-only answer, failing open: unreadable means closed."""
+    if breaker is None:
+        return True
+    try:
+        return breaker.available() is not False
+    except Exception:
+        return True
+
+
+class CloudAvailability:
+    """``cloud_available()``: the probe's answer *and* the breaker's, as one predicate.
+
+    This is what ``main`` hands the sweep and the processor in place of the
+    probe's bare ``internet_reachable`` (#183): the same call, the same
+    fail-open rule at each site, and now two reasons to answer no. Either
+    half may be absent. ``reason`` names the half that refused, for the
+    journal, and is None while the cloud may be asked.
+    """
+
+    def __init__(self, breaker: CloudBreaker | None, internet_reachable=None):
+        self.breaker = breaker
+        self.internet_reachable = internet_reachable
+
+    def __call__(self) -> bool:
+        return (
+            _internet_reachable(self.internet_reachable)
+            and _breaker_available(self.breaker)
+        )
+
+    @property
+    def reason(self) -> str | None:
+        if not _internet_reachable(self.internet_reachable):
+            return REASON_INTERNET_DOWN
+        if not _breaker_available(self.breaker):
+            return REASON_CLOUD_UNREACHABLE
+        return None
+
+
 def _mark_post_started(state: dict) -> None:
     """Tell the caller that a request is about to go out on this attempt.
 
@@ -495,8 +797,13 @@ class PlateRecognizerClient:
                  plate_region: PlateRegion | None = None,
                  precropped_directory: Path | None = None,
                  corpus=None, local_recognizer=None, authorised=None,
-                 match_policy=None, activity=NULL_GATE, direction=None):
+                 match_policy=None, activity=NULL_GATE, direction=None,
+                 cloud_breaker: "CloudBreaker | None" = None):
         self._token = token
+        # The circuit breaker on this client's own requests (see
+        # `CloudBreaker`). One per client, built here unless `main` hands in
+        # the one it also gave the pipeline's predicate and the heartbeat.
+        self._breaker = cloud_breaker if cloud_breaker is not None else CloudBreaker(clock=clock)
         self._session = session
         self._session_generation = 0
         self._session_lock = Lock()
@@ -546,6 +853,11 @@ class PlateRecognizerClient:
         if max_upload_width and not MIN_UPLOAD_WIDTH <= max_upload_width <= MAX_UPLOAD_WIDTH:
             raise ValueError("max_upload_width is outside the safe range")
         self._max_upload_width = max_upload_width
+
+    @property
+    def cloud_breaker(self) -> "CloudBreaker":
+        """The breaker this client feeds and obeys."""
+        return self._breaker
 
     def local_pass(self, path: Path, *, trace_id: str | None = None,
                    budget: float | None = None) -> LocalPass:
@@ -996,9 +1308,26 @@ class PlateRecognizerClient:
             # own probe has fresh evidence the internet is down, so the
             # request would only time out. The on-device answer stands (in
             # `always` mode it was taken just above), and the pacing window,
-            # the upload and the 6 s wait are all spent on nothing.
+            # the upload and the 6 s wait are all spent on nothing. The
+            # predicate `main` hands down is the probe *and* the breaker, and
+            # names which of them refused.
             upload.close()
-            _LOGGER.info("gate_ocr stage=cloud_skipped reason=internet_down")
+            _LOGGER.info(
+                "gate_ocr stage=cloud_skipped reason=%s",
+                _unavailable_reason(state.get("internet_reachable")),
+            )
+            decided = state.get("local_observation")
+            if decided is not None:
+                return decided
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
+        if not self._breaker_admits():
+            # This client's own breaker: its last requests died on the link
+            # without an answer, or the one half-open trial is already out.
+            # Same outcome again; the request is the only thing removed.
+            upload.close()
+            _LOGGER.info("gate_ocr stage=cloud_skipped reason=%s", REASON_CLOUD_UNREACHABLE)
             decided = state.get("local_observation")
             if decided is not None:
                 return decided
@@ -1018,7 +1347,15 @@ class PlateRecognizerClient:
                     headers={"Authorization": f"Token {self._token}"},
                     timeout=timeout or self._timeout,
                 )
+                # A response of any status means the link carried a request:
+                # the breaker closes on it, before the trial is released
+                # below, so no second trial can slip out in between.
+                self._breaker_note(None)
             except Exception as error:
+                # The breaker hears every death on the link, and nothing else
+                # feeds it. Told before the classification below so that a
+                # classifier that raises cannot starve it.
+                self._breaker_note(error)
                 # Classify and journal the transport failure, then let the
                 # original exception propagate unchanged, after one retry on
                 # a fresh connection when it never produced a response.
@@ -1036,6 +1373,10 @@ class PlateRecognizerClient:
                 raise
         finally:
             upload.close()
+            # A trial admitted above but never resolved -- the pacing wait was
+            # abandoned, or the post raised something that was not the link's
+            # doing -- is released here, never left claimed.
+            self._breaker_release()
 
         # A response came back, so the allowance was charged -- whatever the
         # status code says about what it was charged for, and whichever reader
@@ -1113,6 +1454,27 @@ class PlateRecognizerClient:
             observation.plate, observation.confidence, decided=decided is None,
         )
         return decided or observation
+
+    def _breaker_admits(self) -> bool:
+        """The breaker's answer at the request site; unreadable means yes."""
+        try:
+            return self._breaker.admit() is not False
+        except Exception:
+            _LOGGER.debug("gate_ocr stage=cloud_breaker outcome=unreadable", exc_info=True)
+            return True
+
+    def _breaker_note(self, error: BaseException | None) -> None:
+        """Feed the breaker one outcome. Never raises: the frame is not its business."""
+        try:
+            self._breaker.record_outcome(error)
+        except Exception:
+            _LOGGER.debug("gate_ocr stage=cloud_breaker outcome=unreadable", exc_info=True)
+
+    def _breaker_release(self) -> None:
+        try:
+            self._breaker.abandon_trial()
+        except Exception:
+            _LOGGER.debug("gate_ocr stage=cloud_breaker outcome=unreadable", exc_info=True)
 
     def _upload_for(self, path: Path, state: dict, *, want_bytes: bool):
         """The bytes to post, the geometry they map back through, and a copy.

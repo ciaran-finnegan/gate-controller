@@ -77,6 +77,10 @@ CLOUD_SKIP_NO_CAMERA_EVENT = "no_camera_event"
 # passage, while the on-device reads kept working. Journal only: the event
 # ends on the device's own answer, exactly as `no_camera_event` does.
 CLOUD_SKIP_INTERNET_DOWN = "internet_down"
+# The cloud client's own circuit breaker is open: its last requests died on
+# the link without an answer (`ocr.CloudBreaker`), which a probe whose single
+# TLS open succeeds at 40 % packet loss never sees. Journal only, same outcome.
+CLOUD_SKIP_CLOUD_UNREACHABLE = "cloud_unreachable"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -1365,7 +1369,8 @@ class GateProcessor:
             if attempt is not None:
                 attempt.abandon()
             logging.getLogger(__name__).info(
-                "gate_ocr stage=cloud_skipped reason=%s", CLOUD_SKIP_INTERNET_DOWN,
+                "gate_ocr stage=cloud_skipped reason=%s",
+                _unavailable_reason(self._internet_reachable),
             )
             if on_start is not None:
                 on_start()
@@ -1912,6 +1917,22 @@ def _reachable(internet_reachable) -> bool:
         return internet_reachable() is not False
     except Exception:
         return True
+
+
+def _unavailable_reason(internet_reachable) -> str:
+    """Why :func:`_reachable` said no, as the predicate names it, or ``internet_down``.
+
+    The probe's bare method has no opinion. The ``CloudAvailability`` that
+    ``main`` hands in says whether the probe or the cloud client's circuit
+    breaker refused, so the journal never blames the link for the breaker.
+    """
+    try:
+        reason = getattr(internet_reachable, "reason", None)
+    except Exception:
+        return CLOUD_SKIP_INTERNET_DOWN
+    if reason in (CLOUD_SKIP_INTERNET_DOWN, CLOUD_SKIP_CLOUD_UNREACHABLE):
+        return reason
+    return CLOUD_SKIP_INTERNET_DOWN
 
 
 def _accepts_keyword(callable_object, keyword: str, *, variadic: bool = True) -> bool:

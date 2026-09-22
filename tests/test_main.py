@@ -22,6 +22,7 @@ from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
 from gate_controller.metrics import MetricsRing, MetricsRollupWorker, QuotaLedger
 from gate_controller.net_probe import NetProbeWorker
+from gate_controller.ocr import CloudAvailability, CloudBreaker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
@@ -612,9 +613,12 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertEqual(processor.prepare.call_args.kwargs["stillness"], 0.002)
 
     def test_main_hands_the_pipeline_the_network_probes_own_internet_reachable(self):
-        """The predicate the sweep and the processor hold is the probe's, the
-        very object that is started with the background workers. A wrapper or
-        a second probe would answer for a link nobody is measuring."""
+        """The predicate the sweep and the processor hold is one
+        ``CloudAvailability`` whose probe half is the probe's own bound method
+        -- the very object started with the background workers -- and whose
+        breaker is the one the cloud client feeds and the heartbeat reports.
+        A wrapper probe or a second breaker would answer for a link nobody is
+        measuring."""
         seen = {}
 
         def capture(*args, **kwargs):
@@ -623,6 +627,7 @@ class MainConfigurationTests(unittest.TestCase):
 
         def workers(*args, **kwargs):
             seen["net_probe"] = kwargs.get("net_probe")
+            seen["workers_breaker"] = kwargs.get("cloud_breaker")
             return ((kwargs.get("net_probe"),), object(), object())
 
         processor = MagicMock()
@@ -652,7 +657,7 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "TriggerFrameCapture", side_effect=capture,
         ), patch.object(
             gate_main, "PlateRecognizerClient", return_value=object()
-        ), patch.object(
+        ) as client_class, patch.object(
             gate_main, "GateProcessor", return_value=processor
         ) as processor_class, patch.object(
             gate_main, "run_worker"
@@ -662,16 +667,31 @@ class MainConfigurationTests(unittest.TestCase):
         probe = seen["net_probe"]
         self.assertIsInstance(probe, NetProbeWorker, "main built the probe and handed it over")
         self.assertIn(probe, run_worker.call_args.kwargs["background_workers"])
+        breaker = client_class.call_args.kwargs["cloud_breaker"]
+        self.assertIsInstance(breaker, CloudBreaker, "the cloud client is handed the breaker it feeds")
+        self.assertIs(seen["workers_breaker"], breaker, "the heartbeat reports the same breaker")
+        # The probe closes that same breaker when it sees the link come back.
+        restored = probe._on_internet_restored
+        self.assertIs(getattr(restored, "__self__", None), breaker)
+        self.assertEqual(restored, breaker.internet_restored)
         for name, predicate in (
             ("processor", processor_class.call_args.kwargs["internet_reachable"]),
             ("capture", seen["capture"]["internet_reachable"]),
         ):
             with self.subTest(holder=name):
-                self.assertIs(getattr(predicate, "__self__", None), probe)
-                self.assertEqual(predicate, probe.internet_reachable)
+                self.assertIsInstance(predicate, CloudAvailability)
+                self.assertIs(predicate.breaker, breaker)
+                self.assertIs(getattr(predicate.internet_reachable, "__self__", None), probe)
+                self.assertEqual(predicate.internet_reachable, probe.internet_reachable)
                 self.assertTrue(predicate(), "nothing measured yet: the cloud is allowed")
+        self.assertIs(
+            processor_class.call_args.kwargs["internet_reachable"],
+            seen["capture"]["internet_reachable"], "one predicate, one answer",
+        )
 
-    def test_with_the_probe_off_the_pipeline_is_handed_nothing(self):
+    def test_with_the_probe_off_the_pipeline_is_handed_the_breaker_alone(self):
+        """No probe, no probe half: the predicate is the breaker's answer only,
+        so a lossy link is still noticed by the client's own outcomes."""
         seen = {}
 
         def capture(*args, **kwargs):
@@ -703,7 +723,7 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main, "TriggerFrameCapture", side_effect=capture,
         ), patch.object(
             gate_main, "PlateRecognizerClient", return_value=object()
-        ), patch.object(
+        ) as client_class, patch.object(
             gate_main, "GateProcessor", return_value=MagicMock()
         ) as processor_class, patch.object(
             gate_main, "run_worker"
@@ -711,8 +731,16 @@ class MainConfigurationTests(unittest.TestCase):
             gate_main.main()
 
         self.assertIsNone(workers.call_args.kwargs["net_probe"])
-        self.assertIsNone(processor_class.call_args.kwargs["internet_reachable"])
-        self.assertIsNone(seen["capture"]["internet_reachable"])
+        breaker = client_class.call_args.kwargs["cloud_breaker"]
+        self.assertIsInstance(breaker, CloudBreaker)
+        for predicate in (
+            processor_class.call_args.kwargs["internet_reachable"],
+            seen["capture"]["internet_reachable"],
+        ):
+            self.assertIsInstance(predicate, CloudAvailability)
+            self.assertIs(predicate.breaker, breaker)
+            self.assertIsNone(predicate.internet_reachable)
+            self.assertTrue(predicate())
 
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -1668,6 +1696,53 @@ class HeartbeatObservabilityTests(unittest.TestCase):
         status = gate_main._controller_status(BrokenStore(), self.prompt(), {})
 
         self.assertIsNone(status["cloud"]["oldest_pending_outbox_age_s"])
+
+    def test_the_cloud_block_carries_the_breakers_state_and_when_it_reopens(self):
+        import requests
+
+        now = {"value": 1000.0}
+        wall = datetime(2026, 9, 22, 15, 18, tzinfo=timezone.utc)
+        breaker = CloudBreaker(clock=lambda: now["value"], wall_clock=lambda: wall)
+
+        closed = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, cloud_breaker=breaker,
+        )
+        self.assertEqual("closed", closed["cloud"]["cloud_breaker"])
+        self.assertIsNone(closed["cloud"]["cloud_breaker_until"])
+
+        for _ in range(3):
+            breaker.record_outcome(requests.exceptions.ReadTimeout("lossy"))
+        now["value"] += 15.0
+        opened = gate_main._controller_status(
+            self.create_store(), self.prompt(), {}, cloud_breaker=breaker,
+        )
+        self.assertEqual("open", opened["cloud"]["cloud_breaker"])
+        self.assertEqual(
+            (wall + timedelta(seconds=45.0)).isoformat(), opened["cloud"]["cloud_breaker_until"],
+        )
+        # The block's other keys are untouched: the two are additive.
+        self.assertIsNone(opened["cloud"]["heartbeat_rtt_ms"])
+        self.assertIsNone(opened["cloud"]["oldest_pending_outbox_age_s"])
+
+    def test_without_a_breaker_or_with_one_that_cannot_be_read_the_keys_are_null(self):
+        class Unreadable:
+            @staticmethod
+            def status():
+                raise RuntimeError("breaker state lost")
+
+        class Odd:
+            @staticmethod
+            def status():
+                return {"state": 7, "until": 1234}
+
+        for name, breaker in (("absent", None), ("unreadable", Unreadable()), ("odd", Odd())):
+            with self.subTest(breaker=name):
+                status = gate_main._controller_status(
+                    self.create_store(), self.prompt(), {}, cloud_breaker=breaker,
+                )
+                self.assertIn("cloud_breaker", status["cloud"])
+                self.assertIsNone(status["cloud"]["cloud_breaker"])
+                self.assertIsNone(status["cloud"]["cloud_breaker_until"])
 
 
 def gate_main_gate_event(received_at):

@@ -442,7 +442,7 @@ already; nothing here invents one.
 | --- | --- |
 | `host` | `soc_temp_c`, `throttled` (raw hex plus `under_voltage` / `arm_capped` / `currently_throttled`), `load_1m/5m/15m`, `mem_total_kib` / `mem_available_kib` / `swap_free_kib`, `disk_free_bytes` / `disk_total_bytes`, `oom_kill_total`, `uptime_seconds`, `process_uptime_seconds`, `disk_sectors_written` |
 | `network` | the last completed probe cycle: `mode`, `skipped_reason`, `age_seconds`, `hops.lan` / `hops.router` (`state`, `loss`, `samples`, `min_ms` / `p50_ms` / `p95_ms` / `max_ms` / `mean_ms` / `jitter_ms`), `hops.internet` (`state`, `dns_ms`, `connect_ms`, `tls_ms`, `total_ms`, `age_seconds`), `interface` (`name`, `link_mbps`, receive/transmit bytes, packets, dropped and error **rates**, `receive_dropped_pct`) |
-| `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s` |
+| `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s`, and the cloud plate reader's circuit breaker: `cloud_breaker` (`closed` / `open` / `half_open`) and `cloud_breaker_until` (wall time, only while open) -- see [local-recognition.md](local-recognition.md#when-the-link-is-lossy-rather-than-down-the-circuit-breaker); the app drops both until it allow-lists them |
 | `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
 | `corpus` | `local` (bytes, records, pruned, discarded), `upload` (`pending`, `oldest_pending_age_s`, `last_success_at`, `consecutive_failures`, `last_blocked_by`, `outage_probes`, `last_attempt_reason`, `retention_hold`) and `backpressure` (`quiet_window_seconds`, `quiet_for_seconds`, `busy`) |
 

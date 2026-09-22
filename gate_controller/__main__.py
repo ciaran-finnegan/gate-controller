@@ -46,7 +46,7 @@ from .media_capabilities import read_media_capabilities
 from .metrics import (
     MetricsRollupWorker, build_metrics_ring, metrics_rollup_seconds,
 )
-from .ocr import PlateRecognizerClient
+from .ocr import CloudAvailability, CloudBreaker, PlateRecognizerClient
 from .outbox import (
     CloudflareOutboxSender, HttpOutboxSender, OutboxWorker,
     TelemetryRetentionWorker,
@@ -184,8 +184,20 @@ def main() -> None:
     # before handing a frame to the cloud, the processor before queueing a
     # frame for the cloud lane, and the cloud client before the request
     # leaves. It is started with the other background workers further down.
-    net_probe = _net_probe_worker(os.environ)
-    internet_reachable = net_probe.internet_reachable if net_probe is not None else None
+    # The circuit breaker on the cloud plate reader is built first, because
+    # the probe closes it when it sees the link come back, the client feeds
+    # it, the pipeline's predicate reads it and the heartbeat reports it.
+    cloud_breaker = CloudBreaker()
+    net_probe = _net_probe_worker(
+        os.environ, on_internet_restored=cloud_breaker.internet_restored,
+    )
+    # One predicate for the sweep, the processor and (through the processor)
+    # the cloud client: the probe's answer AND the breaker's. The probe half is
+    # the probe's own bound method, so there is still one probe and one
+    # answer; without a probe the breaker answers alone.
+    internet_reachable = CloudAvailability(
+        cloud_breaker, net_probe.internet_reachable if net_probe is not None else None,
+    )
     # The sweep reads session frames with the same recogniser, plate list and
     # policy band the processor uses, so what it admits is what the processor
     # will re-check. Built only when configured; None leaves capture as it was.
@@ -242,6 +254,7 @@ def main() -> None:
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=trigger_correlator,
         corpus=corpus, activity=activity, metrics=metrics, net_probe=net_probe,
+        cloud_breaker=cloud_breaker,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
     # a verdict. It reaches no decision, spends no lookup and ends no
@@ -253,6 +266,9 @@ def main() -> None:
         corpus=corpus,
         direction=direction,
         activity=activity,
+        # The breaker the pipeline's predicate reads and the heartbeat reports:
+        # this client is the only thing that feeds it.
+        cloud_breaker=cloud_breaker,
         local_recognizer=local_recognizer,
         authorised=authorised.get,
         # The very same provider the GateProcessor below is given. The local
@@ -834,7 +850,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
                              corpus=None, activity=None, metrics=None, webhook=None,
-                             net_probe=None):
+                             net_probe=None, cloud_breaker=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -901,7 +917,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             trigger_capture=trigger_capture, webhook=webhook,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
-            metrics=metrics,
+            metrics=metrics, cloud_breaker=cloud_breaker,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -953,10 +969,12 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     )
 
 
-def _net_probe_worker(environment) -> NetProbeWorker | None:
+def _net_probe_worker(environment, *, on_internet_restored=None) -> NetProbeWorker | None:
     """The network probe the environment configures, or None when it is off."""
     net_probe_config = load_net_probe_config(environment)
-    return NetProbeWorker(net_probe_config) if net_probe_config.enabled else None
+    if not net_probe_config.enabled:
+        return None
+    return NetProbeWorker(net_probe_config, on_internet_restored=on_internet_restored)
 
 
 def _telemetry_retention_days(environment) -> int:
@@ -1009,6 +1027,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        trigger_capture=None, webhook=None, net_probe=None,
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
+                       cloud_breaker=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -1060,7 +1079,9 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     network = _network_status(net_probe)
     if network is not None:
         status["network"] = network
-    status["cloud"] = _cloud_status(store, heartbeat, plates, now, metrics=metrics)
+    status["cloud"] = _cloud_status(
+        store, heartbeat, plates, now, metrics=metrics, breaker=cloud_breaker,
+    )
     corpus_status = _corpus_status(corpus, corpus_upload, activity)
     if corpus_status is not None:
         status["corpus"] = corpus_status
@@ -1207,13 +1228,34 @@ def _network_status(net_probe) -> dict | None:
     return measured if isinstance(measured, dict) else None
 
 
-def _cloud_status(store, heartbeat, plates, now: datetime, *, metrics=None) -> dict:
+def _cloud_status(store, heartbeat, plates, now: datetime, *, metrics=None,
+                  breaker=None) -> dict:
     cloud: dict = {
         "heartbeat_rtt_ms": None,
         "heartbeat_consecutive_failures": None,
         "plates_consecutive_failures": None,
         "oldest_pending_outbox_age_s": None,
+        # The cloud plate reader's circuit breaker (`ocr.CloudBreaker`):
+        # `closed`, `open` or `half_open`, and while open the wall time it
+        # reopens for a trial. Additive: the app's heartbeat narrows `cloud`
+        # to allow-listed numbers and drops what it does not know, so these
+        # reach D1 only once the app learns them; the journal has them today.
+        "cloud_breaker": None,
+        "cloud_breaker_until": None,
     }
+    read_breaker = getattr(breaker, "status", None)
+    if callable(read_breaker):
+        try:
+            measured = read_breaker()
+        except Exception:
+            measured = None
+        if isinstance(measured, dict):
+            state = measured.get("state")
+            until = measured.get("until")
+            if isinstance(state, str):
+                cloud["cloud_breaker"] = state
+            if isinstance(until, str):
+                cloud["cloud_breaker_until"] = until
     read_metrics = getattr(heartbeat, "metrics", None)
     if callable(read_metrics):
         try:

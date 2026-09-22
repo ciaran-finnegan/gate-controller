@@ -467,6 +467,74 @@ journalctl -u file-monitor.service --since '-7 days' \
   | grep -c 'stage=cloud_skipped reason=internet_down'
 ```
 
+#### When the link is lossy rather than down: the circuit breaker
+
+The probe's rule has a gap, measured the same afternoon. The farm's link is
+mostly **lossy**, not down: at 40 % packet loss the probe's single TLS open
+succeeds often enough to say `internet=ok`, so the rule above lets every
+request go, and every passage still handed up to five frames to the cloud
+reader, each dying after ~6 s. At 15:18 on 2026-09-22, after the gate had
+already opened on a local read, the journal showed `gate_ocr
+stage=attempt_failed cause=connection_error detail=TimeoutError`,
+`stage=retry cause=connection_error wait_ms=1050`, a `decision_timeout`
+denial row and a `queue_coalesced` skip for the same passage; the outbox
+alone had logged 220 `ConnectionError` and 19 `ReadTimeout` in the previous
+three hours. The cost was the sweep's read budget, 6 s stalls in the cloud
+lane, denial rows uploaded over the same bad link, and lookups billed for
+timeouts (350 of the month's 2,500 by that day).
+
+So the cloud client keeps a **circuit breaker** (`ocr.CloudBreaker`) fed by
+one thing only: its own requests that died on the link without any answer --
+`ConnectionError`, `ConnectTimeout`, `ReadTimeout`, classified exactly as the
+outbox classifies its own sends (`outbox.is_connection_failure`). Nothing
+else feeds it: not the probe, not the prewarm, not the local reads.
+
+| state | what happens |
+| --- | --- |
+| **closed** | every request goes. Any answer from the cloud -- a plate, an empty result, a 4xx, a 5xx -- resets the count, so a healthy link with one blip never opens it. |
+| **open** | three deaths in a row within five minutes (`BREAKER_FAILURE_THRESHOLD`, `BREAKER_FAILURE_WINDOW_SECONDS`) open it for 60 s (`BREAKER_OPEN_SECONDS`). A passage is about five requests, so a lossy link opens it inside one passage. While open, no request is attempted: the sweep makes no `sweep_cloud` hand-over, the processor queues nothing for the cloud lane, and the client posts nothing -- the same three places and the same fast skip as the probe's rule, journalled `reason=cloud_unreachable` instead of `reason=internet_down`, and decided the same way: the local read stands if it decided, otherwise "no plate" and `no_match`. |
+| **half-open** | when the open time runs out, exactly one real request is let through as a trial; the frames behind it are skipped until it is resolved. An answer closes the breaker (count and open time reset). A trial that dies on the link opens it again for twice as long -- 120 s, 240 s, 480 s -- capped at 600 s (`BREAKER_OPEN_MAX_SECONDS`). A trial that fails for any other reason (a bug, an abandoned request) is released and nothing moves. |
+
+The probe closes it too: the first cycle that measures the internet hop
+`ok` after `failed` tells the breaker the link is back, whatever its own
+timer says, so a link that went from lossy to down to back is used on the
+next passage rather than up to ten minutes later. That is the only thing the
+probe says to the breaker, and it is one-way.
+
+The predicate the sweep and the processor hold is now one object,
+`ocr.CloudAvailability` -- the probe's `internet_reachable` **and** the
+breaker's `available()` -- built once in `main` and handed to both, and by the
+processor to the client. It fails open at every site exactly as the probe's
+answer does: a breaker that raises, or whose state cannot be read, is a closed
+one, and the client's own check at the request site (`admit()`, which is
+what claims the half-open trial) is wrapped the same way. **The breaker never
+touches the local reads, the match policy, the cooldown or the relay path.**
+An open breaker can only remove a network call that would have died the
+same way; it never makes the gate open more easily, and a locally authorised
+plate opens exactly as it always has whatever state the breaker is in.
+
+Every transition is journalled once, on the client's logger:
+
+```
+gate_ocr stage=cloud_breaker state=open after=3 failures for_s=60
+gate_ocr stage=cloud_breaker state=half_open after=3 failures for_s=60
+gate_ocr stage=cloud_breaker state=open after=4 failures for_s=120
+gate_ocr stage=cloud_breaker state=closed after=4 failures for_s=120 reason=response
+gate_ocr stage=cloud_breaker state=closed after=3 failures for_s=12 reason=internet_restored
+```
+
+and the heartbeat's `cloud` block carries `cloud_breaker` (`closed` / `open`
+/ `half_open`) and, while open, `cloud_breaker_until` (the wall time it
+reopens for a trial). Both are additive: the app's heartbeat route narrows
+`cloud` to allow-listed numbers and drops keys it does not know, so they reach
+D1 only once the app learns them; the journal has them today. Count what the
+breaker saved the same way as the probe's rule:
+
+```
+journalctl -u file-monitor.service --since '-7 days' \
+  | grep -c 'stage=cloud_skipped reason=cloud_unreachable'
+```
+
 ### Corroborating the cloud read
 
 A confident local read is kept for its event, keyed by trace id, and offered to

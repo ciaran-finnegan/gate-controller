@@ -531,8 +531,16 @@ class NetProbeWorker:
                  proc_root=Path("/proc"), sys_class_net=SYS_CLASS_NET,
                  internet_connect=None,
                  child_timeout: float = CHILD_TIMEOUT_SECONDS,
-                 ping_timeout: float | None = None):
+                 ping_timeout: float | None = None,
+                 on_internet_restored=None):
         self.config = config
+        # Called, on the probe thread, the moment a cycle measures the
+        # internet hop `ok` after the previous measurement said `failed`. The
+        # cloud client's circuit breaker closes on it, so a link that comes
+        # back is used on the next passage rather than when the breaker's own
+        # timer runs out. Best effort: a callback that raises is journalled
+        # and the cycle carries on.
+        self._on_internet_restored = on_internet_restored
         self.child_timeout = child_timeout
         self.ping_timeout = (ping_timeout if ping_timeout is not None
                              else ping_timeout_seconds(config.ping_count))
@@ -751,6 +759,7 @@ class NetProbeWorker:
         now = self._clock()
         with self._lock:
             internet, measured_at = self._internet, self._internet_at
+        internet_before = internet
         if (measured_at is not None and internet is not None
                 # Only a *successful* open keeps the slower cadence. A failed
                 # one is re-measured every cycle: the pipeline stops asking
@@ -769,9 +778,20 @@ class NetProbeWorker:
             internet = {"state": STATE_OK, **timings}
         else:
             internet = {"state": STATE_FAILED}
+        previous = (
+            None if measured_at is None or internet_before is None
+            else internet_before.get("state")
+        )
         with self._lock:
             self._internet = internet
             self._internet_at = now
+        if (previous == STATE_FAILED and internet["state"] == STATE_OK
+                and self._on_internet_restored is not None):
+            try:
+                self._on_internet_restored()
+            except Exception:
+                LOGGER.warning("gate_net_probe stage=internet_restored outcome=callback_failed",
+                               exc_info=True)
         return {**internet, "age_seconds": 0.0}
 
     def _probe_interface(self) -> dict | None:
