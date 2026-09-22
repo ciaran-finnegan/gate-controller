@@ -314,12 +314,24 @@ class SegmentStore:
     """The recorded segments on the card, and the rules that bound them."""
 
     def __init__(self, directory: Path, *, retention_hours: int = DEFAULT_RETENTION_HOURS,
-                 min_free_bytes: int = DEFAULT_MIN_FREE_BYTES, clock=None):
+                 min_free_bytes: int = DEFAULT_MIN_FREE_BYTES, clock=None,
+                 hold_unshipped=None):
         self.directory = Path(directory)
         self.retention_hours = max(MIN_RETENTION_HOURS,
                                    min(MAX_RETENTION_HOURS, int(retention_hours)))
         self.min_free_bytes = max(MIN_MIN_FREE_BYTES, int(min_free_bytes))
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        #: Asked before an unshipped segment past the horizon is taken: a
+        #: reason to keep it, or None. The corpus uploader answers with why it
+        #: is not draining (``CorpusUploadWorker.retention_hold``). While it
+        #: does, the horizon is the free-space floor rather than the clock:
+        #: a segment still carrying its sidecar is the only copy of that
+        #: audio, and a router outage on 2026-09-22 held the uploader off for
+        #: a day while the 48-hour horizon closed on 51 of them.
+        self.hold_unshipped = hold_unshipped
+        self.held = 0
+        self._last_hold_log: tuple[str, int] | None = None
+        self._last_hold_logged_at: datetime | None = None
 
     def prepare(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -364,29 +376,91 @@ class SegmentStore:
         not about to use again.
         """
         removed_age = removed_space = 0
-        cutoff = self._clock() - timedelta(hours=self.retention_hours)
+        now = self._clock()
+        cutoff = now - timedelta(hours=self.retention_hours)
+        hold = self._hold_reason()
         segments = self.segments()
+        held: list[Segment] = []
         for segment in list(segments):
             if segment.started_at < cutoff:
+                if hold is not None and _is_unshipped(segment):
+                    held.append(segment)
+                    continue
                 if self._remove(segment):
                     removed_age += 1
                     segments.remove(segment)
+        # The floor takes what the cloud already has before what it does not:
+        # a shipped segment is in R2 and a never-released one was never going
+        # there, but an unshipped one is the only copy. Within each, oldest
+        # first. The newest is never a candidate.
         while len(segments) > 1 and self.free_bytes() < self.min_free_bytes:
-            if not self._remove(segments[0]):
+            victim = self._space_victim(segments)
+            if not self._remove(victim):
                 break
-            segments.pop(0)
+            segments.remove(victim)
             removed_space += 1
+        kept = [segment for segment in held if segment in segments]
+        self.held = len(kept)
+        if kept:
+            self._journal_hold(hold, kept, now)
+        else:
+            self._last_hold_log = None
         if removed_age or removed_space:
             LOGGER.info(
-                "gate_audio_segments stage=pruned expired=%d for_space=%d remaining=%d free_mb=%d",
-                removed_age, removed_space, len(segments), self.free_bytes() // (1024 * 1024),
+                "gate_audio_segments stage=pruned expired=%d for_space=%d held=%d "
+                "remaining=%d free_mb=%d",
+                removed_age, removed_space, self.held, len(segments),
+                self.free_bytes() // (1024 * 1024),
             )
         return {
             "expired": removed_age,
             "for_space": removed_space,
+            "held": self.held,
             "remaining": len(segments),
             "free_bytes": self.free_bytes(),
         }
+
+    def _hold_reason(self) -> str | None:
+        """Why unshipped segments are being kept past the horizon, or None. Never raises."""
+        if self.hold_unshipped is None:
+            return None
+        try:
+            reason = self.hold_unshipped()
+        except Exception:
+            return None
+        if not reason:
+            return None
+        return "".join(
+            character for character in str(reason) if character.isalnum() or character in "_-"
+        )[:32] or None
+
+    @staticmethod
+    def _space_victim(segments: list[Segment]) -> Segment:
+        candidates = segments[:-1]
+        for segment in candidates:
+            if not _is_unshipped(segment):
+                return segment
+        return candidates[0]
+
+    def _journal_hold(self, reason: str | None, held: list[Segment], now: datetime) -> None:
+        """Say what is being kept and why -- when it changes, and hourly regardless."""
+        key = (reason or "unknown", len(held))
+        if (
+            key == self._last_hold_log
+            and self._last_hold_logged_at is not None
+            and now - self._last_hold_logged_at < timedelta(hours=1)
+        ):
+            return
+        self._last_hold_log = key
+        self._last_hold_logged_at = now
+        oldest = min(held, key=lambda segment: segment.started_at)
+        LOGGER.info(
+            "gate_audio_segments stage=retention_extended reason=%s held=%d held_mb=%d "
+            "oldest=%s horizon_h=%d free_mb=%d detail=unshipped_kept_until_disk_demands",
+            reason, len(held), sum(segment.size for segment in held) // (1024 * 1024),
+            oldest.started_at.isoformat(), self.retention_hours,
+            self.free_bytes() // (1024 * 1024),
+        )
 
     def _remove(self, segment: Segment) -> bool:
         try:
@@ -427,6 +501,11 @@ class SegmentStore:
             if finishes > start and segment.started_at < end:
                 found.append(segment)
         return found
+
+
+def _is_unshipped(segment: Segment) -> bool:
+    """Released to the uploader and not yet confirmed by the cloud."""
+    return segment.path.with_suffix(SIDECAR_SUFFIX).exists()
 
 
 def extract_window(store: SegmentStore, start: datetime, end: datetime) -> bytes:
@@ -1034,6 +1113,7 @@ class SegmentRecorder:
             "released": sum(1 for segment in self.store.segments()
                             if segment.path.with_suffix(SIDECAR_SUFFIX).exists()),
             "low_disk_refusals": self._refusals,
+            "held_unshipped": self.store.held,
             "free_bytes": self.store.free_bytes(),
             "last_error": self._last_error,
         }

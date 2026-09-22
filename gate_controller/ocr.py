@@ -341,6 +341,21 @@ def _cloud_permitted(cloud_permit) -> bool:
         return False
 
 
+def _internet_reachable(internet_reachable) -> bool:
+    """The network probe's answer, failing open towards the cloud.
+
+    The opposite of :func:`_cloud_permitted`: no probe means the request goes;
+    so does a probe that raises or answers anything but a definite False. It
+    only ever removes a request the probe has fresh evidence would time out.
+    """
+    if internet_reachable is None:
+        return True
+    try:
+        return internet_reachable() is not False
+    except Exception:
+        return True
+
+
 def _mark_post_started(state: dict) -> None:
     """Tell the caller that a request is about to go out on this attempt.
 
@@ -671,7 +686,8 @@ class PlateRecognizerClient:
                   budget: float | None = None,
                   attempt: LocalPass | None = None,
                   on_post_started: Callable[[], None] | None = None,
-                  cloud_permit: Callable[[], bool] | None = None) -> PlateObservation:
+                  cloud_permit: Callable[[], bool] | None = None,
+                  internet_reachable: Callable[[], bool] | None = None) -> PlateObservation:
         """Read one frame.
 
         ``cloud_permit`` travels only with a frame of an *early-origin*
@@ -679,6 +695,13 @@ class PlateRecognizerClient:
         alarm. It is asked immediately before the request would go out, and
         while it answers no, nothing is posted: the on-device answer stands,
         or "no plate" when there is none. See ``_recognise_once``.
+
+        ``internet_reachable`` is the controller's network probe
+        (``NetProbeWorker.internet_reachable``), asked at the same place and
+        with the same outcome when it answers a definite False: the on-device
+        answer stands, nothing is posted and nothing waits on a link the probe
+        has fresh evidence is down. Absent, raising, or answering anything
+        else, the request goes exactly as it always has.
 
         ``budget`` is the seconds of decision time left for this frame when
         the call starts. It bounds what the local guard may spend and re-sizes
@@ -703,12 +726,13 @@ class PlateRecognizerClient:
         with self._activity.activity("ocr"):
             return self._recognise(
                 path, timeout, trace_id, budget, attempt, on_post_started,
-                cloud_permit,
+                cloud_permit, internet_reachable,
             )
 
     def _recognise(self, path: Path, timeout, trace_id, budget=None,
                    attempt: LocalPass | None = None,
-                   on_post_started=None, cloud_permit=None) -> PlateObservation:
+                   on_post_started=None, cloud_permit=None,
+                   internet_reachable=None) -> PlateObservation:
         # The generation is captured once so a retry never outlives an
         # event the processor has already abandoned.
         with self._session_lock:
@@ -725,6 +749,7 @@ class PlateRecognizerClient:
         # with: a reused pass must still be able to report that it posted.
         state["on_post_started"] = on_post_started
         state["cloud_permit"] = cloud_permit
+        state["internet_reachable"] = internet_reachable
         # A reused pass carries the deadline *it* was bounded by, which the
         # processor holds short of the decision's so the cloud keeps its
         # reserve. The request itself answers to the decision deadline, so
@@ -960,6 +985,20 @@ class PlateRecognizerClient:
             # on-device answer stands if there is one, and nothing is sent.
             upload.close()
             _LOGGER.info("gate_ocr stage=cloud_refused reason=no_camera_event")
+            decided = state.get("local_observation")
+            if decided is not None:
+                return decided
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
+        if not _internet_reachable(state.get("internet_reachable")):
+            # Same place, same outcome, a different reason: the controller's
+            # own probe has fresh evidence the internet is down, so the
+            # request would only time out. The on-device answer stands (in
+            # `always` mode it was taken just above), and the pacing window,
+            # the upload and the 6 s wait are all spent on nothing.
+            upload.close()
+            _LOGGER.info("gate_ocr stage=cloud_skipped reason=internet_down")
             decided = state.get("local_observation")
             if decided is not None:
                 return decided

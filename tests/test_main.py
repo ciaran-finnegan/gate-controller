@@ -611,6 +611,109 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertIs(processor.prepare.call_args.kwargs["sweep_read"], read)
         self.assertEqual(processor.prepare.call_args.kwargs["stillness"], 0.002)
 
+    def test_main_hands_the_pipeline_the_network_probes_own_internet_reachable(self):
+        """The predicate the sweep and the processor hold is the probe's, the
+        very object that is started with the background workers. A wrapper or
+        a second probe would answer for a link nobody is measuring."""
+        seen = {}
+
+        def capture(*args, **kwargs):
+            seen["capture"] = kwargs
+            return Mock(name="TriggerFrameCapture")
+
+        def workers(*args, **kwargs):
+            seen["net_probe"] = kwargs.get("net_probe")
+            return ((kwargs.get("net_probe"),), object(), object())
+
+        processor = MagicMock()
+        # The webhook secret is what switches trigger capture (and so the
+        # sweep) on; without it there is no capture to hand the predicate to.
+        environment = self.isolated_state_environment(
+            GATE_REOLINK_WEBHOOK_SECRET="correct-horse-battery-staple",
+            GATE_TRIGGER_CAPTURE_ENABLED="true",
+        )
+        with patch.dict(
+            os.environ, environment, clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "_clear_stream_source", return_value=None,
+        ), patch.object(
+            gate_main, "build_background_workers", side_effect=workers,
+        ), patch.object(
+            gate_main, "TriggerFrameCapture", side_effect=capture,
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=processor
+        ) as processor_class, patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
+            gate_main.main()
+
+        probe = seen["net_probe"]
+        self.assertIsInstance(probe, NetProbeWorker, "main built the probe and handed it over")
+        self.assertIn(probe, run_worker.call_args.kwargs["background_workers"])
+        for name, predicate in (
+            ("processor", processor_class.call_args.kwargs["internet_reachable"]),
+            ("capture", seen["capture"]["internet_reachable"]),
+        ):
+            with self.subTest(holder=name):
+                self.assertIs(getattr(predicate, "__self__", None), probe)
+                self.assertEqual(predicate, probe.internet_reachable)
+                self.assertTrue(predicate(), "nothing measured yet: the cloud is allowed")
+
+    def test_with_the_probe_off_the_pipeline_is_handed_nothing(self):
+        seen = {}
+
+        def capture(*args, **kwargs):
+            seen["capture"] = kwargs
+            return Mock(name="TriggerFrameCapture")
+
+        environment = self.isolated_state_environment(
+            GATE_NET_PROBE_ENABLED="false",
+            GATE_REOLINK_WEBHOOK_SECRET="correct-horse-battery-staple",
+            GATE_TRIGGER_CAPTURE_ENABLED="true",
+        )
+        with patch.dict(
+            os.environ, environment, clear=True,
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "_clear_stream_source", return_value=None,
+        ), patch.object(
+            gate_main, "build_background_workers", return_value=((), object(), object())
+        ) as workers, patch.object(
+            gate_main, "TriggerFrameCapture", side_effect=capture,
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=MagicMock()
+        ) as processor_class, patch.object(
+            gate_main, "run_worker"
+        ), no_live_state_access():
+            gate_main.main()
+
+        self.assertIsNone(workers.call_args.kwargs["net_probe"])
+        self.assertIsNone(processor_class.call_args.kwargs["internet_reachable"])
+        self.assertIsNone(seen["capture"]["internet_reachable"])
+
     def test_telemetry_export_does_not_require_ocr_token_or_touch_the_relay(self):
         with patch.dict(os.environ, {}, clear=True), patch(
             "sys.argv",

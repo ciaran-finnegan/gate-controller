@@ -680,8 +680,17 @@ class TriggerFrameCapture:
 
     def __init__(self, config: TriggerCaptureConfig, *, popen=subprocess.Popen,
                  clock=monotonic, wall_clock=None, frame_source=None,
-                 activity=NULL_GATE, sweep=None, early_trigger: bool = False):
+                 activity=NULL_GATE, sweep=None, early_trigger: bool = False,
+                 internet_reachable=None):
         self.config = config
+        # The controller's network probe (`NetProbeWorker.internet_reachable`),
+        # or None. While it answers a definite False the sweep hands no frame
+        # to the cloud during its window: the hand-over would only be skipped
+        # downstream, and each one is a denied event the passage does not
+        # need. The fallback still goes, so the passage is put on record. A
+        # probe that is absent, raises or answers anything else changes
+        # nothing (see `_cloud_reachable`).
+        self._internet_reachable = internet_reachable
         # Whether `on_early_trigger` may start anything at all. False unless
         # GATE_EARLY_TRIGGER=on: in `off` and `shadow` the entry point exists
         # and refuses, whoever calls it.
@@ -973,7 +982,11 @@ class TriggerFrameCapture:
         the pipeline does not spend the on-device reader on a frame already
         read. The sweep does not wait for these. The cap is a spend ceiling,
         because every cloud lookup is billed and the service permits one
-        request a second.
+        request a second. While the network probe has fresh evidence that the
+        internet is down, none of these is handed over at all (journalled
+        once, ``stage=cloud_handover_skipped reason=internet_down``): the
+        local reads go on exactly as before, and the fallback below still puts
+        the passage on record.
 
         **Waiting.** When the window closes with the gate still shut, the best
         frames seen (up to ``sweep_fallback_frames``, never one already
@@ -1087,6 +1100,21 @@ class TriggerFrameCapture:
                 handed.add(digest)
             return path
 
+        handover_skips_journalled = False
+
+        def cloud_reachable() -> bool:
+            """Whether a cloud hand-over is worth making, as the probe sees it."""
+            nonlocal handover_skips_journalled
+            if self._cloud_reachable():
+                return True
+            if not handover_skips_journalled:
+                handover_skips_journalled = True
+                LOGGER.info(
+                    "gate_local_sweep stage=cloud_handover_skipped reason=internet_down "
+                    "of=%d", config.sweep_cloud_frames,
+                )
+            return False
+
         def run_fallback() -> None:
             nonlocal fallback, fallback_done
             fallback_done = True
@@ -1171,6 +1199,10 @@ class TriggerFrameCapture:
                     last_handover_at is None
                     or self._clock() - last_handover_at >= config.sweep_cloud_spacing_seconds
                 )
+                # Asked last, so it is asked only when a hand-over would go,
+                # and asked again each time: a link that comes back mid-sweep
+                # gets the next one.
+                and cloud_reachable()
             ):
                 # A frame with a plate in it, best read first; otherwise the
                 # freshest view there is, which is what this always sent. The
@@ -1347,6 +1379,16 @@ class TriggerFrameCapture:
             round(max(0.0, self._clock() - scheduled_at) * 1000), waiting_reads,
         )
         return injected + fallback + handovers
+
+    def _cloud_reachable(self) -> bool:
+        """False only when the probe answers a definite False; see `__init__`."""
+        probe = self._internet_reachable
+        if probe is None:
+            return True
+        try:
+            return probe() is not False
+        except Exception:
+            return True
 
     def _take_camera_event(self):
         """The camera alarm waiting in the slot, taken off it; or None."""

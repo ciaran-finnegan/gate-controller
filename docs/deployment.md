@@ -444,7 +444,7 @@ already; nothing here invents one.
 | `network` | the last completed probe cycle: `mode`, `skipped_reason`, `age_seconds`, `hops.lan` / `hops.router` (`state`, `loss`, `samples`, `min_ms` / `p50_ms` / `p95_ms` / `max_ms` / `mean_ms` / `jitter_ms`), `hops.internet` (`state`, `dns_ms`, `connect_ms`, `tls_ms`, `total_ms`, `age_seconds`), `interface` (`name`, `link_mbps`, receive/transmit bytes, packets, dropped and error **rates**, `receive_dropped_pct`) |
 | `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s` |
 | `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
-| `corpus` | `local` (bytes, records, pruned, discarded), `upload` (`pending`, `oldest_pending_age_s`, `last_success_at`, `consecutive_failures`, `last_blocked_by`) and `backpressure` (`quiet_window_seconds`, `quiet_for_seconds`, `busy`) |
+| `corpus` | `local` (bytes, records, pruned, discarded), `upload` (`pending`, `oldest_pending_age_s`, `last_success_at`, `consecutive_failures`, `last_blocked_by`, `outage_probes`, `last_attempt_reason`, `retention_hold`) and `backpressure` (`quiet_window_seconds`, `quiet_for_seconds`, `busy`) |
 
 Everything here degrades to an absent field rather than to a healthy-looking
 default. An unreadable `/proc` file omits its metric; a failed probe omits its
@@ -732,6 +732,32 @@ at 10 s. ffmpeg, image or video decode, numpy, onnxruntime, model loads,
 `tests/test_net_probe.py` asserts it along with the measured ceilings: under
 5 MB of steady-state growth and under 0.5 % of one core.
 
+#### What the pipeline does with the `internet` hop
+
+The probe is not only for reading afterwards. `NetProbeWorker.internet_reachable()`
+answers False on a *fresh, definite* `internet=failed` -- no older than two
+cycles, `2 × GATE_NET_PROBE_INTERVAL_SECONDS` (120 s) -- and while it does,
+the recognition pipeline hands nothing to the cloud plate reader: the sweep
+makes no `sweep_cloud` hand-overs, the processor queues nothing for the cloud
+lane, and the cloud client posts nothing. Local reads carry on unchanged and
+a passage ends on the device's own answer instead of eight `decision_timeout`
+events, which is what 2026-09-22 looked like with the router dropping 30-70 %
+of packets. Every other answer -- probe off, never run, closed, `ok`, or a
+failure older than two cycles because the governor withheld the hop -- leaves
+the cloud path exactly as it was. The full rule, and why it fails open towards
+the cloud and never towards the gate, is in
+[local-recognition.md](local-recognition.md#when-the-internet-is-down-the-cloud-is-not-asked).
+
+So that the cloud comes back promptly, a **failed** TLS open is re-measured on
+every cycle (the healthy five-minute cadence above is kept only for a
+successful one): the first cycle after the link returns, at most
+`GATE_NET_PROBE_INTERVAL_SECONDS` later, restores cloud lookups with no
+restart. A failed open costs the probe thread the resolver and connect
+timeouts and nothing else; nothing is billed. `main` builds the probe before
+the capture and the processor and hands each the probe's own bound method, so
+there is one probe and one answer; `GATE_NET_PROBE_ENABLED=false` hands them
+nothing and the pipeline behaves as it did before the probe existed.
+
 #### The journal line
 
 Every cycle writes exactly one `key=value` line at `INFO`, successes included,
@@ -898,10 +924,36 @@ decisions, then event delivery, then the corpus.** In order:
 2. **A quiet period first** (`GATE_CORPUS_QUIET_SECONDS`, default 60 s). The
    gaps inside a presence session — the spacing between frames, the wait for a
    verdict — are much shorter, so a session is never mistaken for quiet.
-3. **Real events first.** A non-empty outbox blocks the corpus entirely. An
-   owner waiting on an evidence image outranks a training frame, and delivery
-   lag is already p90 84 s with p99 pinned at the 600 s ceiling. A queue depth
-   that cannot be read counts as work pending.
+3. **Real events first.** A non-empty outbox blocks the corpus while that
+   outbox is being *delivered*. An owner waiting on an evidence image
+   outranks a training frame, and delivery lag is already p90 84 s with p99
+   pinned at the 600 s ceiling. A queue depth that cannot be read counts as
+   work pending.
+
+   Delivery is what the rule protects, so a queue nothing can deliver does
+   not hold the corpus for ever. The uploader reads the outbox worker's
+   `delivery_health()`: when every pending item has failed *before anything
+   answered* (`ConnectionError`, a connect or read timeout -- an HTTP status,
+   even a 500, is the cloud answering) and that has been so for
+   `GATE_CORPUS_OUTAGE_SECONDS` (`T`, default 900 s: longer than any delivery
+   legitimately takes, three outbox retry ceilings) -- or for less, if the
+   net probe's last full cycle within 30 minutes found the internet
+   `failed` -- the network is down for everyone and yielding achieves
+   nothing. Then the corpus makes **one attempt of its own** per
+   `GATE_CORPUS_OUTAGE_PROBE_SECONDS` (default 600 s), oldest artefact first,
+   at the usual byte rate; if the link answers it keeps going through the
+   batch, and if not it waits the probe interval rather than the exponential
+   backoff. It still stands down the instant the outbox actually puts an
+   item on the wire, checked before the first byte and between chunks like
+   the gate epoch, and the moment the outbox drains the ordinary rule is
+   back. Without an outbox worker to read (no cloud), the block is absolute
+   as before.
+
+   This exists because on 2026-09-22 the farm router dropped 30-70 % of
+   packets for a day: seven telemetry items sat on attempt 18, the journal
+   said `deferred reason=event_delivery pending=8` every five minutes from
+   11:13, and 51 audio segments waited behind them for a 48-hour horizon
+   that would have taken them unheard.
 4. **Abandon, do not finish.** The request body is produced in 8 KB chunks and
    checks the activity epoch between them, so a transfer already running is
    torn down the instant an event begins rather than completing. The epoch,
@@ -919,11 +971,24 @@ leaves the local copy exactly where it was.
 
 ### Watching It
 
-`gate_corpus stage=uploaded|deferred|aborted|upload_failed|unshippable` is the
-one journal prefix, and the heartbeat's `corpus` block carries the same state.
-The thing to watch for is `pending` climbing while `last_success_at` stands
-still: that is the buffer filling because uploads are failing, which is the
-corpus going back to being one copy on one card.
+`gate_corpus stage=uploaded|deferred|attempting|aborted|upload_failed|unshippable`
+is the one journal prefix, and the heartbeat's `corpus` block carries the
+same state. The thing to watch for is `pending` climbing while
+`last_success_at` stands still: that is the buffer filling because uploads
+are failing, which is the corpus going back to being one copy on one card.
+
+A deferral says which rule held it: `reason=event_delivery` is the outbox
+being delivered, `reason=network_down` is the outbox stuck on the link with
+the corpus waiting for its next probe (`next_probe_in_s`), and
+`stage=attempting reason=network_down_probe` is an attempt made under that
+rule; a failure it produces carries the same `reason`. An abort with
+`reason=outbox_send_started` is a probe standing down for the outbox. The
+heartbeat adds `outage_probes`, `last_attempt_reason` and `retention_hold`
+-- the reason unshipped audio is being kept past its horizon, or null.
+
+`stage=pruned_unshipped` is permanent loss the disk demanded: a frame the
+size cap took, or a segment the free-space floor took. It never happens
+quietly.
 
 `stage=unshippable` means an artefact cannot be sent as it stands — an empty
 payload, an unreadable sidecar. It is kept, not deleted, and counted where the
@@ -965,6 +1030,17 @@ the root, under `GATE_TRAINING_CORPUS_MAX_BYTES`; the clips are pruned by
 their own retention window and cap. Reading a directory is not owning it, and
 one directory with two pruners would eventually mean the one that knows
 nothing about the upload deleting a clip on its way to R2.
+
+The segment pruner does ask the uploader one question before taking an
+unshipped segment past the horizon: `CorpusUploadWorker.retention_hold()`,
+the reason the corpus is not draining (`event_delivery`, `network_down`,
+`upload_failed`) or `None`. While there is one, unshipped segments outlive
+`GATE_AUDIO_SEGMENTS_RETENTION_HOURS` and the bound is the free-space floor
+instead, journalled as `gate_audio_segments stage=retention_extended` when
+what is held changes and hourly otherwise; shipped and never-released
+segments still go at the horizon, and when the floor does bite it takes
+those first, oldest first, before the only copies. See
+[gate-audio.md](gate-audio.md#keeping-everything).
 
 ## Controller Cutover And Decommission
 
