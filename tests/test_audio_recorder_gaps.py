@@ -34,6 +34,19 @@ START = datetime(2026, 9, 20, 10, 40, 0, tzinfo=timezone.utc)
 ENTRY_POINT = Path(__file__).resolve().parent.parent / "gate_controller" / "__main__.py"
 
 
+def reading_store(directory, *, now=START):
+    """A store for reading back what a world wrote, on the fixture's clock.
+
+    ``SegmentStore.prune`` drops everything older than ``clock() - retention``
+    and its default clock is the real one, so a store left on the wall clock
+    deletes the very segments these assertions are about once the suite is run
+    more than the retention horizon after ``START``. Every store in this file
+    is pinned instead, so retention is measured against the fixture's own
+    timeline and the tests read the same thing on any day.
+    """
+    return SegmentStore(directory, clock=lambda: now)
+
+
 class FakeFfmpeg:
     """A child that writes ADTS frames to the real directory as the clock moves."""
 
@@ -166,6 +179,10 @@ class World:
         recorder._popen = self.popen
         recorder._probe = self.probe
         recorder._clock = lambda: self.now
+        # The store keeps a clock of its own, and it is the one that prunes.
+        # Left on the wall clock it would delete this world's segments as soon
+        # as the suite ran a retention horizon after START.
+        recorder.store._clock = lambda: self.now
         recorder._monotonic = lambda: self.monotonic_now
         recorder._waiter = self.wait
         recorder.run_forever(self.stop)
@@ -173,7 +190,7 @@ class World:
 
 
 def audio_seconds(directory):
-    return sum(segment.duration() for segment in SegmentStore(directory).segments())
+    return sum(segment.duration() for segment in reading_store(directory).segments())
 
 
 class RecorderCase(unittest.TestCase):
@@ -255,7 +272,7 @@ class ASourceDropMidSegment(RecorderCase):
         world = World(self.directory, until=START + timedelta(minutes=4))
         world.outages.append((START + timedelta(seconds=137), START + timedelta(seconds=150)))
         world.drive(self.build())
-        first = SegmentStore(self.directory).segments()[0]
+        first = reading_store(self.directory).segments()[0]
         self.assertGreaterEqual(first.duration(), 135.0)
         self.assertEqual(self.gaps()[0]["cause"], GAP_SOURCE)
 
@@ -266,7 +283,7 @@ class ASourceDropMidSegment(RecorderCase):
         world.stalls.append((START + timedelta(seconds=137), START + timedelta(seconds=1000)))
         recorder = world.drive(self.build())
 
-        first = SegmentStore(self.directory).segments()[0]
+        first = reading_store(self.directory).segments()[0]
         self.assertGreaterEqual(first.duration(), 135.0)
         self.assertGreaterEqual(recorder.status()["stalls"], 1)
         self.assertTrue(world.children[0][1].terminated)
@@ -284,7 +301,7 @@ class ASourceDropMidSegment(RecorderCase):
         world = World(self.directory, until=START + timedelta(minutes=5))
         world.stalls.append((START + timedelta(seconds=137), START + timedelta(seconds=1000)))
         world.drive(recorder)
-        first = SegmentStore(self.directory).segments()[0]
+        first = reading_store(self.directory).segments()[0]
         self.assertLess(first.duration(), 137.0 - 5.0)
         # A whole number of buffers, to the nearest: 127.99999999999 is four of
         # them, and `% 32` of it is 31.99999999999.
@@ -316,10 +333,10 @@ class Rotation(RecorderCase):
 
         self.assertEqual(len(world.children), 1)
         self.assertEqual(recorder.status()["restarts"], 0)
-        segments = SegmentStore(self.directory).segments()
+        segments = reading_store(self.directory).segments()
         self.assertEqual([s.started_at.minute for s in segments], [40, 45, 50, 55])
         self.assertAlmostEqual(audio_seconds(self.directory), 17 * 60, delta=2 * FRAME_SECONDS + 1.0)
-        for row in segment_coverage(SegmentStore(self.directory)):
+        for row in segment_coverage(reading_store(self.directory)):
             self.assertLess(row["missing_seconds"], 2 * FRAME_SECONDS, row["segment"])
         self.assertEqual(self.gaps(), [])
 
@@ -357,7 +374,7 @@ class GapsAsData(RecorderCase):
         world.drive(self.build())
         ledger = self.directory / audio_segments.GAP_LEDGER_NAME
         self.assertEqual(ledger.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn(ledger, [s.path for s in SegmentStore(self.directory).segments()])
+        self.assertNotIn(ledger, [s.path for s in reading_store(self.directory).segments()])
         from gate_controller.corpus import TrainingCorpus
         corpus = TrainingCorpus(self.directory, max_bytes=64 * 1024 * 1024)
         self.assertEqual([a for a in corpus.pending() if "listening" in a.stem], [])
@@ -408,7 +425,7 @@ class GapsAsData(RecorderCase):
         self.assertEqual(self.gaps(), [], "the recorder never stopped; this is not its gap")
 
         from gate_controller.gate_sound_scan import measure_listening
-        store = SegmentStore(self.directory)
+        store = reading_store(self.directory)
         scanned = [(segment.path.name, 0) for segment in store.segments()[:-1]]
         listening = measure_listening(store, scanned)
         self.assertEqual({gap["cause"] for gap in listening.gaps}, {GAP_SHORTFALL})
@@ -430,7 +447,7 @@ class TheHeartbeat(RecorderCase):
         world.outages.append(outage)
         world.drive(self.build())
 
-        store = SegmentStore(self.directory)
+        store = reading_store(self.directory)
         scanned = [(segment.path.name, 100) for segment in store.segments()[:-1]]
         database = LocalStore(self.directory / "gate.db")
         connection = sqlite3.connect(database.path)

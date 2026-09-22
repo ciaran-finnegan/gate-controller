@@ -234,7 +234,11 @@ class RecorderTests(unittest.TestCase):
         self._temporary = tempfile.TemporaryDirectory()
         self.directory = Path(self._temporary.name)
         self.addCleanup(self._temporary.cleanup)
-        self.store = SegmentStore(self.directory)
+        # Pinned, like every other store here: these tests write segments
+        # dated 2026-09-16, and a store left on the real clock prunes them
+        # once the suite is run past the retention horizon.
+        self.now = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+        self.store = SegmentStore(self.directory, clock=lambda: self.now)
 
     def test_the_child_is_told_to_name_its_files_in_utc(self):
         recorder = SegmentRecorder(self.store)
