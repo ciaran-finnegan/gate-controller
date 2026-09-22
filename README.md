@@ -17,6 +17,10 @@ staleness window, after which authorization fails closed.
 - An unreadable schedule, an unknown level, or an unloadable timezone fails
   closed to stricter matching, never to a wider one.
 - OCR, parsing, network, cloud, and audio failures leave the gate closed.
+- The relay drives a step-by-step input on a two-leaf swing gate: a pulse into an
+  open or moving gate closes, stops or reverses it, and out-of-sequence leaves
+  jam. Nothing may pulse a gate that is not provably shut, and nothing sends
+  "recovery" pulses. See [docs/gate-operator.md](docs/gate-operator.md).
 - A durable global activation marker is committed before GPIO is energized;
   optional event delivery remains off the recognition path.
 - Remote commands reach a loopback-only command server through Cloudflare
