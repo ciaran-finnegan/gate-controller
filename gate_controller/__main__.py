@@ -281,6 +281,16 @@ def main() -> None:
     if audio_capture is not None:
         background_workers += (audio_capture,)
     if audio_segments is not None:
+        # The pruner asks the uploader before taking an unshipped segment
+        # past the horizon: while the corpus is held off the card is the only
+        # copy, and the floor, not the clock, is what bounds it.
+        corpus_upload = next(
+            (worker for worker in background_workers
+             if isinstance(worker, CorpusUploadWorker)),
+            None,
+        )
+        if corpus_upload is not None:
+            audio_segments.store.hold_unshipped = corpus_upload.retention_hold
         background_workers += (audio_segments,)
     if hot_stream is not None:
         background_workers += (hot_stream,)
@@ -441,12 +451,15 @@ def _corpus_quiet_seconds(environment) -> float:
         raise ValueError(f"GATE_CORPUS_QUIET_SECONDS is invalid: {error}") from error
 
 
-def _corpus_upload_worker(environment, corpus, client, controller_id, activity):
+def _corpus_upload_worker(environment, corpus, client, controller_id, activity,
+                          outbox=None, net_probe=None):
     """The background worker that moves the corpus into R2, or None.
 
     Built only when there is a corpus to ship and a cloud to ship it to. It
     is deliberately the last worker in the list: nothing else waits on it,
-    and its failures are its own.
+    and its failures are its own. The outbox worker and the net probe are
+    what let it tell an outbox that is busy from a network that is down for
+    everyone; either may be absent.
     """
     if corpus is None or client is None:
         return None
@@ -456,6 +469,7 @@ def _corpus_upload_worker(environment, corpus, client, controller_id, activity):
     return CorpusUploadWorker(
         corpus, CloudflareCorpusSender(client, controller_id), activity,
         config=config, controller_id=controller_id,
+        outbox=outbox, net_probe=net_probe,
     )
 
 
@@ -849,12 +863,13 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             environment["GATE_CLOUDFLARE_ACCESS_CLIENT_ID"].strip(),
             environment["GATE_CLOUDFLARE_ACCESS_CLIENT_SECRET"].strip(),
         )
-        workers.append(OutboxWorker(
+        outbox_worker = OutboxWorker(
             store,
             CloudflareOutboxSender(cloudflare_client, controller_id),
             controller_id=controller_id,
             telemetry_retention_days=telemetry_retention_days,
-        ))
+        )
+        workers.append(outbox_worker)
         plates_worker = None
         if authorised is not None:
             plates_worker = AuthorisationRefreshWorker(
@@ -872,6 +887,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             ))
         corpus_upload = _corpus_upload_worker(
             environment, corpus, cloudflare_client, controller_id, activity,
+            outbox=outbox_worker, net_probe=net_probe,
         )
         # heartbeat_worker is late-bound on purpose: the status it reports
         # includes the round trip of the POST the worker itself makes.

@@ -17,7 +17,7 @@ import gate_controller.outbox as outbox_module
 from gate_controller.models import GateEvent
 from gate_controller.outbox import (
     CloudflareOutboxSender, EvidenceSpoolError, HttpOutboxSender, OutboxSyncError,
-    OutboxWorker,
+    OutboxWorker, is_connection_failure,
 )
 from gate_controller.store import LocalStore
 from gate_controller.telemetry import EventTelemetry, StageDurations
@@ -1114,6 +1114,122 @@ class OutboxWorkerTests(unittest.TestCase):
 
         self.assertIn("retry_in_s=300", logs.output[0])
         self.assertEqual(store.pending_outbox_count(), 1)
+
+
+class DeliveryHealthTests(unittest.TestCase):
+    """What the corpus uploader reads to tell a busy outbox from a dead link."""
+
+    def _queued_store(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = LocalStore(Path(directory.name) / "gate.db")
+        event_id = store.record_event(
+            GateEvent(
+                source="ocr", reason="exact_match", opened=True, idempotency_key="event-1",
+                received_at=datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc),
+            )
+        )
+        return store, event_id
+
+    def test_is_connection_failure_reads_the_cause_chain(self):
+        wrapped = RuntimeError("send failed")
+        wrapped.__cause__ = requests.ReadTimeout("read timed out")
+        for description, error, expected in (
+            ("requests could not connect", requests.ConnectionError("refused"), True),
+            ("requests timed out connecting", requests.ConnectTimeout("timed out"), True),
+            ("requests timed out reading", requests.ReadTimeout("timed out"), True),
+            ("a raw socket failed", ConnectionResetError("reset"), True),
+            ("a raw socket timed out", TimeoutError("timed out"), True),
+            ("wrapped by the sender", wrapped, True),
+            ("the cloud answered with a status",
+             OutboxSyncError("outbox endpoint returned HTTP 500"), False),
+            ("the cloud answered, wrapped", requests.HTTPError("503"), False),
+            ("the evidence was unreadable", EvidenceSpoolError("gone"), False),
+        ):
+            with self.subTest(description):
+                self.assertIs(is_connection_failure(error), expected)
+
+    def test_an_http_status_beneath_a_connection_error_is_still_an_answer(self):
+        # `raise OutboxSyncError(...) from HTTPError` with a ConnectionError
+        # earlier in the chain: the nearest cause decides, and it answered.
+        answered = OutboxSyncError("outbox endpoint returned HTTP 502")
+        answered.__cause__ = requests.HTTPError("502")
+        answered.__cause__.__context__ = requests.ConnectionError("earlier")
+        self.assertFalse(is_connection_failure(answered))
+
+    def test_health_tells_a_dead_link_from_a_refusing_cloud(self):
+        store, event_id = self._queued_store()
+        now = [datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)]
+        failure = {"error": requests.ConnectionError("connection refused")}
+
+        def send(payload):
+            if failure["error"] is not None:
+                raise failure["error"]
+
+        worker = OutboxWorker(
+            store, send=send, controller_id="primary",
+            clock=lambda: now[0], jitter=lambda: 1.0,
+        )
+        worker.enqueue(event_id)
+        before = worker.delivery_health()
+        self.assertEqual(before["pending"], 1)
+        self.assertEqual(before["failing"], 0)
+        self.assertFalse(before["unreachable"], "untried is not unreachable")
+
+        with self.assertLogs("gate_controller.outbox", level="WARNING"):
+            worker.run_once()
+        now[0] += timedelta(seconds=90)
+        stuck = worker.delivery_health()
+        self.assertEqual(stuck["pending"], 1)
+        self.assertEqual(stuck["failing"], 1)
+        self.assertTrue(stuck["unreachable"])
+        self.assertFalse(stuck["sending"])
+        self.assertEqual(stuck["last_error_type"], "ConnectionError")
+        self.assertEqual(stuck["stuck_for_s"], 90.0, "by the worker's clock")
+        self.assertIsInstance(stuck["oldest_pending_age_s"], float)
+
+        failure["error"] = OutboxSyncError("outbox endpoint returned HTTP 500")
+        now[0] += timedelta(seconds=301)
+        with self.assertLogs("gate_controller.outbox", level="WARNING"):
+            worker.run_once()
+        answered = worker.delivery_health()
+        self.assertFalse(answered["unreachable"], "a 500 is the cloud answering")
+        self.assertEqual(answered["last_error_type"], "OutboxSyncError")
+
+        failure["error"] = None
+        now[0] += timedelta(seconds=301)
+        self.assertEqual(worker.run_once(), 1)
+        drained = worker.delivery_health()
+        self.assertEqual((drained["pending"], drained["failing"]), (0, 0))
+        self.assertFalse(drained["unreachable"])
+        self.assertIsNone(drained["last_error_type"])
+        self.assertIsNone(drained["stuck_for_s"])
+        self.assertIsNone(drained["oldest_pending_age_s"])
+
+    def test_sending_is_true_only_while_the_item_is_on_the_wire(self):
+        store, event_id = self._queued_store()
+        seen = []
+
+        def send(payload):
+            seen.append(worker.sending())
+            raise requests.ConnectionError("refused")
+
+        worker = OutboxWorker(store, send=send, controller_id="primary")
+        worker.enqueue(event_id)
+        self.assertFalse(worker.sending())
+        with self.assertLogs("gate_controller.outbox", level="WARNING"):
+            worker.run_once()
+        self.assertEqual(seen, [True])
+        self.assertFalse(worker.sending(), "cleared on the way out, failure or not")
+
+    def test_health_never_raises_when_the_store_cannot_answer(self):
+        store, event_id = self._queued_store()
+        worker = OutboxWorker(store, send=lambda payload: None, controller_id="primary")
+        worker.enqueue(event_id)
+        store.pending_outbox_count = lambda: (_ for _ in ()).throw(sqlite3.OperationalError())
+        health = worker.delivery_health()
+        self.assertIsNone(health["pending"])
+        self.assertIsNone(health["oldest_pending_age_s"])
 
 
 if __name__ == "__main__":

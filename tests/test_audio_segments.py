@@ -538,3 +538,182 @@ class KeepEverythingTests(unittest.TestCase):
         self.assertFalse(load_segment_config({})["keep_everything"])
         self.assertTrue(load_segment_config(
             {"GATE_AUDIO_SEGMENTS_KEEP_EVERYTHING": "true"})["keep_everything"])
+
+
+class RetentionHoldTests(unittest.TestCase):
+    """The horizon is the clock while the uploader drains, and the disk while it cannot.
+
+    On 2026-09-22 the router dropped most packets for a day, the corpus
+    uploader deferred behind seven undeliverable telemetry items, and 51
+    unshipped segments -- the only copy of that audio -- sat waiting for a
+    48-hour horizon that would have taken them unheard.
+    """
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+        self.hold = [None]
+
+    def store(self, **overrides) -> SegmentStore:
+        settings = {"retention_hours": 48, "clock": lambda: self.now,
+                    "hold_unshipped": lambda: self.hold[0]}
+        settings.update(overrides)
+        store = SegmentStore(self.directory, **settings)
+        store.free_bytes = lambda: DEFAULT_MIN_FREE_BYTES * 2
+        return store
+
+    def write(self, hours_ago: float, *, state="fresh") -> Path:
+        started = self.now - timedelta(hours=hours_ago)
+        path = self.directory / f"gate-{started.strftime('%Y%m%dT%H%M%S')}Z.aac"
+        path.write_bytes(stream(10))
+        if state == "unshipped":
+            path.with_suffix(".json").write_text("{}")
+        elif state == "shipped":
+            path.with_suffix(".shipped").write_bytes(b"")
+        return path
+
+    def test_unshipped_segments_outlive_the_horizon_while_the_uploader_is_held_off(self):
+        unshipped = self.write(50, state="unshipped")
+        shipped = self.write(49, state="shipped")
+        never_released = self.write(49.5)
+        recent = self.write(10, state="unshipped")
+        self.write(0.1)
+        self.hold[0] = "network_down"
+        store = self.store()
+
+        with self.assertLogs("gate_controller.audio_segments", level="INFO") as logs:
+            report = store.prune()
+
+        self.assertEqual(report["held"], 1)
+        self.assertEqual(report["expired"], 2, "shipped and never-released still go")
+        self.assertTrue(unshipped.exists())
+        self.assertTrue(unshipped.with_suffix(".json").exists(), "still offered to the uploader")
+        self.assertFalse(shipped.exists())
+        self.assertFalse(never_released.exists())
+        self.assertTrue(recent.exists())
+        held_lines = [line for line in logs.output if "stage=retention_extended" in line]
+        self.assertEqual(len(held_lines), 1)
+        self.assertIn("reason=network_down held=1", held_lines[0])
+        self.assertIn("oldest=2026-09-20T10:00:00+00:00", held_lines[0])
+        self.assertIn("detail=unshipped_kept_until_disk_demands", held_lines[0])
+        self.assertFalse(any("pruned_unshipped" in line for line in logs.output))
+        self.assertEqual(store.held, 1)
+
+    def test_the_hold_is_journalled_when_it_changes_and_hourly_otherwise(self):
+        self.write(50, state="unshipped")
+        self.write(0.1)
+        self.hold[0] = "event_delivery"
+        store = self.store()
+        with self.assertLogs("gate_controller.audio_segments", level="INFO") as logs:
+            store.prune()
+            self.now += timedelta(minutes=5)
+            store.prune()
+        self.assertEqual(sum("retention_extended" in line for line in logs.output), 1)
+
+        self.hold[0] = "network_down"
+        with self.assertLogs("gate_controller.audio_segments", level="INFO") as logs:
+            store.prune()
+        self.assertIn("reason=network_down", logs.output[0])
+
+        self.now += timedelta(hours=1, minutes=1)
+        with self.assertLogs("gate_controller.audio_segments", level="INFO") as logs:
+            store.prune()
+        self.assertIn("retention_extended", logs.output[0])
+
+    def test_the_hold_ends_when_the_uploader_is_draining_again(self):
+        stale = self.write(50, state="unshipped")
+        self.write(0.1)
+        store = self.store()
+        self.hold[0] = "network_down"
+        store.prune()
+        self.assertTrue(stale.exists())
+
+        self.hold[0] = None
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING") as logs:
+            report = store.prune()
+        self.assertEqual(report["held"], 0)
+        self.assertTrue(any("pruned_unshipped" in line for line in logs.output))
+        self.assertFalse(stale.exists())
+        self.assertEqual(store.held, 0)
+
+    def test_a_hold_that_cannot_be_read_is_no_hold(self):
+        stale = self.write(50, state="unshipped")
+        self.write(0.1)
+        broken = self.store(hold_unshipped=lambda: (_ for _ in ()).throw(RuntimeError("gone")))
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING"):
+            broken.prune()
+        self.assertFalse(stale.exists())
+
+        absent = self.store(hold_unshipped=None)
+        self.write(51, state="unshipped")
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING"):
+            absent.prune()
+
+    def test_the_floor_takes_what_the_cloud_already_has_before_the_only_copy(self):
+        oldest_unshipped = self.write(3, state="unshipped")
+        shipped = self.write(2.5, state="shipped")
+        never_released = self.write(2)
+        newer_unshipped = self.write(1.5, state="unshipped")
+        newest = self.write(0.1)
+        self.hold[0] = "network_down"
+        store = self.store()
+        free = [0]
+        store.free_bytes = lambda: free[0]
+        removed = []
+        original = store._remove
+
+        def recording(segment):
+            removed.append(segment.path)
+            if len(removed) == 2:
+                free[0] = DEFAULT_MIN_FREE_BYTES * 2
+            return original(segment)
+
+        store._remove = recording
+
+        report = store.prune()
+
+        self.assertEqual(report["for_space"], 2)
+        self.assertEqual(removed, [shipped, never_released],
+                         "shipped and never-released first, oldest first")
+        self.assertTrue(oldest_unshipped.exists())
+        self.assertTrue(newer_unshipped.exists())
+        self.assertTrue(newest.exists())
+
+        # When the disk still demands it, the only copies go too -- oldest
+        # first, and never quietly.
+        free[0] = 0
+        store._remove = original
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING") as logs:
+            report = store.prune()
+        self.assertEqual(report["for_space"], 2)
+        self.assertFalse(oldest_unshipped.exists())
+        self.assertFalse(newer_unshipped.exists())
+        self.assertTrue(newest.exists(), "the one being written is never a candidate")
+        self.assertEqual(sum("pruned_unshipped" in line for line in logs.output), 2)
+
+    def test_a_held_segment_past_the_horizon_still_goes_when_the_floor_demands(self):
+        held = self.write(50, state="unshipped")
+        self.write(0.1)
+        self.hold[0] = "network_down"
+        store = self.store()
+        store.free_bytes = lambda: 0
+        with self.assertLogs("gate_controller.audio_segments", level="WARNING") as logs:
+            report = store.prune()
+        self.assertEqual((report["held"], report["for_space"]), (0, 1))
+        self.assertFalse(held.exists())
+        self.assertTrue(any("pruned_unshipped" in line for line in logs.output))
+
+    def test_the_recorder_reports_what_it_is_holding(self):
+        from gate_controller.audio_segments import SegmentRecorder
+
+        self.write(50, state="unshipped")
+        self.write(0.1)
+        self.hold[0] = "network_down"
+        store = self.store()
+        recorder = SegmentRecorder(store, source_url="rtsp://127.0.0.1:8554/clear")
+        self.assertEqual(recorder.status()["held_unshipped"], 0)
+        store.prune()
+        self.assertEqual(recorder.status()["held_unshipped"], 1)
+
