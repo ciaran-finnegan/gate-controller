@@ -20,17 +20,30 @@ compared with a slowly adapting background. By day the comparison is in the
 log domain with the median change removed, so an exposure step or the sun
 going in is no change at all, and what is left has to be one connected,
 vehicle-sized blob that *enters* rather than appears everywhere at once and
-holds for consecutive samples. By night -- the patch is black -- the signal is
-a bright source that appears, persists and does not shrink, with diffuse light
+holds for consecutive samples -- and, since the first shadow day, must have
+*replaced* what was there rather than re-lit it: cloud shade keeps the
+gravel's texture underneath, a vehicle does not (``blob_spread``). By night --
+the patch is black -- the signal is a bright source of some size that appears,
+persists, does not shrink and lights the ground around it, with diffuse light
 (a car passing on the road beyond, the floodlight) removed the same way. The
 two are separate detectors with separate thresholds, chosen by the measured
 luma of the background.
 
+**What confirms it.** A would-trigger of the vision rule is not, on its own, a
+decision. Two looks that already ran in shadow are now on the decision path:
+the farm-machinery image tower shown a square of the clear stream around the
+lane (does it see a vehicle class, not ``empty``?) and the local plate reader
+shown the plate band (is there a plate box?). Either confirms; both are asked
+in parallel and waited for no longer than ``GATE_EARLY_TRIGGER_CONFIRM_SECONDS``
+(0.5). The vision rule's own verdict, the looks and the final decision are
+recorded separately, so the report can still measure the raw rule.
+
 **What it may do.** ``GATE_EARLY_TRIGGER=off|shadow|on``; the code's default is
 ``off``. In ``shadow`` it journals and records and touches nothing. In ``on`` a
-would-trigger asks :class:`~gate_controller.trigger_capture.TriggerFrameCapture`
-for a *local-only* sweep. The rule that sweep runs under is not in this module
-and is not negotiable from it: nothing of an early-origin passage reaches the
+*confirmed* would-trigger asks
+:class:`~gate_controller.trigger_capture.TriggerFrameCapture` for a
+*local-only* sweep; an unconfirmed one asks for nothing. The rule that sweep
+runs under is not in this module and is not negotiable from it: nothing of an early-origin passage reaches the
 cloud plate reader until the camera's own vehicle event for it has arrived.
 
 Everything it sees is written to its own SQLite file beside the controller's
@@ -52,7 +65,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
 
 from .plate_region import PlateRegion
@@ -76,6 +89,7 @@ ENV_MIN_INTERVAL = "GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS"
 ENV_MAX_PER_HOUR = "GATE_EARLY_TRIGGER_MAX_PER_HOUR"
 ENV_BACKOFF = "GATE_EARLY_TRIGGER_BACKOFF_SECONDS"
 ENV_LAYERS_PER_MINUTE = "GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE"
+ENV_CONFIRM_SECONDS = "GATE_EARLY_TRIGGER_CONFIRM_SECONDS"
 ENV_THUMBNAILS = "GATE_EARLY_TRIGGER_THUMBNAILS"
 ENV_THUMBNAIL_MAX = "GATE_EARLY_TRIGGER_THUMBNAIL_MAX"
 ENV_THUMBNAIL_DAYS = "GATE_EARLY_TRIGGER_THUMBNAIL_DAYS"
@@ -122,6 +136,20 @@ DEFAULT_MAX_PER_HOUR = 12
 DEFAULT_BACKOFF_SECONDS = 1800.0
 MAX_BACKOFF_SECONDS = 4 * 3600.0
 DEFAULT_LAYERS_PER_MINUTE = 4
+#: How long a would-trigger waits for a confirming look before it is judged
+#: unconfirmed. Measured on the Pi on 2026-09-22: the CLIP look answered in
+#: 455-530 ms end to end (one clear-stream keyframe decode, ~0.3 s, then the
+#: 108 ms embed) and a single plate look is a decode and a ~200 ms read. The
+#: two run in parallel, so the first answer is about half a second away and
+#: half a second is the bound. Every second here is a second off the lead,
+#: so it is a bound, not a target: the wait ends at the first "yes".
+DEFAULT_CONFIRM_SECONDS = 0.5
+MAX_CONFIRM_SECONDS = 3.0
+#: A CLIP look whose ``empty`` share is at or under this sees a vehicle class.
+#: On the Pi's real frames a car in the lane read ``empty`` 0.03 and the
+#: empty lane 0.997-1.0 (eight looks on 2026-09-22), so the line has room on
+#: both sides.
+CLIP_EMPTY_MAX = 0.5
 DEFAULT_THUMBNAIL_MAX = 500
 DEFAULT_THUMBNAIL_DAYS = 7.0
 #: A would-trigger with no camera alarm within this long either side of it is
@@ -169,6 +197,23 @@ class DetectorConfig:
     #: |median log ratio| that means the whole patch changed brightness: an
     #: exposure step or the sun. The background is re-based, nothing triggers.
     global_jump: float = 0.22
+    #: Light or an object? Cloud shade arriving over part of the patch is a
+    #: connected, vehicle-sized, entering, held blob -- every one of the seven
+    #: false day triggers of 2026-09-22 was one -- but it *re-lights* the
+    #: gravel rather than replacing it, so inside the blob the log ratio to
+    #: the background is nearly one number: measured spread (standard
+    #: deviation of the residual over the blob's cells) 0.00-0.17 on the
+    #: seven, all of one sign. A vehicle brings its own texture: 0.53-0.61 on
+    #: the three real vehicle frames of the same day (a dark front at the far
+    #: fence gap, a pale flank filling the patch, twice). The line is 0.30.
+    day_light_max_spread: float = 0.30
+    #: ...and shade is only so deep. The seven measured a mean residual of
+    #: -0.22 to -0.40 (the gravel 20-33% darker); the dark car front was
+    #: -0.74. A uniform blob *this* far from the background is an object
+    #: whatever its texture, which is what keeps a flat-sided car, or a
+    #: painted one in the fixtures, from reading as light. A hard noon
+    #: shadow could exceed it: that is what the confirmation layer is for.
+    day_light_max_contrast: float = 0.55
     # -- night: a bright source on a black patch -----------------------------
     #: Background mean (0-255) below which the patch is dark. The re-aimed
     #: view at night measured 0.1-1.8; a dull dawn is over 40.
@@ -179,8 +224,19 @@ class DetectorConfig:
     night_delta: float = 60.0
     #: ...and how bright in itself. A lamp in view blooms to near white.
     night_peak: float = 150.0
-    night_min_cells: int = 2
+    #: Cells the source must cover. The one night false trigger of
+    #: 2026-09-22 (04:29 UTC) was two cells, 0.5% of the patch, at peak 181:
+    #: eyeshine or a droplet. A headlamp pair at the fence gap is 60 px and
+    #: more across the sub stream, several cells before it blooms.
+    night_min_cells: int = 4
     night_max_area: float = 0.60
+    #: A car lights the ground around it: the median rise of the patch (the
+    #: diffuse light the delta is measured over) must be at least this many
+    #: levels when the source would trigger. The point source measured 0.0;
+    #: the one real floodlit frame with a car in the lane measured 44; the
+    #: black patch itself sits at 0.1-1.8. Reasoned from those, not fitted
+    #: to a night arrival, because none has been recorded.
+    night_min_spill: float = 3.0
     #: Samples the source must hold for. A passing car's beam crosses in well
     #: under a second; four samples at 4 fps span 0.75 s.
     night_persistence: int = 4
@@ -216,6 +272,7 @@ class EarlyTriggerConfig:
     max_per_hour: int = DEFAULT_MAX_PER_HOUR
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
     layers_per_minute: int = DEFAULT_LAYERS_PER_MINUTE
+    confirm_seconds: float = DEFAULT_CONFIRM_SECONDS
     thumbnails: bool = True
     thumbnail_max: int = DEFAULT_THUMBNAIL_MAX
     thumbnail_days: float = DEFAULT_THUMBNAIL_DAYS
@@ -278,10 +335,14 @@ def load_config(environment=None, state_directory: Path | None = None) -> EarlyT
         day_entry_max_area=number("DAY_ENTRY_MAX_AREA", defaults.day_entry_max_area, 0.05, 1.0),
         day_max_scatter=number("DAY_MAX_SCATTER", defaults.day_max_scatter, 0.0, 1.0),
         day_persistence=int(number("DAY_PERSISTENCE", defaults.day_persistence, 1, 20)),
+        day_light_max_spread=number("DAY_LIGHT_MAX_SPREAD", defaults.day_light_max_spread, 0.0, 2.0),
+        day_light_max_contrast=number(
+            "DAY_LIGHT_MAX_CONTRAST", defaults.day_light_max_contrast, 0.0, 3.0),
         night_luma=number("NIGHT_LUMA", defaults.night_luma, 0.0, 255.0),
         night_delta=number("NIGHT_DELTA", defaults.night_delta, 5.0, 255.0),
         night_peak=number("NIGHT_PEAK", defaults.night_peak, 0.0, 255.0),
         night_min_cells=int(number("NIGHT_MIN_CELLS", defaults.night_min_cells, 1, 200)),
+        night_min_spill=number("NIGHT_MIN_SPILL", defaults.night_min_spill, 0.0, 255.0),
         night_persistence=int(number("NIGHT_PERSISTENCE", defaults.night_persistence, 1, 40)),
         night_min_growth=number("NIGHT_MIN_GROWTH", defaults.night_min_growth, 0.0, 10.0),
         night_max_speed=number("NIGHT_MAX_SPEED", defaults.night_max_speed, 0.05, 50.0),
@@ -305,6 +366,8 @@ def load_config(environment=None, state_directory: Path | None = None) -> EarlyT
             environment, ENV_BACKOFF, DEFAULT_BACKOFF_SECONDS, 60.0, MAX_BACKOFF_SECONDS),
         layers_per_minute=int(_bounded(
             environment, ENV_LAYERS_PER_MINUTE, DEFAULT_LAYERS_PER_MINUTE, 0, 30)),
+        confirm_seconds=_bounded(
+            environment, ENV_CONFIRM_SECONDS, DEFAULT_CONFIRM_SECONDS, 0.1, MAX_CONFIRM_SECONDS),
         thumbnails=str(environment.get(ENV_THUMBNAILS) or "true").strip().lower()
         not in ("0", "false", "no", "off"),
         thumbnail_max=int(_bounded(environment, ENV_THUMBNAIL_MAX, DEFAULT_THUMBNAIL_MAX, 0, 5000)),
@@ -361,8 +424,11 @@ class PatchDetector:
     ``sudden``    a large region changed at once: light, not a vehicle entering
     ``scattered`` change all over the patch: foliage, rain, dappled shade
     ``candidate`` something vehicle-like, not yet held for long enough
+    ``illumination`` (day) the blob re-lit the ground instead of replacing it:
+                  cloud shade, a sun patch. The background is re-based
     ``fading``    (night) a source that is already going away
     ``sweeping``  (night) a source crossing the patch too fast to be on the lane
+    ``unlit``     (night) a bright point that throws no light on the ground
     ``trigger``   a would-trigger, once per appearance
     ``occupied``  still the thing that triggered, or the refractory gap
     """
@@ -450,6 +516,7 @@ class PatchDetector:
         blob_fraction = len(blob) / self._cells
         changed_fraction = len(changed) / self._cells
         cx, cy = _centroid(blob, self.width, self.height)
+        contrast, spread, mixed = _blob_structure(residual, blob)
         features = {
             "light": self._light,
             "mean_luma": round(mean, 1),
@@ -462,6 +529,10 @@ class PatchDetector:
             "blob_cells": len(blob),
             "scatter": round(changed_fraction - blob_fraction, 4),
             "cx": cx, "cy": cy,
+            # Inside the blob: how far from the background (signed, the mean
+            # residual), how *uniformly* (its spread) and what share of its
+            # cells went the other way. Light is uniform and one-signed.
+            "blob_contrast": contrast, "blob_spread": spread, "blob_mixed": mixed,
             "scene_difference": round(
                 thumbnail_difference([int(round(v)) for v in background], cells), 4),
             "stillness": (
@@ -539,6 +610,19 @@ class PatchDetector:
             features["speed"] = round(speed, 3)
             if speed > config.night_max_speed:
                 return "sweeping"
+            if shift < config.night_min_spill:
+                # A point of light and a black patch around it. The run is
+                # kept: if the spill arrives a sample later, so does this.
+                return "unlit"
+        elif (
+            abs(features["blob_contrast"]) < config.day_light_max_contrast
+            and features["blob_spread"] < config.day_light_max_spread
+        ):
+            # The ground is still there under the change, only lit
+            # differently. Take it as the scene and do not wait on it.
+            self._run, self._run_first = 0, None
+            self._fast_until = now + 1.5
+            return "illumination"
         if (
             self._last_trigger_at is not None
             and now - self._last_trigger_at < config.refractory_seconds
@@ -578,6 +662,22 @@ class PatchDetector:
             background[index] += rate * (value - background[index])
             if verdict not in ("global", "sudden"):
                 noise[index] += learn * (min(cap, abs(residual[index])) - noise[index])
+
+
+def _blob_structure(residual, blob) -> tuple[float, float, float]:
+    """``(contrast, spread, mixed)`` of the residual over the blob's cells.
+
+    The mean residual (signed), its standard deviation, and the share of cells
+    whose sign is in the minority. All zero for no blob.
+    """
+    if not blob:
+        return 0.0, 0.0, 0.0
+    values = [residual[cell] for cell in blob]
+    mean = sum(values) / len(values)
+    spread = math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+    negative = sum(1 for value in values if value < 0)
+    mixed = min(negative, len(values) - negative) / len(values)
+    return round(mean, 3), round(spread, 3), round(mixed, 3)
 
 
 def _median(values) -> float:
@@ -698,15 +798,16 @@ class EarlyTriggerStore:
     def record(self, *, kind: str, source: str, at_epoch: float, mode: str,
                light: str | None = None, detector_state: str | None = None,
                features: dict | None = None, action: str = "none",
-               thumbnail: str | None = None) -> int | None:
+               thumbnail: str | None = None, layers: dict | None = None) -> int | None:
         try:
             with self._lock, closing(self._connect()) as connection, connection:
                 cursor = connection.execute(
                     "INSERT INTO early_trigger_observations (kind, source, at, at_epoch, mode,"
-                    " light, detector_state, features, action, thumbnail)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " light, detector_state, features, action, thumbnail, layers)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (kind, source, _iso(at_epoch), at_epoch, mode, light, detector_state,
-                     json.dumps(features or {}, sort_keys=True), action, thumbnail),
+                     json.dumps(features or {}, sort_keys=True), action, thumbnail,
+                     json.dumps(layers or {}, sort_keys=True)),
                 )
                 return cursor.lastrowid
         except Exception:
@@ -896,15 +997,79 @@ class ThumbnailStore:
 
 
 # ---------------------------------------------------------------------------
-# Confirmation layers, evaluated in shadow
+# Confirmation layers: on the decision path, bounded
 # ---------------------------------------------------------------------------
 
-class ConfirmationLayers:
-    """What a second look would have said, recorded beside the would-trigger.
+class Confirmation:
+    """One would-trigger's answer from the layers, as it arrives.
 
-    Each layer is timed, bounded, and skipped -- and recorded as skipped --
-    when the controller is busy with a vehicle. Both run on their own thread,
-    one would-trigger at a time, and never more than ``per_minute`` a minute.
+    The worker waits on it for at most the deadline; a layer that sees a
+    vehicle calls :meth:`confirm` and the wait ends there. The camera's own
+    alarm arriving calls :meth:`cancel`: the camera has spoken and there is
+    nothing left to lead. The record keeps ``status`` (``confirmed``,
+    ``unconfirmed``, ``cancelled``, or why the layers never ran), which layer
+    answered, and the wait in milliseconds.
+    """
+
+    def __init__(self, status: str = "pending", *, deadline_seconds: float = 0.0):
+        self._event = Event()
+        self._lock = Lock()
+        self.status = status
+        self.by: str | None = None
+        self.waited_ms: int | None = None
+        self.deadline_seconds = deadline_seconds
+        self.deadline_ms = round(deadline_seconds * 1000)
+        if status != "pending":
+            self._event.set()
+
+    def confirm(self, by: str) -> None:
+        with self._lock:
+            if self.status == "pending":
+                self.status, self.by = "confirmed", by
+            elif self.status == "unconfirmed" and self.by is None:
+                # Too late for the decision, but worth knowing: the deadline
+                # was what stood between this look and the sweep.
+                self.by = f"{by}_late"
+        self._event.set()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        with self._lock:
+            if self.status == "pending":
+                self.status = reason
+        self._event.set()
+
+    def wait(self, clock=monotonic) -> dict:
+        """Block up to the deadline; settle ``unconfirmed`` if nothing came. The record."""
+        started = clock()
+        self._event.wait(self.deadline_seconds)
+        with self._lock:
+            if self.status == "pending":
+                self.status = "unconfirmed"
+            self.waited_ms = round((clock() - started) * 1000)
+        return self.record()
+
+    @property
+    def confirmed(self) -> bool:
+        return self.status == "confirmed"
+
+    def record(self) -> dict:
+        with self._lock:
+            return {"status": self.status, "by": self.by, "waited_ms": self.waited_ms,
+                    "deadline_ms": self.deadline_ms}
+
+
+def clip_sees_vehicle(answer: dict | None) -> bool | None:
+    """The CLIP look's vote: True, False, or None when it gave no opinion."""
+    if not answer or answer.get("status") != "ok":
+        return None
+    try:
+        return float(answer.get("empty", 1.0)) <= CLIP_EMPTY_MAX
+    except (TypeError, ValueError):
+        return None
+
+
+class ConfirmationLayers:
+    """Two second looks at a would-trigger, run in parallel, on the decision path.
 
     ``clip_look`` takes a JPEG and returns label shares (the farm-machinery
     tower's prompts include an empty drive); ``lane_frame`` supplies that JPEG:
@@ -912,6 +1077,14 @@ class ConfirmationLayers:
     the centre square of what it is given and an arrival first appears at the
     far left. ``plate_frame`` and ``plate_read`` are the clear stream's newest
     keyframe cut to the plate band and the sweep's own local reader.
+
+    Each look is timed, bounded, and skipped -- and recorded as skipped --
+    when the controller is busy with a vehicle. The two run on their own
+    threads, one would-trigger at a time, never more than ``per_minute`` a
+    minute (the image tower's own rate cap is the agricultural policy's; this
+    keeps the looks well under it). The first look to see a vehicle confirms;
+    the plate look goes on to its third frame afterwards so the record says
+    what a longer wait would have bought.
     """
 
     PLATE_LOOKS = 3
@@ -919,7 +1092,7 @@ class ConfirmationLayers:
 
     def __init__(self, *, clip_look=None, lane_frame=None, plate_frame=None, plate_read=None,
                  busy=None, per_minute: int = DEFAULT_LAYERS_PER_MINUTE, clock=monotonic,
-                 sleep=None):
+                 sleep=None, deadline_seconds: float = DEFAULT_CONFIRM_SECONDS):
         self._clip_look = clip_look
         self._lane_frame = lane_frame
         self._plate_frame = plate_frame
@@ -928,33 +1101,59 @@ class ConfirmationLayers:
         self._per_minute = per_minute
         self._clock = clock
         self._sleep = sleep
+        self.deadline_seconds = deadline_seconds
         self._begun: deque = deque()
         self._running = Lock()
 
     def set_clip_look(self, clip_look) -> None:
         self._clip_look = clip_look
 
-    def begin(self, done) -> bool:
-        """Start the looks on their own thread; ``done(layers)`` gets the answer."""
+    def begin(self, done) -> Confirmation:
+        """Start both looks on their own threads. ``done(layers)`` gets the full record.
+
+        Returns the :class:`Confirmation` to wait on. When the looks cannot
+        run at all it is already settled with the reason, and ``done`` has
+        already been called with that reason as each layer's status.
+        """
         skipped = self._refusal()
         if skipped is not None:
             done({"clip": {"status": skipped}, "plate_look": {"status": skipped}})
-            return False
+            return Confirmation(skipped, deadline_seconds=self.deadline_seconds)
+        confirmation = Confirmation(deadline_seconds=self.deadline_seconds)
+        answers: dict = {}
+        answers_lock = Lock()
 
-        def run():
+        def look(name, run):
             try:
-                done(self.evaluate())
+                answer = run(confirmation)
             except Exception:
-                LOGGER.warning("gate_early_trigger stage=layers_failed", exc_info=True)
-            finally:
-                self._running.release()
+                LOGGER.warning("gate_early_trigger stage=layer_failed layer=%s", name, exc_info=True)
+                answer = {"status": "error"}
+            with answers_lock:
+                answers[name] = answer
+                finished = len(answers) == 2
+            if finished:
+                # Nothing said yes: settle the wait rather than let it run
+                # to the deadline for no reason.
+                confirmation.cancel(
+                    "unavailable" if all(a.get("status") == "unavailable" for a in answers.values())
+                    else "unconfirmed")
+                try:
+                    done(dict(answers))
+                except Exception:
+                    LOGGER.warning("gate_early_trigger stage=layers_failed", exc_info=True)
+                finally:
+                    self._running.release()
 
         try:
-            Thread(target=run, name="gate-early-trigger-layers", daemon=True).start()
+            for name, run in (("clip", self._clip), ("plate_look", self._plate)):
+                Thread(target=look, args=(name, run),
+                       name=f"gate-early-trigger-{name}", daemon=True).start()
         except Exception:
             self._running.release()
-            return False
-        return True
+            confirmation.cancel("error")
+            done({"clip": {"status": "error"}, "plate_look": {"status": "error"}})
+        return confirmation
 
     def _refusal(self) -> str | None:
         if self._per_minute <= 0:
@@ -973,9 +1172,10 @@ class ConfirmationLayers:
         return None
 
     def evaluate(self) -> dict:
+        """Both looks, here and now, with nobody waiting. For the record alone."""
         return {"clip": self._clip(), "plate_look": self._plate()}
 
-    def _clip(self) -> dict:
+    def _clip(self, confirmation: Confirmation | None = None) -> dict:
         if self._clip_look is None or self._lane_frame is None:
             return {"status": "unavailable"}
         if self._busy():
@@ -990,9 +1190,12 @@ class ConfirmationLayers:
             return {"status": "error"}
         answer = dict(answer or {"status": "unavailable"})
         answer["ms"] = round((self._clock() - started) * 1000)
+        answer["vehicle"] = clip_sees_vehicle(answer)
+        if confirmation is not None and answer["vehicle"]:
+            confirmation.confirm("clip")
         return answer
 
-    def _plate(self) -> dict:
+    def _plate(self, confirmation: Confirmation | None = None) -> dict:
         if self._plate_frame is None or self._plate_read is None:
             return {"status": "unavailable"}
         started = self._clock()
@@ -1001,6 +1204,7 @@ class ConfirmationLayers:
             if self._busy():
                 # A real sweep owns the reader from here.
                 return {"status": "skipped_busy", "reads": reads,
+                        "plate_box": any(read.get("plate_box") for read in reads),
                         "ms": round((self._clock() - started) * 1000)}
             if index and self._sleep is not None:
                 self._sleep(self.PLATE_LOOK_SPACING_SECONDS)
@@ -1013,12 +1217,16 @@ class ConfirmationLayers:
             except Exception:
                 reads.append({"status": "error"})
                 continue
+            box = bool(getattr(read, "recognised", False))
             reads.append({
                 "status": getattr(read, "status", "unavailable"),
-                "plate_box": bool(getattr(read, "recognised", False)),
+                "plate_box": box,
                 "score": round(float(getattr(read, "score", 0.0) or 0.0), 3),
                 "authorised": bool(getattr(read, "authorised", False)),
+                "ms": round((self._clock() - started) * 1000),
             })
+            if box and confirmation is not None:
+                confirmation.confirm("plate")
         return {
             "status": "ok", "reads": reads,
             "plate_box": any(read.get("plate_box") for read in reads),
@@ -1036,7 +1244,9 @@ class EarlyTriggerWorker:
     ``capture`` is the production :class:`TriggerFrameCapture`. It is handed
     over in every mode and *called* only in ``on``: :meth:`_act` is the one
     place this module reaches anything that can start work, and in ``shadow``
-    it returns before it gets there.
+    it returns before it gets there. In ``on`` it is reached only with a
+    confirmed would-trigger: vision, and then the image tower or the plate
+    reader agreeing within ``confirm_seconds``.
     """
 
     def __init__(self, config: EarlyTriggerConfig, *, capture=None, activity=None,
@@ -1070,6 +1280,11 @@ class EarlyTriggerWorker:
         self._backoff_until: float | None = None
         self._backoff_seconds = config.backoff_seconds
         self._pending_sweep_row: int | None = None
+        self._confirmation: Confirmation | None = None
+        self._confirmed = 0
+        self._unconfirmed_triggers = 0
+        self._refused = 0
+        self._last_verdict: str | None = None
         self._last_correlated_at = 0.0
         self._last_status_at = 0.0
         width, height = config.frame_size
@@ -1106,6 +1321,11 @@ class EarlyTriggerWorker:
             last = self.detector.last
             features = dict(last.features) if last is not None else {}
             features["event_type"] = str(getattr(event, "event_type", "unknown"))
+            # A would-trigger waiting to be confirmed has nothing left to
+            # lead: the camera has spoken, so the wait ends now.
+            pending = self._confirmation
+            if pending is not None:
+                pending.cancel("cancelled_camera_alarm")
             thumbnail = self._thumbnail(now, "alarm")
             # A camera alarm settles the account for whatever came before it:
             # the feature is doing its job, so the backoff is forgiven.
@@ -1138,10 +1358,10 @@ class EarlyTriggerWorker:
             return
         LOGGER.info(
             "gate_early_trigger stage=configured mode=%s patch=%s fps=%g source=%s hours=%s "
-            "min_interval_s=%g max_per_hour=%d%s",
+            "min_interval_s=%g max_per_hour=%d confirm_s=%g%s",
             self.config.mode, self.config.patch.as_env(), self.config.detector.fps,
             "sub_stream", self.config.hours_text, self.config.min_interval_seconds,
-            self.config.max_per_hour,
+            self.config.max_per_hour, self.config.confirm_seconds,
             "" if self.config.requested_mode is None
             else f" requested={self.config.requested_mode}",
         )
@@ -1212,44 +1432,119 @@ class EarlyTriggerWorker:
         self._frames.append(frame)
         observation = self.detector.observe(grid_from_frame(frame, self.frame_size), now)
         self._state = "warming" if observation.verdict == "warming" else "armed"
+        verdict, previous = observation.verdict, self._last_verdict
+        self._last_verdict = verdict
+        if verdict in ("illumination", "unlit") and verdict != previous:
+            # The vision rule's own refusals, once per appearance, so the
+            # shadow record can say how often light alone got this far.
+            self._refused += 1
+            features = observation.features
+            LOGGER.info(
+                "gate_early_trigger stage=refused reason=%s light=%s blob=%.3f contrast=%s "
+                "spread=%s mixed=%s shift=%s peak=%d",
+                verdict, observation.light, features["blob_fraction"],
+                features["blob_contrast"], features["blob_spread"], features["blob_mixed"],
+                features["shift"], features["peak"],
+            )
         if observation.triggered:
             self._would_trigger(observation)
 
     def _would_trigger(self, observation: Observation) -> None:
+        """The vision rule fired. Ask the layers, wait the bound, decide, record.
+
+        Three things are written down separately: the rule's own evidence
+        (``features``), what the layers said and the decision made on it
+        (``layers``, with its ``decision``), and what was done (``action``).
+        The wait is on this thread, which is the detector's; it is bounded by
+        the deadline, ends at the first "yes", and ends at once when the
+        camera's own alarm arrives. Nothing here is under the worker's lock,
+        so the alarm's thread is never held up by it.
+        """
         self._would_triggers += 1
         at = self._wall()
-        action = self._act(observation)
         features = observation.features
+        store = self._store
+        # The looks finish on their own threads, before or after the row is
+        # written; whichever comes second does the annotating.
+        pending: dict = {}
+        pending_lock = Lock()
+
+        def annotate(row_id, layers, decision):
+            if store is not None:
+                store.annotate(row_id, layers={**layers, "decision": decision})
+
+        def done(layers):
+            # The full record of both looks, once they have finished; the
+            # decision was written with the row and is kept.
+            with pending_lock:
+                if "row" not in pending:
+                    pending["layers"] = layers
+                    return
+                row_id, decision = pending["row"]
+            annotate(row_id, layers, decision)
+
+        decision = self._confirm(done)
+        action = self._act(observation, decision)
         LOGGER.info(
             "gate_early_trigger stage=would_trigger source=vision mode=%s light=%s action=%s "
+            "confirmation=%s by=%s waited_ms=%s "
             "blob=%.3f changed=%.3f scatter=%.3f luma=%.0f luma_jump=%+.0f peak=%d "
-            "persistence=%d cx=%s cy=%s track_dx=%s growth=%s scene_difference=%.3f",
+            "persistence=%d cx=%s cy=%s track_dx=%s growth=%s contrast=%s spread=%s "
+            "scene_difference=%.3f",
             self.config.mode, observation.light, action,
+            decision["status"], decision["by"], decision["waited_ms"],
             features["blob_fraction"], features["changed_fraction"], features["scatter"],
             features["mean_luma"], features["luma_jump"], features["peak"],
             features["persistence"], features["cx"], features["cy"],
-            features.get("track_dx"), features.get("growth"), features["scene_difference"],
+            features.get("track_dx"), features.get("growth"),
+            features["blob_contrast"], features["blob_spread"], features["scene_difference"],
         )
         row = None
-        if self._store is not None:
-            row = self._store.record(
+        if store is not None:
+            row = store.record(
                 kind=KIND_WOULD_TRIGGER, source=SOURCE_VISION, at_epoch=at,
                 mode=self.config.mode, light=observation.light, detector_state=self._state,
                 features=features, action=action, thumbnail=self._thumbnail(at, "trigger"),
+                layers={"decision": decision},
             )
+        with pending_lock:
+            pending["row"] = (row, decision)
+            layers = pending.get("layers")
+        if layers is not None:
+            annotate(row, layers, decision)
         if action == "scheduled":
             self._pending_sweep_row = row
-        if self._layers is not None:
-            store = self._store
-            self._layers.begin(
-                lambda layers, _row=row: store.annotate(_row, layers=layers)
-                if store is not None else None
-            )
 
-    def _act(self, observation: Observation) -> str:
-        """Ask for a local-only sweep. In ``shadow`` this is where it stops."""
+    def _confirm(self, done) -> dict:
+        """Start the layers and wait, bounded, for one to see a vehicle."""
+        if self._layers is None:
+            confirmation = Confirmation("unavailable")
+            done({"clip": {"status": "unavailable"}, "plate_look": {"status": "unavailable"}})
+        else:
+            confirmation = self._layers.begin(done)
+        self._confirmation = confirmation
+        try:
+            decision = confirmation.wait(self._clock)
+        finally:
+            self._confirmation = None
+        if decision["status"] == "confirmed":
+            self._confirmed += 1
+        else:
+            self._unconfirmed_triggers += 1
+        return decision
+
+    def _act(self, observation: Observation, decision: dict) -> str:
+        """Ask for a local-only sweep. In ``shadow`` this is where it stops.
+
+        In ``on`` it goes no further without a confirmed decision: the vision
+        rule alone fired seven times in thirteen minutes of cloud shade on
+        its first shadow morning, and a second look cleared every one.
+        """
         if self.config.mode != MODE_ON:
             return "none"
+        if decision.get("status") != "confirmed":
+            status = str(decision.get("status") or "unconfirmed")
+            return status if status.startswith("skipped_") else f"skipped_{status}"
         start = getattr(self._capture, "on_early_trigger", None)
         if not callable(start):
             return "unavailable"
@@ -1309,6 +1604,8 @@ class EarlyTriggerWorker:
         return {
             "mode": self.config.mode, "state": self._state, "light": self.detector.light,
             "samples": self._samples, "would_triggers": self._would_triggers,
+            "confirmed": self._confirmed, "unconfirmed": self._unconfirmed_triggers,
+            "refused": self._refused,
             "scheduled": self._scheduled, "camera_alarms": self._camera_alarms,
             "restarts": self._restarts, "pauses": self._pauses,
             "backoff": self._backoff_until is not None and self._clock() < self._backoff_until,
@@ -1373,6 +1670,7 @@ def build_worker(environment=None, *, state_directory: Path, events_database: Pa
         plate_read=getattr(sweep_reader, "read", None),
         busy=activity.busy_reason if activity is not None else None,
         per_minute=config.layers_per_minute, sleep=sleep,
+        deadline_seconds=config.confirm_seconds,
     )
     return EarlyTriggerWorker(
         config, capture=capture, activity=activity,

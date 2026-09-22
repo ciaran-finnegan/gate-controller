@@ -7,7 +7,9 @@ controller's database) and prints, by day and by night:
 * passages, and the lead of the would-trigger over the camera's alarm
   (median, p10, p90);
 * misses: camera alarms with no would-trigger in the six seconds before them;
-* false triggers an hour: would-triggers with no camera alarm within a minute;
+* false triggers an hour: would-triggers with no camera alarm within a minute,
+  split into those the confirmation layer removed and those that *passed* it
+  (the number that matters for ``on``);
 * the false triggers bucketed by the detector's own evidence, so that passing
   headlights, rain and foliage can be told apart from the numbers;
 * an estimate of the seconds saved to the first good local read;
@@ -17,6 +19,14 @@ controller's database) and prints, by day and by night:
 "Day" and "night" are the detector's own: the measured luma of the patch's
 background, not the clock and not the match policy's schedule. The question
 that matters is whether the patch was black.
+
+The hours a rate is over come from the journal (``--journal``: the
+``stage=status`` lines' cumulative sample counts, which cover every armed
+second, quiet ones included) or from ``--hours-day`` / ``--hours-night``;
+without either they are estimated from the rows alone, which leaves out every
+quiet stretch and so overstates the rate. The first shadow day's 3.18 an hour
+was over 2.2 rows-only hours; over the ~7 daylight hours actually watched it
+was under 1.5.
 
 With ``--audio-segments`` it also reads the recorder's AAC segments and says,
 for every would-trigger and every camera alarm, whether a vehicle-like sound
@@ -51,7 +61,8 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from gate_controller.early_trigger import (  # noqa: E402
-    KIND_CAMERA_ALARM, KIND_WOULD_TRIGGER, USEFUL_LEAD_SECONDS, correlate, ensure_schema,
+    DEFAULT_FPS, KIND_CAMERA_ALARM, KIND_WOULD_TRIGGER, USEFUL_LEAD_SECONDS, clip_sees_vehicle,
+    correlate, ensure_schema,
 )
 from gate_controller.gate_audio_detect import BANDS  # noqa: E402
 
@@ -67,6 +78,9 @@ VEHICLE_BANDS = (1, 2)  # 150-400 and 400-1200 Hz: tyres on gravel and engine, a
 WIND_BAND, HISS_BAND = 0, 4
 UNCOMMANDED_BEFORE_SECONDS = 90.0
 _SEGMENT = re.compile(r"(\d{8}T\d{6})Z")
+_STATUS = re.compile(r"stage=status (\{.*\})\s*$")
+_CONFIGURED_FPS = re.compile(r"stage=configured .*\bfps=([0-9.]+)")
+_JOURNAL_STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z)?)")
 LIGHTS = ("day", "night")
 
 
@@ -109,6 +123,51 @@ def observed_hours(rows, light: str) -> float:
     return total / 3600.0
 
 
+def journal_hours(lines, *, fps: float | None = None, since: float | None = None) -> dict:
+    """Hours watched in each light, from the journal's ``stage=status`` lines.
+
+    Each line carries the worker's cumulative sample count and the light the
+    detector was in; the samples since the previous line, at the sampling
+    rate (``fps=`` from the ``stage=configured`` line, or given), are the
+    seconds watched, credited to the light the line reports. A count lower
+    than the last is a restart and counts from zero. Only armed time is
+    counted, which is the time a false trigger could have happened in.
+    """
+    hours = {light: 0.0 for light in LIGHTS}
+    rate = fps
+    previous = None
+    for line in lines:
+        if rate is None:
+            configured = _CONFIGURED_FPS.search(line)
+            if configured:
+                rate = float(configured.group(1))
+        found = _STATUS.search(line)
+        if not found:
+            continue
+        if since is not None:
+            stamp = _JOURNAL_STAMP.match(line)
+            if stamp:
+                try:
+                    at = datetime.fromisoformat(stamp.group(1).replace("Z", "+00:00"))
+                    if at.tzinfo is None:
+                        at = at.replace(tzinfo=timezone.utc)
+                    if at.timestamp() < since:
+                        continue
+                except ValueError:
+                    pass
+        try:
+            status = json.loads(found.group(1))
+            samples = int(status.get("samples") or 0)
+        except (ValueError, TypeError):
+            continue
+        light = status.get("light")
+        delta = samples if previous is None or samples < previous else samples - previous
+        previous = samples
+        if light in hours:
+            hours[light] += delta / (rate or DEFAULT_FPS) / 3600.0
+    return {light: round(value, 3) for light, value in hours.items()}
+
+
 def bucket(features: dict) -> str:
     """Name the likely cause of a false trigger from its evidence numbers."""
     if features.get("light") == "night":
@@ -135,20 +194,44 @@ def layer_votes(row: dict) -> dict:
     plate = layers.get("plate_look") or {}
     sweep = row.get("sweep") or {}
     audio = row.get("audio") or {}
-    votes = {"clip": None, "plate": None, "audio": None}
-    if clip.get("status") == "ok":
-        votes["clip"] = float(clip.get("empty", 1.0)) < 0.5
+    votes = {"clip": clip_sees_vehicle(clip), "plate": None, "audio": None, "either": None}
     if plate.get("status") == "ok":
         votes["plate"] = bool(plate.get("plate_box"))
     elif sweep:
         votes["plate"] = bool(sweep.get("plate_reads"))
     if audio.get("status") == "ok":
         votes["audio"] = audio.get("onset_lead_seconds") is not None
+    judged = [votes[name] for name in ("clip", "plate") if votes[name] is not None]
+    if judged:
+        votes["either"] = any(judged)
     return votes
+
+
+def decision_of(row: dict) -> str:
+    """What the confirmation layer made of one would-trigger: ``confirmed``, ``removed`` or ``unjudged``.
+
+    The worker's own decision when it recorded one (every row since the
+    layers went on the decision path); before that, what the recorded looks
+    would have decided, by the same vote.
+    """
+    decision = (row.get("layers") or {}).get("decision") or {}
+    status = decision.get("status")
+    if status == "confirmed":
+        return "confirmed"
+    if status == "unconfirmed":
+        return "removed"
+    if status and status.startswith("cancelled"):
+        # The camera spoke during the wait: nothing to remove, nothing led.
+        return "unjudged"
+    either = layer_votes(row)["either"]
+    if either is None:
+        return "unjudged"
+    return "confirmed" if either else "removed"
 
 
 RULES = (
     ("vision alone", ()),
+    ("vision and a confirming look, CLIP or a plate box (the shipped rule)", ("either",)),
     ("vision and CLIP sees a vehicle", ("clip",)),
     ("vision and a plate box in the first looks", ("plate",)),
     ("vision and a vehicle sound rising (audio-armed vision)", ("audio",)),
@@ -202,7 +285,7 @@ def seconds_saved(row: dict):
     return round(max(0.0, min(lead, read_at - alarm_at + lead - MIN_READ_SECONDS)), 2)
 
 
-def summarise(rows, *, hours=None) -> dict:
+def summarise(rows, *, hours=None, hours_source: str | None = None) -> dict:
     would = [row for row in rows if row["kind"] == KIND_WOULD_TRIGGER and row["verdict"] != "pending"]
     alarms = [row for row in rows if row["kind"] == KIND_CAMERA_ALARM and row["verdict"] != "pending"]
     summary = {"pending": sum(1 for row in rows if row["verdict"] == "pending"), "by_light": {}}
@@ -213,7 +296,14 @@ def summarise(rows, *, hours=None) -> dict:
         false = [row for row in mine if row["verdict"] == "false"]
         useful = [row["lead_seconds"] for row in true
                   if row["lead_seconds"] is not None and 0 <= row["lead_seconds"] <= USEFUL_LEAD_SECONDS]
-        span = (hours or {}).get(light) or observed_hours(rows, light)
+        given = (hours or {}).get(light)
+        span = given or observed_hours(rows, light)
+        source = (hours_source or "given") if given else "rows"
+        decided = {row["id"]: decision_of(row) for row in mine}
+        false_removed = sum(1 for row in false if decided[row["id"]] == "removed")
+        false_passed = sum(1 for row in false if decided[row["id"]] == "confirmed")
+        false_unjudged = len(false) - false_removed - false_passed
+        true_removed = sum(1 for row in true if decided[row["id"]] == "removed")
         saved = [value for value in (seconds_saved(row) for row in true) if value is not None]
         buckets: dict[str, int] = {}
         for row in false:
@@ -230,8 +320,14 @@ def summarise(rows, *, hours=None) -> dict:
             "would_triggers": len(mine), "true": len(true), "false": len(false),
             "lead_median": percentile(useful, 0.5), "lead_p10": percentile(useful, 0.1),
             "lead_p90": percentile(useful, 0.9),
-            "hours": round(span, 2),
+            "hours": round(span, 2), "hours_source": source,
             "false_per_hour": None if span <= 0 else round(len(false) / span, 2),
+            # The confirmation layer's account: false triggers it removed,
+            # false triggers that got past it (what `on` would have swept),
+            # and true ones it cost.
+            "false_removed": false_removed, "false_passed": false_passed,
+            "false_unjudged": false_unjudged, "true_removed": true_removed,
+            "false_passed_per_hour": None if span <= 0 else round(false_passed / span, 2),
             "false_buckets": buckets,
             "saved_median": percentile(saved, 0.5), "saved_known": len(saved),
         }
@@ -416,8 +512,10 @@ def render(summary: dict) -> str:
     lines = []
     for light in LIGHTS:
         block = summary["by_light"][light]
+        source = {"journal": "from the journal's status lines", "given": "given",
+                  "rows": "from the rows alone: quiet time is not counted, so the rates err high"}
         lines += [
-            f"== {light.upper()} ({block['hours']} h of record)",
+            f"== {light.upper()} ({block['hours']} h watched, {source.get(block['hours_source'], block['hours_source'])})",
             f"passages (camera vehicle alarms): {block['passages']}",
             f"  led by a would-trigger within {USEFUL_LEAD_SECONDS:g} s: {block['led']}"
             f"   led too early to help: {block['late_lead']}   MISSED: {block['missed']}"
@@ -425,7 +523,12 @@ def render(summary: dict) -> str:
             f"  lead over the camera: median {_seconds(block['lead_median'])}"
             f"  p10 {_seconds(block['lead_p10'])}  p90 {_seconds(block['lead_p90'])}",
             f"would-triggers: {block['would_triggers']}  true {block['true']}  FALSE {block['false']}"
-            f"  = {block['false_per_hour']} false an hour",
+            f"  = {block['false_per_hour']} false an hour (the vision rule alone)",
+            f"  false removed by the confirmation layer: {block['false_removed']}"
+            f"   false that PASSED it: {block['false_passed']}"
+            f" = {block['false_passed_per_hour']} an hour"
+            f"   unjudged: {block['false_unjudged']}"
+            f"   true it cost: {block['true_removed']}",
         ]
         for name, count in sorted(block["false_buckets"].items(), key=lambda item: -item[1]):
             lines.append(f"    {count:4d}  {name}")
@@ -458,8 +561,12 @@ def main(argv=None) -> int:
     parser.add_argument("--dump-audio-features", type=Path,
                         help="write band levels before each alarm, and of quiet moments, as JSONL")
     parser.add_argument("--since", help="ISO time; rows before it are ignored")
-    parser.add_argument("--hours-day", type=float)
-    parser.add_argument("--hours-night", type=float)
+    parser.add_argument("--journal", type=Path,
+                        help="the controller's journal text; hours watched come from its status lines")
+    parser.add_argument("--fps", type=float,
+                        help="the sampling rate, when the journal's stage=configured line is missing")
+    parser.add_argument("--hours-day", type=float, help="hours watched by day, overriding the journal")
+    parser.add_argument("--hours-night", type=float, help="hours watched by night, overriding the journal")
     parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args(argv)
     if not arguments.database.exists():
@@ -473,17 +580,28 @@ def main(argv=None) -> int:
         correlate(connection, datetime.now(timezone.utc).timestamp(),
                   events_database=arguments.events_database)
         rows = load_rows(connection)
+    since = None
     if arguments.since:
         floor = datetime.fromisoformat(arguments.since)
         if floor.tzinfo is None:
             floor = floor.replace(tzinfo=timezone.utc)
-        rows = [row for row in rows if row["at_epoch"] >= floor.timestamp()]
+        since = floor.timestamp()
+        rows = [row for row in rows if row["at_epoch"] >= since]
+    hours = {"day": arguments.hours_day, "night": arguments.hours_night}
+    hours_source = "given"
+    if arguments.journal:
+        with open(arguments.journal, encoding="utf-8", errors="replace") as handle:
+            watched = journal_hours(handle, fps=arguments.fps, since=since)
+        for light in LIGHTS:
+            if hours[light] is None and watched[light] > 0:
+                hours[light] = watched[light]
+                hours_source = "journal"
     if arguments.events_database:
         annotate_uncommanded(rows, arguments.events_database)
     index = segment_index(arguments.audio_segments) if arguments.audio_segments else []
     if index:
         annotate_audio(rows, index)
-    summary = summarise(rows, hours={"day": arguments.hours_day, "night": arguments.hours_night})
+    summary = summarise(rows, hours=hours, hours_source=hours_source)
     if arguments.events_database:
         summary["uncommanded_gate_before"] = {
             "would_triggers": sum(1 for row in rows if row["kind"] == KIND_WOULD_TRIGGER

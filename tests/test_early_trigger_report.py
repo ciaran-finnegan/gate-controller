@@ -101,6 +101,102 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(plate["median_lead"], 2.0)
         self.assertEqual(table["vision and a vehicle sound rising (audio-armed vision)"]["judged"], 0)
 
+    def test_false_triggers_are_split_into_removed_by_the_layer_and_passed(self):
+        empty = {"clip": {"status": "ok", "empty": 0.9998},
+                 "plate_look": {"status": "ok", "plate_box": False}}
+        seen = {"clip": {"status": "ok", "empty": 0.03},
+                "plate_look": {"status": "ok", "plate_box": False}}
+        for index in range(7):                                   # the shadow morning's shade
+            self.would(BASE + index * 120, layers=empty)
+        self.would(BASE + 3000, layers=seen)                     # a false one the layer let past
+        self.would(BASE + 3300, layers={"clip": {"status": "skipped_busy"},
+                                        "plate_look": {"status": "skipped_busy"}})
+        self.would(BASE + 3600, layers=empty)                    # a true one the layer would cost
+        self.alarm(BASE + 3601)
+        self.would(BASE + 4000, layers=seen)
+        self.alarm(BASE + 4002)
+        day = self.summary()["by_light"]["day"]
+        self.assertEqual((day["false"], day["false_removed"], day["false_passed"], day["false_unjudged"]),
+                         (9, 7, 1, 1))
+        self.assertEqual((day["true"], day["true_removed"]), (2, 1))
+        self.assertAlmostEqual(day["false_passed_per_hour"], 1 / day["hours"], places=2)
+        text = report.render(self.summary())
+        self.assertIn("false removed by the confirmation layer: 7   false that PASSED it: 1", text)
+        self.assertIn("true it cost: 1", text)
+
+    def test_the_workers_own_decision_is_believed_over_the_votes(self):
+        # A row the worker decided: the looks said empty but the record says
+        # confirmed (a late plate box would look like this), and vice versa.
+        self.would(BASE, layers={"clip": {"status": "ok", "empty": 0.99},
+                                 "decision": {"status": "confirmed", "by": "plate"}})
+        self.would(BASE + 600, layers={"clip": {"status": "ok", "empty": 0.01},
+                                       "decision": {"status": "unconfirmed", "by": "clip_late"}})
+        self.would(BASE + 1200, layers={"decision": {"status": "cancelled_camera_alarm"}})
+        self.alarm(BASE + 1200.5)
+        self.would(BASE + 1800, layers={"decision": {"status": "skipped_rate"},
+                                        "clip": {"status": "skipped_rate"}})
+        self.store.correlate(BASE + 100_000)
+        with closing(sqlite3.connect(str(self.path))) as connection:
+            rows = report.load_rows(connection)
+        self.assertEqual([report.decision_of(row) for row in rows if row["kind"] == "would_trigger"],
+                         ["confirmed", "removed", "unjudged", "unjudged"])
+
+    def test_the_shipped_rule_is_in_the_layer_table(self):
+        self.would(BASE, layers={"clip": {"status": "ok", "empty": 0.99},
+                                 "plate_look": {"status": "ok", "plate_box": True}})
+        self.alarm(BASE + 1)
+        self.would(BASE + 600, layers={"clip": {"status": "ok", "empty": 0.99},
+                                       "plate_look": {"status": "ok", "plate_box": False}})
+        self.would(BASE + 1200, layers={"clip": {"status": "ok", "empty": 0.02},
+                                        "plate_look": {"status": "skipped_busy"}})
+        table = {line["rule"]: line["day"] for line in self.summary()["layers"]}
+        shipped = table["vision and a confirming look, CLIP or a plate box (the shipped rule)"]
+        self.assertEqual((shipped["false_removed"], shipped["false_total"], shipped["true_lost"],
+                          shipped["judged"]), (1, 2, 0, 3))
+
+    def test_hours_watched_come_from_the_journals_status_lines(self):
+        def status(stamp, samples, light):
+            return (f"{stamp} pi python[1]: INFO gate_controller.early_trigger gate_early_trigger "
+                    f"stage=status " + json.dumps({"samples": samples, "light": light, "state": "armed"}))
+
+        lines = [
+            "2026-09-22T00:13:21+0100 pi python[1]: gate_early_trigger stage=configured mode=shadow "
+            "patch=0.02,0.26,0.32,0.32 fps=4 source=sub_stream hours=00:00-24:00",
+            status("2026-09-22T00:13:21+0100", 0, "day"),
+            status("2026-09-22T00:23:21+0100", 2400, "night"),     # 10 min of night
+            status("2026-09-22T00:33:21+0100", 4800, "night"),     # 10 more
+            "2026-09-22T00:40:00+0100 pi python[2]: gate_early_trigger stage=would_trigger ...",
+            status("2026-09-22T09:43:21+0100", 1200, "day"),       # a restart: counts from zero
+            status("2026-09-22T09:53:21+0100", 3600, "day"),
+        ]
+        hours = report.journal_hours(lines)
+        self.assertAlmostEqual(hours["night"], 20 / 60, places=3)
+        self.assertAlmostEqual(hours["day"], 15 / 60, places=3)
+        self.assertAlmostEqual(report.journal_hours(lines, fps=2.0)["day"], 30 / 60, places=3)
+        since = report.journal_hours(lines, since=BASE - 10_000_000)
+        self.assertEqual(since, hours)
+        self.assertEqual(report.journal_hours([])["day"], 0.0)
+
+    def test_the_journal_sets_the_hours_the_rates_are_over(self):
+        for index in range(4):
+            self.would(BASE + index * 300)
+        journal = Path(self.directory.name) / "journal.txt"
+        journal.write_text(
+            "x stage=configured fps=4\n"
+            "x stage=status " + json.dumps({"samples": 0, "light": "day"}) + "\n"
+            "x stage=status " + json.dumps({"samples": 4 * 3600 * 8, "light": "day"}) + "\n")
+        with redirect_stdout(StringIO()) as raw:
+            report.main(["--database", str(self.path), "--journal", str(journal), "--json"])
+        day = json.loads(raw.getvalue())["by_light"]["day"]
+        self.assertEqual((day["hours"], day["hours_source"]), (8.0, "journal"))
+        self.assertAlmostEqual(day["false_per_hour"], 0.5)
+        with redirect_stdout(StringIO()) as raw:
+            report.main(["--database", str(self.path), "--journal", str(journal), "--hours-day", "2"])
+        self.assertIn("2.0 h watched, given", raw.getvalue())
+        with redirect_stdout(StringIO()) as raw:
+            report.main(["--database", str(self.path)])
+        self.assertIn("from the rows alone", raw.getvalue())
+
     def test_in_on_mode_the_early_sweeps_own_reads_are_the_plate_look(self):
         self.would(BASE, sweep={"plate_reads": 3, "reason": "opened"})
         self.alarm(BASE + 1)

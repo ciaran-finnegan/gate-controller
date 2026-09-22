@@ -2,7 +2,9 @@
 
 `GATE_EARLY_TRIGGER=off|shadow|on`. The code's default is `off`. The intended
 rollout is a day of `shadow` on the Pi, then the report below, then `on`.
-Issue #107 is the background; #106 is the audio half of it.
+Issue #107 is the background; #106 is the audio half of it. The first shadow
+day was 2026-09-22; what it showed and what changed because of it is
+[below](#the-first-shadow-day-2026-09-22).
 
 ## The geometry that motivates it
 
@@ -102,19 +104,52 @@ step, dusk, or the sun going in is no change at all (`global` when the median
 itself jumps: the background is re-based and nothing triggers). What is left
 must be one 4-connected blob of 6-80% of the patch; with little change outside
 it (`scattered`: foliage, rain, dappled shade); no bigger than 45% the first
-time it is seen (`sudden`: light arrives, vehicles enter); held for 2 samples.
-Each cell also learns its own noise, so a hedge in the wind desensitises the
-cells it lives in and nowhere else.
+time it is seen (`sudden`: light arrives, vehicles enter); held for 2 samples;
+and -- since the first shadow day -- it must have **replaced** what was there,
+not re-lit it (`illumination`). Cloud shade advancing over part of the patch
+passes every rule above: it is connected, vehicle-sized, enters from one side
+and holds. But it multiplies the gravel's brightness rather than covering it,
+so inside the blob the log ratio to the background is nearly one number. The
+detector records that number's mean over the blob (`blob_contrast`), its
+standard deviation (`blob_spread`) and the share of cells of the minority sign
+(`blob_mixed`), and refuses the blob as light when the spread is under 0.30
+*and* the contrast is under 0.55 in magnitude. On the seven shade triggers of
+2026-09-22 the spread was 0.00-0.17 and the contrast -0.22 to -0.40 (the
+gravel 20-33% darker), nothing mixed; on the three real vehicle frames of the
+same day (a dark front tiny at the far fence gap; a pale flank filling the
+patch, twice) the spread was 0.53-0.61 and the front's contrast -0.74. A
+refused blob re-bases the background quickly, as `sudden` does, so a car that
+then drives into the shade is seen against it. Each cell also learns its own
+noise, so a hedge in the wind desensitises the cells it lives in and nowhere
+else.
+
+Two rules that were considered and are *not* used, because the day's data
+said no: "the blob must be darker than its surround" -- all seven false blobs
+were darker (shade), and the true flank was lighter and darker at once -- and
+"penalise a clipped frame (`peak=255`)" -- the sunlit gravel clips in nearly
+every daytime row, and the white bodywork of the real car clipped a fifth of
+its blob's cells, more than any shade frame. The contrast bound is the one
+place the rule could fail open: a hard noon shadow deeper than 42% would be
+taken for an object. That is what the confirmation layer is for.
 
 **Night.** The patch is black (real frames measured a mean of 0.1-1.8). The
 signal is a source at least 60 levels over the background once the median rise
-(diffuse light) is taken off, and at least 150 in itself; held for 4 samples
-(0.75 s); not fading; and not crossing the patch faster than 0.9 patch-widths a
-second. A car passing on the road beyond either lights the scene diffusely
-(removed with the median), or sweeps a beam across and is gone in well under a
-second (persistence, speed). **Honestly:** at 1-2 fps those two could not be
-told from an arrival at all, which is another reason for 4; and even at 4 the
-speed gate is a guess, because no night arrival has been recorded on this view.
+(diffuse light) is taken off, and at least 150 in itself; at least 4 cells
+(1% of the patch); held for 4 samples (0.75 s); not fading; not crossing the
+patch faster than 0.9 patch-widths a second; and **lighting the ground around
+it**: the median rise itself must be at least 3 levels (`unlit` otherwise;
+the run is kept, so spill that arrives a sample after the lamps still
+counts). A car passing on the road beyond either lights the scene diffusely
+with no source in it (removed with the median), or sweeps a beam across and is
+gone in well under a second (persistence, speed). The size and spill floors
+come from the first shadow night: at 04:29 UTC a two-cell source (0.5% of the
+patch, peak 181, speed 0, median rise 0.0) held for four samples and was a
+would-trigger -- eyeshine or a droplet, with nothing lit around it -- while
+the one real floodlit frame with a car in the lane had a median rise of 44.
+**Honestly:** at 1-2 fps a passing beam could not be told from an arrival at
+all, which is another reason for 4; and even at 4 the speed gate and the spill
+floor are reasoned, not measured, because no night arrival has been recorded
+on this view.
 One real finding already: a floodlit night frame with a departing car in the
 lane, run through the detector over real black frames, became a would-trigger
 at its fourth sample with a median rise of 44 levels, and the blob it chose was
@@ -153,9 +188,11 @@ would make every passing headlight visible from the road.
 `shadow` journals and records. It reaches nothing: the capture's
 `on_early_trigger` refuses (`disabled`) unless the mode is `on`, whoever calls.
 
-`on`: a would-trigger asks the production `TriggerFrameCapture` for a sweep,
-through the same `local_sweep` as a camera alarm, with the origin **stated**
-(`SweepPassage.origin = "early"`), never inferred from timing. Same local
+`on`: a would-trigger that a second look has **confirmed** (next section)
+asks the production `TriggerFrameCapture` for a sweep, through the same
+`local_sweep` as a camera alarm, with the origin **stated**
+(`SweepPassage.origin = "early"`), never inferred from timing. An unconfirmed
+one asks for nothing and is recorded as `skipped_unconfirmed`. Same local
 reader, same match policy, same bars, same carried-read path, same cooldown.
 Until the camera's alarm arrives, such a sweep:
 
@@ -201,7 +238,9 @@ even read, so that costs a decoder start and five thumbnails, about a second,
 whatever caused the trigger. A frame with something in it and no plate *yet*
 does not count: that is a vehicle still turning in.
 
-**Caps.** `GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS` (20, the camera's own
+**Caps.** `GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5): how long a would-trigger
+waits for a confirming look before it is judged unconfirmed.
+`GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS` (20, the camera's own
 floor). `GATE_EARLY_TRIGGER_MAX_PER_HOUR` (12) *unconfirmed* sweeps in any
 hour, then a stand-down of `GATE_EARLY_TRIGGER_BACKOFF_SECONDS` (1800) that
 doubles each time, to four hours; a camera alarm forgives the count, because
@@ -236,8 +275,11 @@ the passage's first local read of 0.75 or better (read from the controller's
 database, opened read-only).
 
 Journal: `gate_early_trigger stage=would_trigger source=vision mode=… light=…
-action=… blob=… changed=… scatter=… luma=… luma_jump=… peak=… persistence=…`,
-plus `stage=paused`, `stage=backoff`, and `stage=status` every ten minutes.
+action=… confirmation=… by=… waited_ms=… blob=… changed=… scatter=… luma=…
+luma_jump=… peak=… persistence=… contrast=… spread=…`; `stage=refused
+reason=illumination|unlit …` once per appearance the vision rule itself turned
+away; plus `stage=paused`, `stage=backoff`, and `stage=status` every ten
+minutes (with cumulative `samples`, `confirmed`, `unconfirmed` and `refused`).
 Nothing is added to the heartbeat.
 
 **Pictures.** Each row keeps a before/after pair of the patch, 320x90 grey
@@ -245,21 +287,77 @@ JPEG, about 6 KB, in `early-trigger-thumbnails/`. At most 500 files
 (`GATE_EARLY_TRIGGER_THUMBNAIL_MAX`) and none older than 7 days
 (`GATE_EARLY_TRIGGER_THUMBNAIL_DAYS`): **about 3 MB**. They go nowhere.
 
-**Layers, evaluated in shadow** (each timed; each `skipped_busy` the moment a
-vehicle has the controller):
+**Layers, on the decision path.** Each would-trigger of the vision rule is
+shown to two second looks, in parallel, on their own threads; each is timed,
+and each is `skipped_busy` the moment a vehicle has the controller. Either
+one saying "vehicle" confirms the would-trigger; the worker waits for that at
+most `GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5 s), and the wait ends at the
+first "yes", when both have said "no", or the instant the camera's own alarm
+arrives (there is then nothing left to lead). In `on` only a confirmed
+would-trigger reaches the capture. The record keeps three things apart: the
+vision rule's own evidence (`features`, whose `verdict` is `trigger`), what
+the looks said and the decision made on them (`layers`, with a `decision`
+block: `confirmed` / `unconfirmed` / `cancelled_camera_alarm` / why the looks
+never ran, which layer answered, and the milliseconds waited), and what was
+done (`action`). So the raw vision rule stays measurable after the layer is
+in the way of it.
 
 - *CLIP look.* The farm-machinery image tower, already loaded, shown a
   **square around the lane** (`lane_square`), not the frame: the tower looks
   at the centre square of what it is given and arrivals appear at the far
-  left. Checked on the Pi on real frames: for a night frame with a car in the
-  lane the whole frame says `empty` 0.68 and the lane square says
-  `pickup` 0.68 / `car` 0.26 / `empty` 0.03; two dusk arrival frames read as
-  vehicles either way. The *empty* lane by day was not put through it, so the
-  negative is unchecked. Needs `GATE_AGRI_ADMIT=shadow|on`; otherwise
+  left. "Vehicle" is an `empty` share of 0.5 or under. Checked on the Pi on
+  real frames: for a night frame with a car in the lane the whole frame says
+  `empty` 0.68 and the lane square says `pickup` 0.68 / `car` 0.26 /
+  `empty` 0.03; two dusk arrival frames read as vehicles either way; and on
+  the first shadow day the empty lane under moving shade read `empty`
+  0.9974-1.0 on all eight looks. Needs `GATE_AGRI_ADMIT=shadow|on`; otherwise
   `unavailable`. The look has a lock of its own and never takes the readings'
-  lock, so it can never make a real burst's machinery reading answer `busy`.
-- *Plate look.* Would the local detector find a plate box in the first three
-  looks? In `on` the early sweep's own reads are the answer.
+  lock, so it can never make a real burst's machinery reading answer `busy`;
+  and the looks are capped at `GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE` (4),
+  well under the policy's own rate, so the early trigger can never starve it.
+- *Plate look.* Would the local detector find a plate box? The first look is
+  what can confirm inside the bound; the second and third (0.4 s apart)
+  carry on for the record, so a "yes" that came late is written down as
+  `plate_late` and the report can say what a longer wait would have bought.
+  In `on` the early sweep's own reads are then the answer.
+
+**The added latency, measured.** On the Pi on 2026-09-22 the CLIP look took
+455-530 ms end to end (one clear-stream keyframe decode, about 0.3 s, then the
+108 ms embed) and the three plate looks 2.5-2.9 s together, so a single one is
+about 0.55 s including its decode. The two run at once, so the first answer is
+about half a second away and the bound is half a second: a confirmed
+would-trigger costs the lead up to 0.5 s; an unconfirmed one costs nothing but
+a sweep that would have been false. The wait is on the detector's own thread,
+which misses at most two samples while the detector is `occupied` anyway; it
+holds no lock, and the camera's alarm on the webhook thread is never behind
+it -- it cancels it. If the looks are refused (rate, busy, running, disabled)
+or unavailable, the would-trigger is unconfirmed at once, with no wait.
+
+## The first shadow day (2026-09-22)
+
+Watched 5.1 h by day and 6.5 h by night (from the journal's status lines).
+Vision alone: **7 false day would-triggers in 13 minutes** (08:38-08:51 IST):
+the empty gravel lane, sun and cloud coming and going on a gusty morning.
+Blobs of 8.6-10.7% of the patch, `luma_jump` -21 to +3.7, `peak` 255 (the
+sunlit gravel clips), scatter at most 0.068, `track_dx` at most 0.054: every
+rule of the day detector as first shipped was met, and 7 in 13 minutes is
+over half the hourly cap. Both second looks cleared all seven at no cost to
+the one true trigger (which they were `skipped_busy` for: a sweep had the
+controller). One false night would-trigger, the two-cell point source above.
+1.36 false an hour by day over the hours actually watched (the first cut of
+the report said 3.18: it had estimated the hours from the rows alone, 2.2 h,
+with every quiet stretch left out).
+
+Misses: the one real daylight arrival was only a `candidate` (persistence 1)
+at the instant of the camera's alarm, whose thumbnail shows the car's front
+tiny at the far fence gap. The camera fired at first appearance; there was
+nothing to lead. The would-trigger came 0.10 s after the *second* alarm, with
+the car's flank filling the patch. One arrival is not a lead measurement.
+
+What changed: the `illumination` rule, the night size and spill floors, the
+layers on the decision path, and the report's split. The seven pairs, the two
+vehicle pairs and the point source are in `tests/fixtures/early_trigger/` and
+the detector is run over them.
 
 ## The report, and what would justify `on`
 
@@ -271,13 +369,23 @@ scripts/early_trigger_report.py --database /var/lib/gate-controller/early-trigge
 
 By day and by night: passages, lead (median/p10/p90), misses (no would-trigger
 in the 6 s before the alarm, which is as long as an unconfirmed sweep runs; and
-how many of those were while paused), false triggers an hour, the false ones
-bucketed by their evidence (whole patch lit; fast source; small source;
-scattered change; brightness change; large region; compact region), seconds
-saved to the first good read (an upper bound: it assumes the plate was legible
-that much earlier), and the **layer table**: for vision alone and each
-combination with CLIP, plate box and audio, false triggers removed, true ones
-lost, lead kept. It works on a private copy and never writes to the record.
+how many of those were while paused), false triggers an hour for the vision
+rule alone and then **split**: removed by the confirmation layer, *passed* it
+(what `on` would have swept, as a rate), unjudged, and true ones it cost; the
+false ones bucketed by their evidence (whole patch lit; fast source; small
+source; scattered change; brightness change; large region; compact region),
+seconds saved to the first good read (an upper bound: it assumes the plate was
+legible that much earlier), and the **layer table**: for vision alone, the
+shipped rule (CLIP or plate box), and each combination with CLIP, plate box
+and audio, false triggers removed, true ones lost, lead kept. It works on a
+private copy and never writes to the record.
+
+The hours a rate is over: `--journal /path/to/journal.txt` reads the
+`stage=status` lines' cumulative sample counts (at the `fps=` of the
+`stage=configured` line, or `--fps`) and credits each interval to the light
+the detector was in, so quiet hours count. `--hours-day` / `--hours-night`
+override it. With neither, the hours are estimated from the rows alone,
+which leaves out every quiet stretch, and the report says so.
 
 Audio is **offline**: from the recorder's 300 s AAC segments it finds whether a
 vehicle-like sound (150-1200 Hz) was already rising 6 dB over the quiet half of
@@ -294,9 +402,10 @@ Proposed bar for `on`, per light, over at least 20 passages:
 - median lead **1.5 s or more** (under that the decoder's one-second start
   eats it);
 - misses **no more than 1 in 20** while armed;
-- false triggers **no more than 6 an hour by day and 6 by night** with the
-  quick abort (about 1.5 core-seconds each: 0.25% of a core), and no more than
-  the hourly cap of 12 *ever*. A false sweep costs CPU only, never a lookup,
+- false triggers that **pass the confirmation layer** no more than 6 an hour
+  by day and 6 by night with the quick abort (about 1.5 core-seconds each:
+  0.25% of a core), and no more than the hourly cap of 12 *ever*; and the
+  layer costing no true trigger its lead. A false sweep costs CPU only, never a lookup,
   which is why the number can be this generous; it is the farm-machinery model
   and the audio scanner it must not starve, not the bill.
 
@@ -314,12 +423,17 @@ would be YAMNet's vehicle classes held for 3 s, about 1% of a core. The table's
 
 ## Not established
 
-- No real frame of a vehicle *entering* the re-aimed view: the day detector is
-  proven on synthetic scenes, on the real empty drive (fixtures and 90 live
-  seconds), and on a vehicle painted onto the real drive.
-- No real night arrival: the night thresholds, and above all the speed gate,
-  are reasoned, not measured. The real night frames they were tried on are not
-  in the repository.
+- No real frame of a vehicle *entering* the re-aimed view with a lead: the
+  day detector is proven on synthetic scenes, on the real empty drive
+  (fixtures and 90 live seconds), on a vehicle painted onto the real drive,
+  and on the first shadow day's own pairs (seven shade, two vehicle). The one
+  real arrival was at the camera's own alarm.
+- No real night arrival: the night thresholds -- the speed gate and the spill
+  floor above all -- are reasoned, not measured. The point source that set
+  the size floor is in the fixtures; the floodlit frame is not.
+- The confirmation bound of 0.5 s is set from eight measured looks on one
+  day. A `plate_late` or `clip_late` in the record is the sign it is too
+  short.
 - Whether the sub stream runs later than the main one. The report measures
   lead against the webhook, which is what matters.
 - Whether the first frames of a real early sweep read as "empty scene" and
