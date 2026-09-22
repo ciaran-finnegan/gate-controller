@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import re
 import select
 import subprocess
 from hashlib import sha256
@@ -39,6 +40,8 @@ from .telemetry import TriggerTelemetry
 
 
 LOGGER = logging.getLogger(__name__)
+# The shape a `reason=` token on a journal line may take.
+_JOURNAL_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 LOOPBACK_CLEAR_STREAM = "rtsp://127.0.0.1:8554/clear"
 MIN_CAPTURE_TIMEOUT_SECONDS = 0.5
 MAX_CAPTURE_TIMEOUT_SECONDS = 4.0
@@ -1110,8 +1113,8 @@ class TriggerFrameCapture:
             if not handover_skips_journalled:
                 handover_skips_journalled = True
                 LOGGER.info(
-                    "gate_local_sweep stage=cloud_handover_skipped reason=internet_down "
-                    "of=%d", config.sweep_cloud_frames,
+                    "gate_local_sweep stage=cloud_handover_skipped reason=%s of=%d",
+                    self._cloud_unavailable_reason(), config.sweep_cloud_frames,
                 )
             return False
 
@@ -1389,6 +1392,21 @@ class TriggerFrameCapture:
             return probe() is not False
         except Exception:
             return True
+
+    def _cloud_unavailable_reason(self) -> str:
+        """Why `_cloud_reachable` said no, as the predicate names it, or `internet_down`.
+
+        The probe's bare method has no opinion; the `CloudAvailability`
+        `main` hands in says whether it was the probe or the cloud client's
+        circuit breaker, so the journal never blames the link for the breaker.
+        """
+        try:
+            reason = getattr(self._internet_reachable, "reason", None)
+        except Exception:
+            return "internet_down"
+        if isinstance(reason, str) and _JOURNAL_TOKEN.fullmatch(reason):
+            return reason
+        return "internet_down"
 
     def _take_camera_event(self):
         """The camera alarm waiting in the slot, taken off it; or None."""

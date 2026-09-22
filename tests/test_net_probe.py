@@ -896,6 +896,90 @@ class ForbiddenDependencyTests(unittest.TestCase):
         self.assertNotIn("os.system", body)
 
 
+class InternetRestoredHookTests(unittest.TestCase):
+    """The one thing the probe *tells* rather than answers: the link came back.
+
+    The cloud client's circuit breaker closes on it, so a link that returns
+    is used on the next passage rather than when the breaker's own timer
+    runs out. It fires on a measured ``failed`` -> ``ok`` only.
+    """
+
+    def setUp(self):
+        self.clock = {"value": 1000.0}
+        self.state = {"up": True}
+        self.restored = []
+
+    def _probe(self, callback=None):
+        def open_link(host):
+            if not self.state["up"]:
+                raise OSError("no route to host")
+            return dict(HEALTHY_INTERNET)
+
+        return NetProbeWorker(
+            NetProbeConfig(enabled=True),
+            popen=lambda command, **kwargs: FakePopen(HEALTHY_PING.encode())(command, **kwargs),
+            clock=lambda: self.clock["value"],
+            host_metrics=lambda **_: dict(HEALTHY_METRICS),
+            proc_root=Path("/nonexistent-proc"), sys_class_net=Path("/nonexistent-sys"),
+            internet_connect=open_link,
+            on_internet_restored=callback if callback is not None else (
+                lambda: self.restored.append(self.clock["value"])
+            ),
+        )
+
+    def _cycle(self, worker, *, after=60.0):
+        self.clock["value"] += after
+        self.assertTrue(worker.run_once())
+
+    def test_it_fires_once_when_a_failed_open_is_followed_by_a_good_one(self):
+        worker = self._probe()
+        self._cycle(worker)  # ok: the first measurement is not a return
+        self.assertEqual(self.restored, [])
+        self.state["up"] = False
+        self._cycle(worker, after=300.0)  # failed
+        self._cycle(worker)  # failed again: nothing
+        self.assertEqual(self.restored, [])
+        self.state["up"] = True
+        self._cycle(worker)
+        self.assertEqual(self.restored, [self.clock["value"]], "the first ok after failed")
+        self._cycle(worker)  # ok, within the healthy cadence: not re-measured
+        self._cycle(worker, after=300.0)  # ok, re-measured: still not a return
+        self.assertEqual(len(self.restored), 1)
+
+    def test_a_first_measurement_that_fails_then_succeeds_counts_as_a_return(self):
+        self.state["up"] = False
+        worker = self._probe()
+        self._cycle(worker)
+        self.state["up"] = True
+        self._cycle(worker)
+        self.assertEqual(len(self.restored), 1)
+
+    def test_a_callback_that_raises_is_journalled_and_the_cycle_completes(self):
+        def explode():
+            raise RuntimeError("breaker fell over")
+
+        self.state["up"] = False
+        worker = self._probe(explode)
+        self._cycle(worker)
+        self.state["up"] = True
+        with self.assertLogs("gate_controller.net_probe", level="WARNING") as logs:
+            self.clock["value"] += 60.0
+            self.assertTrue(worker.run_once(), "the cycle failed on the callback")
+        self.assertIn("stage=internet_restored outcome=callback_failed", "\n".join(logs.output))
+        self.assertEqual("ok", worker.status()["hops"]["internet"]["state"])
+        self.assertTrue(worker.internet_reachable())
+
+    def test_without_a_callback_nothing_changes(self):
+        self.state["up"] = False
+        worker = probe(
+            clock=lambda: self.clock["value"],
+            internet_connect=lambda host: (_ for _ in ()).throw(OSError("down")),
+            popen=lambda command, **kwargs: FakePopen(HEALTHY_PING.encode())(command, **kwargs),
+        )
+        self._cycle(worker)
+        self.assertFalse(worker.internet_reachable())
+
+
 class InternetReachableTests(unittest.TestCase):
     """The one answer the recognition pipeline takes from the probe.
 
