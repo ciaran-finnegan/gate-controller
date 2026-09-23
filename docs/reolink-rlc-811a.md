@@ -520,6 +520,71 @@ differences; see the carried-read fix in
 [On-device plate recognition](local-recognition.md#the-sweeps-read-travels-with-its-frame)
 (#175), not restated here.
 
+### Band widened again, 2026-09-23 13:17 UTC
+
+`GATE_PLATE_REGION=0.05,0.10,0.90,0.85`: x 0.05-0.95, y 0.10-0.95. Previous
+env file kept as `/etc/gate-controller.env.bak-2026-09-23-band`.
+
+**Why.** The band of 2026-09-21 was fitted to a car *stopped at the gate*
+whose plate sat low, and it fixed the vertical clipping. It left the right
+edge at x 0.85. A car at the gate on the new aim puts its plate at
+**cx 0.877-0.889**, which is outside that edge, so the frames where the plate
+is largest and squarest — the ones most likely to read at 1.000 — were being
+cropped away.
+
+**Measured.** 35 corpus frames from 2026-09-20 to 2026-09-22 (every frame R2
+holds since the re-aim), replayed on the Pi through the deployed release
+`add45b6` models (`yolo-v9-t-384` + `cct-xs-v2`). The two bands agree on 30 of
+35 frames. The five that differ:
+
+| Frame (UTC) | Band of 2026-09-21 | Band of 2026-09-23 |
+| --- | --- | --- |
+| 2026-09-20 16:57:40 | `131D26996` 0.727 (spurious 9) | `131D2696` 0.984 |
+| 2026-09-20 18:16:25 | `13NE1111` 0.363 | `10CE19990` 0.966 (still wrong) |
+| 2026-09-22 10:00:05 | `131D2696` 0.995 | `131D2696` 0.976 |
+| 2026-09-22 16:04:22 | no plate (spurious 90x210 box) | `131D2696` **1.000** |
+| 2026-09-22 16:04:26 | no plate | `131D2696` **1.000** |
+
+Three correct reads recovered, one read corrected, one already-passing read
+0.019 weaker. The cost predicted in the section above — about 6% of the
+plate's detector pixels per 0.05 of width — is real but is worth paying: it
+shows up as that 0.995 -> 0.976, while the plates it recovers were scoring
+nothing at all.
+
+**One caution.** 2026-09-20 18:16:25 reads `10CE19990` at 0.966 under the new
+band, against a true plate of `10CE1990`. That is a wrong read clearing the
+0.5 admission gate. It is stopped one layer later — `decide_access` requires
+an exact match against the authorised list, and a nine-character read matches
+nothing — but it is a reminder that the confidence gate is not the thing
+keeping wrong plates out, the authorised-list match is.
+
+### Plate width is necessary and not sufficient
+
+The same replay, read as "how big does a plate have to be":
+
+| Frame (UTC) | Plate width | Score |
+| --- | --- | --- |
+| 2026-09-22 16:04:20 | 98 px | no read |
+| 2026-09-21 17:59:16 | 152 px | 0.903 |
+| 2026-09-22 14:18:21 | 186 px | 0.239 |
+| 2026-09-22 16:04:27 | 189 px | 0.103 |
+| 2026-09-22 10:00:05 | 240 px | 0.995 |
+| 2026-09-22 14:18:23 | 400 px | 1.000 |
+| 2026-09-22 16:04:22 | 410 px | 1.000 |
+
+Below about 100 px nothing reads. Above about 240 px everything measured here
+reads at 0.995 or better. **In between, width does not decide it**: a clean
+front-on plate at 152 px read 0.903, while motion-blurred ones at 186 and
+189 px read 0.239 and 0.103. So a rule that waits for the plate to be "big
+enough" before spending a read would have thrown away the 152 px read and kept
+the 189 px one. Angle and motion blur dominate in that range, and neither is
+measured today.
+
+The practical consequence is that there is no useful frame-selection rule to
+be had from box width alone, and the cheapest read is the one already being
+taken: the reader costs 145-190 ms a frame here, against a decision budget of
+4 s.
+
 ### Zoom: not changed, and why
 
 Headroom scaling about the frame centre with a 5% margin is about x1.33,
