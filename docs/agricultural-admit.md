@@ -16,7 +16,7 @@ it. It is **off** unless the environment says otherwise.
 
 > **Every number below was measured on the old camera aim.** The camera was
 > re-aimed on 2026-09-20 between 16:58 and 18:15 UTC and the crop band is now
-> `GATE_PLATE_REGION=0.10,0.15,0.75,0.75`. All six machinery passages, and all
+> `GATE_PLATE_REGION=0.05,0.10,0.90,0.85` (widened again on 2026-09-23). All six machinery passages, and all
 > but 19 of the 929 frames, were taken before that; **no machine has been seen
 > on the new aim at all.** The thresholds are therefore a starting point, not a
 > calibration. **A shadow run on the new aim is the validation that gates
