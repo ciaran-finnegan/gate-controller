@@ -219,7 +219,7 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertTrue(source.start_session())
         self.assertFalse(source.start_session(), "one session at a time")
         copy_cmd = next(c for c, _ in popen.calls if "copy" in c)
-        self.assertEqual(copy_cmd[copy_cmd.index("-t") + 1], "45")
+        self.assertEqual(copy_cmd[copy_cmd.index("-t") + 1], "90")  # DEFAULT_SESSION_SECONDS
         self.assertNotIn("-vf", copy_cmd, "the session's own source only copies packets")
         decode_cmd = next(
             c for c, _ in popen.calls if "pipe:0" in c and "-frames:v" not in c

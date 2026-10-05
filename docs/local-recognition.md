@@ -321,15 +321,20 @@ coordinator's cooldown refuses a second pulse regardless.
 shut, the passage is put on record (the fallback, which never again re-injects
 a frame already handed over - and `duplicate_event` no longer ends a session:
 it is a fact about a file, not about a vehicle) and the reader goes on at
-`GATE_LOCAL_SWEEP_WAITING_FPS` (1 a second) for up to
-`GATE_LOCAL_SWEEP_WAITING_SECONDS` (30), never past the decoder session the
-alarm started (`GATE_SESSION_SECONDS`, 45). It stops on an open, a conclusive
+`GATE_LOCAL_SWEEP_WAITING_FPS` (2 a second) for up to
+`GATE_LOCAL_SWEEP_WAITING_SECONDS` (80), never past the decoder session the
+alarm started (`GATE_SESSION_SECONDS`, 90). It stops on an open, a conclusive
 denial, a new alarm, three consecutive frames of empty drive, or the cap:
 `gate_local_sweep stage=waiting ...`, then `outcome=ended
 reason=opened|departed|wait_cap|new_event|... waiting_reads=N`. The cap covers
-the passage above (first authorisable read at +30.8 s, window plus waiting
-reaches +40 s). The cost is about a fifth of one core for at most 30 s - some
-6 s of inference - against roughly 90% of a core for the window itself, and
+the passage above (first authorisable read at +30.8 s) with room to spare:
+until 2026-10-05 it was 30 s at one read a second, and in the 36 h to that
+evening three sweeps ended `wait_cap` with the car still at the gate (an Audi
+at 11:10 read 54 times over 40 s, then not again), while a pickup that
+afternoon only reached the stop at +37 s. The waiting phase is when the plate
+is largest and stillest, so it now reads twice a second for up to 80 s:
+about 40% of one core while a car waits, against roughly 90% for the window
+itself, and
 nothing on the cloud: handovers stay under the per-passage ceiling and, while
 waiting, none is sent for a frame the device found no plate in. Note that on
 the Pi `GATE_PRESENCE_WINDOW_SECONDS=12` is measured from the alarm, so after
@@ -589,8 +594,8 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_THREADS` | `1` | `intra_op_num_threads`. Leave at 1 on a fanless board. |
 | `GATE_LOCAL_OCR_MIN_CONFIDENCE` | `0.5` | The confidence gate, applied to the **weakest character** of the read (not the mean - see above). In shadow mode it only classifies the journal's `authorised=` field; in active mode it also gates the decision *and* admission to the corroboration pool, so it is the floor under `GATE_MATCH_AGREEMENT_MIN_LOCAL_CONFIDENCE_*` too. 0.95 is the shadow-mode measurement threshold and is too high to be the admission gate: it would keep the agreement rule from ever running on the shipped 0.50 agreement bar. |
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
-| `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `30` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-60 and by `GATE_SESSION_SECONDS`; `0` disables. See "The sweep's read travels with its frame". |
-| `GATE_LOCAL_SWEEP_WAITING_FPS` | `1` | Reads a second while waiting (0.2-2). |
+| `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `80` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-120 and by `GATE_SESSION_SECONDS` (90); `0` disables. See "The sweep's read travels with its frame". |
+| `GATE_LOCAL_SWEEP_WAITING_FPS` | `2` | Reads a second while waiting (0.2-3). |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
 | `GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` | `0.005` | A session frame the device found no plate in still goes to the cloud when its stillness is at or below this; one moving more than this is decided `no_match` on the device's answer, unbilled. `0` disables the rule. See "Frames not worth a lookup". |
 
