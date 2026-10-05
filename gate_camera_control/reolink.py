@@ -23,12 +23,21 @@ from .atomic import atomic_write
 API_PATH = "/cgi-bin/api.cgi"
 ALLOWED_COMMANDS = frozenset({
     "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed", "Snap", "GetTime", "SetTime",
+    # The refocus nudge (focus.py): read the lens, and move the *zoom* one step
+    # and back. `StartZoomFocus` is only ever sent with op `ZoomPos` -- see
+    # `zoom_to` -- so no focus position is ever written from here.
+    "GetZoomFocus", "StartZoomFocus",
 })
 IR_STATES = ("Auto", "Off")
 # The RLC-811A's white spotlight, as the firmware's `WhiteLed.state` reports it:
 # 1 lit, 0 dark. `mode` (off / night-smart / schedule) is the camera's own
 # automation and is never touched here -- only whether it is lit right now.
 SPOTLIGHT_STATES = ("On", "Off")
+# The RLC-811A's motorised lens, as `GetZoomFocus` reports it: zoom 0-28,
+# focus 0-238. Measured on the fitted unit; see docs/reolink-rlc-811a.md.
+ZOOM_MIN = 0
+ZOOM_MAX = 28
+FOCUS_MAX = 238
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MIN_LOGIN_INTERVAL_SECONDS = 60.0
 BREAKER_SECONDS = 60.0
@@ -236,6 +245,34 @@ class ReolinkClient:
         if not isinstance(time_fields, dict) or not isinstance(dst, dict):
             raise ValueError("clock fields must be objects")
         self._command("SetTime", 0, {"Time": dict(time_fields), "Dst": dict(dst)})
+
+    def zoom_focus(self) -> dict:
+        """The lens position: ``{"zoom": int, "focus": int}`` from `GetZoomFocus`."""
+        value = self._command("GetZoomFocus", 1, {"channel": 0})
+        block = value.get("ZoomFocus") if isinstance(value, dict) else None
+        zoom = block.get("zoom") if isinstance(block, dict) else None
+        focus = block.get("focus") if isinstance(block, dict) else None
+        zoom = zoom.get("pos") if isinstance(zoom, dict) else None
+        focus = focus.get("pos") if isinstance(focus, dict) else None
+        if (isinstance(zoom, bool) or not isinstance(zoom, int)
+                or not ZOOM_MIN <= zoom <= ZOOM_MAX
+                or isinstance(focus, bool) or not isinstance(focus, int)
+                or not 0 <= focus <= FOCUS_MAX):
+            raise CameraError("camera reported an unusable lens position")
+        return {"zoom": zoom, "focus": focus}
+
+    def zoom_to(self, position: int) -> None:
+        """Move the zoom motor to ``position``; the camera refocuses by itself.
+
+        Deliberately the only lens write there is: the operation is fixed to
+        `ZoomPos`, so this cannot set a focus position however it is called.
+        """
+        if (isinstance(position, bool) or not isinstance(position, int)
+                or not ZOOM_MIN <= position <= ZOOM_MAX):
+            raise ValueError("zoom position is out of range")
+        self._command("StartZoomFocus", 0, {
+            "ZoomFocus": {"channel": 0, "op": "ZoomPos", "pos": position},
+        })
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""

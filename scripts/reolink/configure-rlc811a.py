@@ -32,7 +32,11 @@ Two things this script deliberately does **not** touch:
   hour, which is how the camera ended up two hours out for four days.
 * **Zoom and focus.** The lens position is being re-derived from a physical
   re-aim (docs/reolink-rlc-811a.md, Capture At The Stop). A hard-coded position
-  here would undo that silently, so no `ZoomFocus` command is ever sent.
+  here would undo that silently, so no `ZoomFocus` command is ever sent. The
+  only lens movement anywhere on the Pi is gate-camera-control's refocus nudge
+  (docs/camera-control.md, Refocus), which steps the zoom one position and back
+  to exactly where it was and never sets a focus position; it is not this
+  script's business and does not change this guarantee.
 
 Sources of truth: docs/reolink-rlc-810a.md (streams, FTP, webhook),
 docs/reolink-rlc-811a.md (frame rate, exposure, spotlight),

@@ -28,6 +28,8 @@ from gate_media_config import (
 
 from .baichuan import BaichuanClient
 from .clock import ClockReconciler, ClockWorker
+from .focus import REASONS as REFOCUS_REASONS
+from .focus import RefocusController, RefocusRefused, ZoomReturnFailed, ZoomReturnWorker
 from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker, SpotlightController
 from .reolink import (
     IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient,
@@ -53,6 +55,10 @@ STATE_ROOT = "/var/lib/gate-camera"
 LEASE_PATH = f"{STATE_ROOT}/lease.json"
 # Its own record: an IR lease and a spotlight lease run and revert independently.
 SPOTLIGHT_LEASE_PATH = f"{STATE_ROOT}/spotlight-lease.json"
+# The zoom position a refocus nudge started from, written before the lens moves
+# and removed once the zoom is proven back. Durable for the same reason as the
+# lease: a power cut between the step and the return must not strand the zoom.
+REFOCUS_RECORD_PATH = f"{STATE_ROOT}/refocus-return.json"
 SNAPSHOT_MIN_INTERVAL_SECONDS = 2.0
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_WAIT_SECONDS = 15.0
@@ -71,21 +77,28 @@ SPOTLIGHT_BURST = IR_BURST
 SPOTLIGHT_REFILL_PER_SECOND = IR_REFILL_PER_SECOND
 _IR_BODY_FIELDS = frozenset({"state", "lease_minutes", "ttl_seconds", "idempotency_key"})
 _TALK_BODY_FIELDS = frozenset({"max_seconds"})
+_REFOCUS_BODY_FIELDS = frozenset({"reason"})
+_REFOCUS_PATH = "/camera/refocus"
 _STATE_PATHS = frozenset({"/camera/state", "/camera/ir", "/camera/spotlight"})
 _LEASE_PATHS = frozenset({"/camera/ir", "/camera/spotlight"})
 _SNAPSHOT_PATHS = frozenset({"/camera/snap", "/camera/snapshot"})
 _TALK_PATH = "/camera/talk"
 
 
-def journal(logger, stage, **fields) -> None:
-    """Emit one structured, credential-free journal line."""
+def journal(logger, stage, *, level="info", **fields) -> None:
+    """Emit one structured, credential-free journal line.
+
+    ``level`` is the logger method, so a zoom that could not be put back lands
+    in the journal at error priority rather than among the routine lines.
+    """
     parts = [f"gate_camera_control stage={_journal_value(stage)}"]
     for key in sorted(fields):
         value = fields[key]
         if value is None:
             continue
         parts.append(f"{key}={_journal_value(value)}")
-    logger.info(" ".join(parts))
+    emit = getattr(logger, level, None) if level in ("info", "warning", "error") else None
+    (emit if callable(emit) else logger.info)(" ".join(parts))
 
 
 def _journal_value(value) -> str:
@@ -102,8 +115,10 @@ class CameraControlService:
     def __init__(self, controller, client, *, clock=time.time, logger=None,
                  snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS,
                  state_rate=None, ir_rate=None, spotlight=None, spotlight_rate=None,
-                 talk=None, talk_rate=None):
+                 talk=None, talk_rate=None, refocus=None):
         self._controller = controller
+        # The zoom nudge, or None on a service built without one.
+        self._refocus = refocus
         # The spotlight's own lease controller, or None on a camera without one.
         self._spotlight = spotlight
         self._client = client
@@ -144,6 +159,27 @@ class CameraControlService:
     @property
     def talk(self):
         return self._talk
+
+    @property
+    def refocus_controller(self):
+        return self._refocus
+
+    def refocus(self, payload) -> dict:
+        """Nudge the zoom one step and back so the camera's autofocus runs again.
+
+        Narrow on purpose: the body may only say why (for the journal), never
+        where. The lens always ends on the zoom it started on; see focus.py.
+        """
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict) or not set(payload) <= _REFOCUS_BODY_FIELDS:
+            raise ValueError("invalid_request")
+        reason = payload.get("reason", "manual")
+        if reason not in REFOCUS_REASONS:
+            raise ValueError("invalid_request")
+        if self._refocus is None:
+            raise RefocusRefused(404, "not_found")
+        return self._refocus.refocus(reason)
 
     def talk_state(self) -> dict:
         self._admit(self._state_limiter, "state_rate_limited")
@@ -490,6 +526,8 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             self._guarded(self._respond_snapshot)
         elif path == _TALK_PATH:
             self._guarded(lambda: self._respond_json(200, self.server.service.talk_state()))
+        elif path == _REFOCUS_PATH:
+            self._respond_json(405, {"error": "method_not_allowed"})
         else:
             self._respond_json(404, {"error": "not_found"})
 
@@ -509,6 +547,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
                 return
             self._guarded(lambda: self._respond_json(
                 200, self.server.service.arm_talk(payload)
+            ))
+            return
+        if path == _REFOCUS_PATH:
+            payload = self._read_json_body(allow_empty=True)
+            if payload is _INVALID:
+                return
+            self._guarded(lambda: self._respond_json(
+                200, self.server.service.refocus(payload)
             ))
             return
         if path not in _LEASE_PATHS:
@@ -544,6 +590,8 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             # Deliberately not a snapshot: a HEAD must not spend the camera's
             # one-every-two-seconds budget to report a length nobody reads.
             self._respond(200, "image/jpeg", b"", body_only_headers=True)
+        elif path == _REFOCUS_PATH:
+            self._respond_json(405, {"error": "method_not_allowed"}, body_only_headers=True)
         else:
             self._respond_json(404, {"error": "not_found"}, body_only_headers=True)
 
@@ -628,6 +676,21 @@ class CameraControlHandler(BaseHTTPRequestHandler):
                 429, {"error": "rate_limited", "retry_after": error.retry_after},
                 retry_after=error.retry_after,
             )
+        except RefocusRefused as error:
+            body = {"error": error.error}
+            if error.reason is not None:
+                body["reason"] = error.reason
+            if error.retry_after is not None:
+                body["retry_after"] = error.retry_after
+            self._respond_json(error.status, body, retry_after=error.retry_after)
+        except ZoomReturnFailed as error:
+            # Already journaled at error priority by the controller, with the
+            # positions. The caller is told the same, and that the service is
+            # still trying.
+            self._respond_json(502, {
+                "error": "zoom_return_failed",
+                "zoom": {"expected": error.expected, "observed": error.observed},
+            })
         except CameraBusy as error:
             journal(self.server.logger, "camera_busy", retry_after=error.retry_after)
             self._respond_json(
@@ -733,9 +796,10 @@ def _talk_rtsp_url(credential, logger):
 
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
                   spotlight_lease_path=SPOTLIGHT_LEASE_PATH,
+                  refocus_record_path=REFOCUS_RECORD_PATH,
                   logger=None, connection_factory=None, clock=time.time,
                   talk_client_factory=None, talk_options=None,
-                  talk_credential=None) -> CameraControlService:
+                  talk_credential=None, refocus_options=None) -> CameraControlService:
     """Wire the client, the IR controller, the spotlight and talk from validated settings.
 
     The spotlight shares IR's lease bounds and is always dark by default: it is
@@ -802,8 +866,16 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         clock=clock,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
+    refocus = RefocusController(
+        client,
+        record_path=refocus_record_path,
+        clock=clock,
+        journal=lambda stage, **fields: journal(logger, stage, **fields),
+        **dict(refocus_options or {}),
+    )
     return CameraControlService(
         controller, client, clock=clock, logger=logger, spotlight=spotlight, talk=talk,
+        refocus=refocus,
     )
 
 
@@ -851,9 +923,13 @@ def main(argv=None) -> int:
     # spotlight -- on.
     service.controller.restore_default_on_start()
     service.spotlight.restore_default_on_start()
+    # Likewise a zoom nudge the previous process never finished: the zoom goes
+    # back to where it started before anything else is served.
+    service.refocus_controller.restore_on_start()
     server = CameraControlServer((arguments.host, arguments.port), service, logger=logger)
     reverts = RevertWorker(service.controller)
     spotlight_reverts = RevertWorker(service.spotlight, name="camera-spotlight-revert")
+    zoom_returns = ZoomReturnWorker(service.refocus_controller)
     clock_reconciler = build_clock_reconciler(settings, service._client, logger=logger)
     clock_worker = ClockWorker(clock_reconciler)
     talk = service.talk
@@ -882,6 +958,7 @@ def main(argv=None) -> int:
             talk_max_seconds=None if talk is None else talk.max_seconds)
     reverts.start()
     spotlight_reverts.start()
+    zoom_returns.start()
     clock_worker.start()
     publisher.start()
     try:
@@ -889,6 +966,7 @@ def main(argv=None) -> int:
     finally:
         publisher.stop()
         clock_worker.stop()
+        zoom_returns.stop()
         spotlight_reverts.stop()
         reverts.stop()
         if talk is not None:

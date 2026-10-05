@@ -3,8 +3,10 @@
 `gate-camera-control` is the only process in the deployment that holds Reolink
 camera API credentials. It exposes a small loopback HTTP surface so the Gate Mate
 Worker can read the IR illuminator state, take a bounded IR lease, fetch one
-on-demand 4K still, and arm one bounded push-to-talk session — without the
-browser, the Worker, or the gate controller ever holding a camera credential.
+on-demand 4K still, arm one bounded push-to-talk session, and nudge the zoom
+one step and back so the camera's autofocus runs again ([Refocus](#refocus)) —
+without the browser, the Worker, or the gate controller ever holding a camera
+credential.
 Push-to-talk has its own document, [Push-to-talk](talkback.md); this one covers
 the service, and only names where talkback plugs into it.
 
@@ -31,8 +33,11 @@ usable record reads the camera once and puts it back if it disagrees. The
 service exposes IR and the spotlight only. It never calls `SetIsp`: the deployed
 Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
 operation. The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
-`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime` and `SetTime`, and
-no request body can widen it. The Baichuan (port 9000) message set used for
+`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime`, `SetTime`,
+`GetZoomFocus` and `StartZoomFocus`, and no request body can widen it.
+`StartZoomFocus` is only ever sent with the operation `ZoomPos`: nothing in the
+service can write a focus position or change the autofocus mode (see
+[Refocus](#refocus)). The Baichuan (port 9000) message set used for
 push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
 `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
 `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
@@ -90,6 +95,7 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `POST /camera/talk` | 6 at once, then 1 every 2 s |
 | `GET /camera/talk` | shares the state budget |
 | `DELETE /camera/talk` | none: hanging up is never refused |
+| `POST /camera/refocus` | one at a time; at least 10 min apart and at most 6 in any 24 h, service-wide |
 
 ### `GET /camera/state` — also served at `GET /camera/ir`
 
@@ -218,6 +224,33 @@ camera's `Snap` API (a few hundred KB, about 0.45 s). Rate limited to **one per
 2 s** service-wide. The service stores nothing; retention, if any, is the
 Worker's decision.
 
+### `POST /camera/refocus`
+
+Steps the zoom one position (up; down at the long end, 28) and back to exactly
+where it was, so the camera's own autofocus runs again. The body is optional and
+may say only why, for the journal — `{"reason": "daily" | "detection" |
+"manual"}`, default `manual`; any other field, including a position, is `400`.
+Only `POST` is served (`GET`/`HEAD` are `405`). It takes about 15 s: read
+`GetZoomFocus`, step, wait 7 s, return, wait 7 s for the autofocus, read back.
+
+```json
+{"observed_at": "2026-10-05T11:30:14+00:00", "status": "completed", "reason": "daily",
+ "zoom": {"before": 2, "stepped_to": 3, "after": 2},
+ "focus": {"before": 86, "after": 78}, "return_attempts": 1}
+```
+
+`status` is `completed`, or `step_failed` when the camera refused the step but
+the zoom was still proven at its original position. `zoom.after` always equals
+`zoom.before` in a `200`. What can go wrong instead:
+
+| Status | Body | Meaning |
+| --- | --- | --- |
+| `409` | `{"error":"refocus_busy","reason":"in_progress"}` | another nudge is running; not queued |
+| `409` | `{"error":"refocus_busy","reason":"zoom_return_pending"}` | a previous return has not been proven yet; no new nudge until it is |
+| `429` | `{"error":"rate_limited","retry_after":N}` | the 10 min spacing or the 6-a-day cap |
+| `502` | `{"error":"zoom_return_failed","zoom":{"expected":2,"observed":3}}` | the zoom could not be proven back. Journaled at error priority; the service keeps retrying in the background (below) |
+| `502`/`503` | `camera_error` / `camera_busy` / `camera_unreachable` | the first `GetZoomFocus` failed; nothing moved |
+
 ### `GET`, `POST`, `DELETE /camera/talk`
 
 Push-to-talk: arm one bounded session, read it, end it. The contract, the
@@ -230,12 +263,14 @@ With talk not enabled, `GET` reports `reason: not_enabled` and `POST` is
 
 | Status | Body | When |
 | --- | --- | --- |
-| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds |
+| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds, a refocus body that names anything but a reason |
+| `409` | `{"error":"refocus_busy","reason":...}` | a refocus is running, or a zoom return is still outstanding |
 | `404` | `{"error":"not_found"}` | unknown path, or any query string |
 | `405` | `{"error":"method_not_allowed"}` | wrong method for a known path |
 | `413` | `{"error":"request_too_large"}` | body over 4096 bytes |
 | `429` | `{"error":"rate_limited","retry_after":2}` | any endpoint budget above; `Retry-After` header set |
 | `502` | `{"error":"camera_error"}` | the camera answered, but not usably |
+| `502` | `{"error":"zoom_return_failed","zoom":{...}}` | a refocus could not prove the zoom back at its original position |
 | `502` | `{"error":"camera_indeterminate"}` | a replay of an `idempotency_key` whose first call was still in flight after 15 s. Not a failure and not a success; do not infer an IR state from it |
 | `503` | `{"error":"camera_busy","retry_after":60}` | circuit breaker open after a camera 502 or a camera that did not answer, or the 60 s login throttle is holding; `Retry-After` header set. **Do not retry** — surface the wait |
 | `503` | `{"error":"camera_unreachable"}` | the camera did not answer at all. This is the *first* such failure; it also opens the breaker, so an immediate retry is `503 camera_busy` |
@@ -310,6 +345,139 @@ reaches the app through the 15 s heartbeat.
 Worst-case heartbeat staleness is Pi heartbeat 15 s plus UI poll 15 s ≈ **30 s**,
 so the app must confirm a toggle with a direct read rather than waiting for a
 heartbeat.
+
+## Refocus
+
+### 2026-10-04: the lens lost focus overnight
+
+Overnight from 3 to 4 October 2026 the RLC-811A lost focus with autofocus
+enabled. Its focus motor ended at 86 (it had been 80) on zoom position 2 (zoom
+range 0-28, focus range 0-238), and every daylight event frame after it was
+soft. The per-frame `sharpness` the controller records in event telemetry
+(`frames[].sharpness`) went from a daylight median of about 0.21-0.26 (frames
+0.19-0.29) between 15 and 30 September to at most 0.158 on 4-5 October, on
+1920- and 3840-wide frames alike. Daytime FTP JPEGs shrank from about 1.2-1.8 MB
+to about 390 KB. Plate reads collapsed, and the gate opened for 1 of 34
+passages.
+
+What fixed it, by hand on 2026-10-05: in daylight, step the zoom from 2 to 3 and
+back to 2, about 7 s apart. The autofocus ran again, settled at focus 78, and
+the picture was sharp.
+
+### The mechanism
+
+`POST /camera/refocus` (above) does exactly that and nothing else. Its
+guarantees, all tested through the HTTP surface against a fake camera
+(`tests/test_camera_refocus.py`):
+
+- it moves the **zoom** only. `ReolinkClient.zoom_to` can only send
+  `StartZoomFocus` with `op: ZoomPos`; no focus position and no autofocus
+  setting exists anywhere in the package;
+- it always returns to **exactly** the zoom it read, and proves it by reading
+  back. The original position is on durable storage before the lens moves, a
+  failed return is retried in the request and then in the background, and a
+  restart puts the zoom back before it serves anything;
+- it is narrow and slow: one at a time, at least 10 minutes apart, at most six
+  a day, whoever asks.
+
+This is a deliberate, narrow exception to the rule that nothing on the Pi
+touches the lens. [`configure-rlc811a.py`](../scripts/reolink/configure-rlc811a.py)
+keeps its own guarantee unchanged — it sends no `ZoomFocus` command of any kind
+(`SetZoomFocus`, `StartZoomFocus` and `SetAutoFocus` stay in its
+`FORBIDDEN_COMMANDS`) — because a setup script that wrote a position could undo
+a physical re-aim. The nudge cannot: wherever the zoom was, it ends there.
+
+### When the controller asks for it
+
+The controller (`gate_controller/camera_focus.py`) decides when, because it is
+what sees the frames, the presence sessions and the sweeps. It calls the
+service over loopback with no credential.
+
+- **Daily**, once per local day inside `GATE_CAMERA_REFOCUS_DAILY_WINDOW`
+  (`12:00-15:00` Europe/Dublin). Any refocus earlier that day counts as the
+  day's.
+- **On detection**, when recent daylight frames are soft. A frame counts only
+  if it is a whole frame (16:9, at least 1280 wide; a cropped plate band
+  scores differently), lit (brightness at least 0.25) and taken with IR `Off`.
+  The trigger is the **median of at least 3 such frames, from at least 2
+  different events, below 0.18**. 0.18 sits under the lowest healthy daylight
+  frame measured (0.19) and above the highest soft one (0.158). The median of
+  several frames from more than one passage keeps a single motion-blurred car
+  from reading as a lens fault. The frames are scored by the same function
+  (`images.measure_frame_quality`, a Laplacian on a 320x180 draft decode), so
+  1920- and 3840-wide frames are compared like with like, which the September
+  and October measurements bear out.
+
+Every attempt is guarded, in this order:
+
+1. at most `GATE_CAMERA_REFOCUS_MAX_PER_DAY` (3) in any 24 h, never two within
+   an hour, and a detection run at most once per
+   `GATE_CAMERA_REFOCUS_MIN_INTERVAL_HOURS` (6) since the last attempt of any
+   kind;
+2. no vehicle: the controller's activity gate idle (no burst, camera event,
+   early sweep or presence session) for `GATE_CAMERA_REFOCUS_QUIET_SECONDS`
+   (120), and no presence session active. An answer it cannot read counts as
+   a vehicle;
+3. IR `Off`, read from `/run/gate-camera/state.json`;
+4. daylight: a 4K still taken first must have brightness at least 0.25. The
+   autofocus hunts in the dark, which is how the lens got lost. A dark still,
+   or no still, waits 15 minutes before the next look.
+
+While the nudge runs, the controller holds its activity gate as
+`camera_refocus`, so the early-trigger watcher pauses rather than reading a
+zooming scene as an arrival, and the corpus stands down. If a vehicle event
+starts during it anyway, the attempt is recorded `disturbed=true`.
+
+It is verified with a second still after the service has settled. Both stills
+are scored by the same function as event frames (`images.measure_jpeg_quality`)
+and one journal line records the attempt:
+
+```text
+gate_camera_refocus stage=attempt trigger=detection outcome=completed zoom_before=2 zoom_step=3 zoom_after=2 focus_before=86 focus_after=78 sharpness_before=0.142 sharpness_after=0.231 brightness_before=0.412 window_median=0.151 window_frames=4 disturbed=false
+```
+
+`outcome` is `completed` (sharpness back at or above the threshold),
+`not_recovered` (warning: the nudge ran and the still is still soft; it is
+**not** repeated until the interval and the cap allow), `step_failed`,
+`unverified` (no still afterwards), `shadow`, or the service's refusal
+(`rate_limited`, `refocus_busy`, `camera_busy`, ...). `zoom_return_failed` is
+logged at error priority with the expected and observed zoom. Skips are one
+`gate_camera_refocus stage=skipped trigger=... reason=...` line when the reason
+changes (at most every 30 min otherwise): `daily_cap`, `vehicle_activity`,
+`ir_not_off`, `dark`, `snapshot_<error>`.
+
+The schedule survives restarts (`/var/lib/gate-controller/camera-refocus.json`);
+a file that cannot be read is treated as an attempt made just now. The outcome
+also rides the heartbeat as an additive `camera_focus` block (mode, window
+frames and median, attempts in 24 h, the last attempt's positions and
+sharpness). The app's heartbeat narrowing drops keys it does not know, so it
+reaches the dashboard only once access-gate-ui learns the block; the journal
+has it today.
+
+| Key (`/etc/gate-controller.env`) | Default | Rules |
+| --- | --- | --- |
+| `GATE_CAMERA_REFOCUS` | `on` | `off`, `shadow` (take and score the still, journal, never move the lens) or `on`. Anything else is `off` |
+| `GATE_CAMERA_REFOCUS_DAILY_WINDOW` | `12:00-15:00` | local `HH:MM-HH:MM`, start before end |
+| `GATE_CAMERA_REFOCUS_TIMEZONE` | `Europe/Dublin` | an IANA zone |
+| `GATE_CAMERA_REFOCUS_SHARPNESS_THRESHOLD` | `0.18` | 0.05-0.5 |
+| `GATE_CAMERA_REFOCUS_MIN_FRAMES` | `3` | whole number 3-12 |
+| `GATE_CAMERA_REFOCUS_MIN_BRIGHTNESS` | `0.25` | 0.1-0.9 |
+| `GATE_CAMERA_REFOCUS_MIN_INTERVAL_HOURS` | `6` | 1-48 |
+| `GATE_CAMERA_REFOCUS_MAX_PER_DAY` | `3` | whole number 1-6 |
+| `GATE_CAMERA_REFOCUS_QUIET_SECONDS` | `120` | 30-3600 |
+
+A value outside its bounds is journaled `gate_camera_refocus stage=config
+status=rejected` and the default used; it never stops the controller starting.
+
+It ships `on`. It cannot reach the relay: it reads telemetry the pipeline has
+already finished with, and talks only to this service.
+
+```bash
+journalctl -u file-monitor --since -1d | grep gate_camera_refocus
+journalctl -u gate-camera-control --since -1d | grep 'stage=refocus'
+# By hand, in daylight, with nobody at the gate:
+curl -s -X POST http://127.0.0.1:8767/camera/refocus -H 'Content-Type: application/json' -d '{"reason":"manual"}'
+```
 
 ## Camera clock reconcile
 
@@ -389,7 +557,16 @@ gate_camera_control stage=ir_rate_limited retry_after=2
 gate_camera_control stage=talk_probe outcome=ready
 gate_camera_control stage=talk_armed max_seconds=30 session=3f2a9c1d0b7e
 gate_camera_control stage=talk_ended blocks=214 reason=publisher_gone seconds=14.1 session=3f2a9c1d0b7e
+gate_camera_control stage=refocus focus_after=78 focus_before=86 outcome=completed reason=daily return_attempts=1 zoom_after=2 zoom_before=2 zoom_step=3
+gate_camera_control stage=refocus_rate_limited reason=manual retry_after=412
+gate_camera_control stage=refocus_return attempt=2 expected=2 observed=3 outcome=mismatch reason=daily
+gate_camera_control stage=refocus_return_failed expected=2 observed=3 reason=daily
+gate_camera_control stage=refocus_return background=true expected=2 observed=2 outcome=completed
+gate_camera_control stage=startup_zoom_return zoom=2
 ```
+
+The `refocus_return*` and `startup_zoom_return` lines are written at warning or
+error priority, so `journalctl -u gate-camera-control -p warning` finds them.
 
 No credential, token, camera address, or camera payload ever appears — the same
 rule as the webhook listener.
@@ -412,6 +589,8 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | The lease record is lost or unreadable anyway | on start, with no usable record, the service **reads** the camera once: a state that is not `GATE_CAMERA_IR_DEFAULT` is put back and journaled `startup_reconcile`; a state that matches it, or a camera that will not answer, is left alone. That read is one `GetIrLights` on the cached token, so a restart loop still cannot become a login storm, and nothing is ever written on the strength of a camera that could not be read. A record that exists but is unusable — bad JSON, or a timestamp outside a year either side of now — is journaled `lease_corrupt` and treated as an expired lease, so the default is restored through the ordinary revert path |
 | A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |
 | Revert call itself fails | retried with 5/10/20/40/60 s backoff for the life of the process; `ir.revert_failed` stays true in `state.json`; every attempt is journaled |
+| A refocus return does not take | retried in the request after 5, 20 and 65 s (the last outlasts the 60 s breaker), then answered `502 zoom_return_failed` and retried in the background with 5/10/20/40/60 s backoff for the life of the process. No further refocus is admitted until the zoom is proven back |
+| Restart or power cut between the step and the return | the original zoom is written to `/var/lib/gate-camera/refocus-return.json` **before** the lens moves; on start the service reads the lens and returns the zoom before it serves anything, then removes the record. No record means nothing was touched, and nothing is moved. An unreadable record moves nothing and is journaled `refocus_record_corrupt` |
 | Two operators toggling at once | serialised under one lock, last write wins, both journaled |
 | Heartbeat lag | heartbeat-derived state can be ~30 s stale; confirm with `GET /camera/state` after a toggle |
 | Camera push interval | the firmware minimum webhook interval is **20 s**, so "did the change help the trigger?" cannot be answered faster than that. Do not imply instant confirmation |
