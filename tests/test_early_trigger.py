@@ -316,6 +316,19 @@ class ShadowTests(unittest.TestCase):
         thumbs.prune(1_790_000_000.0 + 3 * 86400)
         self.assertEqual(list((harness.state / "thumbs").glob("*.jpg")), [])
 
+    def test_pictures_are_aged_by_when_they_were_taken_not_by_the_wall_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thumbs = ThumbnailStore(Path(directory), max_files=10, max_days=1)
+            frame = picture((160, 90))
+            taken = 1_790_000_000.0
+            old = thumbs.save(frame, frame, (160, 90), taken, "trigger")
+            fresh = thumbs.save(frame, frame, (160, 90), taken + 0.75 * 86400, "trigger")
+            # The wall clock says the reverse of the names.
+            os.utime(Path(directory) / fresh, (taken - 10 * 86400,) * 2)
+            os.utime(Path(directory) / old, (taken + 10 * 86400,) * 2)
+            thumbs.prune(taken + 1.5 * 86400)
+            self.assertEqual(sorted(p.name for p in Path(directory).glob("*.jpg")), [fresh])
+
     def test_nothing_is_looked_at_while_the_decoder_may_still_be_showing_rubbish(self):
         harness = WorkerHarness(self, "shadow", data=arrival(load_config({}), frames_before=4))
         harness.run()

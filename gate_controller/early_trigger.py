@@ -990,10 +990,22 @@ class ThumbnailStore:
         excess = max(0, len(files) - self.max_files)
         for index, path in enumerate(files):
             try:
-                if index < excess or path.stat().st_mtime < cutoff:
+                if index < excess or self._taken_at(path) < cutoff:
                     path.unlink()
             except OSError:
                 continue
+
+    @staticmethod
+    def _taken_at(path: Path) -> float:
+        # Aged by the capture time `save` wrote into the name, on the same
+        # clock as `now_epoch`. The file's mtime is the wall clock at write,
+        # which disagrees with any caller that passes its own clock; it is
+        # only the fallback for a name this store did not write.
+        try:
+            stamp = datetime.strptime(path.name.split("-", 1)[0], "%Y%m%dT%H%M%S%fZ")
+        except ValueError:
+            return path.stat().st_mtime
+        return stamp.replace(tzinfo=timezone.utc).timestamp()
 
 
 # ---------------------------------------------------------------------------

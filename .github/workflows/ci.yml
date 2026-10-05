@@ -6,6 +6,10 @@ on:
   push:
     branches:
       - master
+  # A push GitHub never turned into a run leaves master without exact-SHA CI,
+  # and the Pi then refuses that release indefinitely (#190 waited 12 days).
+  # `gh workflow run ci.yml --ref master` re-runs CI on the head of master.
+  workflow_dispatch:
 
 permissions:
   contents: read
