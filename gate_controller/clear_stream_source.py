@@ -40,7 +40,7 @@ from .scene import SceneBaseline, frame_thumbnail, thumbnail_difference
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SESSION_FPS = 5.0
-DEFAULT_SESSION_SECONDS = 45.0
+DEFAULT_SESSION_SECONDS = 90.0  # kept equal to trigger_capture.DEFAULT_SESSION_SECONDS
 DEFAULT_BASELINE_SECONDS = 30.0
 # The clear stream's own frame rate, which must match the camera's main
 # stream. An Annex-B pipe carries no timestamps, so the session decoder has

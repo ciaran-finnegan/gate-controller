@@ -202,7 +202,7 @@ class TriggerCaptureConfigTests(unittest.TestCase):
 
     def test_clear_stream_defaults_to_compressed_and_validates_session_settings(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
-        self.assertEqual((config.clear_stream_mode, config.session_fps, config.session_seconds), ("compressed", 5.0, 45.0))
+        self.assertEqual((config.clear_stream_mode, config.session_fps, config.session_seconds), ("compressed", 5.0, 90.0))
         decoded = load_trigger_capture_config(
             {"GATE_CLEAR_STREAM_MODE": "decoded", "GATE_SESSION_FPS": "2", "GATE_SESSION_SECONDS": "30"},
             Path("/uploads"), webhook_enabled=True,
@@ -577,8 +577,78 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
             extra = capture.presence_session(event(), 100.0, self._Stop(clock))
 
-        self.assertEqual(extra, 1)
+        # Two frames agreeing on the plate is what makes it conclusive
+        # (CONCLUSIVE_AGREEING_READS, since 2026-10-05): the first presence
+        # frame reads it, the second agrees and ends the session.
+        self.assertEqual(extra, 2)
         self.assertIn("presence_ended reason=plate_denied", "\n".join(logs.output))
+
+    def test_one_confident_read_of_another_vehicle_is_held_until_a_second_agrees(self):
+        clock = [100.0]
+        stranger = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="231WH553", confidence=0.91,
+            policy_level="standard", policy_band="08:00-22:00",
+        ))
+        capture, _popen = self._presence_capture(
+            6, clock=clock, max_frames=4,
+            verdict=lambda n: stranger if n == 5 else (
+                stranger if n == 6 else ProcessingResult(False, "ocr_error")),
+        )
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+        combined = "\n".join(logs.output)
+        self.assertIn("stage=conclusive_held reason=awaiting_agreement plate=231WH553 reads=1 of=2", combined)
+        self.assertEqual(extra, 3, "one read held the session open; the second ended it")
+        self.assertIn("presence_ended reason=plate_denied", combined)
+
+    def test_a_confident_read_in_no_registration_shape_never_ends_the_passage(self):
+        # 2026-10-05 16:38: the cloud read "1SU2U" at 0.811 from a soft frame.
+        clock = [100.0]
+        junk = ProcessingResult(False, "no_match", decision=MatchDecision(
+            False, "no_match", observed_plate="1SU2U", confidence=0.811,
+            policy_level="standard", policy_band="08:00-22:00",
+        ))
+        capture, _popen = self._presence_capture(8, clock=clock, max_frames=3, verdict=lambda n: junk)
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+        combined = "\n".join(logs.output)
+        self.assertNotIn("reason=plate_denied", combined)
+        self.assertIn("stage=conclusive_ignored reason=implausible plate=1SU2U", combined)
+        self.assertEqual(extra, 3, "the session ran its whole budget")
+
+    def test_two_different_strangers_read_once_each_are_not_conclusive(self):
+        clock = [100.0]
+        plates = iter(["231WH553", "191D4471", "231WH553"])
+        reads = {}
+
+        def verdict(n):
+            if n < 4:
+                return ProcessingResult(False, "ocr_error")
+            plate = reads.setdefault(n, next(plates, "231WH553"))
+            return ProcessingResult(False, "no_match", decision=MatchDecision(
+                False, "no_match", observed_plate=plate, confidence=0.9,
+                policy_level="standard", policy_band="08:00-22:00",
+            ))
+
+        capture, _popen = self._presence_capture(8, clock=clock, max_frames=4, verdict=verdict)
+        capture.capture_series(event(), 100.0, self._Stop(clock))
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            extra = capture.presence_session(event(), 100.0, self._Stop(clock))
+        combined = "\n".join(logs.output)
+        self.assertEqual(extra, 3, "settled on the second read of 231WH553, not on 191D4471")
+        self.assertIn("presence_ended reason=plate_denied", combined)
+
+    def test_registration_shapes(self):
+        from gate_controller.trigger_capture import _plausible_registration
+        for plate in ("131D2696", "84WH741", "10CE1990", "262WH327", "AB12CDE", "A123BCD",
+                      "ABC123D", "AXZ1234", "LHF455"):
+            with self.subTest(plate=plate):
+                self.assertTrue(_plausible_registration(plate))
+        for plate in ("1SU2U", "17211", "1", "1E37", "", "131D2696X", "3311113"):
+            with self.subTest(plate=plate):
+                self.assertFalse(_plausible_registration(plate))
 
     def test_a_night_visitor_is_conclusive_at_the_conclusive_read_bar(self):
         """Overnight, `strict` asks 0.90 of a read before it may open a gate.

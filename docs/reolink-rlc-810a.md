@@ -215,7 +215,8 @@ a few megabytes), and a small parser groups them by keyframe. When a camera
 event arrives, the newest buffered keyframe is decoded on demand (about half
 a second including ffmpeg start-up, still well ahead of a fresh RTSP grab,
 which waits for the next keyframe) and a live session decoder starts at
-`GATE_SESSION_FPS` (5) for up to `GATE_SESSION_SECONDS` (45). Measured with
+`GATE_SESSION_FPS` (5) for up to `GATE_SESSION_SECONDS` (90 since 2026-10-05, so a
+waiting car is still being read; it stops as soon as the passage ends). Measured with
 hardware decode, crop and scale: a 5 fps session costs about 60% of one core
 while it runs; 10 fps about 116%, so 5 is the default.
 
@@ -339,7 +340,7 @@ passage is still recorded and the cloud gets a last-resort read; 0 keeps
 every sweep frame off the cloud. A frame already handed over is never handed
 over again. If the picture still shows something other than the empty drive,
 the on-device reader then **keeps looking** at `GATE_LOCAL_SWEEP_WAITING_FPS`
-(default 1 a second) for up to `GATE_LOCAL_SWEEP_WAITING_SECONDS` (default 30,
+(default 2 a second) for up to `GATE_LOCAL_SWEEP_WAITING_SECONDS` (default 80,
 0 disables, never past `GATE_SESSION_SECONDS`), ending on an open, a
 conclusive denial, a new alarm, three empty frames in a row, or the cap. The
 presence session then runs as before for whatever remains of its window -
@@ -383,8 +384,18 @@ shade under the confidence bar. Three things end it now:
 - **the gate opened** (`reason=opened`);
 - **a confident read of another vehicle** (`reason=plate_denied`): a plate
   read at or above `GATE_PRESENCE_CONCLUSIVE_CONFIDENCE` (0.75) with no
-  authorised plate within two edits of it. Another frame of the same car
-  cannot change that, and each one is a paid lookup.
+  authorised plate within two edits of it, **in the shape of a real
+  registration** (Irish, or UK/Northern Irish for visitors), **on two frames
+  of the passage**. Another frame of the same car cannot change that, and each
+  one is a paid lookup.
+
+  The shape and the second frame were added on 2026-10-05: a confident read
+  is not a right one, and the cloud had just returned "1SU2U" at 0.811 from a
+  soft frame. A read in no registration shape is journalled
+  `stage=conclusive_ignored reason=implausible`; the first of two is
+  `stage=conclusive_held reason=awaiting_agreement`. Both keep the session
+  reading. A real plate in some other shape is never conclusive, which costs
+  reads, never an open.
 
   That bar is deliberately *not* the band's own exact-match bar. The two
   answer different questions: the band's bar decides whether to open the gate

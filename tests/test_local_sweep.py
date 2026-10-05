@@ -120,7 +120,7 @@ class SweepConfigTests(unittest.TestCase):
         self.assertEqual(config.sweep_cloud_frames, 5)
         self.assertEqual(config.sweep_cloud_spacing_seconds, 1.0)
         # Once the sweep is on, a waiting vehicle is looked at by default.
-        self.assertEqual((config.sweep_waiting_seconds, config.sweep_waiting_fps), (30.0, 1.0))
+        self.assertEqual((config.sweep_waiting_seconds, config.sweep_waiting_fps), (80.0, 2.0))
 
     def test_the_waiting_phase_is_bounded_from_the_environment(self):
         config = load_trigger_capture_config(
@@ -130,9 +130,9 @@ class SweepConfigTests(unittest.TestCase):
         self.assertEqual((config.sweep_waiting_seconds, config.sweep_waiting_fps), (0.0, 2.0))
         for key, value in (
             ("GATE_LOCAL_SWEEP_WAITING_SECONDS", "-1"),
-            ("GATE_LOCAL_SWEEP_WAITING_SECONDS", "61"),
+            ("GATE_LOCAL_SWEEP_WAITING_SECONDS", "121"),
             ("GATE_LOCAL_SWEEP_WAITING_FPS", "0.1"),
-            ("GATE_LOCAL_SWEEP_WAITING_FPS", "2.5"),
+            ("GATE_LOCAL_SWEEP_WAITING_FPS", "3.5"),
         ):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(ValueError):
@@ -408,6 +408,42 @@ class LocalSweepTests(unittest.TestCase):
         self.assertLessEqual(waiting_reads, 6, "one a second for five seconds")
         # The passage was put on record when the window closed, not 5 s later.
         self.assertLess(output.index("source=sweep_fallback"), output.index("stage=waiting"))
+
+    def test_with_the_shipped_defaults_a_car_still_at_the_gate_at_65_s_is_still_read(self):
+        # 2026-10-05 11:10: an Audi sat at the gate, the sweep read it 54
+        # times over 40 s at 30 s / 1 a second, and stopped `wait_cap` with the
+        # car still there. With the shipped wait and session it is still being
+        # read, twice a second, long after that.
+        from gate_controller.trigger_capture import (
+            DEFAULT_SESSION_SECONDS, DEFAULT_SWEEP_WAITING_FPS, DEFAULT_SWEEP_WAITING_SECONDS,
+        )
+        # 0.4 s apart keeps every frame distinct: jpeg() repeats after 256 seeds.
+        frames = [(100.0 + index * 0.4, jpeg(seed=index)) for index in range(240)]
+        # Soft until +65 s, then (say, the sun goes in) every frame reads.
+        readable = {frame: SweepRead(
+            status="recognized", plate="131D2696", score=0.97, authorised=True,
+        ) for at, frame in frames if at >= 165.0}
+        sweep = ScriptedSweep(readable)
+        capture = None
+
+        def inject(paths, received_at, trigger):
+            self.injected.append((paths, trigger))
+            capture.note_result(paths, ProcessingResult(True, "exact_match"))
+
+        capture = self._capture(
+            FrameSource(self.clock, frames), sweep, inject=inject, fallback=0,
+            waiting=DEFAULT_SWEEP_WAITING_SECONDS, waiting_fps=DEFAULT_SWEEP_WAITING_FPS,
+        )
+        self.assertEqual(capture.config.session_seconds, DEFAULT_SESSION_SECONDS)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            injected = capture.local_sweep(event(), 100.0, Stop(self.clock))
+        self.assertEqual(injected, 1, "the late, sharp read went in")
+        self.assertIn(self.injected[0][0][0].read_bytes(), readable)
+        self.assertGreaterEqual(self.clock.now, 165.0)
+        self.assertNotIn("reason=wait_cap", "\n".join(logs.output))
+        waiting_reads = capture.status()["sweep"]["waiting_reads"]
+        # ~55 s of waiting before the late frame, at two a second.
+        self.assertGreaterEqual(waiting_reads, 100)
 
     def test_waiting_never_outlives_the_decoder_session(self):
         frames = [(100.0 + index * 0.5, jpeg(seed=index)) for index in range(200)]

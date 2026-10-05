@@ -34,6 +34,7 @@ from .hot_stream import (
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
 )
 from .images import measure_flat_fraction, measure_frame_quality
+from .matching import normalise_plate
 from .plate_region import PlateRegion, parse_plate_region
 from .scene import SceneBaseline
 from .telemetry import TriggerTelemetry
@@ -87,15 +88,32 @@ SWEEP_POLL_SECONDS = 0.05
 #
 # One read a second because the car is not moving: a waiting vehicle gives the
 # same picture again, and what changes between reads is sensor noise, which is
-# exactly what moves a borderline weakest-character score across its bar. At
+# exactly what moves a borderline weakest-character score across its bar.
+# (Superseded in part on 2026-10-05; see the note just below.) At
 # ~0.2 s a read that is a fifth of one of the Pi's four cores for at most
 # 30 s (about 6 s of inference a passage), against roughly 90% of a core for
 # the 10 s window itself. It spends nothing on the cloud: handovers stay under
 # the per-passage ceiling the window already had, and none of them is blind.
-DEFAULT_SWEEP_WAITING_SECONDS = 30.0
-MAX_SWEEP_WAITING_SECONDS = 60.0
-DEFAULT_SWEEP_WAITING_FPS = 1.0
-MIN_SWEEP_WAITING_FPS, MAX_SWEEP_WAITING_FPS = 0.2, 2.0
+#
+# Raised on 2026-10-05 to 80 s at two reads a second, with the decoder session
+# to 90 s, because 30 s at one a second stopped looking at cars that were
+# still there. In the 36 h to 18:30 that day three sweeps ended `wait_cap`
+# with the car at the gate: at 11:10 an Audi got 54 reads over 40 s, its best
+# the right plate at 0.32 from a soft frame, and then nothing read it again. A
+# pickup the same afternoon only reached the stop at +37 s. The waiting phase
+# is when the plate is at its largest and stillest, so it is the worst place
+# to slow down: at ~0.2 s a read, two a second is 40% of one core, still under
+# half the window's own rate, for at most 80 s. A car that leaves still ends
+# it within three empty frames, and an open ends it at once.
+DEFAULT_SWEEP_WAITING_SECONDS = 80.0
+MAX_SWEEP_WAITING_SECONDS = 120.0
+DEFAULT_SWEEP_WAITING_FPS = 2.0
+MIN_SWEEP_WAITING_FPS, MAX_SWEEP_WAITING_FPS = 0.2, 3.0
+# The live decoder session an alarm starts, which the waiting phase rides on
+# and never outlives: the 10 s window plus the 80 s wait. The session is
+# stopped as soon as the passage ends, so the ceiling only costs anything
+# while a vehicle is still in the picture.
+DEFAULT_SESSION_SECONDS = 90.0
 # Consecutive frames showing the idle scene before the waiting phase concludes
 # the vehicle has gone. One could be a decoder hiccup; three at one a second
 # is three seconds of empty drive.
@@ -217,6 +235,26 @@ DEFAULT_CONCLUSIVE_READ_CONFIDENCE = 0.75
 # Below this a "conclusive read" is not conclusive, so the session would stop
 # retrying on noise. The same reasoning as the matching bars' own floor.
 MIN_CONCLUSIVE_READ_CONFIDENCE = 0.10
+# ...and how many frames of the passage must read the *same* plate before the
+# read is conclusive. A confident read is not the same as a right one: on
+# 2026-10-05 at 16:38 the cloud returned "1SU2U" at 0.811 from a soft frame.
+# One such read used to end the passage; two frames agreeing on the same
+# characters is what a different car looks like.
+CONCLUSIVE_AGREEING_READS = 2
+# Shapes a real registration takes, normalised (upper case, no spaces). Only
+# these can be conclusive; anything else -- "1SU2U", "17211" -- is a misread,
+# and a misread is the case another frame fixes. Irish: year (2 or 3 digits),
+# county (1-2 letters), number (1-6 digits). UK current, prefix and suffix,
+# and Northern Ireland, for visitors. A real plate in some other shape is
+# never conclusive, which only means the passage keeps reading until it ends
+# another way: it costs reads, never an open.
+_PLAUSIBLE_REGISTRATIONS = tuple(re.compile(pattern) for pattern in (
+    r"[0-9]{2,3}[A-Z]{1,2}[0-9]{1,6}",   # Ireland: 131D2696, 84WH741
+    r"[A-Z]{2}[0-9]{2}[A-Z]{3}",         # UK since 2001: AB12CDE
+    r"[A-Z][0-9]{1,3}[A-Z]{3}",          # UK prefix: A123BCD
+    r"[A-Z]{3}[0-9]{1,3}[A-Z]",          # UK suffix: ABC123D
+    r"[A-Z]{2,3}[0-9]{1,4}",             # Northern Ireland: AXZ1234, LHF455
+))
 RELAY_PULSE_ALLOWANCE_SECONDS = 5.0
 MIN_DECISION_TIMEOUT_SECONDS = 0.5
 MAX_DECISION_TIMEOUT_SECONDS = 30.0
@@ -273,7 +311,7 @@ class TriggerCaptureConfig:
     clear_stream_mode: str = "compressed"
     # Live decode rate and length of the per-event session in compressed mode.
     session_fps: float = 5.0
-    session_seconds: float = 45.0
+    session_seconds: float = DEFAULT_SESSION_SECONDS
     # What the camera's main stream actually runs at, so the session decoder
     # can time an Annex-B pipe that carries no timestamps of its own.
     source_fps: float = 10.0
@@ -402,7 +440,8 @@ def load_trigger_capture_config(
         raise ValueError("GATE_CLEAR_STREAM_MODE must be 'compressed' or 'decoded'")
     session_fps = _number(environment.get("GATE_SESSION_FPS", "5"), MIN_SESSION_FPS, MAX_SESSION_FPS)
     session_seconds = _number(
-        environment.get("GATE_SESSION_SECONDS", "45"), MIN_SESSION_SECONDS, MAX_SESSION_SECONDS,
+        environment.get("GATE_SESSION_SECONDS", str(DEFAULT_SESSION_SECONDS)),
+        MIN_SESSION_SECONDS, MAX_SESSION_SECONDS,
     )
     source_fps = _number(
         environment.get("GATE_CLEAR_STREAM_SOURCE_FPS", "10"), MIN_SOURCE_FPS, MAX_SOURCE_FPS,
@@ -763,6 +802,9 @@ class TriggerFrameCapture:
         self._session_active = False
         # Whether any frame of this session put characters on the vehicle.
         self._session_read_a_plate = False
+        # Conclusive reads of a different car so far, by plate: the session
+        # settles on the CONCLUSIVE_AGREEING_READS-th of the same plate.
+        self._session_conclusive: dict[str, int] = {}
         self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
         # (the default probe alone costs about two seconds at 4K), and the
@@ -956,6 +998,7 @@ class TriggerFrameCapture:
             self._session_pending_since = None
             self._session_settled = None
             self._session_read_a_plate = False
+            self._session_conclusive = {}
             self._session_changed.clear()
 
     def local_sweep(self, event, scheduled_at, stop_event) -> int:
@@ -1557,11 +1600,35 @@ class TriggerFrameCapture:
                 elif _is_another_vehicle(
                     decision, self.config.conclusive_read_confidence,
                 ):
-                    self._session_settled = "plate_denied"
+                    if self._another_vehicle_agreed(decision):
+                        self._session_settled = "plate_denied"
                 elif getattr(result, "reason", None) not in PRESENCE_RETRY_REASONS:
                     self._session_settled = f"final_{getattr(result, 'reason', 'unknown')}"
             self._session_changed.set()
             return True
+
+    def _another_vehicle_agreed(self, decision) -> bool:
+        """Count one conclusive read of a different car; True once enough agree.
+
+        Called with the session lock held. A plate in no registration shape is
+        journalled and never counted; one that is, settles the session on its
+        CONCLUSIVE_AGREEING_READS-th read.
+        """
+        plate = normalise_plate(str(getattr(decision, "observed_plate", "") or ""))
+        if not _plausible_registration(plate):
+            LOGGER.info(
+                "gate_presence stage=conclusive_ignored reason=implausible plate=%s", plate or "-",
+            )
+            return False
+        seen = self._session_conclusive.get(plate, 0) + 1
+        self._session_conclusive[plate] = seen
+        if seen < CONCLUSIVE_AGREEING_READS:
+            LOGGER.info(
+                "gate_presence stage=conclusive_held reason=awaiting_agreement plate=%s reads=%d of=%d",
+                plate, seen, CONCLUSIVE_AGREEING_READS,
+            )
+            return False
+        return True
 
     def superseded(self, paths) -> bool:
         """Has this frame's own session already opened the gate?
@@ -2179,6 +2246,11 @@ def _is_another_vehicle(decision, bar: float = DEFAULT_CONCLUSIVE_READ_CONFIDENC
     except (TypeError, ValueError):
         return False
     return isfinite(confidence) and confidence >= bar
+
+
+def _plausible_registration(plate: str) -> bool:
+    """Whether a normalised plate has the shape of a real registration."""
+    return any(pattern.fullmatch(plate) for pattern in _PLAUSIBLE_REGISTRATIONS)
 
 
 def _read_a_plate(decision) -> bool:
