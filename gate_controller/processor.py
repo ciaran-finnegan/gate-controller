@@ -132,6 +132,10 @@ class PreparedBurst:
     local_pass_ran: bool = False
     #: Why the cloud will not be asked for the first frame, or None.
     cloud_skip: str | None = None
+    #: Why this burst, finished on the burst thread, must not touch the cloud
+    #: slot or the network for any of its frames; set by
+    #: :meth:`route_to_cloud_lane`. None for a burst the cloud lane finishes.
+    offline: str | None = None
     stillness: float | None = None
     #: The answer for a burst the store already holds; nothing else applies.
     duplicate: ProcessingResult | None = None
@@ -179,6 +183,39 @@ class PreparedBurst:
             # only skip it.
             and self.cloud_reachable
         )
+
+    def route_to_cloud_lane(self) -> bool:
+        """Where this burst is finished: True for the cloud lane, False for here.
+
+        Decided once, and a burst kept here is finished without the network
+        whatever the link does next. `needs_cloud` asks the cloud's
+        availability, and since 2026-09-22 that is the circuit breaker as well
+        as the probe, which can turn from no to yes within a second (a
+        half-open trial answers). On 2026-10-05 at 21:31:37 the camera's own
+        still was kept on the burst thread as unreachable, the breaker closed
+        at 38.24, and finishing the still then took the cloud slot and posted:
+        the burst thread waited to its 7 s deadline while a sweep frame read
+        as 131D2696 at 0.999 sat behind it, and the gate opened 6.4 s after
+        that read instead of at once. That is the 2026-09-10 21:52 delay the
+        fast lane (#165) exists to prevent.
+        """
+        # The availability is asked exactly once, so the route and the reason
+        # recorded for it are the same answer.
+        reachable = self.cloud_reachable
+        undecided = (
+            self.duplicate is None and not self.decided and self.cloud_skip is None
+            and not self.appearance_admits
+        )
+        allowed = self.cloud_allowed
+        if undecided and allowed and reachable:
+            return True
+        if self.offline is None and undecided and allowed and not reachable:
+            # Kept here only because the cloud could not be asked: finished
+            # here without it, whatever the breaker says by then. (A burst
+            # kept for any other reason never reaches a request: decided,
+            # skipped, admitted, or refused by the permit in the recogniser.)
+            self.offline = _unavailable_reason(self.internet_reachable)
+        return False
 
     def recognise_options(self, sequence: int) -> dict:
         """What `_recognise` is told about the pass the fast lane already ran."""
@@ -533,6 +570,7 @@ class GateProcessor:
                     path, deadline, mark_ocr_start, first_attempt=sequence == 0,
                     trace_id=trace.trace_id, on_post_started=mark_post_started,
                     cloud_permit=prepared.cloud_permit,
+                    offline=prepared.offline,
                     **prepared.recognise_options(sequence),
                 )
             except _OcrBusy:
@@ -1274,7 +1312,7 @@ class GateProcessor:
                    on_post_started=None, prepared_attempt=_NOT_PREPARED,
                    local_pass_started: float | None = None,
                    cloud_skip: str | None = None, stillness: float | None = None,
-                   cloud_permit=None):
+                   cloud_permit=None, offline: str | None = None):
         remaining = deadline - self._decision_clock()
         if remaining <= 0:
             raise _OcrDeadlineExceeded("OCR request exceeded the decision deadline")
@@ -1337,6 +1375,24 @@ class GateProcessor:
                 if on_start is not None:
                     on_start(started)
                 return attempt.observation
+        if offline is not None and _device_read(attempt):
+            # Finished on the burst thread (`PreparedBurst.route_to_cloud_lane`):
+            # nothing here may wait on the cloud slot or the network, whatever
+            # the link's state is by now. The device's answer stands. (Where
+            # the device never read the frame -- `GATE_LOCAL_OCR_CLOUD=always`,
+            # or no local reader -- its answer is only to be had from the
+            # recogniser's own call, which asks the permit and the predicate
+            # itself, so that call is still made below.)
+            if attempt is not None:
+                attempt.abandon()
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skipped reason=%s lane=fast", offline,
+            )
+            if on_start is not None:
+                on_start()
+            return PlateObservation(
+                plate=None, confidence=0.0, source="local", cloud_lookup=False,
+            )
         if (
             cloud_permit is not None and not self._recognizer_accepts_cloud_permit
             and not _permits(cloud_permit)
@@ -1917,6 +1973,19 @@ def _reachable(internet_reachable) -> bool:
         return internet_reachable() is not False
     except Exception:
         return True
+
+
+def _device_read(attempt) -> bool:
+    """Whether the on-device pass ran for this frame.
+
+    `PlateRecognizerClient.local_pass` returns a pass with no ``state`` only
+    when it never read the frame: ``GATE_LOCAL_OCR_CLOUD=always``, no local
+    reader, or a failure. Every pass that ran carries its state.
+    """
+    try:
+        return attempt is not None and getattr(attempt, "state", None) is not None
+    except Exception:
+        return False
 
 
 def _unavailable_reason(internet_reachable) -> str:

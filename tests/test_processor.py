@@ -3193,6 +3193,40 @@ class InternetDownTests(unittest.TestCase):
             self.assertTrue(prepared.needs_cloud, "asked, not remembered: the link is back")
             prepared.discard("test")
 
+    def test_a_burst_routed_off_the_lane_is_finished_without_the_cloud_after_the_link_returns(self):
+        # 2026-10-05 21:31: routed as unreachable, finished after the breaker
+        # had closed. The route is the answer; finishing it must not post.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            down = {"value": True}
+            processor = self._processor(
+                directory, recognizer, internet_reachable=lambda: not down["value"],
+            )
+
+            prepared = processor.prepare((frame,))
+            self.assertFalse(prepared.route_to_cloud_lane())
+            self.assertEqual(prepared.offline, "internet_down")
+            down["value"] = False
+            self.assertTrue(prepared.needs_cloud, "the link is back")
+            result = processor.process((frame,), prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
+
+    def test_a_burst_the_lane_takes_is_not_marked_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            processor = self._processor(
+                directory, TwoPhaseRecognizer(), internet_reachable=lambda: True,
+            )
+            prepared = processor.prepare((frame,))
+            self.assertTrue(prepared.route_to_cloud_lane())
+            self.assertIsNone(prepared.offline)
+            prepared.discard("test")
+
     def test_a_recogniser_that_takes_the_predicate_is_handed_it_and_asks_it_itself(self):
         class RefusingRecognizer:
             """The real client's shape: the request site asks the predicate."""

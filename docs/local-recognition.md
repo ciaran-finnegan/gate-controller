@@ -203,6 +203,22 @@ cooldown, which refuses the second activation, and a burst still *waiting*
 for the lane when its passage opens is given up unbilled
 (`gate_burst stage=skipped cause=event_already_opened ... lane=cloud`).
 
+**A burst kept off the cloud lane never goes on the network.** Since
+2026-09-22 (#183) a burst the cloud cannot be asked about is finished on the
+burst thread rather than queued for a lane that would only skip it, and since
+#189 "can be asked" includes the cloud client's circuit breaker, which can turn
+from no to yes within a second when a half-open trial answers. Until
+2026-10-06 that answer was asked again when the burst was finished, so a burst
+routed as unreachable could take the cloud slot and post from the burst
+thread. On 2026-10-05 at 21:31:37 that is what the camera's own still did:
+routed while the breaker was half-open, finished after it closed at 38.24, it
+held the burst thread to its 7 s deadline at 43.90, and a sweep frame read as
+`131D2696` at 0.999 at 37.74 was not decided until 43.99 -- the gate opened
+6.4 s after the plate was read. `PreparedBurst.route_to_cloud_lane` now asks
+the availability once; a burst it keeps here carries the reason in `offline`,
+and `_recognise` answers it from the device without touching the slot
+(`gate_ocr stage=cloud_skipped reason=cloud_unreachable|internet_down|... lane=fast`).
+
 Journal lines: `gate_ocr stage=local_pass ... lane=fast` for the read.
 `burst_to_ocr_ms` still means "burst to the start of the read that decided";
 for a cloud-decided frame that includes its wait for the lane, which is the

@@ -197,6 +197,59 @@ class FastLaneTests(unittest.TestCase):
         self.assertFalse(older_result.opened)
         self.assertEqual(older_result.reason, "no_match")
 
+    def test_a_burst_kept_off_the_lane_never_waits_on_the_cloud_when_the_breaker_closes(self):
+        """2026-10-05 21:31: the regression of the test above, through the breaker.
+
+        34.95 a sweep frame went to the cloud lane as the half-open breaker's
+        trial request. 37.20 the camera's own still, read as nothing on the
+        device, was kept on the burst thread because the cloud was then
+        unavailable. 37.74 a sweep frame read 131D2696 at 0.999 queued behind
+        it. 38.24 the trial answered and the breaker closed, so finishing the
+        still took the slot and posted, and the burst thread waited to the
+        still's 7 s deadline at 43.90. The 0.999 read was decided at 43.99 and
+        the relay pulsed 6.4 s after the plate was read.
+        """
+        class Availability:
+            """The breaker's answer: down for exactly the routing of one burst."""
+            reason = "cloud_unreachable"
+
+            def __init__(self):
+                self.answers = []
+
+            def __call__(self):
+                return self.answers.pop(0) if self.answers else True
+
+        trial = self._jpeg("trial.jpg", 110)
+        still = self._jpeg("camera-still.jpg", 100, (3840, 2160))
+        readable = self._jpeg("sweep-0999.jpg", 120)
+        session = StallingSession(stall_seconds=3.0)
+        client = self._client([(None, 0.0), (None, 0.0), ("131D2696", 0.999)], session)
+        availability = Availability()
+        processor = self._processor(client, internet_reachable=availability)
+        self.lanes = Lanes(processor)
+
+        self.lanes.inject(trial, stillness=0.001)
+        self.assertTrue(wait_for(lambda: session.calls, 3.0), "the trial never posted")
+
+        availability.answers = [False]  # unavailable while the still is routed...
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            self.lanes.inject(still)
+            injected = self.lanes.inject(readable, stillness=0.001)
+            # ...and available again from then on, as when the trial answered.
+            self.assertTrue(
+                wait_for(lambda: self.lanes.result_for(readable) is not None, 2.5),
+                "the 0.999 read waited behind the camera still's cloud call",
+            )
+        decided_at, result = self.lanes.result_for(readable)
+        self.assertTrue(result.opened, f"denied: {result.reason}")
+        self.assertLess(decided_at - injected, 1.5)
+        _, still_result = self.lanes.result_for(still)
+        self.assertFalse(still_result.opened)
+        self.assertEqual(len(session.calls), 1, "only the trial may have posted")
+        self.assertTrue(any(
+            "cloud_skipped reason=cloud_unreachable lane=fast" in line for line in journal.output
+        ), journal.output)
+
     def test_a_moving_frame_the_device_finds_no_plate_in_is_not_sent_to_the_cloud(self):
         # 21:52:22.47, frame 2766: the car still turning in, plate 88 px wide
         # and oblique, nothing on the device, then 2.3 s of cloud for "no
