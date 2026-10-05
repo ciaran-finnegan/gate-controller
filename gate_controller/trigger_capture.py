@@ -67,6 +67,64 @@ DEFAULT_SWEEP_CLOUD_FRAMES = 5
 MAX_SWEEP_CLOUD_FRAMES = 10
 DEFAULT_SWEEP_CLOUD_SPACING_SECONDS = 1.0
 MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
+# Holding those paid lookups until the frame is worth one.
+#
+# The camera's alarm (and the early trigger) fire with the car still far down
+# the lane, and the hand-overs above went at the spacing from the first frame
+# on. On the Pi on 2026-10-05 (arrival 16:30:27) all five had gone by +8.8 s;
+# the sweep ran to +17 s, the on-device reader kept reading about 1.5 frames
+# a second throughout, and no frame from the closest part of the approach was
+# ever shown to the cloud. 15 Sep-5 Oct: 222 `decision_timeout`, 50
+# `ocr_busy`, 72 `queue_coalesced` -- far frames holding the one cloud lane
+# while better ones queued behind them.
+#
+# So a hand-over waits until one of three things is true:
+#
+# * the plate the on-device detector boxed is at least
+#   `sweep_cloud_min_plate_px` wide, in 4K-equivalent pixels (the box is in
+#   frame fractions, so the setting means the same at any decode width). 300:
+#   measured after the re-aim (docs/reolink-rlc-811a.md), plates at the stop
+#   are 369-372 px and on the approach 192-258 px, so 300 sits between the two
+#   with about 15% to spare on each side; it is also the documented target
+#   width, and above the ~240 px past which every measured frame read 0.995+;
+# * the plate has **stopped growing**: the car has stopped, wherever it
+#   stopped, and the next frame will be no better (see SWEEP_CLOUD_STOPPED_*);
+# * it is the **last chance**: within `sweep_cloud_last_chance_seconds` of the
+#   window's end, or the waiting phase -- so a passage that never shows a
+#   large plate, or none at all, still gets the cloud's opinion before the
+#   sweep gives up. 3 s leaves room for three lookups at the 1 s spacing
+#   before the window's own fallback; by +7 s an arriving car has arrived (it
+#   crosses the picture in about three seconds, docs/early-trigger.md).
+#
+# Only the *cloud* waits. The on-device reader reads every frame as before,
+# and an authorised local read is injected the moment it is taken -- which
+# matters, because width alone does not decide a read (a clean 152 px plate
+# read 0.903 on the device; blurred 186-189 px ones read 0.1-0.24). A held
+# frame is not in the pipeline at all, so it is not charged to
+# GATE_DECISION_TIMEOUT_SECONDS: a burst's decision clock starts when it is
+# enqueued (worker.inject_trigger_burst), i.e. at the hand-over. The cap and
+# the spacing stay as they were, as spend ceilings.
+#
+# `shadow` (the default) hands over exactly as before and journals what `on`
+# would have held; `off` does neither.
+SWEEP_CLOUD_HOLD_MODES = ("off", "shadow", "on")
+DEFAULT_SWEEP_CLOUD_HOLD = "shadow"
+DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX = 300
+MAX_SWEEP_CLOUD_MIN_PLATE_PX = 3840
+DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 3.0
+MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 30.0
+# "Stopped growing": every plate box read in the last two seconds -- at least
+# three of them, at least a second apart end to end -- within 8% of each
+# other in width. An arriving car's plate grows by roughly a quarter a second
+# here (120-190 px at first sight to ~370 at the stop in about three
+# seconds), so a second of approach is well over 8%; the five frames of the
+# stopped car measured 369-372 px, and the detector's own jitter at the 1920
+# decode is a few pixels in ~185. A shrinking plate (a car leaving) is not
+# "stopped", but it started large, so the width rule has already let it go.
+SWEEP_CLOUD_STOPPED_READS = 3
+SWEEP_CLOUD_STOPPED_WINDOW_SECONDS = 2.0
+SWEEP_CLOUD_STOPPED_MIN_SPAN_SECONDS = 1.0
+SWEEP_CLOUD_STOPPED_SPREAD = 0.08
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
 # The waiting phase: once the full-rate window has closed with the gate still
@@ -345,6 +403,12 @@ class TriggerCaptureConfig:
     # gate. 0 keeps the cloud out of the window entirely.
     sweep_cloud_frames: int = DEFAULT_SWEEP_CLOUD_FRAMES
     sweep_cloud_spacing_seconds: float = DEFAULT_SWEEP_CLOUD_SPACING_SECONDS
+    # Whether those hand-overs wait for a plate worth a lookup: `off`,
+    # `shadow` (hand over as before, journal what `on` would hold) or `on`.
+    # See DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX for the rule and its numbers.
+    sweep_cloud_hold: str = DEFAULT_SWEEP_CLOUD_HOLD
+    sweep_cloud_min_plate_px: int = DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX
+    sweep_cloud_last_chance_seconds: float = DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS
     # After the window: keep reading on the device, slowly, while a vehicle is
     # still in the picture and the gate has not opened. 0 seconds disables it.
     # See DEFAULT_SWEEP_WAITING_SECONDS for where the numbers come from.
@@ -483,6 +547,24 @@ def load_trigger_capture_config(
         ),
         MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS,
     )
+    sweep_cloud_hold = str(
+        environment.get("GATE_LOCAL_SWEEP_CLOUD_HOLD", DEFAULT_SWEEP_CLOUD_HOLD)
+    ).strip().lower()
+    if sweep_cloud_hold not in SWEEP_CLOUD_HOLD_MODES:
+        raise ValueError("GATE_LOCAL_SWEEP_CLOUD_HOLD must be 'off', 'shadow' or 'on'")
+    sweep_cloud_min_plate_px = _integer(
+        environment.get(
+            "GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX", str(DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX),
+        ),
+        0, MAX_SWEEP_CLOUD_MIN_PLATE_PX,
+    )
+    sweep_cloud_last_chance_seconds = _number(
+        environment.get(
+            "GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS",
+            str(DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS),
+        ),
+        0.0, MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS,
+    )
     sweep_waiting_seconds = _number(
         environment.get(
             "GATE_LOCAL_SWEEP_WAITING_SECONDS", str(DEFAULT_SWEEP_WAITING_SECONDS),
@@ -536,6 +618,9 @@ def load_trigger_capture_config(
         sweep_fallback_frames=sweep_fallback_frames,
         sweep_cloud_frames=sweep_cloud_frames,
         sweep_cloud_spacing_seconds=sweep_cloud_spacing,
+        sweep_cloud_hold=sweep_cloud_hold,
+        sweep_cloud_min_plate_px=sweep_cloud_min_plate_px,
+        sweep_cloud_last_chance_seconds=sweep_cloud_last_chance_seconds,
         sweep_waiting_seconds=sweep_waiting_seconds,
         sweep_waiting_fps=sweep_waiting_fps,
         early_max_seconds=early_max_seconds,
@@ -756,6 +841,9 @@ class TriggerFrameCapture:
         self._sweep_injected = 0
         self._sweep_fallbacks = 0
         self._sweep_cloud_handovers = 0
+        # Frames a cloud hand-over was held back from (`on`), or handed over
+        # although `on` would have held them (`shadow`).
+        self._sweep_cloud_held = 0
         self._sweep_waiting_reads = 0
         self._sweep_last_read_ms: float | None = None
         self.output_directory = config.output_directory
@@ -1028,11 +1116,19 @@ class TriggerFrameCapture:
         the pipeline does not spend the on-device reader on a frame already
         read. The sweep does not wait for these. The cap is a spend ceiling,
         because every cloud lookup is billed and the service permits one
-        request a second. While the network probe has fresh evidence that the
-        internet is down, none of these is handed over at all (journalled
-        once, ``stage=cloud_handover_skipped reason=internet_down``): the
-        local reads go on exactly as before, and the fallback below still puts
-        the passage on record.
+        request a second. With ``sweep_cloud_hold="on"`` a hand-over also
+        waits until the frame is worth a lookup: a plate box at least
+        ``sweep_cloud_min_plate_px`` wide, a plate that has stopped growing,
+        or the last ``sweep_cloud_last_chance_seconds`` of the window and the
+        waiting phase after it; and the frame offered is the one with the
+        largest plate, not merely the best local score. It is journalled once
+        a passage (``stage=cloud_held``), and every hand-over says how wide
+        its plate was and what let it go. ``shadow`` hands over as before and
+        journals what ``on`` would have held. While the network probe has
+        fresh evidence that the internet is down, none of these is handed
+        over at all (journalled once, ``stage=cloud_handover_skipped
+        reason=internet_down``): the local reads go on exactly as before, and
+        the fallback below still puts the passage on record.
 
         **Waiting.** When the window closes with the gate still shut, the best
         frames seen (up to ``sweep_fallback_frames``, never one already
@@ -1089,8 +1185,18 @@ class TriggerFrameCapture:
         # to answer "no plate found" -- which still costs a lookup and, at one
         # request a second with answers taking five or six, still delays every
         # later answer including the one that opens the gate.
-        candidate: tuple | None = None  # (score, frame, captured_at, digest, read)
+        candidate: tuple | None = None  # (rank, frame, captured_at, digest, read)
         handover_blind = 0
+        hold_mode = config.sweep_cloud_hold
+        # Under `on` the paid lookup goes to the largest plate seen, the
+        # local score breaking ties; otherwise to the best local score, as it
+        # always has, so `shadow` changes nothing it reports on.
+        rank_by_width = hold_mode == "on"
+        # (clock, plate_px) of every read whose detector boxed a plate, for
+        # the stopped-growing rule; only the last couple of seconds matter.
+        plate_boxes: list[tuple[float, int]] = []
+        held: set[bytes] = set()
+        held_journalled = False
         best_plate: str | None = None
         last_frame_digest: bytes | None = None
         duplicates = 0
@@ -1160,6 +1266,60 @@ class TriggerFrameCapture:
                     self._cloud_unavailable_reason(), config.sweep_cloud_frames,
                 )
             return False
+
+        def plate_stopped() -> bool:
+            """Whether the boxed plate has stopped growing: the car has stopped."""
+            now = self._clock()
+            recent = [
+                (at, width) for at, width in plate_boxes
+                if now - at <= SWEEP_CLOUD_STOPPED_WINDOW_SECONDS
+            ]
+            if len(recent) < SWEEP_CLOUD_STOPPED_READS:
+                return False
+            if recent[-1][0] - recent[0][0] < SWEEP_CLOUD_STOPPED_MIN_SPAN_SECONDS:
+                return False
+            widths = [width for _at, width in recent]
+            return max(widths) <= min(widths) * (1.0 + SWEEP_CLOUD_STOPPED_SPREAD)
+
+        def cloud_release() -> str | None:
+            """What lets a cloud hand-over go now, or None while it should wait.
+
+            Asked whatever the mode, so `shadow` can say what `on` would do.
+            Read at call time, so an early sweep upgraded by the camera's alarm
+            has its last chance measured from the alarm's own window.
+            """
+            if waiting or (
+                self._clock() >= window_deadline - config.sweep_cloud_last_chance_seconds
+            ):
+                return "last_chance"
+            plate_px = None if candidate is None else _plate_px(candidate[4])
+            if plate_px is not None and plate_px >= config.sweep_cloud_min_plate_px:
+                return "plate_width"
+            if plate_stopped():
+                return "stopped"
+            return None
+
+        def note_held(digest: bytes) -> None:
+            """Count a frame `on` holds back (or would), and say why once a passage."""
+            nonlocal held_journalled
+            held.add(digest)
+            if held_journalled:
+                return
+            held_journalled = True
+            if candidate is None:
+                why, plate_px = "no_plate", None
+            else:
+                plate_px = _plate_px(candidate[4])
+                why = "plate_unmeasured" if plate_px is None else "small_plate"
+            LOGGER.info(
+                "gate_local_sweep stage=cloud_held mode=%s reason=%s plate_px=%s "
+                "min_px=%d last_chance_in_ms=%d",
+                hold_mode, why, "-" if plate_px is None else plate_px,
+                config.sweep_cloud_min_plate_px,
+                max(0, round((
+                    window_deadline - config.sweep_cloud_last_chance_seconds - self._clock()
+                ) * 1000)),
+            )
 
         def run_fallback() -> None:
             nonlocal fallback, fallback_done
@@ -1245,32 +1405,47 @@ class TriggerFrameCapture:
                     last_handover_at is None
                     or self._clock() - last_handover_at >= config.sweep_cloud_spacing_seconds
                 )
+            ):
+                release = None if hold_mode == "off" else cloud_release()
+                offered = candidate if candidate is not None else unread
+                if hold_mode == "on" and release is None:
+                    # Not yet worth a lookup. Nothing is spent and nothing
+                    # is consumed: the candidate stays, keeps being replaced
+                    # by a larger plate, and goes the moment one of the
+                    # rules lets it.
+                    note_held(offered[3])
                 # Asked last, so it is asked only when a hand-over would go,
                 # and asked again each time: a link that comes back mid-sweep
                 # gets the next one.
-                and cloud_reachable()
-            ):
-                # A frame with a plate in it, best read first; otherwise the
-                # freshest view there is, which is what this always sent. The
-                # fallback stays because the on-device detector missing a plate
-                # the cloud would have found is exactly the case a second
-                # opinion is being paid for.
-                if candidate is not None:
-                    _score, frame, captured_at, digest, read = candidate
-                    candidate = None
-                    blind = False
-                else:
-                    frame, captured_at, digest, read = unread
-                    blind = True
-                unread = None
-                last_handover_at = self._clock()
-                if hand_over(frame, captured_at, digest, read, source="sweep_cloud"):
-                    handovers += 1
-                    handover_blind += 1 if blind else 0
-                    LOGGER.info(
-                        "gate_local_sweep stage=cloud_handover frame=%d of=%d plate_seen=%s",
-                        handovers, config.sweep_cloud_frames, not blind,
-                    )
+                elif cloud_reachable():
+                    if hold_mode == "shadow" and release is None:
+                        note_held(offered[3])
+                        release = "would_hold"
+                    # A frame with a plate in it, best read first; otherwise
+                    # the freshest view there is, which is what this always
+                    # sent. The fallback stays because the on-device detector
+                    # missing a plate the cloud would have found is exactly
+                    # the case a second opinion is being paid for.
+                    if candidate is not None:
+                        _rank, frame, captured_at, digest, read = candidate
+                        candidate = None
+                        blind = False
+                    else:
+                        frame, captured_at, digest, read = unread
+                        blind = True
+                    unread = None
+                    last_handover_at = self._clock()
+                    if hand_over(frame, captured_at, digest, read, source="sweep_cloud"):
+                        handovers += 1
+                        handover_blind += 1 if blind else 0
+                        plate_px = _plate_px(read)
+                        LOGGER.info(
+                            "gate_local_sweep stage=cloud_handover frame=%d of=%d "
+                            "plate_seen=%s plate_px=%s release=%s at_ms=%d",
+                            handovers, config.sweep_cloud_frames, not blind,
+                            "-" if plate_px is None else plate_px, release or "off",
+                            round(max(0.0, self._clock() - scheduled_at) * 1000),
+                        )
             if not batch:
                 if waiting and last_read_at is not None:
                     # Paced *before* the fetch while waiting, in slices, so
@@ -1345,6 +1520,10 @@ class TriggerFrameCapture:
                 busy += 1
                 continue
             newest = (frame, captured_at, digest, read)
+            plate_px = _plate_px(read)
+            if plate_px is not None:
+                plate_boxes.append((self._clock(), plate_px))
+                del plate_boxes[:-32]
             if read.recognised:
                 blank = 0
                 plate_reads += 1
@@ -1358,8 +1537,9 @@ class TriggerFrameCapture:
             if read.recognised:
                 LOGGER.info(
                     "gate_local_sweep stage=read plate=%s score=%.3f authorised=%s "
-                    "read_ms=%d frame=%d",
+                    "read_ms=%d frame=%d plate_px=%s",
                     read.plate, read.score, read.authorised, round(read.read_ms), frames,
+                    "-" if plate_px is None else plate_px,
                 )
                 if best is None or read.score > best[0]:
                     best = (read.score, frame, captured_at, digest, read)
@@ -1368,8 +1548,13 @@ class TriggerFrameCapture:
                 # The freshest view the on-device reader could not settle, and
                 # so the one worth a paid second opinion.
                 unread = (frame, captured_at, digest, read)
-                if read.recognised and (candidate is None or read.score > candidate[0]):
-                    candidate = (read.score, frame, captured_at, digest, read)
+                if read.recognised:
+                    rank = (
+                        (-1 if plate_px is None else plate_px, read.score)
+                        if rank_by_width else (read.score,)
+                    )
+                    if candidate is None or rank > candidate[0]:
+                        candidate = (rank, frame, captured_at, digest, read)
                 continue
             authorised += 1
             if authorised_path is not None or injected >= MAX_SWEEP_AUTHORISED_INJECTIONS:
@@ -1393,6 +1578,7 @@ class TriggerFrameCapture:
         self._sweep_injected += injected
         self._sweep_fallbacks += fallback
         self._sweep_cloud_handovers += handovers
+        self._sweep_cloud_held += len(held)
         self._sweep_waiting_reads += waiting_reads
         unconfirmed = passage.early and not passage.confirmed
         if passage.early:
@@ -1417,12 +1603,14 @@ class TriggerFrameCapture:
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
             "busy=%d duplicates=%d read_fps=%.1f authorised=%d injected=%d "
             "cloud_handovers=%d blind_handovers=%d fallback=%d "
-            "best_plate=%s best_score=%s elapsed_ms=%d waiting_reads=%d",
+            "best_plate=%s best_score=%s elapsed_ms=%d waiting_reads=%d "
+            "cloud_hold=%s cloud_held=%d",
             reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
             duplicates, reads / max(1e-6, self._clock() - scheduled_at),
             authorised, injected, handovers, handover_blind, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",
             round(max(0.0, self._clock() - scheduled_at) * 1000), waiting_reads,
+            hold_mode, len(held),
         )
         return injected + fallback + handovers
 
@@ -2108,6 +2296,10 @@ class TriggerFrameCapture:
                 "fallbacks": self._sweep_fallbacks,
                 "cloud_frames": self.config.sweep_cloud_frames,
                 "cloud_handovers": self._sweep_cloud_handovers,
+                "cloud_hold": self.config.sweep_cloud_hold,
+                "cloud_min_plate_px": self.config.sweep_cloud_min_plate_px,
+                "cloud_last_chance_seconds": self.config.sweep_cloud_last_chance_seconds,
+                "cloud_held": self._sweep_cloud_held,
                 "waiting_seconds": self.config.sweep_waiting_seconds,
                 "waiting_fps": self.config.sweep_waiting_fps,
                 "waiting_reads": self._sweep_waiting_reads,
@@ -2251,6 +2443,15 @@ def _is_another_vehicle(decision, bar: float = DEFAULT_CONCLUSIVE_READ_CONFIDENC
 def _plausible_registration(plate: str) -> bool:
     """Whether a normalised plate has the shape of a real registration."""
     return any(pattern.fullmatch(plate) for pattern in _PLAUSIBLE_REGISTRATIONS)
+
+
+def _plate_px(read) -> int | None:
+    """The 4K-equivalent width of the plate a sweep read boxed, or None."""
+    try:
+        width = getattr(read, "plate_px", None)
+    except Exception:
+        return None
+    return width if isinstance(width, int) and not isinstance(width, bool) else None
 
 
 def _read_a_plate(decision) -> bool:

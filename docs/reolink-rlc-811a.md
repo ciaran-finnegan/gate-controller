@@ -588,6 +588,14 @@ be had from box width alone, and the cheapest read is the one already being
 taken: the reader costs 145-190 ms a frame here, against a decision budget of
 4 s.
 
+That is a statement about the on-device read, and it still stands: nothing
+gates that read on width. The *paid* lookup is a different question -- it is
+billed, one a second, five a passage -- and since 2026-10-05 the sweep can
+hold it until the plate is 300 px or has stopped growing
+(`GATE_LOCAL_SWEEP_CLOUD_HOLD`, see
+[the cloud hold](local-recognition.md#frames-not-worth-a-lookup-yet-the-sweeps-cloud-hold)).
+A 152 px plate the device reads at 0.903 still opens the gate at once.
+
 ### Zoom: not changed, and why
 
 The refocus nudge added after the 2026-10-04 defocus does not change this: it

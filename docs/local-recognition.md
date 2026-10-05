@@ -403,6 +403,92 @@ threshold.
 its whole purpose is to keep the cloud request on the decision path so every
 frame is labelled, and splitting it would change what it collects.
 
+### Frames not worth a lookup *yet*: the sweep's cloud hold
+
+The camera's vehicle alarm, and the early trigger, fire with the car still far
+down the lane, and the sweep handed the cloud a frame every
+`GATE_LOCAL_SWEEP_CLOUD_SPACING_SECONDS` from the first one on. Measured on the
+Pi on 2026-10-05 for an arrival at 16:30:27: the five hand-overs went at about
++1.8, +4.0, +5.1, +7.5 and +8.8 s; the sweep ended `reason=departed` at +17 s;
+the on-device reader kept reading about 1.5 frames a second throughout; and no
+frame from the closest part of the approach was ever shown to the cloud. Over
+15 September - 5 October, 222 events ended `decision_timeout`, 50 `ocr_busy`
+and 72 `queue_coalesced`: far frames holding the one cloud lane while better
+ones arrived behind them. Before October the on-device reader decided 66 of 73
+openings, at the stop; the cloud decided 7.
+
+`GATE_LOCAL_SWEEP_CLOUD_HOLD=on` holds a hand-over until **one** of these is
+true:
+
+| rule | journalled as | why |
+| --- | --- | --- |
+| the plate the on-device detector boxed is at least `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (default **300**, 4K-equivalent pixels) | `release=plate_width` | Post-re-aim measurements ([camera notes](reolink-rlc-811a.md#post-re-aim-plate-measurements)): 369-372 px stopped at the gate, 192-258 px on the approach. 300 sits between them with about 15% to spare each side; it is the documented target width, and above the ~240 px past which every measured frame read 0.995 or better. |
+| the plate has **stopped growing**: every box of the last 2 s (at least three, at least 1 s apart end to end) within 8% in width | `release=stopped` | A car that stops short of 300 px will not show a better plate by waiting. An arriving plate grows by roughly a quarter a second here; the stopped car's five frames measured 369-372 px. |
+| the **last chance**: within `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (default **3**) of the window's end, and the whole waiting phase | `release=last_chance` | A passage that never presents a large plate, or none at all, still gets the cloud's opinion before the sweep gives up. With the 10 s window that is +7 s: room for three lookups at the 1 s spacing before the window's own fallback, and an arriving car crosses the picture in about three seconds. |
+
+The width is resolution-independent: the recogniser's box is in frame
+fractions, padded by 8% of its width each side for the OCR crop; the pad is
+taken off and the rest is scaled to 3840, so 300 means 300 px of plate in the
+camera's 4K frame (about 150 px at the 1920-wide decode the sweep reads).
+
+What it does **not** touch:
+
+- **The on-device reader.** It reads every frame exactly as before, and an
+  authorised local read is injected the moment it is taken, however far away
+  the plate. That matters: width alone does not decide a read ([camera
+  notes](reolink-rlc-811a.md#plate-width-is-necessary-and-not-sufficient) - a
+  clean 152 px plate read 0.903; blurred 186-189 px ones read 0.1-0.24). The
+  hold is a rule for *spending*, never for reading.
+- **The ceilings.** `GATE_LOCAL_SWEEP_CLOUD_FRAMES` and the spacing stay what
+  they were. The hold only decides *when* inside them.
+- **A blind frame** (no plate box) no longer goes first, at once: it waits for
+  the last chance like a small plate does. While waiting, as before, only a
+  frame with a plate in it is handed over.
+- **The fallback** at the window's end still hands the best frame on (it never
+  waited for anything); the internet-down and circuit-breaker skips still
+  apply to every hand-over that would go; an unconfirmed early sweep still
+  hands the cloud nothing.
+- **The decision timeout.** A held frame is not in the pipeline at all. A
+  burst's decision clock starts when the worker enqueues it
+  (`inject_trigger_burst` stamps `monotonic()` there, and `prepare` takes that
+  as `decision_started_at`), which is the hand-over, so holding a frame can
+  never turn it into a `decision_timeout`. Nothing about the timeout's
+  semantics changed; fewer, later hand-overs simply leave less queued in front
+  of the frame that matters.
+
+Under `on`, the frame offered is the one with the **largest** plate seen since
+the last hand-over, the local score breaking ties, rather than the best local
+score alone: the cloud is being paid for the frame the device could not read,
+and the largest is the one most likely to read.
+
+**Rollout.** The code's default is `shadow`, as every other change on the
+decision path here has shipped. `shadow` hands over exactly as `off` does and
+journals what `on` would have done: `stage=cloud_held mode=shadow` once a
+passage, and `release=would_hold` on each hand-over `on` would have kept back.
+After a few days, count the passages whose cloud-decided opening came from a
+`would_hold` frame, and read the `plate_px=` of each hand-over and of each
+`stage=read`; then `GATE_LOCAL_SWEEP_CLOUD_HOLD=on` and a restart.
+`off` neither holds nor journals.
+
+```
+gate_local_sweep stage=cloud_held mode=on reason=small_plate plate_px=214 min_px=300 last_chance_in_ms=5200
+gate_local_sweep stage=cloud_handover frame=1 of=5 plate_seen=True plate_px=372 release=plate_width at_ms=2600
+gate_local_sweep outcome=ended reason=opened ... cloud_hold=on cloud_held=7
+```
+
+`reason` is `small_plate`, `no_plate` (only blind frames so far) or
+`plate_unmeasured` (a plate read with no box, which the recogniser does not
+produce today). `cloud_held` counts the distinct frames held back (or, in
+`shadow`, handed over although `on` would have held them); the heartbeat's
+`recognition.trigger_capture.sweep` block carries the same count and the three
+settings.
+
+**What it costs.** A passage the device cannot read at all now gets its first
+cloud look later: a headlight blaze with no plate box goes at the last chance
+(+7 s) instead of at once. That is the trade the numbers above ask for -- the
+first look at once was the one costing the lane -- and the passage the device
+*can* read is untouched.
+
 ### What the guard may spend
 
 The local read still runs inside the burst's decision budget, so a stalled
@@ -612,6 +698,9 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 | `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `80` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-120 and by `GATE_SESSION_SECONDS` (90); `0` disables. See "The sweep's read travels with its frame". |
 | `GATE_LOCAL_SWEEP_WAITING_FPS` | `2` | Reads a second while waiting (0.2-3). |
+| `GATE_LOCAL_SWEEP_CLOUD_HOLD` | `on` | `off`, `shadow` or `on`: whether the sweep's cloud hand-overs wait for a plate worth a lookup, and whether the camera's own alarm still is kept off the cloud while a sweep is reading the live stream. See "Frames not worth a lookup *yet*". |
+| `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` | `220` | The plate width, in 4K-equivalent pixels (0-3840), at which a hand-over may go. |
+| `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` | `3` | How long before the sweep window's end the hold lifts (0-30); the waiting phase is always a last chance. |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
 | `GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` | `0.005` | A session frame the device found no plate in still goes to the cloud when its stillness is at or below this; one moving more than this is decided `no_match` on the device's answer, unbilled. `0` disables the rule. See "Frames not worth a lookup". |
 

@@ -29,14 +29,39 @@ import logging
 from dataclasses import dataclass, field
 from hashlib import sha256
 from io import BytesIO
+from math import isfinite
 from time import monotonic
 
+from .local_recognizer import CROP_PAD
 from .plate_region import PlateRegion
 
 
 LOGGER = logging.getLogger(__name__)
 SWEEP_JPEG_QUALITY = 90
 DEFAULT_READ_TIMEOUT_SECONDS = 1.5
+#: The width plate sizes are quoted in: the camera's own 4K frame, which is
+#: what every measurement in docs/reolink-rlc-811a.md is given in. A sweep
+#: frame is decoded at 1920, so a plate is half as many *decoded* pixels; the
+#: box is in frame fractions, so this is resolution-independent.
+REFERENCE_FRAME_WIDTH_PX = 3840
+
+
+def plate_width_px(box) -> int | None:
+    """The plate's width in 4K-equivalent pixels, from a local read's frame-fraction box.
+
+    The recogniser's box is the detector's box padded by ``CROP_PAD`` of its
+    width on each side (the crop it hands the OCR model), so the pad is taken
+    back off here: the number then means what the documented plate widths
+    mean (the stopped car's 369-372 px, the far approach's 192-258 px). None
+    when there is no box or it cannot be measured.
+    """
+    try:
+        width = float(box[2])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not isfinite(width) or width <= 0:
+        return None
+    return round(width * REFERENCE_FRAME_WIDTH_PX / (1.0 + 2.0 * CROP_PAD))
 
 
 @dataclass(frozen=True)
@@ -69,6 +94,11 @@ class SweepRead:
     def carried(self) -> bool:
         """Whether there is a completed read here for the pipeline to adopt."""
         return self.recognition is not None and bool(self.frame_digest)
+
+    @property
+    def plate_px(self) -> int | None:
+        """How wide the plate the detector boxed is, in 4K pixels; None without a box."""
+        return plate_width_px(getattr(self.recognition, "box", None))
 
 
 @dataclass(frozen=True)

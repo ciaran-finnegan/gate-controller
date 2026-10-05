@@ -736,5 +736,279 @@ class LocalSweepTests(unittest.TestCase):
         self.assertEqual(self.injected, [])
 
 
+
+def boxed(plate_px, *, plate="10CE1990", score=0.6, authorised=False):
+    """A sweep read whose on-device detector boxed a plate ``plate_px`` wide (4K).
+
+    The box is in frame fractions and padded by the recogniser's CROP_PAD, as
+    a real `LocalRecognition` box is, so ``plate_px`` comes back out of
+    `SweepRead.plate_px` exactly as production computes it.
+    """
+    width = plate_px * 1.16 / 3840
+    recognition = LocalRecognition(
+        plate=plate, score=score, status="recognized" if plate else "no_plate",
+        box=(0.4, 0.55, width, width / 4),
+    )
+    return SweepRead(
+        status=recognition.status, plate=plate, score=score, authorised=authorised,
+        read_ms=170.0, recognition=recognition,
+    )
+
+
+class CloudHoldConfigTests(unittest.TestCase):
+    def test_the_hold_ships_in_shadow_at_300_px_with_a_3_s_last_chance(self):
+        config = load_trigger_capture_config({}, Path("/tmp"), webhook_enabled=True)
+        self.assertEqual(
+            (config.sweep_cloud_hold, config.sweep_cloud_min_plate_px,
+             config.sweep_cloud_last_chance_seconds),
+            ("shadow", 300, 3.0),
+        )
+
+    def test_the_hold_is_read_from_the_environment_and_bounded(self):
+        config = load_trigger_capture_config(
+            {
+                "GATE_LOCAL_SWEEP_CLOUD_HOLD": "on",
+                "GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX": "280",
+                "GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS": "2.5",
+            },
+            Path("/tmp"), webhook_enabled=True,
+        )
+        self.assertEqual(
+            (config.sweep_cloud_hold, config.sweep_cloud_min_plate_px,
+             config.sweep_cloud_last_chance_seconds),
+            ("on", 280, 2.5),
+        )
+        for key, value in (
+            ("GATE_LOCAL_SWEEP_CLOUD_HOLD", "yes"),
+            ("GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX", "-1"),
+            ("GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX", "3841"),
+            ("GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX", "300.5"),
+            ("GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS", "-0.1"),
+            ("GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS", "31"),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ValueError):
+                    load_trigger_capture_config({key: value}, Path("/tmp"), webhook_enabled=True)
+
+    def test_the_plate_width_is_the_detectors_box_without_its_pad_in_4k_pixels(self):
+        self.assertEqual(boxed(370).plate_px, 370)
+        self.assertEqual(boxed(192).plate_px, 192)
+        self.assertIsNone(SweepRead(status="recognized", plate="10CE1990", score=0.6).plate_px)
+        no_box = LocalRecognition(plate="10CE1990", score=0.6, status="recognized")
+        self.assertIsNone(SweepRead(status="recognized", recognition=no_box).plate_px)
+
+
+class CloudHoldTests(unittest.TestCase):
+    """The paid lookup waits for a plate worth it; everything else is as it was.
+
+    2026-10-05, arrival 16:30:27: the five hand-overs went at +1.8, +4.0, +5.1,
+    +7.5 and +8.8 s, the sweep ran to +17 s, and no frame from the closest part
+    of the approach was shown to the cloud. Every test here runs the real
+    ``local_sweep`` on a fake clock: frames appear as it advances, every read
+    carries a plate box like the recogniser's, and the injector records when
+    each frame went and with what.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.clock = Clock(100.0)
+        self.handed = []  # (clock, frame bytes)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _capture(self, source, sweep, *, hold="on", seconds=10.0, cloud=5, spacing=1.0,
+                 min_px=300, last_chance=3.0, fallback=0, waiting=0.0, inject=None,
+                 internet_reachable=None):
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            sweep_enabled=True, sweep_seconds=seconds, sweep_max_fps=5.0,
+            sweep_fallback_frames=fallback, presence_max_frames=0,
+            empty_scene_threshold=0.0, max_flat_fraction=0.0,
+            sweep_cloud_frames=cloud, sweep_cloud_spacing_seconds=spacing,
+            sweep_cloud_hold=hold, sweep_cloud_min_plate_px=min_px,
+            sweep_cloud_last_chance_seconds=last_chance,
+            sweep_waiting_seconds=waiting, sweep_waiting_fps=1.0,
+        )
+        capture = TriggerFrameCapture(
+            config, popen=lambda *a, **k: None, clock=self.clock,
+            frame_source=source, sweep=sweep, internet_reachable=internet_reachable,
+        )
+
+        def record(paths, received_at, trigger):
+            self.handed.append((self.clock(), paths[0].read_bytes()))
+
+        capture.attach(inject or record)
+        return capture
+
+    def _passage(self, widths, *, spacing=0.2, **read):
+        """One frame every ``spacing`` s from t=100, the plate as wide as ``widths`` says."""
+        frames = [(100.0 + index * spacing, jpeg(seed=index)) for index in range(len(widths))]
+        answers = {
+            data: (boxed(width, **read) if width else SweepRead(status="no_plate", read_ms=170.0))
+            for (_at, data), width in zip(frames, widths)
+        }
+        return frames, FrameSource(self.clock, frames), ScriptedSweep(answers), answers
+
+    def _sweep(self, capture):
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        return "\n".join(logs.output)
+
+    @staticmethod
+    def _handovers(output):
+        return [line for line in output.splitlines() if "stage=cloud_handover frame=" in line]
+
+    # -- the rules -----------------------------------------------------------
+
+    def test_far_frames_are_held_and_the_first_close_one_goes_to_the_cloud(self):
+        # 190 px at first sight, 15 px a frame, at the stop (370 px) from +2.4 s.
+        widths = [min(370, 190 + 15 * index) for index in range(50)]
+        frames, source, sweep, answers = self._passage(widths)
+        output = self._sweep(self._capture(source, sweep))
+
+        handed_at = [at for at, _data in self.handed]
+        self.assertEqual(len(self.handed), 5, "the per-passage ceiling still holds")
+        self.assertGreaterEqual(handed_at[0], 101.6, "a far frame went to the cloud")
+        for _at, data in self.handed:
+            self.assertGreaterEqual(answers[data].plate_px, 300)
+        for earlier, later in zip(handed_at, handed_at[1:]):
+            self.assertGreaterEqual(later - earlier, 1.0, "the spacing still holds")
+        lines = self._handovers(output)
+        self.assertIn("plate_seen=True plate_px=310 release=plate_width at_ms=16", lines[0])
+        held = [line for line in output.splitlines() if "stage=cloud_held" in line]
+        self.assertEqual(len(held), 1, "the hold is journalled once a passage, not per frame")
+        self.assertIn("mode=on reason=small_plate plate_px=", held[0])
+        self.assertIn("min_px=300 last_chance_in_ms=7000", held[0])
+        self.assertIn("cloud_hold=on cloud_held=", output)
+        self.assertEqual(len(sweep.reads), 50, "the on-device reader read every frame regardless")
+
+    def test_a_car_that_stops_short_of_a_large_plate_is_handed_over_once_it_has_stopped(self):
+        # Grows to 260 px and stops there: never "large", but no frame will be better.
+        widths = [min(260, 200 + 15 * index) for index in range(50)]
+        _frames, source, sweep, answers = self._passage(widths)
+        output = self._sweep(self._capture(source, sweep))
+
+        first_at, first = self.handed[0]
+        self.assertEqual(answers[first].plate_px, 260)
+        # The last growing box (245 px at +0.6 s) must have left the 2 s window.
+        self.assertGreater(first_at, 102.4)
+        self.assertLess(first_at, 103.0, "the stopped car waited for the last chance")
+        self.assertIn("plate_px=260 release=stopped", self._handovers(output)[0])
+
+    def test_a_plate_that_never_grows_large_still_gets_the_clouds_opinion_at_the_last_chance(self):
+        # Still creeping, still small, for the whole window.
+        widths = [150 + 3 * index for index in range(50)]
+        _frames, source, sweep, answers = self._passage(widths)
+        output = self._sweep(self._capture(source, sweep))
+
+        first_at, first = self.handed[0]
+        self.assertAlmostEqual(first_at, 107.0, delta=0.21, msg="window end less the last chance")
+        self.assertLess(answers[first].plate_px, 300)
+        self.assertIn("release=last_chance", self._handovers(output)[0])
+        self.assertEqual(len(self.handed), 3, "+7, +8, +9: what the window had left")
+
+    def test_a_blind_frame_waits_for_the_last_chance_instead_of_spending_the_budget_first(self):
+        """The first hand-over used to go blind, at once, before anything was read."""
+        _frames, source, sweep, _answers = self._passage([0] * 50)
+        output = self._sweep(self._capture(source, sweep))
+
+        self.assertGreaterEqual(self.handed[0][0], 107.0)
+        self.assertIn("plate_seen=False plate_px=- release=last_chance", self._handovers(output)[0])
+        self.assertIn("stage=cloud_held mode=on reason=no_plate plate_px=-", output)
+
+    def test_the_waiting_phase_is_a_last_chance_and_the_fallback_still_goes(self):
+        # A small, still-growing plate; no last chance inside the window at all.
+        widths = [150 + 3 * index for index in range(50)]
+        _frames, source, sweep, _answers = self._passage(widths)
+        output = self._sweep(self._capture(
+            source, sweep, seconds=3.0, last_chance=0.0, fallback=1, waiting=4.0,
+        ))
+
+        self.assertIn("source=sweep_fallback", output, "the passage is still put on record")
+        lines = self._handovers(output)
+        self.assertTrue(lines, "nothing went to the cloud while the car waited")
+        self.assertIn("release=last_chance", lines[0])
+        self.assertGreaterEqual(self.handed[0][0], 103.0)
+        self.assertLess(output.index("source=sweep_fallback"), output.index(lines[0]))
+
+    def test_the_largest_plate_is_the_one_paid_for_not_the_best_local_score(self):
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(6)]
+        source = FrameSource(self.clock, frames)
+        largest = frames[1][1]
+        sweep = ScriptedSweep({
+            frames[0][1]: boxed(380, score=0.3),
+            largest: boxed(390, score=0.3),
+            frames[2][1]: boxed(350, score=0.9),
+            frames[3][1]: boxed(340, score=0.95),
+            frames[4][1]: boxed(330, score=0.99),
+            frames[5][1]: boxed(320, score=0.99),
+        })
+        self._sweep(self._capture(source, sweep, seconds=2.0, cloud=2, last_chance=0.0))
+        self.assertEqual([data for _at, data in self.handed], [frames[0][1], largest])
+
+    # -- what must not change ---------------------------------------------------
+
+    def test_an_authorised_local_read_of_a_far_plate_is_injected_at_once(self):
+        widths = [190, 200, 210]
+        frames, source, sweep, _answers = self._passage(widths)
+        winner = frames[2][1]
+        sweep.answers[winner] = boxed(210, score=0.99, authorised=True)
+        injected = []
+        capture = None
+
+        def inject(paths, received_at, trigger):
+            injected.append((self.clock(), paths[0].read_bytes()))
+            capture.note_result(paths, ProcessingResult(True, "exact_match"))
+
+        capture = self._capture(source, sweep, inject=inject)
+        output = self._sweep(capture)
+        self.assertEqual([data for _at, data in injected], [winner])
+        self.assertLess(injected[0][0], 100.5, "the hold delayed a local open")
+        self.assertIn("reason=opened", output)
+        self.assertIn("source=sweep ", output)
+        self.assertNotIn("source=sweep_cloud", output)
+
+    def test_with_the_internet_down_nothing_is_handed_to_the_cloud_however_large(self):
+        _frames, source, sweep, _answers = self._passage([370] * 50)
+        output = self._sweep(self._capture(
+            source, sweep, fallback=1, internet_reachable=lambda: False,
+        ))
+        self.assertEqual(self._handovers(output), [])
+        self.assertEqual(output.count("stage=cloud_handover_skipped reason=internet_down"), 1)
+        self.assertIn("cloud_handovers=0", output)
+        self.assertIn("source=sweep_fallback", output, "the fallback still records the passage")
+
+    def test_the_budget_cap_and_spacing_bound_a_close_plate_too(self):
+        _frames, source, sweep, _answers = self._passage([370] * 50)
+        capture = self._capture(source, sweep, cloud=2, spacing=1.5)
+        output = self._sweep(capture)
+        self.assertEqual(len(self.handed), 2)
+        self.assertGreaterEqual(self.handed[1][0] - self.handed[0][0], 1.5)
+        self.assertEqual(capture.status()["sweep"]["cloud_handovers"], 2)
+        self.assertNotIn("stage=cloud_held", output, "a close plate is never held")
+
+    def test_shadow_hands_over_exactly_as_off_and_says_what_on_would_have_held(self):
+        widths = [min(370, 190 + 15 * index) for index in range(50)]
+        timings = {}
+        for hold in ("off", "shadow"):
+            self.handed = []
+            self.clock.now = 100.0
+            _frames, source, sweep, _answers = self._passage(widths)
+            output = self._sweep(self._capture(source, sweep, hold=hold))
+            timings[hold] = ([at for at, _data in self.handed], [data for _at, data in self.handed])
+            if hold == "off":
+                self.assertNotIn("stage=cloud_held", output)
+                self.assertIn("release=off", self._handovers(output)[0])
+            else:
+                self.assertIn("stage=cloud_held mode=shadow reason=small_plate", output)
+                lines = self._handovers(output)
+                self.assertIn("plate_px=190 release=would_hold at_ms=0", lines[0])
+                self.assertTrue(any("release=plate_width" in line for line in lines))
+        self.assertEqual(timings["off"], timings["shadow"])
+        self.assertLess(timings["shadow"][0][0], 100.1, "shadow must not hold anything")
+
+
 if __name__ == "__main__":
     unittest.main()
