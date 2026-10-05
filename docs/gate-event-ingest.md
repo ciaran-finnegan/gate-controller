@@ -112,7 +112,7 @@ recorded, and the nine cooldown rows are the ones this change moves.
 | `no_match` | 80 | yes | a genuine no-read, or a correct refusal of a plate that is not authorised |
 | `decision_timeout` | 19 | sometimes | the frame spent its whole decision budget queued behind the Plate Recognizer 1 req/s throttle |
 | `queue_coalesced` | 10 | **no** | the controller declined to spend a cloud call on a car it had just let in. Also what the worker's `gate_burst stage=skipped cause=event_already_opened` records |
-| `upload_incomplete` | 4 | **no** | the camera's FTP upload was truncated; there is no frame |
+| `upload_incomplete` | 4 | **no** | the camera's FTP upload never became a whole JPEG: it stopped growing for `GATE_UPLOAD_STALL_SECONDS`, vanished, or was still arriving at `GATE_UPLOAD_MAX_SECONDS`; there is no frame. A slow upload that does complete is decided instead — see `docs/deployment.md`, "Slow FTP Uploads" |
 | `ocr_error` | 1 | attempted | the reader errored — an error, not a refusal |
 | `stale_burst`, `processing_error`, `image_too_large`, `ocr_busy` | — | **no** | the frame was rejected before or instead of a read |
 

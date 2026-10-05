@@ -68,6 +68,7 @@ from .store import LocalStore
 from .telemetry_export import export_telemetry
 from .worker import (
     DEFAULT_MAX_BURST_CANDIDATES, DEFAULT_MAX_CANDIDATE_BYTES,
+    DEFAULT_UPLOAD_MAX_SECONDS, DEFAULT_UPLOAD_STALL_SECONDS,
     MAX_BURST_CANDIDATES, MAX_CANDIDATE_BYTES, run_worker,
 )
 from .runtime import require_python_version
@@ -144,6 +145,7 @@ def main() -> None:
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
     max_burst_candidates, max_candidate_bytes = image_runtime_limits(os.environ)
+    upload_stall_seconds, upload_max_seconds = upload_wait_limits(os.environ)
     hot_stream_config = load_hot_stream_config(os.environ, arguments.directory)
     hot_stream = HotStreamBuffer(hot_stream_config) if hot_stream_config.enabled else None
     authorised = AuthorisedPlateCache(
@@ -450,6 +452,8 @@ def main() -> None:
         shutdown=shutdown,
         max_burst_candidates=max_burst_candidates,
         max_candidate_bytes=max_candidate_bytes,
+        upload_stall_seconds=upload_stall_seconds,
+        upload_max_seconds=upload_max_seconds,
         trigger_resolver=trigger_correlator.correlate,
         hot_frame_provider=hot_stream,
         trigger_capture=trigger_capture,
@@ -1019,6 +1023,57 @@ def image_runtime_limits(environment) -> tuple[int, int]:
     if max_candidates > MAX_BURST_CANDIDATES or max_bytes > MAX_CANDIDATE_BYTES:
         raise ValueError("image runtime limits exceed the safe maximum")
     return max_candidates, max_bytes
+
+
+MIN_UPLOAD_STALL_SECONDS, MAX_UPLOAD_STALL_SECONDS = 2.0, 60.0
+MIN_UPLOAD_MAX_SECONDS, MAX_UPLOAD_MAX_SECONDS = 10.0, 300.0
+
+
+def upload_wait_limits(environment) -> tuple[float, float]:
+    """How long a camera upload that is still arriving is waited for.
+
+    ``GATE_UPLOAD_STALL_SECONDS`` (default 10, accepted 2-60) is how long an
+    upload may go without a single new byte, while still not a whole JPEG,
+    before it is rejected ``upload_incomplete``. ``GATE_UPLOAD_MAX_SECONDS``
+    (default 120, accepted 10-300) is the hard ceiling from first sight,
+    however the upload is doing. Neither decides whether a late frame may open
+    the gate: ``GATE_MAX_IMAGE_AGE_SECONDS`` does, measured from the moment
+    the upload was first seen.
+
+    An unusable value is rejected whole, logged as an error, and replaced by
+    the default, as the cooldowns are: a controller that will not start opens
+    for nobody.
+    """
+    stall = _bounded_seconds(
+        environment, "GATE_UPLOAD_STALL_SECONDS", DEFAULT_UPLOAD_STALL_SECONDS,
+        MIN_UPLOAD_STALL_SECONDS, MAX_UPLOAD_STALL_SECONDS, "upload_wait",
+    )
+    ceiling = _bounded_seconds(
+        environment, "GATE_UPLOAD_MAX_SECONDS", DEFAULT_UPLOAD_MAX_SECONDS,
+        MIN_UPLOAD_MAX_SECONDS, MAX_UPLOAD_MAX_SECONDS, "upload_wait",
+    )
+    logging.getLogger(__name__).info(
+        "upload_wait stall_seconds=%g max_seconds=%g", stall, ceiling,
+    )
+    return stall, ceiling
+
+
+def _bounded_seconds(environment, key: str, default: float, minimum: float,
+                     maximum: float, journal: str) -> float:
+    raw = str(environment.get(key, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if not math.isfinite(seconds) or not minimum <= seconds <= maximum:
+        logging.getLogger(__name__).error(
+            "%s key=%s status=rejected allowed=%g..%g using_default_seconds=%g",
+            journal, key, minimum, maximum, default,
+        )
+        return default
+    return seconds
 
 
 def _controller_status(store, prompt_player, latest_image, authorised=None, *, relay=None,

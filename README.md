@@ -230,7 +230,11 @@ overall event-decision budget, including frame ranking and content hashing; each
 Plate Recognizer request also uses a shorter bounded timeout and exact matches
 still stop the burst immediately. `GATE_MAX_BURST_CANDIDATES` defaults to 8 and
 `GATE_MAX_CANDIDATE_IMAGE_BYTES` defaults to 8 MiB. Startup rejects values above
-the hard safety ceilings of 16 candidates or 16 MiB per candidate. Within that
+the hard safety ceilings of 16 candidates or 16 MiB per candidate. An FTP upload
+that is still arriving is waited for while it grows (`GATE_UPLOAD_STALL_SECONDS`,
+`GATE_UPLOAD_MAX_SECONDS`); a still that completes late is still judged by
+`GATE_MAX_IMAGE_AGE_SECONDS` from the moment its upload was first seen. See
+`docs/deployment.md`, "Slow FTP Uploads". Within that
 bounded set, the high-resolution FTP trigger remains the first OCR attempt. Up
 to two continuously buffered fluent-stream fallbacks follow in quality order,
 keeping all three inside the existing OCR attempt ceiling.

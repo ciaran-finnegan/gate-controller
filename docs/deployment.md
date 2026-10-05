@@ -201,6 +201,107 @@ sudo systemctl list-timers gate-controller-updater.timer
 sudo journalctl -u gate-controller-updater.service -n 100 --no-pager
 ```
 
+## Slow FTP Uploads
+
+The camera FTPs a 4K still into the uploads directory when it sees a vehicle,
+and the controller reads it. Camera and Pi share a switch at the gate: a
+1.0-1.9 MB still normally lands at 1,300-1,600 KB/s, well inside a second.
+
+From about 21:52 UTC on 30 September to early 4 October 2026 the gate network
+degraded. Uploads ran at 3-40 KB/s and took 30-50 s or more; vsftpd logged
+nearly every one `OK UPLOAD` (one `FAIL UPLOAD`). The controller gave every
+upload a flat five seconds, rejected all of them `upload_incomplete`, and never
+ran the on-device reader on any of them. All 24 passages in those three days
+were refused, and the camera's webhook did not arrive in that period, so the
+FTP still was the only trigger.
+
+### When an upload counts as arrived
+
+An upload is complete when it is a whole, decodable JPEG: start-of-image at the
+head, end-of-image (`FFD9`) at the tail, and headers Pillow can parse. JPEG
+byte-stuffs every `FF` inside the compressed data, so `FFD9` at the tail is the
+camera's last write and not a chunk boundary. inotify's close-after-write
+(`IN_CLOSE_WRITE`, watchdog's `on_closed`) and a rename into place make the
+controller look again at once rather than at the next 50 ms poll.
+
+While an upload is not yet whole it is waited for as long as it keeps growing.
+It is rejected `upload_incomplete` only when
+
+- it has gone `GATE_UPLOAD_STALL_SECONDS` without a single new byte and is
+  still not a whole JPEG (a truncated or abandoned upload), or
+- it has vanished from disk, or
+- `GATE_UPLOAD_MAX_SECONDS` have passed since it was first seen, however it is
+  doing.
+
+An upload over `GATE_MAX_CANDIDATE_IMAGE_BYTES` is still rejected
+`image_too_large` as before.
+
+| Variable | Default | Accepted | Meaning |
+| --- | --- | --- | --- |
+| `GATE_UPLOAD_STALL_SECONDS` | `10` | 2-60 | no new byte for this long, and not whole: give up |
+| `GATE_UPLOAD_MAX_SECONDS` | `120` | 10-300 | hard ceiling from first sight |
+
+A value outside the accepted range is logged as an error
+(`upload_wait key=... status=rejected`) and the default is used, as for the
+relay cooldowns: a controller that refuses to start opens for nobody.
+
+### What a still that arrives late may do
+
+Waiting longer for a still does **not** let an old still open the gate. Every
+still carries `received_at`, the moment its upload was first seen -- which,
+with inotify, is the moment vsftpd created the file, a few milliseconds after
+the camera took the frame -- and the processor's existing freshness rule,
+`GATE_MAX_IMAGE_AGE_SECONDS` (8 s), is measured from it. It is checked before
+the on-device read, when the decision starts, after the decision, before the
+relay is claimed, and again inside the relay's own pre-activation check.
+
+| The upload took | What happens |
+| --- | --- |
+| under ~1.5 s (a healthy network) | exactly as before |
+| a few seconds, deciding within 8 s of first sight | decided normally: read on the device (no internet needed) and, for an authorised plate, the relay pulses once, subject to the 90 s cooldown. Anything past 5 s was `upload_incomplete` before |
+| 45 s | decided, recorded `stale_burst`, `opened=false`. **No** on-device read, **no** cloud request, **no** pulse. The event carries no plate |
+| still arriving at 120 s, or stopped arriving | `upload_incomplete`, as before, with the cause in the journal |
+
+That is deliberate. The relay drives the operator's step-by-step input: a
+pulse into an open gate closes it, and into a moving gate stops it dead
+(`docs/gate-operator.md`). After 45 s the car may have left, or been let in by
+a fob or the keypad, which the controller cannot see and its 90 s cooldown does
+not cover; a pulse then could close the gate on whoever is in it, or leave the
+leaves out of sequence. A slow gate network is now visible in the journal and
+the events say `stale_burst` instead of `upload_incomplete`, but **a still that
+takes longer than about 8 s to arrive will not open the gate**. Fixing that
+means making the still arrive in time: the network at the gate, or a smaller
+FTP still from the camera.
+
+One case would defeat timing from first sight: an upload that was already
+under way when the controller first saw it -- the service restarted part-way
+through it (startup reconciliation then picks it up), or the create event was
+missed. When a file already holds bytes at first sight, the controller times
+the bytes that arrive afterwards by the file's own mtime (stamped by the kernel
+on every write), estimates from that rate how long the earlier bytes took, and
+moves `received_at` back by that much. The estimate can only make a still
+older, never younger. Without it, a still that spent 30 s arriving before a
+restart and 3 s after would have looked 3 s old and opened the gate.
+
+### In the journal
+
+```text
+gate_pipeline stage=filesystem_ingress observed_at=2026-10-01T21:52:10+00:00 pending_count=1
+gate_pipeline stage=upload_arriving waited_ms=3010 bytes=98304 bytes_per_second=32659
+gate_pipeline stage=upload_completed upload_ms=45020 bytes=1468006 bytes_per_second=32607 unobserved_ms=0
+gate_pipeline stage=upload_rejected reason=upload_incomplete cause=stalled waited_ms=21400 idle_ms=10010 bytes=802816
+```
+
+`upload_arriving` is written once per upload, when it is still not whole 3 s
+after first sight; `upload_completed` follows it (or any upload whose
+`unobserved_ms`, the estimated time before first sight, is 3 s or more).
+`upload_rejected` names the cause: `stalled`, `ceiling` or `missing`. A healthy
+upload writes none of the three. To see how the gate network has been doing:
+
+```sh
+sudo journalctl -u file-monitor.service --since today | grep -E 'stage=upload_(arriving|completed|rejected)'
+```
+
 ## Cloudflare Tunnel
 
 Cloudflare Tunnel exposes only the loopback command endpoint and the hardened
