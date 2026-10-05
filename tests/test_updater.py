@@ -167,6 +167,18 @@ class WorkflowDecisionTests(unittest.TestCase):
 
         self.assertTrue(has_successful_ci_run(payload, TARGET_SHA))
 
+    def test_accepts_a_manual_run_on_the_protected_branch(self):
+        payload = {"workflow_runs": [workflow_run(event="workflow_dispatch")]}
+
+        self.assertTrue(has_successful_ci_run(payload, TARGET_SHA))
+
+    def test_rejects_a_manual_run_on_another_branch(self):
+        payload = {
+            "workflow_runs": [workflow_run(event="workflow_dispatch", branch="feature")]
+        }
+
+        self.assertFalse(has_successful_ci_run(payload, TARGET_SHA))
+
     def test_rejects_success_for_wrong_sha_when_target_failed(self):
         payload = {
             "workflow_runs": [

@@ -245,6 +245,11 @@ def read_main_sha(payload: object) -> str:
     return sha
 
 
+# A manual run on the protected branch tests the same commit a push run would;
+# it is how a push GitHub dropped is recovered (see ci.yml).
+TRUSTED_CI_EVENTS = ("push", "workflow_dispatch")
+
+
 def has_successful_ci_run(payload: object, sha: str, branch: str = "master") -> bool:
     if SHA_PATTERN.fullmatch(sha) is None:
         raise ValueError("candidate SHA is invalid")
@@ -258,7 +263,7 @@ def has_successful_ci_run(payload: object, sha: str, branch: str = "master") -> 
         isinstance(run, dict)
         and run.get("head_sha") == sha
         and run.get("head_branch") == branch
-        and run.get("event") == "push"
+        and run.get("event") in TRUSTED_CI_EVENTS
         and run.get("status") == "completed"
         and run.get("conclusion") == "success"
         and run.get("path") in (CI_WORKFLOW_PATH, f"{CI_WORKFLOW_PATH}@{branch}")
@@ -373,7 +378,6 @@ def _workflow_runs_payload(config: UpdateConfig, sha: str) -> object:
     query = urllib.parse.urlencode(
         {
             "branch": config.branch,
-            "event": "push",
             "status": "completed",
             "head_sha": sha,
             "per_page": "20",
