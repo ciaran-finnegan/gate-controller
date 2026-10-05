@@ -946,7 +946,11 @@ def _process_bursts(
                 _report_lost(on_dropped, paths, "processing_error")
                 _remove_uploads(paths)
                 continue
-            if prepared.needs_cloud:
+            # Routed once: a burst kept here is finished without the network,
+            # however the cloud's availability changes while it is (#165).
+            route = getattr(prepared, "route_to_cloud_lane", None)
+            to_cloud_lane = route() if callable(route) else prepared.needs_cloud
+            if to_cloud_lane:
                 if cloud_lane.submit(item, prepared, options, trigger_summary, timing):
                     continue
                 # The lane has closed under this burst: the service is
