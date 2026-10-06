@@ -5,7 +5,7 @@ from itertools import count
 from queue import Empty, PriorityQueue, Queue
 import signal
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
 from time import monotonic, sleep, time
 
@@ -21,6 +21,23 @@ DEFAULT_MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 MAX_BURST_CANDIDATES = 16
 MAX_CANDIDATE_BYTES = 16 * 1024 * 1024
 MAX_STARTUP_ENTRIES = 128
+# How long an FTP upload is waited for. Measured on the Pi's vsftpd log: the
+# camera and the Pi share a switch at the gate and a 1.0-1.9 MB still normally
+# lands at 1,300-1,600 KB/s, well inside a second. From 30 Sep to 4 Oct 2026
+# the gate network ran at 3-40 KB/s and the same stills took 30-50 s; vsftpd
+# logged nearly every one `OK UPLOAD`, and the controller, which gave each
+# upload a flat five seconds, rejected all of them `upload_incomplete` and
+# never read one. An upload is now waited for while bytes keep arriving:
+# rejected only once it has stopped growing for the stall window and is still
+# not a whole JPEG, or once the hard ceiling has passed. Whether a frame that
+# completes late may still open the gate is not decided here -- it carries the
+# time its upload was first seen, and the processor's freshness rule
+# (`GATE_MAX_IMAGE_AGE_SECONDS`) decides.
+DEFAULT_UPLOAD_STALL_SECONDS = 10.0
+DEFAULT_UPLOAD_MAX_SECONDS = 120.0
+# An upload still arriving after this long is journalled once: at the normal
+# rate the largest still is in by about 1.5 s.
+UPLOAD_SLOW_NOTICE_SECONDS = 3.0
 _TRIGGER_UNSET = object()
 
 
@@ -315,24 +332,66 @@ class BurstCollector:
         return True
 
 
+@dataclass
+class _PendingUpload:
+    """One upload the handler is waiting on, and how it has been arriving."""
+
+    #: Monotonic time the upload was first seen, and the wall time of the same
+    #: moment: the frame's `received_at`, which the freshness rule reads.
+    first_seen: float
+    received_at: datetime
+    retry_at: float
+    #: Bytes on disk when first seen (None when the size could not be read).
+    #: Non-zero means the upload began before anything here saw it.
+    first_size: int | None
+    #: The file's mtime (ns) when first seen: the kernel stamps it on every
+    #: write, so it times the bytes that arrive afterwards exactly, where the
+    #: 50 ms poll could not.
+    first_mtime_ns: int | None
+    #: Bytes at the last check, and the monotonic time the size last changed.
+    size: int | None
+    grew_at: float
+    #: The "still arriving" line has been written for this upload.
+    reported_slow: bool = False
+
+
 class CompletedImageHandler(FileSystemEventHandler):
-    # 50 ms polling keeps ingress fast; 100 attempts preserves the same five
-    # second readability window a slow FTP transfer had at 250 ms x 20.
+    """Wait for camera uploads to finish, then hand them to the burst collector.
+
+    An upload is complete when it is a whole, decodable JPEG -- start-of-image
+    at the head, end-of-image at the tail (`images._is_valid_image`). Entropy-
+    coded JPEG data byte-stuffs every 0xFF, so FFD9 at the tail of a file whose
+    headers parse is the camera's last write, not a chunk boundary. The
+    inotify close-after-write (`on_closed`, IN_CLOSE_WRITE) and a rename into
+    place (`on_moved`) are taken as a prompt to look again at once.
+
+    50 ms polling keeps ingress fast. An upload that is not yet whole is kept
+    while it is still growing: it is rejected `upload_incomplete` only when it
+    has gone ``stall_timeout`` seconds without a byte and is still not whole,
+    when it has been pending ``max_age`` seconds however it is doing, or when
+    it has gone from disk. See `DEFAULT_UPLOAD_STALL_SECONDS`.
+    """
+
     def __init__(self, collector: BurstCollector, retry_interval: float = 0.05,
-                 max_attempts: int = 100, max_age: float = 30.0, clock=monotonic,
+                 stall_timeout: float = DEFAULT_UPLOAD_STALL_SECONDS,
+                 max_age: float = DEFAULT_UPLOAD_MAX_SECONDS, clock=monotonic,
                  on_rejected=None, arrival_clock=None,
                  max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                  max_pending_candidates: int = DEFAULT_MAX_BURST_CANDIDATES,
-                 on_first_completed=None, ignored_roots=()):
+                 on_first_completed=None, ignored_roots=(),
+                 slow_notice: float = UPLOAD_SLOW_NOTICE_SECONDS):
         super().__init__()
         if not 1 <= max_candidate_bytes <= MAX_CANDIDATE_BYTES:
             raise ValueError("max_candidate_bytes exceeds the safe range")
         if not 1 <= max_pending_candidates <= MAX_BURST_CANDIDATES:
             raise ValueError("max_pending_candidates exceeds the safe range")
+        if not (0 < stall_timeout < float("inf") and 0 < max_age < float("inf")):
+            raise ValueError("upload stall and ceiling must be finite and positive")
         self._collector = collector
         self._retry_interval = retry_interval
-        self._max_attempts = max_attempts
+        self._stall_timeout = stall_timeout
         self._max_age = max_age
+        self._slow_notice = slow_notice
         self._clock = clock
         self._arrival_clock = arrival_clock or (lambda: datetime.now(timezone.utc))
         self._on_rejected = on_rejected
@@ -340,11 +399,20 @@ class CompletedImageHandler(FileSystemEventHandler):
         self._max_pending_candidates = max_pending_candidates
         self._on_first_completed = on_first_completed
         self._ignored_roots = tuple(Path(root).resolve() for root in ignored_roots)
-        self._retry_at: dict[Path, tuple[float, float, int, datetime]] = {}
+        self._retry_at: dict[Path, _PendingUpload] = {}
         self._lock = Lock()
 
     def on_closed(self, event) -> None:
-        self.schedule_candidate(Path(event.src_path), event.is_directory)
+        # IN_CLOSE_WRITE. For a path this handler is not waiting on and that
+        # is no longer there, it is the writer finishing a file that was
+        # already decided or rejected: nothing to look at, and nothing to
+        # record a second time.
+        path = Path(event.src_path)
+        with self._lock:
+            tracked = path in self._retry_at
+        if not tracked and not event.is_directory and not path.exists():
+            return
+        self.schedule_candidate(path, event.is_directory)
 
     def on_moved(self, event) -> None:
         self.schedule_candidate(Path(event.dest_path), event.is_directory)
@@ -357,12 +425,23 @@ class CompletedImageHandler(FileSystemEventHandler):
             return
         dropped = []
         first_observation = None
+        first_stat = _file_stat(path)
+        first_size, first_mtime_ns = first_stat or (None, None)
         with self._lock:
             now = self._clock()
             candidate = self._retry_at.pop(path, None)
             if candidate is None:
                 first_observation = self._arrival_clock()
-            self._retry_at[path] = candidate or (now, now, 0, first_observation)
+                candidate = _PendingUpload(
+                    first_seen=now, received_at=first_observation, retry_at=now,
+                    first_size=first_size, first_mtime_ns=first_mtime_ns,
+                    size=first_size, grew_at=now,
+                )
+            else:
+                # Seen again -- closed after writing, or renamed into place:
+                # look at it on the next pass rather than after the interval.
+                candidate.retry_at = now
+            self._retry_at[path] = candidate
             while len(self._retry_at) > self._max_pending_candidates:
                 dropped_path = next(iter(self._retry_at))
                 self._retry_at.pop(dropped_path)
@@ -393,9 +472,8 @@ class CompletedImageHandler(FileSystemEventHandler):
         now = self._clock()
         with self._lock:
             due = [
-                path for path, (first_seen, retry_at, attempts, received_at)
-                in self._retry_at.items()
-                if retry_at <= now
+                path for path, candidate in self._retry_at.items()
+                if candidate.retry_at <= now
             ]
         completed = 0
         for path in due:
@@ -403,30 +481,103 @@ class CompletedImageHandler(FileSystemEventHandler):
                 candidate = self._retry_at.get(path)
             if candidate is None:
                 continue
-            first_seen, _, attempts, received_at = candidate
-            if attempts >= self._max_attempts or now - first_seen >= self._max_age or not path.exists():
-                with self._lock:
-                    self._retry_at.pop(path, None)
-                self._reject(path, "upload_incomplete")
+            stat = _file_stat(path)
+            if stat is None:
+                # Gone from disk mid-upload: there is no frame to wait for.
+                self._give_up(path, candidate, now, "missing")
                 continue
+            size, mtime_ns = stat
+            if size != candidate.size:
+                candidate.size = size
+                candidate.grew_at = now
             if self._too_large(path):
                 with self._lock:
                     self._retry_at.pop(path, None)
                 self._reject(path, "image_too_large")
                 continue
             if wait_until_readable(path, timeout=0, poll_interval=0):
+                # Sized again: the last bytes may have landed since the stat.
+                size, mtime_ns = _file_stat(path) or (size, mtime_ns)
+                received_at = self._completed_received_at(candidate, size, mtime_ns, now)
                 first_candidate = self._collector.add(path, received_at)
                 with self._lock:
                     self._retry_at.pop(path, None)
                 if first_candidate:
                     self._add_hot_frames(received_at)
                 completed += 1
-            else:
-                with self._lock:
-                    if path in self._retry_at:
-                        self._retry_at[path] = (first_seen, self._clock() + self._retry_interval,
-                                                attempts + 1, received_at)
+                continue
+            waited = now - candidate.first_seen
+            if waited >= self._max_age:
+                self._give_up(path, candidate, now, "ceiling")
+                continue
+            if now - candidate.grew_at >= self._stall_timeout:
+                self._give_up(path, candidate, now, "stalled")
+                continue
+            if waited >= self._slow_notice and not candidate.reported_slow:
+                candidate.reported_slow = True
+                LOGGER.info(
+                    "gate_pipeline stage=upload_arriving waited_ms=%d bytes=%d "
+                    "bytes_per_second=%s",
+                    round(waited * 1000), size, _arrival_rate(candidate, size, now),
+                )
+            with self._lock:
+                if path in self._retry_at:
+                    candidate.retry_at = self._clock() + self._retry_interval
         return completed
+
+    def _completed_received_at(self, candidate: _PendingUpload, size: int,
+                               mtime_ns: int, now: float) -> datetime:
+        """The `received_at` a completed upload carries into the pipeline.
+
+        Normally the moment the upload was first seen, which inotify makes the
+        moment vsftpd created the file, a few milliseconds after the camera
+        took the frame. That is what the processor's freshness rule measures
+        against, so a still that took 45 s to arrive is 45 s old when it is
+        decided, and never opens the gate for a car that may have gone.
+
+        One case would defeat that: an upload already under way when it was
+        first seen -- the controller restarted part-way through it (startup
+        reconciliation picks it up), or the create event was missed. Its first
+        sighting is not its start, and a still that had spent 30 s arriving
+        before a restart and 3 s after it would look 3 s old. So when the file
+        already held bytes at first sight, the time those bytes took is
+        estimated from the rate the rest of them arrived at -- timed by the
+        file's own mtime, which the kernel stamps on every write, not by the
+        poll -- and taken off `received_at`. The estimate only ever moves
+        `received_at` earlier: it can make a frame stale, never fresh. For an
+        upload seen from its first bytes it is a few milliseconds at most.
+        """
+        received_at = candidate.received_at
+        waited = now - candidate.first_seen
+        unobserved = _unobserved_seconds(
+            candidate.first_size, candidate.first_mtime_ns, size, mtime_ns,
+        )
+        if unobserved > 0:
+            try:
+                received_at = received_at - timedelta(seconds=unobserved)
+            except OverflowError:
+                received_at = datetime.min.replace(tzinfo=timezone.utc)
+        if candidate.reported_slow or unobserved >= self._slow_notice:
+            LOGGER.info(
+                "gate_pipeline stage=upload_completed upload_ms=%d bytes=%d "
+                "bytes_per_second=%s unobserved_ms=%d",
+                round(waited * 1000), size, _arrival_rate(candidate, size, now),
+                round(min(unobserved, 86_400.0) * 1000),
+            )
+        return received_at
+
+    def _give_up(self, path: Path, candidate: _PendingUpload, now: float,
+                 cause: str) -> None:
+        with self._lock:
+            self._retry_at.pop(path, None)
+        LOGGER.warning(
+            "gate_pipeline stage=upload_rejected reason=upload_incomplete cause=%s "
+            "waited_ms=%d idle_ms=%d bytes=%s",
+            cause, round((now - candidate.first_seen) * 1000),
+            round((now - candidate.grew_at) * 1000),
+            candidate.size if candidate.size is not None else "unavailable",
+        )
+        self._reject(path, "upload_incomplete")
 
     def _add_hot_frames(self, received_at: datetime) -> None:
         if self._on_first_completed is None:
@@ -542,13 +693,18 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                max_candidate_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
                on_timed_skipped=None, trigger_resolver=None,
                hot_frame_provider=None, trigger_capture=None, on_result=None,
-               prepare=None) -> None:
+               prepare=None,
+               upload_stall_seconds: float = DEFAULT_UPLOAD_STALL_SECONDS,
+               upload_max_seconds: float = DEFAULT_UPLOAD_MAX_SECONDS) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection.
 
     With ``prepare`` (the processor's fast-lane half of a decision) the burst
     thread only ever runs the on-device read, and a second thread -- the cloud
     lane -- waits for cloud answers, so a frame the device can read is decided
     the moment it lands rather than behind every cloud call ahead of it.
+
+    ``upload_stall_seconds`` and ``upload_max_seconds`` bound how long an FTP
+    upload that is still arriving is waited for (`CompletedImageHandler`).
     """
     bursts = BoundedBurstQueue(max_pending_bursts)
     note_result = getattr(trigger_capture, "note_result", None)
@@ -647,6 +803,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         ) if on_skipped else None,
         max_candidate_bytes=max_candidate_bytes,
         max_pending_candidates=max_burst_candidates,
+        stall_timeout=upload_stall_seconds,
+        max_age=upload_max_seconds,
         on_first_completed=(
             hot_frame_provider.select if hot_frame_provider is not None else None
         ),
@@ -1092,6 +1250,41 @@ def _install_sigterm_handler(stop_event: Event):
     previous = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     return previous
+
+
+def _file_stat(path: Path) -> tuple[int, int] | None:
+    """(size, mtime in ns) of an upload, or None when it is not there."""
+    try:
+        status = Path(path).stat()
+    except OSError:
+        return None
+    return status.st_size, status.st_mtime_ns
+
+
+def _unobserved_seconds(first_size, first_mtime_ns, size, mtime_ns) -> float:
+    """How long the bytes already on disk at first sight took to arrive.
+
+    Estimated at the rate the bytes after first sight came in, both timed by
+    the file's mtime. Zero when the upload was seen from its first byte, when
+    nothing arrived after first sight (it was already whole), or when the
+    writes after first sight all fell inside one tick of the filesystem clock.
+    """
+    if not first_size or first_mtime_ns is None or mtime_ns is None:
+        return 0.0
+    observed_bytes = size - first_size
+    observed_seconds = (mtime_ns - first_mtime_ns) / 1e9
+    if observed_bytes <= 0 or observed_seconds <= 0:
+        return 0.0
+    return first_size * observed_seconds / observed_bytes
+
+
+def _arrival_rate(candidate: _PendingUpload, size: int, now: float) -> str:
+    """Bytes per second since the upload was first seen, for the journal."""
+    waited = now - candidate.first_seen
+    arrived = size - (candidate.first_size or 0)
+    if waited <= 0 or arrived < 0:
+        return "unavailable"
+    return str(round(arrived / waited))
 
 
 def _remove_uploads(paths) -> None:

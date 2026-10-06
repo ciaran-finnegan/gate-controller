@@ -220,11 +220,13 @@ class WorkerTests(unittest.TestCase):
             ),
         ])
 
-    def test_default_readability_window_stays_at_five_seconds(self):
+    def test_default_upload_wait_follows_growth_up_to_a_two_minute_ceiling(self):
+        """A flat five seconds rejected every still from 30 Sep to 4 Oct 2026."""
         handler = CompletedImageHandler(BurstCollector(lambda *_: None))
 
         self.assertEqual(handler._retry_interval, 0.05)
-        self.assertGreaterEqual(handler._retry_interval * handler._max_attempts, 5.0)
+        self.assertEqual(handler._stall_timeout, 10.0)
+        self.assertEqual(handler._max_age, 120.0)
 
     def test_injected_trigger_burst_uses_its_own_trigger_and_never_correlates(self):
         received_at = datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc)
@@ -1640,7 +1642,7 @@ class WorkerTests(unittest.TestCase):
         rejected = []
         clock = MutableClock()
         handler = CompletedImageHandler(
-            collector, retry_interval=1, max_attempts=2, max_age=2, clock=clock,
+            collector, retry_interval=1, stall_timeout=2, max_age=2, clock=clock,
             on_rejected=lambda path, reason: rejected.append((path, reason)),
         )
         path = Path("missing.jpg")
