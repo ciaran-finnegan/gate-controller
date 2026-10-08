@@ -67,8 +67,8 @@ def talkback_document(talk_block) -> dict:
 
 
 CLOCK_OUTCOMES = (
-    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
-    "camera_unreachable", "camera_error", "disabled",
+    "not_checked", "ok", "corrected", "correction_failed", "skipped_config",
+    "pi_unsynced", "camera_busy", "camera_unreachable", "camera_error", "disabled",
 )
 
 

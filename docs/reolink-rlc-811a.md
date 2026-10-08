@@ -349,7 +349,7 @@ against saved camera blocks, so they cannot drift back.
 | --- | --- |
 | `SetEnc` | clear 3840x2160 H.265 6144 kbit/s **6 fps, gop 1** (keyframe every second); `audio 1`; the fluent stream is left as found |
 | `SetIsp` | `exposure Manual`, `shutter 4/4` (1/250 s), `gain 16/16`, `antiFlicker Off`, `backLight Off`, `hdr 0`, `nr3d 1`, **`dayNight Color`**, **`constantFrameRate 1`**. `Color` is the resting state; an IR lease from the app switches `dayNight` to `Black&White` for its duration and `gate-camera-control` writes this block back exactly when it ends ([camera-control.md, Night vision](camera-control.md#night-vision-the-isp-half-of-the-ir-lease)) |
-| `SetNtp` | `enable 1`, `pool.ntp.org`, 60 min. The time itself is never written here: `gate-camera-control` owns the camera clock (see [Camera clock reconcile](camera-control.md#camera-clock-reconcile)) |
+| `SetNtp` | `enable 1`, `pool.ntp.org`, 60 min. The time itself is never written here: `gate-camera-control` owns the camera clock, and turns NTP back on whenever it finds it off (see [Camera clock reconcile](camera-control.md#camera-clock-reconcile)) |
 | `SetIrLights` | `Off` |
 | `SetWhiteLed` | `mode 0`, `state 0`: the PIR floodlight is the only plate light (Night Light above) |
 | `SetFtpV20` | server `192.168.0.33:21`, `ftp-user`, `onlyFtps 0`, `streamType 3`, `picInterval 5`, 4K stills, schedule `AI_VEHICLE` only |

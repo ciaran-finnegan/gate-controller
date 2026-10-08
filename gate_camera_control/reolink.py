@@ -32,6 +32,9 @@ ALLOWED_COMMANDS = frozenset({
     # the only ISP values this service can ever write are the camera's own,
     # with `dayNight` switched for the lease and switched back after it.
     "GetIsp", "SetIsp",
+    # The clock reconcile (clock.py): read the camera's NTP switch, and turn
+    # it back on when something on the LAN has turned it off.
+    "GetNtp", "SetNtp",
 })
 IR_STATES = ("Auto", "Off")
 # `Isp.dayNight` as the firmware's `GetIsp` range reports it. `Black&White` is
@@ -324,6 +327,19 @@ class ReolinkClient:
         if not usable_isp_block(block):
             raise ValueError("an ISP write must be a whole ISP block read from the camera")
         self._command("SetIsp", 0, {"Isp": json.loads(json.dumps(block))})
+
+    def ntp_state(self) -> dict:
+        """The camera's NTP block: whether it is on, and the server it uses."""
+        value = self._command("GetNtp", 1, {"channel": 0})
+        if not isinstance(value, dict) or not isinstance(value.get("Ntp"), dict):
+            raise CameraError("camera reported an unusable NTP block")
+        return dict(value["Ntp"])
+
+    def set_ntp(self, ntp: dict) -> None:
+        """Write the NTP block back; the reconciler only ever turns it on."""
+        if not isinstance(ntp, dict):
+            raise ValueError("ntp fields must be an object")
+        self._command("SetNtp", 0, {"Ntp": dict(ntp)})
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""
