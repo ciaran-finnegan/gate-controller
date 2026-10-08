@@ -245,6 +245,37 @@ class ClockReconcilerTests(unittest.TestCase):
         self.assertEqual(snapshot["outcome"], "corrected")
         self.assertEqual(journal[-1][1]["ntp"], "unknown")
 
+    def test_a_right_clock_whose_ntp_could_not_be_read_is_looked_at_again_soon(self):
+        client = FakeClient(camera_time(self.NOW), ntp_error=CameraError("no ntp"))
+        reconciler, journal = self._reconciler(client, interval_seconds=3600, retry_seconds=300)
+        snapshot = reconciler.reconcile()
+        self.assertEqual((snapshot["outcome"], journal[-1][1]["ntp"]), ("ok", "unknown"))
+        self.assertEqual(reconciler._next_at, 1300.0)
+
+    def test_a_configuration_the_firmware_did_not_take_is_not_reported_corrected(self):
+        """The time landing within tolerance is not enough: a camera still on
+        a foreign zone will be moved off UTC by its own NTP, so the read-back
+        must show UTC with DST off before the correction counts."""
+        class KeepsItsZone(FakeClient):
+            def set_clock(self, fields, dst):
+                self.writes.append((dict(fields), dict(dst)))
+                # The time is taken; the zone and DST flag are not.
+                self.state = {
+                    "Time": dict(fields, isDst=0, timeZone=self.state["Time"]["timeZone"]),
+                    "Dst": dict(self.state["Dst"]),
+                }
+
+        client = KeepsItsZone(camera_time(self.NOW.replace(hour=14), time_zone=-7200, dst_enabled=1), ntp=NTP_ON)
+        reconciler, journal = self._reconciler(client, retry_seconds=300)
+
+        snapshot = reconciler.reconcile()
+
+        self.assertEqual(len(client.writes), 2, "the configuration is written once more before it is given up on")
+        self.assertEqual((snapshot["outcome"], snapshot["synced"], snapshot["skew_seconds"], snapshot["corrections"]),
+                         ("correction_failed", False, 0, 0))
+        self.assertEqual(journal[-1][1]["outcome"], "correction_failed")
+        self.assertEqual(reconciler._next_at, 1300.0)
+
     def test_camera_errors_are_recorded_and_retried_sooner_than_the_hourly_pass(self):
         for error, outcome in (
             (CameraBusy(30), "camera_busy"),
@@ -299,23 +330,25 @@ class ClockReconcilerTests(unittest.TestCase):
 
 
 class PiClockIsSyncedTests(unittest.TestCase):
-    def test_the_timesyncd_stamp_is_the_definite_answer(self):
-        with tempfile.TemporaryDirectory() as directory:
-            stamp = os.path.join(directory, "synchronized")
-            open(stamp, "w").close()
-            self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 5))
-
-    def test_without_the_stamp_the_kernel_clock_state_decides(self):
+    def test_the_live_kernel_clock_state_decides_when_it_can_be_read(self):
         with tempfile.TemporaryDirectory() as directory:
             stamp = os.path.join(directory, "synchronized")
             self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 0))
             self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 1), "a leap second pending is still synced")
             self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 5), "TIME_ERROR is an undisciplined clock")
 
-    def test_when_nothing_can_answer_the_clock_is_not_trusted(self):
+    def test_a_stamp_from_an_earlier_sync_never_outranks_a_live_unsynced_reading(self):
         with tempfile.TemporaryDirectory() as directory:
             stamp = os.path.join(directory, "synchronized")
-            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: None))
+            open(stamp, "w").close()
+            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 5))
+
+    def test_the_stamp_stands_in_when_the_sandbox_refuses_adjtimex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stamp = os.path.join(directory, "synchronized")
+            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: None), "nothing can answer: not trusted")
+            open(stamp, "w").close()
+            self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: None))
 
     def test_the_default_probe_runs_without_raising(self):
         # Whether this host is synced is the host's business; the probe must
