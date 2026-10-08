@@ -207,6 +207,10 @@ class CameraControlStateFileTests(unittest.TestCase):
         parsed = validated_camera_control({**ready, "clock": clock})
         self.assertEqual(parsed["clock"], clock)
         self.assertNotIn("clock", validated_camera_control(ready))
+        for outcome in ("pi_unsynced", "correction_failed"):
+            with self.subTest(outcome=outcome):
+                waiting = {**clock, "synced": False, "outcome": outcome}
+                self.assertEqual(validated_camera_control({**ready, "clock": waiting})["clock"], waiting)
         for bad in (
             {**clock, "outcome": "made_up"},
             {**clock, "synced": False},

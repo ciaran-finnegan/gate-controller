@@ -23,6 +23,7 @@ from .atomic import atomic_write
 API_PATH = "/cgi-bin/api.cgi"
 ALLOWED_COMMANDS = frozenset({
     "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed", "Snap", "GetTime", "SetTime",
+    "GetNtp", "SetNtp",
 })
 IR_STATES = ("Auto", "Off")
 # The RLC-811A's white spotlight, as the firmware's `WhiteLed.state` reports it:
@@ -236,6 +237,19 @@ class ReolinkClient:
         if not isinstance(time_fields, dict) or not isinstance(dst, dict):
             raise ValueError("clock fields must be objects")
         self._command("SetTime", 0, {"Time": dict(time_fields), "Dst": dict(dst)})
+
+    def ntp_state(self) -> dict:
+        """The camera's NTP block: whether it is on, and the server it uses."""
+        value = self._command("GetNtp", 1, {"channel": 0})
+        if not isinstance(value, dict) or not isinstance(value.get("Ntp"), dict):
+            raise CameraError("camera reported an unusable NTP block")
+        return dict(value["Ntp"])
+
+    def set_ntp(self, ntp: dict) -> None:
+        """Write the NTP block back; the reconciler only ever turns it on."""
+        if not isinstance(ntp, dict):
+            raise ValueError("ntp fields must be an object")
+        self._command("SetNtp", 0, {"Ntp": dict(ntp)})
 
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""

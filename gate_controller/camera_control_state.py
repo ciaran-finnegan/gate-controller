@@ -161,8 +161,8 @@ def _parse_light(value, states, name) -> dict:
 
 
 _CLOCK_OUTCOMES = frozenset({
-    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
-    "camera_unreachable", "camera_error", "disabled",
+    "not_checked", "ok", "corrected", "correction_failed", "skipped_config",
+    "pi_unsynced", "camera_busy", "camera_unreachable", "camera_error", "disabled",
 })
 _MAX_CLOCK_SKEW_SECONDS = 10_000_000
 
