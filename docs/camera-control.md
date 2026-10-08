@@ -40,12 +40,14 @@ lease and the block restored exactly afterwards; no exposure, shutter or gain
 value originates here ([Night vision](#night-vision-the-isp-half-of-the-ir-lease)).
 The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
 `SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime`, `SetTime`,
-`GetZoomFocus`, `StartZoomFocus`, `GetIsp` and `SetIsp`, and no request body
-can widen it. `StartZoomFocus` is only ever sent with the operation `ZoomPos`:
-nothing in the service can write a focus position or change the autofocus mode
-(see [Refocus](#refocus)). `SetIsp` only ever takes a whole block `GetIsp`
-returned. The Baichuan (port 9000) message set used for
-push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
+`GetZoomFocus`, `StartZoomFocus`, `GetIsp`, `SetIsp`, `GetNtp` and `SetNtp`,
+and no request body can widen it. `StartZoomFocus` is only ever sent with the
+operation `ZoomPos`: nothing in the service can write a focus position or
+change the autofocus mode (see [Refocus](#refocus)). `SetIsp` only ever takes a
+whole block `GetIsp` returned. `GetNtp` and `SetNtp` belong to the clock
+reconcile, which only ever turns the camera's NTP back on (see
+[Camera clock reconcile](#camera-clock-reconcile)). The Baichuan (port 9000)
+message set used for push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
 `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
 `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
 
@@ -647,10 +649,19 @@ unsynchronised: a camera that agrees with an untrusted clock is not `ok`,
 and the camera's NTP is not touched either until the Pi is. The Pi has
 no RTC, and after a power cut this service is up before `systemd-timesyncd`
 has stepped the clock; the first pass used to run at once and could write the
-Pi's boot-time clock into a camera that was right. The check is the
-timesyncd stamp at `/run/systemd/timesync/synchronized`, then the kernel
-clock state from `adjtimex`; when neither can answer the clock is treated as
-unsynced, which is `pi_unsynced` every 5 min in the journal until it clears.
+Pi's boot-time clock into a camera that was right. The check is the kernel
+clock state from `adjtimex` (what `timedatectl` reports as "System clock
+synchronized", and which goes back to unsynced when the clock has gone
+undisciplined since the last sync); when the service's sandbox refuses that
+syscall, the timesyncd stamp at `/run/systemd/timesync/synchronized` stands
+in; when neither can answer the clock is treated as unsynced, which is
+`pi_unsynced` every 5 min in the journal until it clears.
+
+A correction is `corrected` only when the read-back shows both the time
+within tolerance and the configuration UTC with DST off; a firmware that
+took the time but not the configuration gets one more write and is then
+`correction_failed`. A clock found right whose NTP could not be read is
+looked at again after 5 min rather than an hour.
 
 A clock found right is read again in an hour. Everything else (a correction,
 `pi_unsynced`, a camera that would not answer) is looked at again after

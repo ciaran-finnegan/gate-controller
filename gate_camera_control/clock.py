@@ -142,9 +142,11 @@ class ClockReconciler:
             # most of an hour; a Pi not yet synced, or a camera that would not
             # answer, is asked again sooner too -- but never in a tight loop:
             # the client's own login throttle and breaker sit underneath this.
-            self._next_at = now + (
-                self._interval if outcome in ("ok", "skipped_config") else self._retry
-            )
+            # A clock found right but whose NTP could not be read or restored
+            # is also asked again soon: the hourly wait is for a camera whose
+            # whole clock is known to be in order.
+            settled = outcome in ("ok", "skipped_config") and detail.get("ntp") != "unknown"
+            self._next_at = now + (self._interval if settled else self._retry)
         self._journal(
             "clock_reconcile", outcome=outcome,
             skew_seconds="unknown" if skew is None else f"{skew:+.0f}",
@@ -172,33 +174,31 @@ class ClockReconciler:
             # unsynced Pi "ok" would wait an hour on a comparison that means
             # nothing. No write of any kind; look again soon.
             return "pi_unsynced", skew, detail
-        displays_utc = zone == 0 and dst_enabled == 0
-        if displays_utc and abs(skew) <= self._tolerance:
+        if _displays_utc(fields, dst) and abs(skew) <= self._tolerance:
             detail["ntp"] = self._restore_ntp()
             return "ok", skew, detail
-        residual = self._correct(fields, dst)
+        residual, displays_utc = self._correct(fields, dst)
         detail["ntp"] = self._restore_ntp()
-        if abs(residual) <= self._tolerance:
+        if abs(residual) <= self._tolerance and displays_utc:
             return "corrected", residual, detail
         return "correction_failed", residual, detail
 
-    def _correct(self, fields: dict, dst: dict) -> float:
-        """Write UTC, displayed as UTC, and return the skew that remains."""
-        residual = self._write_utc(fields, dst)
-        if abs(residual) <= self._tolerance:
-            return residual
+    def _correct(self, fields: dict, dst: dict) -> tuple[float, bool]:
+        """Write UTC, displayed as UTC, and return the skew that remains and
+        whether the camera now displays UTC."""
+        residual, after_fields, after_dst = self._write_utc(fields, dst)
+        if abs(residual) <= self._tolerance and _displays_utc(after_fields, after_dst):
+            return residual, True
         # The first write changed the configuration as well as the time, and
         # the firmware shifts the display by the DST hour when the flag moves
-        # in the same call. The configuration is now UTC with DST off, so a
-        # second write of the time alone displays exactly what it is sent.
-        state = self._client.clock_state()
-        after_fields = state.get("Time") if isinstance(state, dict) else None
-        after_dst = state.get("Dst") if isinstance(state, dict) else None
-        if not isinstance(after_fields, dict) or not isinstance(after_dst, dict):
-            raise CameraError("camera reported an unusable clock")
-        return self._write_utc(after_fields, after_dst)
+        # in the same call. The configuration should now be UTC with DST off,
+        # so a second write of the time alone displays exactly what it is
+        # sent; and a configuration the firmware did not take is written
+        # once more before it is reported as not taken.
+        residual, after_fields, after_dst = self._write_utc(after_fields, after_dst)
+        return residual, _displays_utc(after_fields, after_dst)
 
-    def _write_utc(self, fields: dict, dst: dict) -> float:
+    def _write_utc(self, fields: dict, dst: dict) -> tuple[float, dict, dict]:
         now = self._utc_now()
         corrected = {
             key: value for key, value in fields.items() if key != "isDst"
@@ -210,9 +210,11 @@ class ClockReconciler:
         self._client.set_clock(corrected, dict(dst, enable=0))
         after = self._client.clock_state()
         after_fields = after.get("Time") if isinstance(after, dict) else None
-        if not isinstance(after_fields, dict):
+        after_dst = after.get("Dst") if isinstance(after, dict) else None
+        if not isinstance(after_fields, dict) or not isinstance(after_dst, dict):
             raise CameraError("camera reported an unusable clock")
-        return (_displayed(after_fields) - self._utc_now().replace(tzinfo=None)).total_seconds()
+        residual = (_displayed(after_fields) - self._utc_now().replace(tzinfo=None)).total_seconds()
+        return residual, after_fields, after_dst
 
     def _restore_ntp(self) -> str:
         """Turn the camera's own NTP back on when a writer has switched it off.
@@ -273,21 +275,23 @@ class ClockWorker:
 def pi_clock_is_synced(*, stamp_path: str = TIMESYNC_STAMP, adjtimex=None) -> bool:
     """Whether the Pi's own clock has been set by NTP since boot.
 
-    ``systemd-timesyncd`` leaves a stamp on tmpfs after its first successful
-    sync, which is the definite answer on the Pi. Failing that, ``adjtimex``
-    is asked for the kernel clock state, which is what ``timedatectl`` reports
-    as "System clock synchronized". When neither can answer (the service's
-    sandbox refuses the syscall and no stamp exists) the clock is treated as
-    not synced: a camera left alone is recoverable on the next pass, a camera
-    written with a boot-time clock is wrong until then.
+    The kernel's own clock state from ``adjtimex`` is the live answer: it is
+    what ``timedatectl`` reports as "System clock synchronized", and it goes
+    back to ``TIME_ERROR`` when the clock has gone undisciplined again since
+    the last sync. When the service's sandbox refuses that syscall, the stamp
+    ``systemd-timesyncd`` leaves on tmpfs after its first successful sync
+    since boot stands in: evidence of a past sync, never contradicted by a
+    live reading. When neither can answer the clock is treated as not synced:
+    a camera left alone is recoverable on the next pass, a camera written
+    with a boot-time clock is wrong until then.
     """
-    try:
-        if os.path.exists(stamp_path):
-            return True
-    except OSError:
-        pass
     state = _adjtimex_state() if adjtimex is None else adjtimex()
-    return state is not None and 0 <= state < _TIME_ERROR
+    if state is not None:
+        return 0 <= state < _TIME_ERROR
+    try:
+        return os.path.exists(stamp_path)
+    except OSError:
+        return False
 
 
 def _adjtimex_state() -> int | None:
@@ -309,6 +313,10 @@ def _adjtimex_state() -> int | None:
 
 def _config(fields: dict, dst: dict) -> tuple[int, int]:
     return _int(fields.get("timeZone"), -1), _int(dst.get("enable"), 0)
+
+
+def _displays_utc(fields: dict, dst: dict) -> bool:
+    return _config(fields, dst) == (0, 0)
 
 
 def _int(value, default: int = -1) -> int:
