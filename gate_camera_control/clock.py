@@ -5,18 +5,41 @@ clock. On 2026-09-16 every webhook was refused for four days because the
 NVR that records the camera kept pushing it a clock two hours out, and the
 camera's own NTP was overwritten with it. The Pi is NTP-synced and already
 talks to the camera, so it is the natural owner of the camera's time: once
-an hour it reads ``GetTime`` and, when the display is more than a few seconds
-from UTC, writes ``SetTime`` with UTC.
+an hour it reads ``GetTime`` and, when the display is not UTC to within a
+few seconds, writes ``SetTime`` with UTC.
 
-The reconciler only corrects a camera configured to *display* UTC
-(``timeZone 0`` with DST disabled). ``SetTime`` takes the displayed time and
-the firmware shifts it by the DST hour when that flag changes in the same
-write, so any other configuration is reported as skew but left alone: it is
-the operator's setting, and a wrong correction is worse than none.
+The camera's alarm timestamps carry a fixed ``+0000`` suffix whatever the
+camera displays, so the only configuration the controller can trust is a
+camera that *displays* UTC: ``timeZone 0`` with DST disabled. Anything else
+is not a choice this system can honour, whoever made it (the NVR's channel
+time push, a phone app's "sync with phone time", a save of the camera's Date
+and Time page), and it is corrected the same way.
+
+Three things made the fault keep coming back after the first reconciler
+shipped, and each has its own guard here:
+
+* A zone other than UTC was reported as ``skipped_config`` and never touched,
+  so one sync from a phone in another time zone silenced recognition for good.
+  Every non-UTC configuration is now corrected.
+* ``SetTime`` takes the *displayed* time and the firmware shifts it by the DST
+  hour when that flag changes in the same write, so a correction that also
+  changed the configuration could land an hour out. The correction is read
+  back and, when it did not land, written a second time with the configuration
+  now unchanged, so the firmware displays exactly what it was sent.
+* The Pi has no RTC and the service starts before ``systemd-timesyncd`` has
+  stepped the clock after a power cut. The first pass used to run at once and
+  could write the Pi's stale boot time into a camera that was right. Nothing is
+  written until the Pi's own clock is known to be synchronised.
+
+The same writer that moves the clock turns the camera's NTP off, so each pass
+also reads ``GetNtp`` and turns it back on when it finds it disabled.
 """
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,10 +51,18 @@ DEFAULT_TOLERANCE_SECONDS = 5.0
 DEFAULT_INTERVAL_SECONDS = 3600.0
 DEFAULT_RETRY_SECONDS = 300.0
 OUTCOMES = (
-    "not_checked", "ok", "corrected", "skipped_config", "camera_busy",
-    "camera_unreachable", "camera_error", "disabled",
+    "not_checked", "ok", "corrected", "correction_failed", "skipped_config",
+    "pi_unsynced", "camera_busy", "camera_unreachable", "camera_error", "disabled",
 )
 MAX_REPORTED_SKEW_SECONDS = 10_000_000
+# What the camera's NTP block is put back to when a writer has switched it
+# off and left no server: the values the commissioning script writes.
+NTP_DEFAULTS = {"server": "pool.ntp.org", "port": 123, "interval": 60}
+# ``systemd-timesyncd`` touches this file on the first successful sync after
+# boot; it lives on tmpfs and so is absent until then.
+TIMESYNC_STAMP = "/run/systemd/timesync/synchronized"
+# ``adjtimex(2)`` returns this clock state while the kernel clock is undisciplined.
+_TIME_ERROR = 5
 
 
 class ClockReconciler:
@@ -41,7 +72,7 @@ class ClockReconciler:
                  tolerance_seconds: float = DEFAULT_TOLERANCE_SECONDS,
                  interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
                  retry_seconds: float = DEFAULT_RETRY_SECONDS,
-                 clock=time.time, utc_now=None, journal=None):
+                 clock=time.time, utc_now=None, pi_clock_synced=None, journal=None):
         self._client = client
         self._enabled = bool(enabled)
         self._tolerance = float(tolerance_seconds)
@@ -49,6 +80,7 @@ class ClockReconciler:
         self._retry = float(retry_seconds)
         self._clock = clock
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
+        self._pi_clock_synced = pi_clock_synced or pi_clock_is_synced
         self._journal = journal or (lambda *_a, **_k: None)
         self._lock = threading.Lock()
         self._next_at = None if self._enabled else float("inf")
@@ -90,9 +122,9 @@ class ClockReconciler:
     def reconcile(self) -> dict:
         if not self._enabled:
             return self.snapshot()
-        outcome, skew = "camera_error", None
+        outcome, skew, detail = "camera_error", None, {}
         try:
-            outcome, skew = self._reconcile()
+            outcome, skew, detail = self._reconcile()
         except CameraError as error:
             outcome = _error_outcome(error)
         except Exception:
@@ -104,20 +136,25 @@ class ClockReconciler:
             self._checked_at = now
             if outcome == "corrected":
                 self._corrections += 1
-            # A camera that would not answer is asked again sooner than the
-            # hourly pass, but never in a tight loop: the client's own login
-            # throttle and breaker sit underneath this.
-            self._next_at = now + (
-                self._interval if outcome in ("ok", "corrected", "skipped_config")
-                else self._retry
-            )
+            # Only a clock found right waits the full hour. A correction is
+            # looked at again soon, so a writer that keeps moving the clock is
+            # caught within minutes rather than leaving the camera wrong for
+            # most of an hour; a Pi not yet synced, or a camera that would not
+            # answer, is asked again sooner too -- but never in a tight loop:
+            # the client's own login throttle and breaker sit underneath this.
+            # A clock found right but whose NTP could not be read or restored
+            # is also asked again soon: the hourly wait is for a camera whose
+            # whole clock is known to be in order.
+            settled = outcome in ("ok", "skipped_config") and detail.get("ntp") != "unknown"
+            self._next_at = now + (self._interval if settled else self._retry)
         self._journal(
             "clock_reconcile", outcome=outcome,
             skew_seconds="unknown" if skew is None else f"{skew:+.0f}",
+            **detail,
         )
         return self.snapshot()
 
-    def _reconcile(self) -> tuple[str, float | None]:
+    def _reconcile(self) -> tuple[str, float | None, dict]:
         state = self._client.clock_state()
         fields, dst = state.get("Time"), state.get("Dst")
         if not isinstance(fields, dict) or not isinstance(dst, dict):
@@ -125,22 +162,44 @@ class ClockReconciler:
         displayed = _displayed(fields)
         now = self._utc_now()
         skew = (displayed - now.replace(tzinfo=None)).total_seconds()
-        if int(fields.get("timeZone", -1)) != 0:
-            # A zone somebody chose. The skew above includes their offset, so
-            # it is not an error and this must not "correct" it away.
-            return "skipped_config", skew
-        # timeZone is already UTC and only the DST flag has moved, which is not
-        # a choice anybody makes: it is the state this camera keeps being put
-        # back into, and the firmware then counts the offset twice and lands
-        # two hours out. Seen on 2026-09-16, fixed, and back by 12:43 on the
-        # 17th -- after which the reconciler logged `skipped_config +7200`
-        # every hour for sixteen hours and corrected nothing, which is the
-        # worst of both: it could see the fault and had decided not to act.
-        #
-        # The correction below already writes `enable=0`, so this needs no new
-        # behaviour, only permission to run.
-        if abs(skew) <= self._tolerance:
-            return "ok", skew
+        zone, dst_enabled = _config(fields, dst)
+        # What the camera was found displaying goes on every line, so the
+        # journal shows the signature of whatever keeps writing it: the NVR
+        # pushes UTC with DST on, a phone app pushes its own zone.
+        detail = {"time_zone": zone, "dst": dst_enabled}
+        if not self._pi_clock_synced():
+            # The Pi's own time is not yet trusted, so the skew above is not a
+            # verdict either way: writing it into the camera would move a right
+            # clock to a wrong one, and calling a camera that agrees with an
+            # unsynced Pi "ok" would wait an hour on a comparison that means
+            # nothing. No write of any kind; look again soon.
+            return "pi_unsynced", skew, detail
+        if _displays_utc(fields, dst) and abs(skew) <= self._tolerance:
+            detail["ntp"] = self._restore_ntp()
+            return "ok", skew, detail
+        residual, displays_utc = self._correct(fields, dst)
+        detail["ntp"] = self._restore_ntp()
+        if abs(residual) <= self._tolerance and displays_utc:
+            return "corrected", residual, detail
+        return "correction_failed", residual, detail
+
+    def _correct(self, fields: dict, dst: dict) -> tuple[float, bool]:
+        """Write UTC, displayed as UTC, and return the skew that remains and
+        whether the camera now displays UTC."""
+        residual, after_fields, after_dst = self._write_utc(fields, dst)
+        if abs(residual) <= self._tolerance and _displays_utc(after_fields, after_dst):
+            return residual, True
+        # The first write changed the configuration as well as the time, and
+        # the firmware shifts the display by the DST hour when the flag moves
+        # in the same call. The configuration should now be UTC with DST off,
+        # so a second write of the time alone displays exactly what it is
+        # sent; and a configuration the firmware did not take is written
+        # once more before it is reported as not taken.
+        residual, after_fields, after_dst = self._write_utc(after_fields, after_dst)
+        return residual, _displays_utc(after_fields, after_dst)
+
+    def _write_utc(self, fields: dict, dst: dict) -> tuple[float, dict, dict]:
+        now = self._utc_now()
         corrected = {
             key: value for key, value in fields.items() if key != "isDst"
         }
@@ -151,11 +210,41 @@ class ClockReconciler:
         self._client.set_clock(corrected, dict(dst, enable=0))
         after = self._client.clock_state()
         after_fields = after.get("Time") if isinstance(after, dict) else None
-        if isinstance(after_fields, dict):
-            residual = (_displayed(after_fields) - self._utc_now().replace(tzinfo=None)).total_seconds()
-        else:
-            residual = skew
-        return "corrected", residual
+        after_dst = after.get("Dst") if isinstance(after, dict) else None
+        if not isinstance(after_fields, dict) or not isinstance(after_dst, dict):
+            raise CameraError("camera reported an unusable clock")
+        residual = (_displayed(after_fields) - self._utc_now().replace(tzinfo=None)).total_seconds()
+        return residual, after_fields, after_dst
+
+    def _restore_ntp(self) -> str:
+        """Turn the camera's own NTP back on when a writer has switched it off.
+
+        Never raises: NTP is the camera's own drift control between passes,
+        and a camera that will not answer ``GetNtp`` still had its clock set.
+        """
+        ntp_state = getattr(self._client, "ntp_state", None)
+        if ntp_state is None:
+            return "unsupported"
+        try:
+            ntp = ntp_state()
+            if not isinstance(ntp, dict):
+                return "unknown"
+            if _int(ntp.get("enable")) == 1:
+                return "on"
+            wanted = dict(ntp)
+            server = wanted.get("server")
+            if not isinstance(server, str) or not server.strip():
+                wanted.update(NTP_DEFAULTS)
+            wanted["enable"] = 1
+            self._client.set_ntp(wanted)
+            # An acknowledged write is not an applied one: read it back, and
+            # a switch still off is "unknown", which is looked at again soon.
+            after = ntp_state()
+            if isinstance(after, dict) and _int(after.get("enable")) == 1:
+                return "restored"
+            return "unknown"
+        except Exception:
+            return "unknown"
 
 
 class ClockWorker:
@@ -186,6 +275,62 @@ class ClockWorker:
                 # Recorded on the reconciler; it must never take the service down.
                 pass
             self._stopped.wait(self._poll_seconds)
+
+
+def pi_clock_is_synced(*, stamp_path: str = TIMESYNC_STAMP, adjtimex=None) -> bool:
+    """Whether the Pi's own clock has been set by NTP since boot.
+
+    The kernel's own clock state from ``adjtimex`` is the live answer: it is
+    what ``timedatectl`` reports as "System clock synchronized", and it goes
+    back to ``TIME_ERROR`` when the clock has gone undisciplined again since
+    the last sync. When the service's sandbox refuses that syscall, the stamp
+    ``systemd-timesyncd`` leaves on tmpfs after its first successful sync
+    since boot stands in: evidence of a past sync, never contradicted by a
+    live reading. When neither can answer the clock is treated as not synced:
+    a camera left alone is recoverable on the next pass, a camera written
+    with a boot-time clock is wrong until then.
+    """
+    state = _adjtimex_state() if adjtimex is None else adjtimex()
+    if state is not None:
+        return 0 <= state < _TIME_ERROR
+    try:
+        return os.path.exists(stamp_path)
+    except OSError:
+        return False
+
+
+def _adjtimex_state() -> int | None:
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        call = libc.adjtimex
+    except (OSError, AttributeError):
+        return None
+    call.argtypes = [ctypes.c_void_p]
+    call.restype = ctypes.c_int
+    # A zeroed struct has modes == 0, which only reads the clock state.
+    buffer = ctypes.create_string_buffer(1024)
+    try:
+        state = call(buffer)
+    except Exception:
+        return None
+    return None if state < 0 else state
+
+
+def _config(fields: dict, dst: dict) -> tuple[int, int]:
+    return _int(fields.get("timeZone"), -1), _int(dst.get("enable"), 0)
+
+
+def _displays_utc(fields: dict, dst: dict) -> bool:
+    return _config(fields, dst) == (0, 0)
+
+
+def _int(value, default: int = -1) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _displayed(fields: dict) -> datetime:

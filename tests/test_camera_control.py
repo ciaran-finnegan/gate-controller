@@ -1476,13 +1476,14 @@ class ServiceFacadeTests(unittest.TestCase):
         )
 
         self.assertNotIn("SetIsp", text)
-        # The clock reconcile adds exactly GetTime and SetTime: the camera's
-        # displayed time and DST block, nothing that touches the picture. The
-        # spotlight adds exactly GetWhiteLed and SetWhiteLed, and only ever
-        # sends `state` -- never the automation `mode` or the brightness.
+        # The clock reconcile adds exactly GetTime, SetTime, GetNtp and SetNtp:
+        # the camera's displayed time, DST block and NTP switch, nothing that
+        # touches the picture. The spotlight adds exactly GetWhiteLed and
+        # SetWhiteLed, and only ever sends `state` -- never the automation
+        # `mode` or the brightness.
         self.assertEqual(frozenset({
             "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed",
-            "Snap", "GetTime", "SetTime",
+            "Snap", "GetTime", "SetTime", "GetNtp", "SetNtp",
         }), ALLOWED_COMMANDS)
         self.assertIn('"WhiteLed": {"channel": 0, "state": 1 if state == "On" else 0}', text)
 

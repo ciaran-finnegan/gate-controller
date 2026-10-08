@@ -31,8 +31,8 @@ usable record reads the camera once and puts it back if it disagrees. The
 service exposes IR and the spotlight only. It never calls `SetIsp`: the deployed
 Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
 operation. The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
-`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime` and `SetTime`, and
-no request body can widen it. The Baichuan (port 9000) message set used for
+`SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime`, `SetTime`,
+`GetNtp` and `SetNtp`, and no request body can widen it. The Baichuan (port 9000) message set used for
 push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
 `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
 `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
@@ -319,21 +319,59 @@ because the NVR that records the camera pushed it a clock two hours out (see
 [reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md)).
 The Pi is NTP-synced and already holds the only camera credentials, so this
 service owns the camera clock: with `GATE_CAMERA_CLOCK_SYNC=true` (the
-default) it reads `GetTime` once an hour and, when the displayed time is more
-than 5 s from UTC, writes `SetTime` with UTC. `GetTime` and `SetTime` are the
-only additions to the command allowlist.
+default) it reads `GetTime` once an hour and, when the camera is not
+displaying UTC to within 5 s, writes `SetTime` with UTC, `timeZone 0` and
+DST off. `GetTime`, `SetTime`, `GetNtp` and `SetNtp` are the only additions
+to the command allowlist.
 
-It only corrects a camera configured to *display* UTC: `timeZone 0` with DST
-disabled. `SetTime` takes the displayed time and the firmware shifts it by
-the DST hour when that flag changes in the same write, so any other
-configuration is reported as skew and left alone. A camera that would not
-answer is asked again after 5 min rather than an hour.
+The camera stamps every alarm `+0000` whatever it displays, so a camera that
+displays anything but UTC is a camera the controller cannot trust, and the
+reconciler treats every configuration that way: a zone pushed by the NVR's
+channel time sync, by a phone app's "sync with phone time" from another time
+zone, or by a save of the camera's Date and Time page is corrected, not
+reported and left. (Until 2026-10 a zone other than `0` was `skipped_config`
+and never touched, which is how one phone sync could stop recognition for
+good.) A correction is read back; because `SetTime` carries the *displayed*
+time and the firmware shifts it by the DST hour when that flag changes in the
+same write, a correction that did not land is written once more with the
+configuration now unchanged, and the residual is what the state reports. The
+camera's own NTP is read on every pass and turned back on when the same
+writer has switched it off.
+
+Nothing is written, and no verdict is given, while the Pi's own clock is
+unsynchronised: a camera that agrees with an untrusted clock is not `ok`,
+and the camera's NTP is not touched either until the Pi is. The Pi has
+no RTC, and after a power cut this service is up before `systemd-timesyncd`
+has stepped the clock; the first pass used to run at once and could write the
+Pi's boot-time clock into a camera that was right. The check is the kernel
+clock state from `adjtimex` (what `timedatectl` reports as "System clock
+synchronized", and which goes back to unsynced when the clock has gone
+undisciplined since the last sync); when the service's sandbox refuses that
+syscall, the timesyncd stamp at `/run/systemd/timesync/synchronized` stands
+in; when neither can answer the clock is treated as unsynced, which is
+`pi_unsynced` every 5 min in the journal until it clears.
+
+A correction is `corrected` only when the read-back shows both the time
+within tolerance and the configuration UTC with DST off; a firmware that
+took the time but not the configuration gets one more write and is then
+`correction_failed`. A clock found right whose NTP could not be read is
+looked at again after 5 min rather than an hour.
+
+A clock found right is read again in an hour. Everything else (a correction,
+`pi_unsynced`, a camera that would not answer) is looked at again after
+5 min, so a writer that keeps moving the clock is caught within minutes and
+the journal shows the fight, rather than the camera being wrong for most of
+an hour between passes.
 
 State (`camera_control.clock`): `synced`, `outcome` (`not_checked`, `ok`,
-`corrected`, `skipped_config`, `camera_busy`, `camera_unreachable`,
-`camera_error`, `disabled`), `skew_seconds` (camera minus Pi, integer, null
-when unknown), `checked_at`, `corrections`. Journal:
-`gate_camera_control stage=clock_reconcile outcome=… skew_seconds=+N`.
+`corrected`, `correction_failed`, `skipped_config`, `pi_unsynced`,
+`camera_busy`, `camera_unreachable`, `camera_error`, `disabled`),
+`skew_seconds` (camera minus Pi, integer, null when unknown), `checked_at`,
+`corrections`. Journal: `gate_camera_control stage=clock_reconcile outcome=…
+skew_seconds=+N time_zone=Z dst=D ntp=on|restored|unknown`, where
+`time_zone` and `dst` are what the camera was found displaying (the NVR's
+signature is `0`/`1`, a phone's is its own zone in seconds) and `ntp` says
+whether the camera's NTP was on or had to be restored.
 
 ## Environment
 
