@@ -232,6 +232,18 @@ class ClockReconcilerTests(unittest.TestCase):
                 ], "the operator's server is kept; only the switch moves")
                 self.assertEqual(journal[-1][1]["ntp"], "restored")
 
+    def test_an_ntp_write_the_camera_did_not_apply_is_not_called_restored(self):
+        class IgnoresNtpWrites(FakeClient):
+            def set_ntp(self, ntp):
+                self.ntp_writes.append(dict(ntp))
+
+        client = IgnoresNtpWrites(camera_time(self.NOW), ntp=NTP_OFF)
+        reconciler, journal = self._reconciler(client, interval_seconds=3600, retry_seconds=300)
+        snapshot = reconciler.reconcile()
+        self.assertEqual(len(client.ntp_writes), 1)
+        self.assertEqual((snapshot["outcome"], journal[-1][1]["ntp"]), ("ok", "unknown"))
+        self.assertEqual(reconciler._next_at, 1300.0, "looked at again soon, not in an hour")
+
     def test_ntp_with_no_server_is_given_the_commissioning_defaults(self):
         client = FakeClient(camera_time(self.NOW), ntp={"enable": 0, "server": "", "port": 0, "interval": 0})
         reconciler, _journal = self._reconciler(client)
