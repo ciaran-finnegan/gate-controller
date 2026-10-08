@@ -237,7 +237,12 @@ class ClockReconciler:
                 wanted.update(NTP_DEFAULTS)
             wanted["enable"] = 1
             self._client.set_ntp(wanted)
-            return "restored"
+            # An acknowledged write is not an applied one: read it back, and
+            # a switch still off is "unknown", which is looked at again soon.
+            after = ntp_state()
+            if isinstance(after, dict) and _int(after.get("enable")) == 1:
+                return "restored"
+            return "unknown"
         except Exception:
             return "unknown"
 
