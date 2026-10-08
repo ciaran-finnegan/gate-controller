@@ -165,14 +165,17 @@ class ClockReconciler:
         # journal shows the signature of whatever keeps writing it: the NVR
         # pushes UTC with DST on, a phone app pushes its own zone.
         detail = {"time_zone": zone, "dst": dst_enabled}
+        if not self._pi_clock_synced():
+            # The Pi's own time is not yet trusted, so the skew above is not a
+            # verdict either way: writing it into the camera would move a right
+            # clock to a wrong one, and calling a camera that agrees with an
+            # unsynced Pi "ok" would wait an hour on a comparison that means
+            # nothing. No write of any kind; look again soon.
+            return "pi_unsynced", skew, detail
         displays_utc = zone == 0 and dst_enabled == 0
         if displays_utc and abs(skew) <= self._tolerance:
             detail["ntp"] = self._restore_ntp()
             return "ok", skew, detail
-        if not self._pi_clock_synced():
-            # The Pi's own time is not yet trusted. Writing it into the camera
-            # would move a right clock to a wrong one; wait and look again.
-            return "pi_unsynced", skew, detail
         residual = self._correct(fields, dst)
         detail["ntp"] = self._restore_ntp()
         if abs(residual) <= self._tolerance:

@@ -338,7 +338,9 @@ configuration now unchanged, and the residual is what the state reports. The
 camera's own NTP is read on every pass and turned back on when the same
 writer has switched it off.
 
-Nothing is written while the Pi's own clock is unsynchronised. The Pi has
+Nothing is written, and no verdict is given, while the Pi's own clock is
+unsynchronised: a camera that agrees with an untrusted clock is not `ok`,
+and the camera's NTP is not touched either until the Pi is. The Pi has
 no RTC, and after a power cut this service is up before `systemd-timesyncd`
 has stepped the clock; the first pass used to run at once and could write the
 Pi's boot-time clock into a camera that was right. The check is the

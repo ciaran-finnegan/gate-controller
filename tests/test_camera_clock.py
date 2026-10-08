@@ -209,12 +209,16 @@ class ClockReconcilerTests(unittest.TestCase):
         self.assertEqual(journal[-1][1]["outcome"], "pi_unsynced")
         self.assertEqual(reconciler._next_at, 1300.0, "asked again soon, not in an hour")
 
-    def test_a_right_clock_is_still_reported_ok_while_the_pi_is_unsynced(self):
-        """`pi_unsynced` is about writing; a camera that agrees with the Pi is
-        still reported as agreeing."""
-        client = FakeClient(camera_time(self.NOW), ntp=NTP_ON)
-        reconciler, _journal = self._reconciler(client, pi_synced=False)
-        self.assertEqual(reconciler.reconcile()["outcome"], "ok")
+    def test_an_unsynced_pi_gives_no_verdict_even_when_the_camera_agrees_with_it(self):
+        """Agreement with an untrusted clock means nothing, so it is not `ok`
+        and does not earn the hourly wait; and the camera's NTP is not
+        written either, so no camera write of any kind rides on it."""
+        client = FakeClient(camera_time(self.NOW), ntp=NTP_OFF)
+        reconciler, _journal = self._reconciler(client, pi_synced=False, retry_seconds=300)
+        snapshot = reconciler.reconcile()
+        self.assertEqual((snapshot["outcome"], snapshot["synced"], snapshot["skew_seconds"]), ("pi_unsynced", False, 0))
+        self.assertEqual((client.writes, client.ntp_writes), ([], []))
+        self.assertEqual(reconciler._next_at, 1300.0)
 
     def test_ntp_switched_off_by_the_writer_is_turned_back_on(self):
         for state, name in ((camera_time(self.NOW), "ok"), (camera_time(self.NOW.replace(hour=14)), "corrected")):
