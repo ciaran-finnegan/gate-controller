@@ -41,6 +41,32 @@ until someone frees it by hand. That is exactly what happened on 2026-09-21.
    harness that broke the gate had all three and still broke it, because its
    recovery logic violated rule 3.
 
+## Invariants: read before touching the decision path
+
+[docs/invariants.md](docs/invariants.md) lists what the controller must
+always do -- the burst thread never waits on the network, the gate opens on
+the Pi's own read with no link to the house, no stale frame opens it, far
+frames are not sent to the cloud, a waiting car keeps being read, the lens is
+never left changed, the camera clock is UTC, only CI-passed commits deploy,
+the suite does not depend on the date -- with the incident behind each and
+the tests that guard it. `tests/test_invariants_doc.py` fails if a guard it
+names disappears.
+
+- Before changing routing, availability, deadlines, the sweep, uploads, the
+  camera or the updater, find the invariants your change touches and run
+  their guards. If your change adds a new way for one to fail -- a value that
+  can change between two steps, a new thread, a new caller -- add a test that
+  drives that case through the real path, and add it to the document.
+- Guard behaviour, not code. A test that reads source text and asserts a line
+  is present pins one implementation; it stayed green through the 2026-10-05
+  fast-lane regression (#183 + #189 undid #165; fixed in #197) while the
+  behaviour it stood for was broken. Contract tests on wording and wiring are
+  fine as extras; they are never the guard.
+- Two PRs that each pass can break an invariant together. Before merging,
+  rebase onto current `master` and re-run the full suite; when two open PRs
+  touch the same function, merge one, rebase the other, re-test.
+- A change to an invariant is a change to `docs/invariants.md` in the same PR.
+
 ## Other things that have bitten
 
 - Merging to `master` deploys to the Pi within ~5 minutes of CI passing.
