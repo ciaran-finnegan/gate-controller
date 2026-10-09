@@ -89,6 +89,12 @@ class Lanes:
         self.bursts.put(((path,), now, monotonic(), now, identity))
         return monotonic()
 
+    def inject_upload(self, path):
+        """A camera FTP upload: no BurstIdentity, exactly as the watcher queues it."""
+        now = datetime.now(timezone.utc)
+        self.bursts.put(((path,), now, monotonic(), now))
+        return monotonic()
+
     def result_for(self, path):
         with self._lock:
             for at, paths, result in self.results:
@@ -249,6 +255,47 @@ class FastLaneTests(unittest.TestCase):
         self.assertTrue(any(
             "cloud_skipped reason=cloud_unreachable lane=fast" in line for line in journal.output
         ), journal.output)
+
+    def test_the_cameras_alarm_still_is_not_sent_to_the_cloud_while_a_sweep_is_reading(self):
+        # 2026-10-05 21:31:35: the camera's still, taken at the alarm with the
+        # car far down the lane (read L514 at 0.078 on the device), went to the
+        # cloud while the sweep was already reading the live stream.
+        still = self._jpeg("camera-still.jpg", 100, (3840, 2160))
+        session = FakeSession([])
+        client = self._client([("L514", 0.078)], session)
+        processor = self._processor(client, camera_still_hold=lambda: "on")
+        self.lanes = Lanes(processor)
+
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            self.lanes.inject_upload(still)
+            self.assertTrue(wait_for(lambda: self.lanes.result_for(still) is not None, 3.0))
+        _, result = self.lanes.result_for(still)
+        self.assertFalse(result.opened)
+        self.assertEqual(session.calls, [], "the still was sent to the cloud")
+        self.assertTrue(any("cloud_skipped reason=sweep_reading" in line
+                            for line in journal.output), journal.output)
+
+    def test_the_cameras_alarm_still_still_goes_to_the_cloud_with_no_sweep_reading(self):
+        still = self._jpeg("camera-still.jpg", 100, (3840, 2160))
+        session = FakeSession([])
+        client = self._client([("L514", 0.078)], session)
+        processor = self._processor(client, camera_still_hold=lambda: None)
+        self.lanes = Lanes(processor)
+
+        self.lanes.inject_upload(still)
+        self.assertTrue(wait_for(lambda: self.lanes.result_for(still) is not None, 3.0))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_a_sweep_frame_is_never_treated_as_the_cameras_still(self):
+        frame = self._jpeg("sweep.jpg", 100)
+        session = FakeSession([])
+        client = self._client([("L514", 0.078)], session)
+        processor = self._processor(client, camera_still_hold=lambda: "on")
+        self.lanes = Lanes(processor)
+
+        self.lanes.inject(frame, stillness=0.001)
+        self.assertTrue(wait_for(lambda: self.lanes.result_for(frame) is not None, 3.0))
+        self.assertEqual(len(session.calls), 1, "a sweep hand-over is the sweep's own lookup")
 
     def test_a_moving_frame_the_device_finds_no_plate_in_is_not_sent_to_the_cloud(self):
         # 21:52:22.47, frame 2766: the car still turning in, plate 88 px wide

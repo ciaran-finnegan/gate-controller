@@ -354,6 +354,11 @@ def main() -> None:
         # answers False no frame is queued for the cloud lane or posted, and
         # the moment it answers True again the cloud is back, with no restart.
         internet_reachable=internet_reachable,
+        # While a sweep reads the live stream, the camera's own alarm still is
+        # decided on the device and not sent to the cloud.
+        camera_still_hold=(
+            trigger_capture.camera_still_hold if trigger_capture is not None else None
+        ),
     )
     if early_trigger is not None:
         # The image tower the processor's policy loaded is the one the early
@@ -364,7 +369,7 @@ def main() -> None:
     def prepare(paths, received_at=None, decision_started_at=None,
                 processing_started_at=None, *, trigger=None,
                 idempotency_key=None, stillness=None, sweep_read=None,
-                cloud_permit=None):
+                cloud_permit=None, camera_upload=False):
         # The fast lane's half of a decision: identity, trace and the
         # on-device read, never the network. `process` finishes it.
         latest_image["path"] = str(paths[0]) if paths else None
@@ -384,6 +389,9 @@ def main() -> None:
                 # Only on a frame of a passage the early trigger started: the
                 # cloud reader is not asked until the camera has spoken.
                 **({"cloud_permit": cloud_permit} if cloud_permit is not None else {}),
+                # The camera's own FTP upload, not a frame the sweep handed
+                # over: held off the cloud while a sweep is reading.
+                **({"camera_upload": True} if camera_upload else {}),
             )
 
     def process(paths, received_at=None, decision_started_at=None,

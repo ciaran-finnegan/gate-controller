@@ -81,6 +81,9 @@ CLOUD_SKIP_INTERNET_DOWN = "internet_down"
 # the link without an answer (`ocr.CloudBreaker`), which a probe whose single
 # TLS open succeeds at 40 % packet loss never sees. Journal only, same outcome.
 CLOUD_SKIP_CLOUD_UNREACHABLE = "cloud_unreachable"
+# The camera's own alarm still, while a sweep is reading the same passage's
+# live stream: the device's read of it stands (`TriggerFrameCapture.camera_still_hold`).
+CLOUD_SKIP_SWEEP_READING = "sweep_reading"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -245,7 +248,7 @@ class GateProcessor:
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
                  match_policy=None, min_cloud_request_seconds: float | None = None,
                  cloud_skip_stillness: float | None = None,
-                 farm_machinery=None, internet_reachable=None):
+                 farm_machinery=None, internet_reachable=None, camera_still_hold=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -312,6 +315,9 @@ class GateProcessor:
         # `GATE_LOCAL_OCR_CLOUD=always` takes there -- and asked here, before
         # anything is queued for the slot, for a recogniser that cannot.
         self._internet_reachable = internet_reachable
+        # `TriggerFrameCapture.camera_still_hold`, or None: whether a camera
+        # upload is to be kept off the cloud because a sweep is reading.
+        self._camera_still_hold = camera_still_hold
         self._recognizer_accepts_internet_reachable = _accepts_keyword(
             self._recognise_call, "internet_reachable", variadic=False,
         )
@@ -351,7 +357,8 @@ class GateProcessor:
                 idempotency_key: str | None = None,
                 stillness: float | None = None,
                 local_pass: bool = True,
-                sweep_read=None, cloud_permit=None) -> PreparedBurst:
+                sweep_read=None, cloud_permit=None,
+                camera_upload: bool = False) -> PreparedBurst:
         """Take a burst as far as the on-device read without touching the network.
 
         This is the fast lane's half of a decision: the burst's identity, its
@@ -430,6 +437,8 @@ class GateProcessor:
             return prepared
         if self._local_pass is not None:
             self._prepare_local_pass(prepared, deadline, stillness, sweep_read)
+        if camera_upload:
+            self._hold_camera_still(prepared)
         if not prepared.decided:
             # A frame the device could not decide -- read here, or carried in
             # already read by the sweep -- may be a machine with no plate to
@@ -438,6 +447,31 @@ class GateProcessor:
             # device *did* decide, by either read, is never shown to it.
             self._begin_farm_machinery(prepared, deadline)
         return prepared
+
+    def _hold_camera_still(self, prepared: PreparedBurst) -> None:
+        """Keep a camera upload off the cloud while a sweep is reading. Never raises.
+
+        Only a frame the device actually read and could not decide: where the
+        device never read it (``GATE_LOCAL_OCR_CLOUD=always``, no reader) the
+        recogniser's own call is where its answer comes from.
+        """
+        if (
+            self._camera_still_hold is None or prepared.decided
+            or prepared.cloud_skip is not None
+            or not _device_read(prepared.local_attempt)
+        ):
+            return
+        try:
+            hold = self._camera_still_hold()
+        except Exception:
+            return
+        if hold == "on":
+            prepared.cloud_skip = CLOUD_SKIP_SWEEP_READING
+        elif hold == "shadow":
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_hold_shadow source=camera_still would=%s",
+                CLOUD_SKIP_SWEEP_READING,
+            )
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
                             stillness: float | None, sweep_read=None) -> None:

@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -1095,6 +1096,10 @@ def _process_bursts(
             if identity is not None and identity.cloud_permit is not None:
                 # Likewise: only an early-origin frame has one.
                 prepare_options["cloud_permit"] = identity.cloud_permit
+            if identity is None and _accepts_camera_upload(prepare):
+                # An FTP upload from the camera (its alarm still), not a frame
+                # the sweep handed over: see `camera_still_hold`.
+                prepare_options["camera_upload"] = True
             try:
                 prepared = prepare(paths, received_at, *timing, **prepare_options)
             except Exception as error:
@@ -1139,6 +1144,17 @@ def _process_bursts(
 
 def _never() -> bool:
     return False
+
+
+def _accepts_camera_upload(prepare) -> bool:
+    try:
+        parameters = inspect.signature(prepare).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "camera_upload" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _burst_options(item, trigger_resolver):

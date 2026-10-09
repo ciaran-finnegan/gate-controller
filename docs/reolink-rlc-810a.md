@@ -305,7 +305,7 @@ sequenceDiagram
 | Rate | 5 frames a second | 1 frame a second |
 | Cost per frame | ~200 ms of one core | a billed lookup |
 | Frames per passage | every frame in the window | `GATE_LOCAL_SWEEP_CLOUD_FRAMES` (5) |
-| Which frames | all of them, newest first | the newest the device could not place |
+| Which frames | all of them, newest first | the newest the device could not place; with `GATE_LOCAL_SWEEP_CLOUD_HOLD=on`, only once its plate is 300 px (4K) or has stopped growing, or near the window's end |
 | Good at | a clean plate, instantly | a plate the device cannot read at all, such as one inside a headlight blaze |
 
 Neither waits for the other. A frame the device authorises is injected
@@ -315,6 +315,16 @@ while that verdict is outstanding (it used to stop, and on 2026-09-20 spent
 waited for either, which is what makes the two parallel rather than one behind
 the other. Set `GATE_LOCAL_SWEEP_CLOUD_FRAMES=0` to keep the paid reader out
 of the window entirely and make the sweep local-only.
+
+The camera's alarm fires with the car still far down the lane, so a lookup
+spent at once is spent on a small plate. `GATE_LOCAL_SWEEP_CLOUD_HOLD`
+(`off`/`shadow`/`on`, default `on` since 2026-10-09) holds each cloud
+hand-over until the plate the device boxed is
+`GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (220, in 4K pixels), has stopped
+growing, or the last `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (3) of the
+window or the waiting phase have come, and keeps the camera's own alarm still
+off the cloud while the sweep is reading; the on-device reader is untouched. See
+[the cloud hold](local-recognition.md#frames-not-worth-a-lookup-yet-the-sweeps-cloud-hold).
 
 With `GATE_LOCAL_OCR_MODE=active` the on-device reader answers in about
 175 ms, so the session decoder's 5 fps output can be read frame by frame

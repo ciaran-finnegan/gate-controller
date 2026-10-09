@@ -373,7 +373,9 @@ class CloudPathGuardTests(unittest.TestCase):
         source = self._source("trigger_capture.py")
         sweep = source[source.index("    def local_sweep("):source.index("    def _cloud_reachable(")]
         handover = sweep.index('hand_over(frame, captured_at, digest, read, source="sweep_cloud")')
-        self.assertLess(sweep.index("and cloud_reachable()\n"), handover)
+        # An `elif` since the cloud hold: a held frame never asks the probe,
+        # and a frame that would go asks it immediately before it goes.
+        self.assertLess(sweep.index("elif cloud_reachable():\n"), handover)
         fallback = sweep[sweep.index("def run_fallback("):sweep.index("while True:")]
         self.assertNotIn(
             "cloud_reachable()", fallback,
