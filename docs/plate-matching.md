@@ -273,6 +273,36 @@ the owner can tell "the schedule turned this car away" from "the camera could
 not read it". The near miss is computed for review only and never widens a
 match.
 
+A frame whose cloud request was **skipped** (the sweep is reading, the cloud
+breaker is open, the internet is down, the frame is the camera's held still)
+answers "no plate" to matching on purpose: the device's own read, offered as
+an observation, could corroborate itself under the agreement rule, and a skip
+must never open the gate. The read the device refused still rides along on
+that frame as `PlateObservation.review_plate`. `decide_access` looks at it only
+after every rule has refused, and only when no reader's answer had a plate; if
+it is within two characters of an authorised plate, the denial carries
+`near_miss_plate` / `near_miss_distance` and the block's `observed_plate` names
+the refused read:
+
+```json
+"match_policy": {
+  "band": "08:00-22:00",
+  "level": "standard",
+  "timezone": "Europe/Dublin",
+  "local_time": "10:06",
+  "observed_plate": "172L61",
+  "near_miss_plate": "172L66",
+  "near_miss_distance": 1
+}
+```
+
+The decision's own `observed_plate` stays empty, so the event row, its
+`ocr_confidence` and the sweep's "a different car" rule
+(`trigger_capture._is_another_vehicle`, which ends a session on a confident
+observed read with no near miss) are exactly what they were. A refused read
+with no authorised plate within two characters records nothing. Guarded by
+`tests/test_near_miss_when_cloud_skipped.py`.
+
 The wire keys are frozen by the Cloudflare ingest contract. Adding one here
 without extending the Worker's `MATCH_POLICY_KEYS` allowlist first will make
 the Worker reject the whole event.

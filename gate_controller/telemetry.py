@@ -251,7 +251,15 @@ class MatchPolicyTelemetry:
             local_time=getattr(decision, "policy_local_time", None) or "unknown",
             rule=getattr(decision, "match_rule", None),
             edit_distance=getattr(decision, "edit_distance", None),
-            observed_plate=getattr(decision, "observed_plate", None),
+            # A denial whose only read was a refused device read (the cloud
+            # was skipped) names that read here, beside its near miss, so the
+            # passage page can say "read 172L61, closest authorised 172L66".
+            # The decision's own `observed_plate` stays empty; see
+            # `MatchDecision.near_miss_read`.
+            observed_plate=(
+                getattr(decision, "observed_plate", None)
+                or getattr(decision, "near_miss_read", None)
+            ),
             authorised_plate=getattr(decision, "authorised_plate", None),
             near_miss_plate=getattr(decision, "near_miss_plate", None),
             near_miss_distance=getattr(decision, "near_miss_distance", None),
