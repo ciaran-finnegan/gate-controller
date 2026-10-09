@@ -88,8 +88,10 @@ MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 #   device at 0.994 at 238 px and never got wider than ~274 px even stopped,
 #   and on 2026-10-06 the same pickup stopped at the gate measured 197-217 px.
 #   Far frames that were sent and could not be read measured 160-215 px. 220
-#   holds those and lets the frames that do read go; a car stopped smaller than
-#   that is released by the stopped rule below;
+#   held those and let the frames that do read go; a car stopped smaller than
+#   that is released by the stopped rule below. Those widths were measured at
+#   zoom position 2; on 2026-10-09 the zoom went to 3, which scales every plate
+#   by x1.056, so the same line is now 232;
 # * the plate has **stopped growing**: the car has stopped, wherever it
 #   stopped, and the next frame will be no better (see SWEEP_CLOUD_STOPPED_*);
 # * it is the **last chance**: within `sweep_cloud_last_chance_seconds` of the
@@ -119,7 +121,7 @@ MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 # before and journals what `on` would have held; `off` does neither.
 SWEEP_CLOUD_HOLD_MODES = ("off", "shadow", "on")
 DEFAULT_SWEEP_CLOUD_HOLD = "on"
-DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX = 220
+DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX = 232
 MAX_SWEEP_CLOUD_MIN_PLATE_PX = 3840
 DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 3.0
 MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 30.0

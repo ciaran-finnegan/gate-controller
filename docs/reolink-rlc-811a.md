@@ -591,7 +591,7 @@ taken: the reader costs 145-190 ms a frame here, against a decision budget of
 That is a statement about the on-device read, and it still stands: nothing
 gates that read on width. The *paid* lookup is a different question -- it is
 billed, one a second, five a passage -- and since 2026-10-09 the sweep holds
-it until the plate is 220 px or has stopped growing
+it until the plate is 232 px (220 before the zoom step) or has stopped growing
 (`GATE_LOCAL_SWEEP_CLOUD_HOLD`, see
 [the cloud hold](local-recognition.md#frames-not-worth-a-lookup-yet-the-sweeps-cloud-hold)).
 A 152 px plate the device reads at 0.903 still opens the gate at once.
@@ -680,6 +680,50 @@ scores when the lens is sharp. The first daily nudges' `sharpness_before` and
 `sharpness_after` journal values are that baseline; if a sharp empty scene
 scores below 0.18, every nudge will report `not_recovered` and the threshold
 for the after-check needs its own number.
+
+## Zoom step to position 3, 2026-10-09
+
+The zoom went from position 2 to 3 at 08:45 IST, in daylight with the gate
+quiet, to put more pixels on a plate at the stop: the silver pickup (172L66)
+stops with its plate 197-274 px wide, and on 2026-10-06 it waited ~50 s with
+`66` misread as `68`/`88`/`61`.
+
+**Measured** (a 4K still at each position, ORB features and a RANSAC
+similarity fit, 1436 of 1500 matches inliers):
+
+| | zoom 2 | zoom 3 |
+| --- | --- | --- |
+| focus motor (autofocus) | 78 | 97 |
+| sharpness (controller metric) | 0.233 | 0.234 |
+| scale | 1 | **x1.0556** |
+| zoom centre | -- | x 0.501, y 0.480 of the frame, no rotation |
+
+So one step is about +5.6 % on every plate: the pickup at the stop ~205 ->
+~216 px, its 238 px read -> ~251 px. The scene moves outward by the same
+factor: a car stopped at cx 0.84 is now at 0.86, the far approach at x 0.20 is
+now 0.18, and the pickup that stops right up against the gate (cx 0.94) is now
+at 0.96 -- still cut by the picture's own edge, as before.
+
+**Re-fitted with it:**
+
+- `GATE_PLATE_REGION` is **unchanged** at `0.05,0.10,0.90,0.85` on purpose. The
+  sweep's decoder crops the band at native 4K and then scales it to 1920 px, so
+  a band mapped outward to cover the same scenery (0.025-0.975) would be scaled
+  down 5 % more and cancel the gain exactly. Kept in place it passes the 5.6 %
+  through, and the scenery it gives up at the edges (about 2.5 % each side)
+  holds no plate position measured so far.
+- `GATE_EARLY_TRIGGER_PATCH` default -> `0,0.248,0.338,0.338`: the original
+  square scaled by x1.056 and started at the left edge (its x 0.02 maps to
+  -0.007), so its thumbnail keeps the 160x90 shape.
+- `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` default 220 -> 232 (x1.056).
+- The camera's own vehicle-detection zone (a 60x33 grid covering x 0.07-0.87,
+  y 0.15-0.85) is unchanged: the approach lane stays well inside it.
+- The refocus nudge (`POST /camera/refocus`) steps from wherever the zoom is,
+  so it now nudges 3 -> 4 -> 3.
+
+**Rollback:** `StartZoomFocus` `ZoomPos` 2 in daylight (focus settles by
+autofocus), then revert the two defaults above. What to watch: `plate_px=` on
+`gate_local_sweep stage=read` lines for the pickup at the stop, and its reads.
 
 ## Cutover And Rollback
 
