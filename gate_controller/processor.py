@@ -21,7 +21,7 @@ from .images import measure_frame_quality
 from .match_policy import DEFAULT_POLICY
 from .matching import decide_access, normalise_plate
 from .models import GateEvent, MatchDecision, PlateObservation, ProcessingResult
-from .ocr import classify_failure_cause
+from .ocr import classify_failure_cause, skipped_observation
 from .telemetry import (
     MatchPolicyTelemetry, OcrAttemptTelemetry, ProcessingTrace, TriggerTelemetry,
     ftp_fallback_trigger,
@@ -1377,9 +1377,7 @@ class GateProcessor:
                     on_start(recognition_began)
                 # The device's answer stands for the frame: nothing was read,
                 # and nothing was billed.
-                return PlateObservation(
-                    plate=None, confidence=0.0, source="local", cloud_lookup=False,
-                )
+                return _skipped(attempt)
         elif self._local_pass is not None:
             # `on_start` is deliberately NOT fired here. `burst_to_ocr_ms` has
             # meant "burst to the cloud request starting" in every measurement
@@ -1424,9 +1422,7 @@ class GateProcessor:
             )
             if on_start is not None:
                 on_start()
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return _skipped(attempt)
         if (
             cloud_permit is not None and not self._recognizer_accepts_cloud_permit
             and not _permits(cloud_permit)
@@ -1441,9 +1437,7 @@ class GateProcessor:
             )
             if on_start is not None:
                 on_start()
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return _skipped(attempt)
         if (
             self._internet_reachable is not None
             and not self._recognizer_accepts_internet_reachable
@@ -1464,9 +1458,7 @@ class GateProcessor:
             )
             if on_start is not None:
                 on_start()
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return _skipped(attempt)
         remaining = deadline - self._decision_clock()
         if remaining < self._min_cloud_request_seconds:
             # Skipping is what keeps the lookup unbilled; a request posted
@@ -2007,6 +1999,21 @@ def _reachable(internet_reachable) -> bool:
         return internet_reachable() is not False
     except Exception:
         return True
+
+
+def _skipped(attempt) -> PlateObservation:
+    """The "no plate" a skipped cloud request answers, with the device's read for review.
+
+    The device's refused read rides along as ``review_plate`` only, which
+    matching uses to name the closest authorised plate on a denial and never
+    to grant (`ocr.skipped_observation`). Never raises.
+    """
+    try:
+        return skipped_observation(getattr(attempt, "state", None))
+    except Exception:
+        return PlateObservation(
+            plate=None, confidence=0.0, source="local", cloud_lookup=False,
+        )
 
 
 def _device_read(attempt) -> bool:

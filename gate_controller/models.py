@@ -24,6 +24,14 @@ class PlateObservation:
     #: gate was opened locally and the allowance was charged anyway. The quota
     #: burn-down counts this, never ``source``.
     cloud_lookup: bool = True
+    #: Record-only. On the "no plate" a skipped cloud request stands for, the
+    #: plate the on-device reader *did* read on this frame and was not allowed
+    #: to decide on (2026-10-06 10:06: ``172L61`` at 0.61 for ``172L66``).
+    #: Matching never grants on it: :func:`~gate_controller.matching.decide_access`
+    #: looks at it only once every rule has refused, and only to say which
+    #: authorised plate the read nearly was (``near_miss_*``).
+    review_plate: str | None = None
+    review_confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,11 @@ class MatchDecision:
     #: for review only; it never widens a match.
     near_miss_plate: str | None = None
     near_miss_distance: int | None = None
+    #: The refused on-device read a near miss was measured from, when no
+    #: reader's answer stood for the frame (``PlateObservation.review_plate``).
+    #: Telemetry only: ``observed_plate`` stays empty, so the event row and the
+    #: sweep's "a different car" rule see exactly what they saw before.
+    near_miss_read: str | None = None
 
 
 @dataclass(frozen=True)

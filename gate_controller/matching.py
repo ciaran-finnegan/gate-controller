@@ -79,6 +79,7 @@ def decide_access(
     rule = resolved.rule
     authorised_plates = {normalise_plate(plate) for plate in authorised}
     authorised_plates.discard("")
+    observations = list(observations)
     normalised_observations = [
         (normalise_plate(observation.plate), observation)
         for observation in observations
@@ -125,8 +126,21 @@ def decide_access(
         default=None,
     )
     if best is None:
+        # No reader's answer carried a plate. A skipped cloud request stands
+        # for the frame as "no plate", but the device may still have read
+        # something and refused it; say which authorised plate that read
+        # nearly was. Record-only, and deliberately not `observed_plate`: the
+        # sweep ends a session on a confident observed read with no near miss
+        # (`trigger_capture._is_another_vehicle`), and a read nothing was
+        # allowed to stand on must not start ending sessions.
+        near_read, near_plate, near_distance = _nearest_reviewed(
+            observations, authorised_plates
+        )
         return MatchDecision(
-            allowed=False, reason="no_match", **_policy_fields(resolved)
+            allowed=False, reason="no_match",
+            near_miss_plate=near_plate, near_miss_distance=near_distance,
+            near_miss_read=near_read,
+            **_policy_fields(resolved),
         )
     near_plate, near_distance = _nearest_authorised(best[0], authorised_plates)
     return MatchDecision(
@@ -402,6 +416,39 @@ def _nearest_authorised(
         elif distance == best_distance and plate < (best_plate or ""):
             best_plate = plate
     return best_plate, best_distance
+
+
+def _nearest_reviewed(
+    observations: list[PlateObservation], authorised_plates: set[str]
+) -> tuple[str | None, str | None, int | None]:
+    """The most confident refused device read that nearly was an authorised plate.
+
+    Reads ``PlateObservation.review_plate`` only -- a read no rule was allowed
+    to stand on -- and only for review: it returns ``(read, plate, distance)``
+    for the denial to carry, or three ``None`` when no reviewed read is within
+    :data:`MAX_NEAR_MISS_DISTANCE` of the list. A reviewed read that *is* an
+    authorised plate is not a near miss (distance 0 is skipped) and is not a
+    grant either; it was refused where it was read.
+    """
+    best: tuple[float, str, str, int] | None = None
+    for observation in observations:
+        read = normalise_plate(getattr(observation, "review_plate", None) or "")
+        if not read:
+            continue
+        try:
+            confidence = float(getattr(observation, "review_confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not isfinite(confidence):
+            confidence = 0.0
+        plate, distance = _nearest_authorised(read, authorised_plates)
+        if plate is None:
+            continue
+        if best is None or confidence > best[0]:
+            best = (confidence, read, plate, distance)
+    if best is None:
+        return None, None, None
+    return best[1], best[2], best[3]
 
 
 def _bounded_levenshtein(left: str, right: str, maximum: int) -> int | None:

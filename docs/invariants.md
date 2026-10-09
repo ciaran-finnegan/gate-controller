@@ -27,9 +27,16 @@ for speed or spend -- the sweep, the cloud hold, the conclusive-read rule, the
 early trigger -- may open the gate on anything else; those only decide what
 is read and what is spent.
 
+A frame whose cloud request was skipped answers "no plate"; the device's
+refused read rides along only as `PlateObservation.review_plate`, which
+matching reads after every rule has refused, to name a near miss, and never
+to grant (#201).
+
 - `tests/test_matching.py::test_rejects_a_low_confidence_exact_authorised_plate`
 - `tests/test_matching.py::test_an_exact_plate_still_opens_overnight`
 - `tests/test_actuation.py::test_persisted_cooldown_records_the_grant_rather_than_a_denial`
+- `tests/test_near_miss_when_cloud_skipped.py::test_an_exact_authorised_plate_at_full_confidence_is_never_a_grant`
+- `tests/test_near_miss_when_cloud_skipped.py::test_a_confident_misread_is_still_only_a_near_miss`
 
 ## 2. The burst thread never waits on the network
 

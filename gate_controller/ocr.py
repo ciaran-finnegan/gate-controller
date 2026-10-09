@@ -67,6 +67,10 @@ class LocalPass:
             and not getattr(recognition, "plate", None)
         )
 
+    def skipped(self) -> PlateObservation:
+        """The "no plate" a skipped cloud request stands for. See :func:`skipped_observation`."""
+        return skipped_observation(self.state)
+
     def abandon(self) -> None:
         """No cloud request will follow. Settle the frame so it is journalled."""
         frame = (self.state or {}).get("frame")
@@ -76,6 +80,30 @@ class LocalPass:
             frame.abandon_cloud()
         except Exception:
             return
+
+
+def skipped_observation(state: dict | None) -> PlateObservation:
+    """What a frame whose cloud request was skipped answers: "no plate".
+
+    Deliberately not the device's own read: offered as an observation it could
+    corroborate itself under the agreement rule, and a skip must never open a
+    gate. The read is carried instead as ``review_plate``, which matching only
+    ever uses to name the closest authorised plate on a denial. Never raises.
+    """
+    plate, confidence = None, 0.0
+    try:
+        recognition = (state or {}).get("recognition")
+        read = getattr(recognition, "plate", None)
+        if isinstance(read, str) and normalise_plate(read):
+            plate = normalise_plate(read)
+            score = float(getattr(recognition, "score", 0.0) or 0.0)
+            confidence = score if isfinite(score) else 0.0
+    except Exception:
+        plate, confidence = None, 0.0
+    return PlateObservation(
+        plate=None, confidence=0.0, source="local", cloud_lookup=False,
+        review_plate=plate, review_confidence=confidence,
+    )
 
 
 @dataclass(frozen=True)
@@ -1300,9 +1328,7 @@ class PlateRecognizerClient:
             decided = state.get("local_observation")
             if decided is not None:
                 return decided
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return skipped_observation(state)
         if not _internet_reachable(state.get("internet_reachable")):
             # Same place, same outcome, a different reason: the controller's
             # own probe has fresh evidence the internet is down, so the
@@ -1319,9 +1345,7 @@ class PlateRecognizerClient:
             decided = state.get("local_observation")
             if decided is not None:
                 return decided
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return skipped_observation(state)
         if not self._breaker_admits():
             # This client's own breaker: its last requests died on the link
             # without an answer, or the one half-open trial is already out.
@@ -1331,9 +1355,7 @@ class PlateRecognizerClient:
             decided = state.get("local_observation")
             if decided is not None:
                 return decided
-            return PlateObservation(
-                plate=None, confidence=0.0, source="local", cloud_lookup=False,
-            )
+            return skipped_observation(state)
         try:
             self._pace(generation)
             # Past the throttle window, the upload and every abandonment
