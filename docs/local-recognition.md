@@ -422,14 +422,14 @@ true:
 
 | rule | journalled as | why |
 | --- | --- | --- |
-| the plate the on-device detector boxed is at least `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (default **300**, 4K-equivalent pixels) | `release=plate_width` | Post-re-aim measurements ([camera notes](reolink-rlc-811a.md#post-re-aim-plate-measurements)): 369-372 px stopped at the gate, 192-258 px on the approach. 300 sits between them with about 15% to spare each side; it is the documented target width, and above the ~240 px past which every measured frame read 0.995 or better. |
-| the plate has **stopped growing**: every box of the last 2 s (at least three, at least 1 s apart end to end) within 8% in width | `release=stopped` | A car that stops short of 300 px will not show a better plate by waiting. An arriving plate grows by roughly a quarter a second here; the stopped car's five frames measured 369-372 px. |
+| the plate the on-device detector boxed is at least `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (default **220**, 4K-equivalent pixels) | `release=plate_width` | First set at 300 from the post-re-aim measurements ([camera notes](reolink-rlc-811a.md#post-re-aim-plate-measurements): 369-372 px stopped, 192-258 px approaching). Lowered to 220 on 2026-10-09 because those were one car: on 2026-10-05 a pickup was read on the device at **0.994 at 238 px** and never got wider than ~274 px, and on 2026-10-06 the same pickup stopped at the gate measured 197-217 px. The far frames that were sent and could not be read measured 160-215 px. |
+| the plate has **stopped growing**: every box of the last 2 s (at least three, at least 1 s apart end to end) within 8% in width | `release=stopped` | A car that stops short of the width will not show a better plate by waiting. An arriving plate grows by roughly a quarter a second here. |
 | the **last chance**: within `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (default **3**) of the window's end, and the whole waiting phase | `release=last_chance` | A passage that never presents a large plate, or none at all, still gets the cloud's opinion before the sweep gives up. With the 10 s window that is +7 s: room for three lookups at the 1 s spacing before the window's own fallback, and an arriving car crosses the picture in about three seconds. |
 
 The width is resolution-independent: the recogniser's box is in frame
 fractions, padded by 8% of its width each side for the OCR crop; the pad is
-taken off and the rest is scaled to 3840, so 300 means 300 px of plate in the
-camera's 4K frame (about 150 px at the 1920-wide decode the sweep reads).
+taken off and the rest is scaled to 3840, so 220 means 220 px of plate in the
+camera's 4K frame (about 110 px at the 1920-wide decode the sweep reads).
 
 What it does **not** touch:
 
@@ -461,17 +461,27 @@ the last hand-over, the local score breaking ties, rather than the best local
 score alone: the cloud is being paid for the frame the device could not read,
 and the largest is the one most likely to read.
 
-**Rollout.** The code's default is `shadow`, as every other change on the
-decision path here has shipped. `shadow` hands over exactly as `off` does and
-journals what `on` would have done: `stage=cloud_held mode=shadow` once a
-passage, and `release=would_hold` on each hand-over `on` would have kept back.
-After a few days, count the passages whose cloud-decided opening came from a
-`would_hold` frame, and read the `plate_px=` of each hand-over and of each
-`stage=read`; then `GATE_LOCAL_SWEEP_CLOUD_HOLD=on` and a restart.
-`off` neither holds nor journals.
+**The camera's own alarm still** is held too. While a sweep is reading the
+passage's live stream (`TriggerFrameCapture.camera_still_hold`: the sweep's
+reader is ready and its session is active), an FTP upload from the camera
+that the device read and could not decide is decided on that read and never
+sent to the cloud (`gate_ocr stage=cloud_skipped reason=sweep_reading`). That
+still is taken at the alarm, with the car furthest away: on 2026-10-05 at
+21:31 one read `L514` at 0.078 on the device and spent 6 s on a lookup that
+could not succeed. With no sweep reading -- sweep disabled, its reader
+unavailable, or no alarm to start it -- the still goes to the cloud as before.
+A still the device never read (`GATE_LOCAL_OCR_CLOUD=always`) is untouched.
+
+**Rollout.** On by default since 2026-10-09, after the 2026-10-05/06 passages
+above showed the far frames costing lookups and, once, the gate's time.
+`shadow` hands over exactly as `off` does and journals what `on` would have
+done: `stage=cloud_held mode=shadow` once a passage, `release=would_hold` on
+each hand-over `on` would have kept back, and `gate_ocr stage=cloud_hold_shadow
+source=camera_still` for a still. `off` neither holds nor journals. Read the
+`plate_px=` of each hand-over and each `stage=read` to re-fit the width.
 
 ```
-gate_local_sweep stage=cloud_held mode=on reason=small_plate plate_px=214 min_px=300 last_chance_in_ms=5200
+gate_local_sweep stage=cloud_held mode=on reason=small_plate plate_px=194 min_px=220 last_chance_in_ms=5200
 gate_local_sweep stage=cloud_handover frame=1 of=5 plate_seen=True plate_px=372 release=plate_width at_ms=2600
 gate_local_sweep outcome=ended reason=opened ... cloud_hold=on cloud_held=7
 ```

@@ -82,11 +82,14 @@ MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 #
 # * the plate the on-device detector boxed is at least
 #   `sweep_cloud_min_plate_px` wide, in 4K-equivalent pixels (the box is in
-#   frame fractions, so the setting means the same at any decode width). 300:
-#   measured after the re-aim (docs/reolink-rlc-811a.md), plates at the stop
-#   are 369-372 px and on the approach 192-258 px, so 300 sits between the two
-#   with about 15% to spare on each side; it is also the documented target
-#   width, and above the ~240 px past which every measured frame read 0.995+;
+#   frame fractions, so the setting means the same at any decode width). 220:
+#   300 was first chosen from the re-aim's measurements (stop 369-372 px,
+#   approach 192-258 px), but on 2026-10-05 a pickup's plate was read on the
+#   device at 0.994 at 238 px and never got wider than ~274 px even stopped,
+#   and on 2026-10-06 the same pickup stopped at the gate measured 197-217 px.
+#   Far frames that were sent and could not be read measured 160-215 px. 220
+#   holds those and lets the frames that do read go; a car stopped smaller than
+#   that is released by the stopped rule below;
 # * the plate has **stopped growing**: the car has stopped, wherever it
 #   stopped, and the next frame will be no better (see SWEEP_CLOUD_STOPPED_*);
 # * it is the **last chance**: within `sweep_cloud_last_chance_seconds` of the
@@ -105,11 +108,18 @@ MIN_SWEEP_CLOUD_SPACING_SECONDS, MAX_SWEEP_CLOUD_SPACING_SECONDS = 0.5, 5.0
 # enqueued (worker.inject_trigger_burst), i.e. at the hand-over. The cap and
 # the spacing stay as they were, as spend ceilings.
 #
-# `shadow` (the default) hands over exactly as before and journals what `on`
-# would have held; `off` does neither.
+# The camera's own alarm still is held the same way: while a sweep is
+# reading this passage's live stream, the still -- taken at the alarm, when the
+# car is furthest away -- is decided on the device and never sent to the
+# cloud (`camera_still_hold`, honoured in `GateProcessor.prepare`). On
+# 2026-10-05 at 21:31 such a still (read `L514` at 0.078 on the device) spent
+# 6 s on a lookup that could not succeed.
+#
+# `on` (the default since 2026-10-09) holds; `shadow` hands over exactly as
+# before and journals what `on` would have held; `off` does neither.
 SWEEP_CLOUD_HOLD_MODES = ("off", "shadow", "on")
-DEFAULT_SWEEP_CLOUD_HOLD = "shadow"
-DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX = 300
+DEFAULT_SWEEP_CLOUD_HOLD = "on"
+DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX = 220
 MAX_SWEEP_CLOUD_MIN_PLATE_PX = 3840
 DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 3.0
 MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS = 30.0
@@ -990,6 +1000,24 @@ class TriggerFrameCapture:
     def session_active(self) -> bool:
         with self._session_lock:
             return self._session_active
+
+    def camera_still_hold(self) -> str | None:
+        """How the camera's own alarm still is to be treated right now.
+
+        ``"on"`` or ``"shadow"`` while a sweep is reading the live stream (the
+        sweep's own frames are better and carry their own cloud budget), None
+        otherwise -- no sweep, a sweep whose reader is unavailable, or the
+        hold switched off -- and then the still is read as it always was.
+        """
+        mode = self.config.sweep_cloud_hold
+        if mode not in ("on", "shadow"):
+            return None
+        try:
+            if not (self._sweep_ready() and self.session_active()):
+                return None
+        except Exception:
+            return None
+        return mode
 
     def on_early_trigger(self, features=None) -> str:
         """Ask for a local-only sweep ahead of the camera's alarm. Never blocks.

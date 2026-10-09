@@ -318,11 +318,12 @@ of the window entirely and make the sweep local-only.
 
 The camera's alarm fires with the car still far down the lane, so a lookup
 spent at once is spent on a small plate. `GATE_LOCAL_SWEEP_CLOUD_HOLD`
-(`off`/`shadow`/`on`, default `shadow`) holds each cloud hand-over until the
-plate the device boxed is `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (300, in
-4K pixels), has stopped growing, or the last
-`GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (3) of the window or the waiting
-phase have come; the on-device reader is untouched. See
+(`off`/`shadow`/`on`, default `on` since 2026-10-09) holds each cloud
+hand-over until the plate the device boxed is
+`GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (220, in 4K pixels), has stopped
+growing, or the last `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (3) of the
+window or the waiting phase have come, and keeps the camera's own alarm still
+off the cloud while the sweep is reading; the on-device reader is untouched. See
 [the cloud hold](local-recognition.md#frames-not-worth-a-lookup-yet-the-sweeps-cloud-hold).
 
 With `GATE_LOCAL_OCR_MODE=active` the on-device reader answers in about

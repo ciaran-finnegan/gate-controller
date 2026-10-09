@@ -445,6 +445,23 @@ class LocalSweepTests(unittest.TestCase):
         # ~55 s of waiting before the late frame, at two a second.
         self.assertGreaterEqual(waiting_reads, 100)
 
+    def test_the_camera_still_is_held_only_while_a_sweep_is_reading(self):
+        source = FrameSource(self.clock, [])
+        for mode, ready, active, expected in (
+            ("on", True, True, "on"),
+            ("shadow", True, True, "shadow"),
+            ("off", True, True, None),
+            ("on", True, False, None),
+            ("on", False, True, None),
+        ):
+            with self.subTest(mode=mode, ready=ready, active=active):
+                capture = self._capture(source, ScriptedSweep({}, ready=ready))
+                object.__setattr__(capture.config, "sweep_cloud_hold", mode)
+                with capture._session_lock:
+                    capture._session_active = active
+                self.assertEqual(capture.camera_still_hold(), expected)
+
+
     def test_waiting_never_outlives_the_decoder_session(self):
         frames = [(100.0 + index * 0.5, jpeg(seed=index)) for index in range(200)]
         source = FrameSource(self.clock, frames)
@@ -756,12 +773,14 @@ def boxed(plate_px, *, plate="10CE1990", score=0.6, authorised=False):
 
 
 class CloudHoldConfigTests(unittest.TestCase):
-    def test_the_hold_ships_in_shadow_at_300_px_with_a_3_s_last_chance(self):
+    def test_the_hold_ships_on_at_220_px_with_a_3_s_last_chance(self):
+        # On since 2026-10-09; 220 px because a pickup read at 0.994 at 238 px
+        # and stopped at the gate at 197-274 px (see DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX).
         config = load_trigger_capture_config({}, Path("/tmp"), webhook_enabled=True)
         self.assertEqual(
             (config.sweep_cloud_hold, config.sweep_cloud_min_plate_px,
              config.sweep_cloud_last_chance_seconds),
-            ("shadow", 300, 3.0),
+            ("on", 220, 3.0),
         )
 
     def test_the_hold_is_read_from_the_environment_and_bounded(self):

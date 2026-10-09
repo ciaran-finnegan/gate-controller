@@ -590,8 +590,8 @@ taken: the reader costs 145-190 ms a frame here, against a decision budget of
 
 That is a statement about the on-device read, and it still stands: nothing
 gates that read on width. The *paid* lookup is a different question -- it is
-billed, one a second, five a passage -- and since 2026-10-05 the sweep can
-hold it until the plate is 300 px or has stopped growing
+billed, one a second, five a passage -- and since 2026-10-09 the sweep holds
+it until the plate is 220 px or has stopped growing
 (`GATE_LOCAL_SWEEP_CLOUD_HOLD`, see
 [the cloud hold](local-recognition.md#frames-not-worth-a-lookup-yet-the-sweeps-cloud-hold)).
 A 152 px plate the device reads at 0.903 still opens the gate at once.
