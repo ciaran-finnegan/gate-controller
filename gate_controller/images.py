@@ -51,49 +51,74 @@ def measure_frame_quality(path: Path, *, digest: str | None = None) -> FrameTele
     try:
         if not _has_jpeg_signature(path):
             raise ValueError("invalid image signature")
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(path) as image:
-                if image.format != "JPEG":
-                    raise ValueError("invalid image format")
-                width, height = image.size
-                image.draft("L", QUALITY_SIZE)
-                image.load()
-                image.thumbnail(QUALITY_SIZE, Image.Resampling.BILINEAR)
-                grayscale = image.convert("L")
-
-        histogram = grayscale.histogram()
-        pixel_count = max(sum(histogram), 1)
-        brightness = sum(value * count for value, count in enumerate(histogram)) / (
-            255 * pixel_count
-        )
-        darkness = sum(histogram[:33]) / pixel_count
-        highlight_clipping = sum(histogram[240:]) / pixel_count
-        sharpness = _sharpness_proxy(grayscale)
-        return FrameTelemetry(
-            sequence=0,
-            digest=digest,
-            width=width,
-            height=height,
-            sharpness=sharpness,
-            brightness=brightness,
-            darkness=darkness,
-            highlight_clipping=highlight_clipping,
-        )
+        return _measure_quality(path, digest)
     except (
         OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
     ):
-        return FrameTelemetry(
-            sequence=0,
-            digest=digest,
-            width=1,
-            height=1,
-            sharpness=0.0,
-            brightness=0.0,
-            darkness=0.0,
-            highlight_clipping=0.0,
-            status="quality_unavailable",
-        )
+        return _quality_unavailable(digest)
+
+
+def measure_jpeg_quality(data: bytes) -> FrameTelemetry:
+    """The same proxies as :func:`measure_frame_quality`, for a JPEG held in memory.
+
+    Used for the camera-control service's 4K stills (the refocus check), so a
+    still and an event frame are scored by one function and their sharpness
+    figures can be compared directly.
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        if not data.startswith(b"\xff\xd8\xff"):
+            raise ValueError("invalid image signature")
+        return _measure_quality(BytesIO(data), digest)
+    except (
+        OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError,
+    ):
+        return _quality_unavailable(digest)
+
+
+def _measure_quality(source, digest: str) -> FrameTelemetry:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(source) as image:
+            if image.format != "JPEG":
+                raise ValueError("invalid image format")
+            width, height = image.size
+            image.draft("L", QUALITY_SIZE)
+            image.load()
+            image.thumbnail(QUALITY_SIZE, Image.Resampling.BILINEAR)
+            grayscale = image.convert("L")
+    histogram = grayscale.histogram()
+    pixel_count = max(sum(histogram), 1)
+    brightness = sum(value * count for value, count in enumerate(histogram)) / (
+        255 * pixel_count
+    )
+    darkness = sum(histogram[:33]) / pixel_count
+    highlight_clipping = sum(histogram[240:]) / pixel_count
+    sharpness = _sharpness_proxy(grayscale)
+    return FrameTelemetry(
+        sequence=0,
+        digest=digest,
+        width=width,
+        height=height,
+        sharpness=sharpness,
+        brightness=brightness,
+        darkness=darkness,
+        highlight_clipping=highlight_clipping,
+    )
+
+
+def _quality_unavailable(digest: str) -> FrameTelemetry:
+    return FrameTelemetry(
+        sequence=0,
+        digest=digest,
+        width=1,
+        height=1,
+        sharpness=0.0,
+        brightness=0.0,
+        darkness=0.0,
+        highlight_clipping=0.0,
+        status="quality_unavailable",
+    )
 
 
 def measure_flat_fraction(frame: bytes, region: PlateRegion | None = None) -> float | None:

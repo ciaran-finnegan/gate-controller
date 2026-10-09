@@ -362,7 +362,10 @@ block (no address), OSD, `AutoUpgrade 1`, `PowerLed On`, the displayed time and
 the DST block, and **zoom and focus**. The lens position follows the physical
 re-aim in [Capture At The Stop](#capture-at-the-stop) and is set at the gate;
 the script holds no position and sends no `ZoomFocus` command, so it can never
-undo a re-aim. It also warns when `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi
+undo a re-aim. The one thing on the Pi that does move the lens is the narrow
+refocus nudge in `gate-camera-control`, which steps the zoom one position and
+back to exactly where it was and never sets a focus position; see
+[Defocus, 2026-10-04, and the refocus nudge](#defocus-2026-10-04-and-the-refocus-nudge). It also warns when `GATE_CLEAR_STREAM_SOURCE_FPS` on the Pi
 disagrees with the frame rate it is about to write, because the two must move
 together.
 
@@ -587,6 +590,10 @@ taken: the reader costs 145-190 ms a frame here, against a decision budget of
 
 ### Zoom: not changed, and why
 
+The refocus nudge added after the 2026-10-04 defocus does not change this: it
+steps the zoom one position and returns it to exactly where it was
+([below](#defocus-2026-10-04-and-the-refocus-nudge)).
+
 Headroom scaling about the frame centre with a 5% margin is about x1.33,
 limited by the far-approach plate at the left edge (x0 = 0.163, the first
 approach frame above), not by the stopped plate, which would allow x2.11 on
@@ -634,6 +641,37 @@ fall inside the new band. The Pi journal retains only about 1.8 days (it is
 size-capped), and the Pi keeps only the last three event photos in
 `/var/lib/gate-controller/event-evidence/`; older frames have to be fetched
 back from the dashboard.
+
+## Defocus, 2026-10-04, and the refocus nudge
+
+Overnight from 3 to 4 October 2026 the camera lost focus with autofocus
+enabled: the focus motor ended at 86 (it had been 80 since the re-aim) on zoom
+position 2. Every daylight event frame after it was soft. Event telemetry
+`frames[].sharpness` fell from a daylight median of about 0.21-0.26 (frames
+0.19-0.29, 15-30 September) to at most 0.158 on 4-5 October, on 1920- and
+3840-wide frames alike; daytime FTP JPEGs shrank from about 1.2-1.8 MB to about
+390 KB; plate reads collapsed and the gate opened for 1 of 34 passages.
+
+The fix on 2026-10-05, in daylight: zoom 2 -> 3 -> 2 through the CGI API,
+about 7 s apart (`StartZoomFocus`, `op ZoomPos`). The autofocus re-ran, settled
+at focus 78, and the picture was pin sharp again. Nothing else was changed.
+
+The Pi now does this itself: once a day around midday, and when recent daylight
+event frames read soft (median of at least 3 whole, lit, IR-off frames from at
+least 2 events below 0.18). It is a narrow, explicit exception to "zoom: not
+changed": `gate-camera-control` reads `GetZoomFocus`, steps one position,
+returns to exactly the position it read, reads back to prove it, and never
+writes a focus position or leaves the zoom changed. The calibration procedure
+above, and any change to the framing, remain at-the-gate work. The details,
+guards and journal lines are in
+[camera-control.md, Refocus](camera-control.md#refocus).
+
+Still unknown: why the autofocus drifted overnight in the first place (no
+journal line on the Pi can see the lens), and what an empty-scene 4K still
+scores when the lens is sharp. The first daily nudges' `sharpness_before` and
+`sharpness_after` journal values are that baseline; if a sharp empty scene
+scores below 0.18, every nudge will report `not_recovered` and the threshold
+for the after-check needs its own number.
 
 ## Cutover And Rollback
 

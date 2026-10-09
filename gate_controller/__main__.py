@@ -42,6 +42,7 @@ from .trigger_capture import (
 from .camera_control_state import (
     CAMERA_CONTROL_STATE_PATH, read_camera_control_state,
 )
+from .camera_focus import build_refocus_worker
 from .media_capabilities import read_media_capabilities
 from .metrics import (
     MetricsRollupWorker, build_metrics_ring, metrics_rollup_seconds,
@@ -249,6 +250,15 @@ def main() -> None:
     # Built before the workers so the heartbeat can report webhook acceptance
     # and the camera's clock skew; the listener itself is wired further down.
     trigger_correlator = build_reolink_correlator(os.environ)
+    # GATE_CAMERA_REFOCUS=off|shadow|on (default on): a daily zoom nudge, and
+    # one when daylight event frames go soft, through gate-camera-control.
+    # Built before the workers so the heartbeat can report it; it reads only
+    # telemetry a finished burst hands it, and never touches the relay.
+    camera_refocus = build_refocus_worker(
+        os.environ, state_directory=Path(arguments.database).resolve().parent,
+        activity=activity, trigger_capture=trigger_capture,
+        ir_state=_camera_ir_state,
+    )
     background_workers, _, _ = build_background_workers(
         store, relay, latest_image=latest_image, coordinator=coordinator,
         authorised=authorised, camera_directory=arguments.directory,
@@ -256,7 +266,7 @@ def main() -> None:
         local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=trigger_correlator,
         corpus=corpus, activity=activity, metrics=metrics, net_probe=net_probe,
-        cloud_breaker=cloud_breaker,
+        cloud_breaker=cloud_breaker, camera_focus=camera_refocus,
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
     # a verdict. It reaches no decision, spends no lookup and ends no
@@ -318,6 +328,8 @@ def main() -> None:
         background_workers += (trigger_capture,)
     if early_trigger is not None:
         background_workers += (early_trigger,)
+    if camera_refocus is not None:
+        background_workers += (camera_refocus,)
     outbox = next((worker for worker in background_workers if isinstance(worker, OutboxWorker)), None)
     processor = GateProcessor(
         recognizer=recognizer,
@@ -403,6 +415,10 @@ def main() -> None:
         # the 429 counter in `MetricsRing._absorb_retry_counts_locked`.
         if metrics is not None:
             metrics.record_processing_result(result)
+        # Likewise after the decision: the refocus trigger only looks at the
+        # sharpness of frames this burst has finished with.
+        if camera_refocus is not None:
+            camera_refocus.observe_result(result)
         return result
 
     def record_skipped(paths, reason, received_at, decision_started_at=None,
@@ -459,6 +475,11 @@ def main() -> None:
         trigger_capture=trigger_capture,
         prepare=prepare,
     )
+
+
+def _camera_ir_state(path=CAMERA_CONTROL_STATE_PATH) -> str:
+    """The IR state gate-camera-control last published; ``unknown`` if it cannot say."""
+    return read_camera_control_state(path)["ir"]["state"]
 
 
 def _corpus_quiet_seconds(environment) -> float:
@@ -854,7 +875,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
                              corpus=None, activity=None, metrics=None, webhook=None,
-                             net_probe=None, cloud_breaker=None):
+                             net_probe=None, cloud_breaker=None, camera_focus=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -921,7 +942,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             trigger_capture=trigger_capture, webhook=webhook,
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
-            metrics=metrics, cloud_breaker=cloud_breaker,
+            metrics=metrics, cloud_breaker=cloud_breaker, camera_focus=camera_focus,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -969,7 +990,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         camera_stale_seconds=camera_stale_seconds,
         hot_stream=hot_stream, local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
-        corpus=corpus, activity=activity,
+        corpus=corpus, activity=activity, camera_focus=camera_focus,
     )
 
 
@@ -1082,7 +1103,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        trigger_capture=None, webhook=None, net_probe=None,
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
-                       cloud_breaker=None,
+                       cloud_breaker=None, camera_focus=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -1140,6 +1161,12 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     corpus_status = _corpus_status(corpus, corpus_upload, activity)
     if corpus_status is not None:
         status["corpus"] = corpus_status
+    # Additive, like `cloud_breaker`: the app's heartbeat narrows to the keys
+    # it knows and drops this block until it learns it; the journal has every
+    # attempt today.
+    camera_focus_status = _camera_focus_status(camera_focus)
+    if camera_focus_status is not None:
+        status["camera_focus"] = camera_focus_status
     release_sha = _managed_release_sha(
         module_path, releases_root=managed_releases_root
     )
@@ -1247,6 +1274,17 @@ def _trigger_capture_status(trigger_capture) -> dict | None:
     vehicle at a gate that stayed shut, were being counted and discarded.
     """
     read_status = getattr(trigger_capture, "status", None)
+    if not callable(read_status):
+        return None
+    try:
+        measured = read_status()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
+
+
+def _camera_focus_status(camera_focus) -> dict | None:
+    read_status = getattr(camera_focus, "status", None)
     if not callable(read_status):
         return None
     try:

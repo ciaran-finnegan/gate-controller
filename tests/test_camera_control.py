@@ -85,6 +85,18 @@ class FakeCamera:
         self.clock_fields = {"year": 2026, "mon": 9, "day": 16, "hour": 14, "min": 0, "sec": 0,
                              "hourFmt": 1, "timeFmt": "DD/MM/YYYY", "timeZone": 0, "isDst": 0}
         self.dst_fields = {"enable": 0, "offset": 1}
+        # The RLC-811A's motorised lens as found on 2026-10-04: zoom 2, focus
+        # drifted to 86. A zoom move re-runs autofocus, which lands on
+        # `focus_after_zoom[zoom]` (78 at zoom 2, as measured on 2026-10-05).
+        self.zoom_pos = 2
+        self.focus_pos = 86
+        self.focus_after_zoom = {2: 78, 3: 81}
+        self.zoom_ops = []
+        # When set, a zoom move is acknowledged and ignored -- a motor that
+        # did not move -- or refused outright.
+        self.zoom_stuck = False
+        self.zoom_refuse = False
+        self.zoom_focus_value = None
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCameraHandler)
         self._server.camera = self
@@ -163,6 +175,22 @@ class FakeCamera:
                 self.clock_fields = dict(payload[0]["param"]["Time"])
                 self.dst_fields = dict(payload[0]["param"]["Dst"])
                 return 200, _command_response("SetTime", None)
+            if command == "GetZoomFocus":
+                value = self.zoom_focus_value or {"ZoomFocus": {
+                    "channel": 0, "zoom": {"pos": self.zoom_pos},
+                    "focus": {"pos": self.focus_pos},
+                }}
+                return 200, _command_response("GetZoomFocus", value)
+            if command == "StartZoomFocus":
+                param = payload[0]["param"]["ZoomFocus"]
+                self.zoom_ops.append(dict(param))
+                if self.zoom_refuse:
+                    return 200, json.dumps([{"cmd": command, "code": 1,
+                                             "error": {"rspCode": -1}}]).encode("utf-8")
+                if param.get("op") == "ZoomPos" and not self.zoom_stuck:
+                    self.zoom_pos = param["pos"]
+                    self.focus_pos = self.focus_after_zoom.get(self.zoom_pos, 100)
+                return 200, _command_response("StartZoomFocus", None)
             return 200, _authentication_failure(command)
 
     def snapshot(self, token):
@@ -1479,10 +1507,12 @@ class ServiceFacadeTests(unittest.TestCase):
         # The clock reconcile adds exactly GetTime and SetTime: the camera's
         # displayed time and DST block, nothing that touches the picture. The
         # spotlight adds exactly GetWhiteLed and SetWhiteLed, and only ever
-        # sends `state` -- never the automation `mode` or the brightness.
+        # sends `state` -- never the automation `mode` or the brightness. The
+        # refocus nudge adds exactly GetZoomFocus and StartZoomFocus, and only
+        # ever with the zoom operation: no focus position, no autofocus mode.
         self.assertEqual(frozenset({
             "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed",
-            "Snap", "GetTime", "SetTime",
+            "Snap", "GetTime", "SetTime", "GetZoomFocus", "StartZoomFocus",
         }), ALLOWED_COMMANDS)
         self.assertIn('"WhiteLed": {"channel": 0, "state": 1 if state == "On" else 0}', text)
 

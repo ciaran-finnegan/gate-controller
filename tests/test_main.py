@@ -18,6 +18,7 @@ from gate_controller.__main__ import (
 )
 from gate_controller.actuation import ActuationCoordinator
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
+from gate_controller.camera_focus import CameraRefocusWorker
 from gate_controller.control_plane import HeartbeatWorker
 from gate_controller.command_server import CommandServerWorker
 from gate_controller.metrics import MetricsRing, MetricsRollupWorker, QuotaLedger
@@ -26,6 +27,7 @@ from gate_controller.ocr import CloudAvailability, CloudBreaker
 from gate_controller.outbox import OutboxWorker
 from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
+from gate_controller.telemetry import FrameTelemetry
 
 
 #: Absolute paths the running controller owns on the device. No unit test may
@@ -371,13 +373,125 @@ class MainConfigurationTests(unittest.TestCase):
         ) as run_worker, no_live_state_access():
             gate_main.main()
 
-        self.assertEqual(
-            run_worker.call_args.kwargs["background_workers"],
-            (base_worker, webhook_worker),
-        )
+        workers = run_worker.call_args.kwargs["background_workers"]
+        self.assertEqual(workers[:2], (base_worker, webhook_worker))
+        # The camera refocus worker ships on by default and is the only
+        # other worker main adds in this configuration.
+        self.assertEqual(len(workers), 3)
+        self.assertIsInstance(workers[2], CameraRefocusWorker)
         self.assertIs(
             run_worker.call_args.kwargs["trigger_resolver"], correlator.correlate,
         )
+
+    def test_main_feeds_each_finished_burst_to_the_refocus_worker(self):
+        """The production `process` closure is what hands frames to the trigger.
+
+        Driven through `main()`'s own wiring: a helper that nothing called
+        would pass every unit test and never see a frame on the Pi.
+        """
+        soft = tuple(
+            FrameTelemetry(
+                sequence=index, digest="a" * 64, width=3840, height=2160,
+                sharpness=0.15, brightness=0.42, darkness=0.0, highlight_clipping=0.0,
+            )
+            for index in range(3)
+        )
+        processor = Mock()
+        processor.process.return_value = Mock(
+            telemetry=Mock(trace_id="trace-1", frames=soft),
+        )
+        with patch.dict(
+            os.environ, self.isolated_state_environment(), clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers",
+            return_value=((), object(), object()),
+        ) as build_workers, patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=processor
+        ), patch.object(
+            gate_main, "_camera_ir_state", return_value="Off"
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
+            gate_main.main()
+            process = run_worker.call_args.args[1]
+            process([Path("frame.jpg")])
+
+        refocus = [
+            worker for worker in run_worker.call_args.kwargs["background_workers"]
+            if isinstance(worker, CameraRefocusWorker)
+        ]
+        self.assertEqual(1, len(refocus))
+        # The same instance the heartbeat reports.
+        self.assertIs(refocus[0], build_workers.call_args.kwargs["camera_focus"])
+        verdict = refocus[0].window.verdict()
+        self.assertEqual(3, verdict["frames"])
+        self.assertAlmostEqual(0.15, verdict["median"])
+
+    def test_main_builds_no_refocus_worker_when_it_is_off(self):
+        with patch.dict(
+            os.environ, self.isolated_state_environment(GATE_CAMERA_REFOCUS="off"), clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers",
+            return_value=((), object(), object()),
+        ) as build_workers, patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=object()
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
+            gate_main.main()
+
+        self.assertIsNone(build_workers.call_args.kwargs["camera_focus"])
+        self.assertFalse(any(
+            isinstance(worker, CameraRefocusWorker)
+            for worker in run_worker.call_args.kwargs["background_workers"]
+        ))
+
+    def test_status_carries_the_refocus_block_beside_camera_control(self):
+        store = self.create_store()
+        prompt = type("Prompt", (), {"available": False})()
+
+        class Refocus:
+            def status(self):
+                return {"mode": "on", "attempts_24h": 1}
+
+        class Broken:
+            def status(self):
+                raise RuntimeError("boom")
+
+        status = gate_main._controller_status(store, prompt, {}, camera_focus=Refocus())
+
+        self.assertEqual({"mode": "on", "attempts_24h": 1}, status["camera_focus"])
+        self.assertIn("camera_control", status)
+        # Absent when not configured, and a status that raises never costs the
+        # heartbeat.
+        self.assertNotIn("camera_focus", gate_main._controller_status(store, prompt, {}))
+        self.assertNotIn("camera_focus", gate_main._controller_status(
+            store, prompt, {}, camera_focus=Broken(),
+        ))
 
     def create_store(self):
         directory = tempfile.TemporaryDirectory()
