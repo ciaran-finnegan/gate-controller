@@ -70,7 +70,10 @@ CPU-s) for the plate look.
 ## The patch
 
 `GATE_EARLY_TRIGGER_PATCH=x,y,w,h`, frame fractions like `GATE_PLATE_REGION`.
-Default `0.02,0.26,0.32,0.32` (x 0.02-0.34, y 0.26-0.58). Laid over a live
+Default `0,0.248,0.338,0.338` since the zoom step of 2026-10-09 (the original
+`0.02,0.26,0.32,0.32` mapped through the measured x1.056 about 0.501, 0.480,
+kept square and started at the picture's left edge; see
+[the camera notes](reolink-rlc-811a.md#zoom-step-to-position-3-2026-10-09)). Laid over a live
 daytime frame (2026-09-21 06:27 UTC), the measured first-appearance box is the
 bright gap where the drive comes in, at about (0.09, 0.37), and the gravel
 below and to the right of it. The patch runs from the foreground fence to

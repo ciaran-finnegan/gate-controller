@@ -104,7 +104,12 @@ ENV_THUMBNAIL_DAYS = "GATE_EARLY_TRIGGER_THUMBNAIL_DAYS"
 #: gravel, which is the steadiest background in the picture, and only as far
 #: up as the top of the far fence, because everything above that is trees,
 #: which are the least steady. It clears the camera's clock and watermark.
-DEFAULT_PATCH = "0.02,0.26,0.32,0.32"
+#: Re-fitted on 2026-10-09 when the zoom went from position 2 to 3 (x1.056
+#: about frame point 0.501, 0.480, measured by feature matching): the patch
+#: is the same square, scaled by that factor (0.338) and started at the
+#: picture's left edge (the original's x 0.02 maps to -0.007). It was
+#: 0.02,0.26,0.32,0.32.
+DEFAULT_PATCH = "0,0.248,0.338,0.338"
 DEFAULT_SOURCE_URL = "rtsp://127.0.0.1:8554/camera"
 #: The sub stream is decoded in full whatever is sampled from it (its GOP is
 #: 4 s, so keyframes alone would be one picture every four seconds), and the

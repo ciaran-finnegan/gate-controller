@@ -422,14 +422,14 @@ true:
 
 | rule | journalled as | why |
 | --- | --- | --- |
-| the plate the on-device detector boxed is at least `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (default **220**, 4K-equivalent pixels) | `release=plate_width` | First set at 300 from the post-re-aim measurements ([camera notes](reolink-rlc-811a.md#post-re-aim-plate-measurements): 369-372 px stopped, 192-258 px approaching). Lowered to 220 on 2026-10-09 because those were one car: on 2026-10-05 a pickup was read on the device at **0.994 at 238 px** and never got wider than ~274 px, and on 2026-10-06 the same pickup stopped at the gate measured 197-217 px. The far frames that were sent and could not be read measured 160-215 px. |
+| the plate the on-device detector boxed is at least `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` wide (default **232**, 4K-equivalent pixels; 220 at zoom 2, x1.056 for the zoom step of 2026-10-09) | `release=plate_width` | First set at 300 from the post-re-aim measurements ([camera notes](reolink-rlc-811a.md#post-re-aim-plate-measurements): 369-372 px stopped, 192-258 px approaching). Lowered to 220 on 2026-10-09 because those were one car: on 2026-10-05 a pickup was read on the device at **0.994 at 238 px** and never got wider than ~274 px, and on 2026-10-06 the same pickup stopped at the gate measured 197-217 px. The far frames that were sent and could not be read measured 160-215 px. |
 | the plate has **stopped growing**: every box of the last 2 s (at least three, at least 1 s apart end to end) within 8% in width | `release=stopped` | A car that stops short of the width will not show a better plate by waiting. An arriving plate grows by roughly a quarter a second here. |
 | the **last chance**: within `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` (default **3**) of the window's end, and the whole waiting phase | `release=last_chance` | A passage that never presents a large plate, or none at all, still gets the cloud's opinion before the sweep gives up. With the 10 s window that is +7 s: room for three lookups at the 1 s spacing before the window's own fallback, and an arriving car crosses the picture in about three seconds. |
 
 The width is resolution-independent: the recogniser's box is in frame
 fractions, padded by 8% of its width each side for the OCR crop; the pad is
-taken off and the rest is scaled to 3840, so 220 means 220 px of plate in the
-camera's 4K frame (about 110 px at the 1920-wide decode the sweep reads).
+taken off and the rest is scaled to 3840, so 232 means 232 px of plate in the
+camera's 4K frame (about 116 px at the 1920-wide decode the sweep reads).
 
 What it does **not** touch:
 
@@ -481,7 +481,7 @@ source=camera_still` for a still. `off` neither holds nor journals. Read the
 `plate_px=` of each hand-over and each `stage=read` to re-fit the width.
 
 ```
-gate_local_sweep stage=cloud_held mode=on reason=small_plate plate_px=194 min_px=220 last_chance_in_ms=5200
+gate_local_sweep stage=cloud_held mode=on reason=small_plate plate_px=194 min_px=232 last_chance_in_ms=5200
 gate_local_sweep stage=cloud_handover frame=1 of=5 plate_seen=True plate_px=372 release=plate_width at_ms=2600
 gate_local_sweep outcome=ended reason=opened ... cloud_hold=on cloud_held=7
 ```
@@ -709,7 +709,7 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `80` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-120 and by `GATE_SESSION_SECONDS` (90); `0` disables. See "The sweep's read travels with its frame". |
 | `GATE_LOCAL_SWEEP_WAITING_FPS` | `2` | Reads a second while waiting (0.2-3). |
 | `GATE_LOCAL_SWEEP_CLOUD_HOLD` | `on` | `off`, `shadow` or `on`: whether the sweep's cloud hand-overs wait for a plate worth a lookup, and whether the camera's own alarm still is kept off the cloud while a sweep is reading the live stream. See "Frames not worth a lookup *yet*". |
-| `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` | `220` | The plate width, in 4K-equivalent pixels (0-3840), at which a hand-over may go. |
+| `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` | `232` | The plate width, in 4K-equivalent pixels (0-3840), at which a hand-over may go. |
 | `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` | `3` | How long before the sweep window's end the hold lifts (0-30); the waiting phase is always a last chance. |
 | `GATE_OCR_MIN_REQUEST_SECONDS` | `1.0` | The decision budget a **cloud** lookup must still have before it is worth billing. Below it the frame is skipped unbilled. Re-derive it if the uplink changes. |
 | `GATE_OCR_CLOUD_SKIP_MOVING_STILLNESS` | `0.005` | A session frame the device found no plate in still goes to the cloud when its stillness is at or below this; one moving more than this is decided `no_match` on the device's answer, unbilled. `0` disables the rule. See "Frames not worth a lookup". |
