@@ -345,6 +345,18 @@ class DepartingPlateTests(unittest.TestCase):
         self.assertFalse(judge.receding_at(99.0), "a clock that went backwards")
         self.assertFalse(DepartingPlate().receding_at(0.0))
 
+    def test_a_lapsed_verdict_is_gone_until_the_plate_recedes_again(self):
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.5))
+        judge.lapse()
+        self.assertFalse(judge.receding)
+        self.assertFalse(judge.receding_at(103.5))
+        # One more shrunk read is not enough on its own; two are, as always.
+        self.assertFalse(judge.note(180, 104.0))
+        self.assertTrue(judge.note(170, 104.5))
+
     def test_nonsense_widths_change_nothing(self):
         judge = DepartingPlate()
         judge.note(300); judge.note(300)

@@ -804,6 +804,12 @@ class DepartingPlate:
         #: Whether this passage's recession has been journalled.
         self.noticed = False
 
+    def lapse(self) -> None:
+        """End the verdict: the passage it described is over (a new alarm is in)."""
+        self.receding = False
+        self.shrunk = 0
+        self.last_at = None
+
     def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
         """Whether the plate was receding on a read no older than ``grace`` seconds."""
         if not self.receding or self.last_at is None:
@@ -1123,11 +1129,25 @@ class TriggerFrameCapture:
                         outcome = "scheduled"
                     if outcome == "scheduled":
                         self._last_scheduled_at = now
+                        # A new alarm is a new car. Whatever the last passage's
+                        # reads said about its plate receding ends here, not
+                        # when the sweep gets round to dequeuing this one:
+                        # the new car's still must not inherit it.
+                        self._lapse_departing()
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s",
             outcome, getattr(event, "event_type", "unknown"),
         )
         return outcome
+
+    def _lapse_departing(self) -> None:
+        """End the current passage's departure verdict. Never raises."""
+        try:
+            passage = self._passage
+            if passage is not None:
+                passage.departing.lapse()
+        except Exception:
+            return
 
     def _displace_early(self, item) -> bool:
         """Put a camera event in the slot in place of a queued early one. Holds ``_lock``."""
@@ -1176,10 +1196,12 @@ class TriggerFrameCapture:
         ``"on"`` or ``"shadow"`` while the sweep's latest read of the passage,
         no older than ``SWEEP_DEPARTING_GRACE_SECONDS``, says the plate is
         receding (`DepartingPlate`); None otherwise: no passage read lately, a
-        car that is not receding, or the rule switched off. Not tied to the
-        session flag, because the sweep's last hand-overs -- the fallback at
-        the window's end -- and the camera's still can reach `prepare` after
-        the session has closed. Asked by `GateProcessor.prepare` once per
+        car that is not receding, a new alarm accepted since (`on_camera_event`
+        lapses the verdict the moment it queues one, so the next car's still
+        cannot inherit it), or the rule switched off. Not tied to the session
+        flag, because the sweep's last hand-overs -- the fallback at the
+        window's end -- and the camera's still can reach `prepare` after the
+        session has closed. Asked by `GateProcessor.prepare` once per
         burst, before the burst is routed, so the answer a burst was routed
         on is the answer it is finished on. Never raises.
         """
@@ -1217,6 +1239,7 @@ class TriggerFrameCapture:
                     outcome = "skipped_busy"
                 else:
                     outcome = "scheduled"
+                    self._lapse_departing()
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s origin=%s",
             outcome, EARLY_EVENT_TYPE, ORIGIN_EARLY,

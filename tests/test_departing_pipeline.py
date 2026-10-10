@@ -25,6 +25,7 @@ it is told are close.
 """
 import unittest
 from functools import partial
+from time import monotonic
 from unittest import mock
 
 from gate_controller.local_sweep import crop_to_region
@@ -204,6 +205,38 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertIn("gate_local_sweep stage=departing mode=on", text)
         self.assertIn("gate_local_sweep outcome=ended reason=opened", text)
         self.assertEqual(gate.sweep_status()["departing"], 1)
+
+    def test_a_new_alarm_ends_the_last_cars_verdict_before_its_sweep_begins(self):
+        # The next alarm is queued by the webhook thread and dequeued by the
+        # sweep's loop later; its camera still can reach the processor in
+        # between, and must not be kept off the cloud by the car before it.
+        frames, widths = receding_passage(range(260, 268))
+        answers = {
+            digest(crop_to_region(data, REGION)): (STRANGER, 0.40) for data in frames
+        }
+        cloud = CloseOnlyCloud()
+        gate = self.gate = departing_gate(
+            self, widths_by_frame=widths, answers=answers, cloud=cloud,
+            sweep_seconds=4.0, cloud_frames=5,
+        )
+        gate.frames.script([(0.05 + index * 0.15, data) for index, data in enumerate(frames)])
+
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(wait_for(
+                lambda: "gate_local_sweep stage=departing" in logs.text(), 4.0,
+            ), logs.text())
+            self.assertEqual(gate.capture.departing_skip(), "on")
+            # Past the capture's minimum interval between alarms.
+            wait_for(lambda: monotonic() - started >= 0.6, 1.0)
+            gate.alarm()
+            self.assertIsNone(gate.capture.departing_skip(), "the next car inherited the verdict")
+            self.assertTrue(wait_for(
+                lambda: logs.text().count("gate_local_sweep outcome=ended") >= 2, 12.0,
+            ), logs.text())
+
+        self.assertEqual(gate.relay_calls, [])
 
     def test_shadow_journals_the_skip_and_sends_the_frame_as_before(self):
         frames, widths = receding_passage(range(240, 248))
