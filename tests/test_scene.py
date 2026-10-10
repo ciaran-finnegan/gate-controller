@@ -133,3 +133,126 @@ class SceneBaselineTests(unittest.TestCase):
             SceneBaseline(refresh_seconds=0)
         with self.assertRaises(ValueError):
             SceneBaseline(idle_seconds=-1)
+
+
+class WaitingCarTests(unittest.TestCase):
+    """2026-10-10 10:05:38 and 10:07:34: the D-Max parked at the stop, half the
+    picture, became the idle baseline 60-90 s after the last alarm, and the
+    next alarm's sweep skipped its frames unread as "empty". The on-device
+    detector now stands between a keyframe and the baseline.
+    """
+
+    def setUp(self):
+        self.clock = [1000.0]
+        self.asked = []
+        self.empty = jpeg((120, 120, 120))
+        self.car = jpeg_with_car()
+
+    def scene(self, check):
+        def vehicle_check(frame):
+            self.asked.append(frame)
+            return check(frame)
+
+        return SceneBaseline(
+            idle_seconds=60, refresh_seconds=30, clock=lambda: self.clock[0],
+            vehicle_check=vehicle_check,
+        )
+
+    def test_a_keyframe_the_detector_boxes_a_plate_in_is_refused_and_the_old_baseline_kept(self):
+        scene = self.scene(lambda frame: frame == self.car)
+        self.assertTrue(scene.observe(self.empty), "the empty drive is adopted")
+        self.clock[0] += 90.0  # the car has stood there since the last alarm
+        with self.assertLogs("gate_controller.scene", level="INFO") as logs:
+            self.assertFalse(scene.observe(self.car), "a boxed plate never becomes the idle drive")
+        self.assertEqual(self.asked, [self.empty, self.car])
+        # The baseline is still the empty drive, so the car's frames differ from it: read.
+        self.assertGreater(scene.difference(self.car), 0.08)
+        self.assertLess(scene.difference(self.empty), 0.03)
+        status = scene.status()
+        self.assertEqual((status["refreshes"], status["refused_vehicle"]), (1, 1))
+        self.assertEqual(status["age_seconds"], 90.0)
+        self.assertIn("gate_scene_baseline outcome=refresh_refused reason=plate_box refused=1",
+                      logs.output[0])
+
+    def test_a_detector_that_cannot_answer_keeps_the_old_baseline(self):
+        # Not ready, busy with a sweep frame, timed out, or raising: none of
+        # those is "no car here". A stale picture of the empty drive makes a
+        # car's frames differ -- the safe side -- so the refresh waits.
+        answers = iter([False, None, RuntimeError("engine")])
+
+        def check(_frame):
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        scene = self.scene(check)
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 60.0
+        self.assertFalse(scene.observe(self.car), "no answer is not an empty drive")
+        self.clock[0] += 60.0
+        self.assertFalse(scene.observe(self.car), "nor is a failure")
+        self.assertGreater(scene.difference(self.car), 0.08)
+        status = scene.status()
+        self.assertEqual(status["refreshes"], 1)
+        self.assertEqual((status["refused_vehicle"], status["refused_unanswered"]), (0, 2))
+
+    def test_an_empty_frame_is_still_adopted_when_the_detector_finds_nothing(self):
+        scene = self.scene(lambda frame: False)
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 30.0
+        later = jpeg((110, 110, 110))
+        self.assertTrue(scene.observe(later), "the light changed; the empty drive is refreshed")
+        self.assertLess(scene.difference(jpeg((111, 111, 111))), 0.03)
+        self.assertEqual(scene.status()["refreshes"], 2)
+        self.assertEqual(scene.status()["refused_vehicle"], 0)
+
+    def test_without_a_detector_every_idle_frame_is_adopted_as_before(self):
+        scene = SceneBaseline(idle_seconds=60, refresh_seconds=30, clock=lambda: self.clock[0])
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 30.0
+        self.assertTrue(scene.observe(self.car))
+        self.assertEqual(scene.status()["refused_vehicle"], 0)
+
+    def test_the_detector_is_asked_no_more_often_than_a_refresh_could_happen(self):
+        # The decoded keyframe ring offers a frame every second; a car that
+        # waits must not cost a detector read a second.
+        scene = self.scene(lambda frame: frame == self.car)
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 60.0
+        for _second in range(45):
+            scene.observe(self.car)
+            self.clock[0] += 1.0
+        self.assertEqual(len(self.asked), 3, "once for the empty frame, then once per 30 s")
+        self.assertEqual(scene.status()["refused_vehicle"], 2)
+
+    def test_refusals_are_journalled_once_per_rate_limit_with_the_count_between(self):
+        from gate_controller.scene import REFUSAL_LOG_SECONDS
+        scene = self.scene(lambda frame: frame == self.car)
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 60.0
+        with self.assertLogs("gate_controller.scene", level="INFO") as logs:
+            # A car waiting ten minutes: twenty refusals at the 30 s cadence,
+            # the first at once and the next when the rate limit has passed.
+            for _refresh in range(20):
+                scene.observe(self.car)
+                self.clock[0] += 30.0
+        self.assertEqual(scene.status()["refused_vehicle"], 20)
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("reason=plate_box refused=1 ", logs.output[0])
+        self.assertIn(f"refused={int(REFUSAL_LOG_SECONDS // 30)} ", logs.output[1])
+
+    def test_a_dark_frame_with_a_boxed_plate_does_not_become_the_dark_baseline_either(self):
+        # A car whose plate lamp is the only light in the picture: the dark
+        # frame is never skipped unread anyway, and it is not the unlit drive.
+        scene = self.scene(lambda frame: frame == night_jpeg(lamp=True))
+        self.assertTrue(scene.observe(night_jpeg()))
+        self.clock[0] += 60.0
+        self.assertFalse(scene.observe(night_jpeg(lamp=True)))
+        self.assertEqual(scene.status()["dark_age_seconds"], 60.0)
+        self.assertTrue(scene.status()["dark_available"])
+
+    def test_an_undecodable_frame_never_reaches_the_detector(self):
+        scene = self.scene(lambda frame: False)
+        self.assertFalse(scene.observe(b"not a jpeg"))
+        self.assertEqual(self.asked, [])

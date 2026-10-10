@@ -988,7 +988,8 @@ class ClearKeyframeBuffer(HotStreamBuffer):
     is stale.
     """
 
-    def __init__(self, capture_config: TriggerCaptureConfig, **kwargs) -> None:
+    def __init__(self, capture_config: TriggerCaptureConfig, *, vehicle_check=None,
+                 **kwargs) -> None:
         super().__init__(
             HotStreamConfig(
                 enabled=True,
@@ -1014,7 +1015,10 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "-vf", ",".join(decoder_filters(capture_config, sample=True)),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
-        self.scene = SceneBaseline(clock=self._clock)
+        # The detector gate on the baseline (scene.py). This ring offers every
+        # decoded keyframe, one a second; the baseline asks the detector no
+        # more often than it could refresh.
+        self.scene = SceneBaseline(clock=self._clock, vehicle_check=vehicle_check)
         self._decode = {
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
@@ -1204,12 +1208,7 @@ class TriggerFrameCapture:
             outcome = "skipped_type"
         else:
             now = self._clock()
-            note_activity = getattr(self._frame_source, "note_activity", None)
-            if callable(note_activity):
-                try:
-                    note_activity()
-                except Exception:
-                    pass
+            self._note_source_activity()
             # A vehicle alarm is a car in view, whether or not a sweep is
             # scheduled for it (one inside the minimum interval is not).
             # Whatever the last passage's reads said about its plate receding
@@ -1920,6 +1919,10 @@ class TriggerFrameCapture:
             newest = (frame, captured_at, digest, read)
             plate_px = _plate_px(read)
             if plate_px is not None:
+                # A boxed plate is a car in view as surely as an alarm is, and
+                # a car that waits raises none: the idle clock behind the
+                # scene baseline starts from this read, not the last alarm.
+                self._note_source_activity()
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
                 if read.recognised:
@@ -2642,6 +2645,15 @@ class TriggerFrameCapture:
             raise
         self._capture_count += 1
         return True
+
+    def _note_source_activity(self) -> None:
+        """Tell the frame source the drive is busy, so its baseline waits."""
+        note_activity = getattr(self._frame_source, "note_activity", None)
+        if callable(note_activity):
+            try:
+                note_activity()
+            except Exception:
+                pass
 
     def _scene_difference(self, frame: bytes) -> float | None:
         return self._source_difference("scene_difference", frame)

@@ -145,6 +145,21 @@ read on two frames.
   closed the older hole on a quiet night, where the baseline is itself black
   and three *unread* black looks used to end the wait, or the window: a dark
   frame always goes to the reader now, in the window and while waiting.
+- **2026-10-10 10:05:38 and 10:07:34** -- a car that waits raises no alarm,
+  and "idle" was measured from the last alarm. The D-Max `172-L-66` sat at
+  the stop, half the picture, through the 60 s of quiet after its alarm; the
+  keyframe decoder's 30 s refresh adopted it as the idle drive, and the next
+  alarm's sweep skipped its frames unread as "empty" (the samples #203 kept
+  show the car, judged empty; 9 Oct 12:35 -- 17 frames, 3 reads, the first
+  at +9.7 s -- and 8 Oct 10:24 -- 10 frames, 0 reads -- went the same way).
+  A frame is now shown to the on-device plate detector before it becomes the
+  baseline; one with a plate box in it is refused and the old baseline kept,
+  and so is one the detector cannot answer for (not ready, busy with a sweep
+  frame, failed), because a stale picture of the *empty* drive makes a car's
+  frames differ, which is to say read. A sweep read that boxes a plate also
+  counts as activity, so the idle clock runs from the last sight of the car,
+  not the last alarm. Without a local recogniser there is no detector and
+  the baseline refreshes as before.
 
 Guards:
 
@@ -155,6 +170,13 @@ Guards:
 - `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_black_drive_with_no_dark_idle_frame_on_record_is_read_to_the_cap`
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_boxed_plate_in_the_dark_starts_the_run_again`
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_failed_read_in_the_dark_is_not_an_empty_drive`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_car_waiting_at_the_gate_through_the_idle_refresh_is_read_on_the_next_alarm`
+  (the 10 Oct morning: alarm → sweep of misreads → 90 s of quiet with the
+  car offered as the idle drive → second alarm, read and let in once)
+- `tests/test_scene.py::WaitingCarTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_refused_and_the_old_baseline_kept`
+- `tests/test_scene.py::WaitingCarTests::test_a_detector_that_cannot_answer_keeps_the_old_baseline`
+- `tests/test_scene.py::WaitingCarTests::test_an_empty_frame_is_still_adopted_when_the_detector_finds_nothing`
+- `tests/test_clear_stream_source.py::ClearStreamSourceTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_never_adopted_as_the_idle_drive`
 
 ## 7. The camera lens is never left changed
 
