@@ -472,7 +472,24 @@ shows an empty plate band, either because the alarm fired before the vehicle
 entered the picture or because it has already left, and is skipped as
 `gate_trigger_capture outcome=skipped_empty_scene scene_difference=…`. Inside
 a presence session an empty frame is the departure signal and ends the
-session with `reason=departed`. Every captured frame journals its
+session with `reason=departed`.
+
+The baseline is the drive under whatever light it had at the refresh. After
+dark that light is the camera's own spotlight, which comes on with motion
+before the alarm and goes off some 20 s after the last of it, so the baseline
+in force during a night passage is usually a *lit* drive and a black frame
+(the spotlight off, the IR illuminator off) is 0.385 away from it -- the
+2026-10-09 21:42 sweep read 152 black frames of an empty drive to its cap for
+exactly that reason. The decoder therefore also remembers the newest dark
+idle frame (thumbnail mean under 20 of 255; the black stills measure 7.4) and
+answers `dark_scene_difference` for a dark frame against it (black against
+black: 0.0013). Only the sweep's waiting phase asks, and only together with
+the reader's own verdict on the frame, because a plate lamp is below what a
+96x54 thumbnail can see; see
+[local-recognition.md](local-recognition.md). The scene block of the status
+reports `dark_available` and `dark_age_seconds` beside the baseline's own.
+
+Every captured frame journals its
 `scene_difference=`, `clipping=` (the fraction of near-white pixels) and
 `flat_fraction=` so the thresholds can be chosen from real captures; set
 `GATE_MAX_HIGHLIGHT_CLIPPING` (default `0`, off) to skip headlight- or

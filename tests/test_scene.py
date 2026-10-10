@@ -3,12 +3,36 @@ from io import BytesIO
 
 from PIL import Image
 
-from gate_controller.scene import SceneBaseline, frame_thumbnail, thumbnail_difference
+from gate_controller.scene import (
+    DARK_THUMBNAIL_LUMA, SceneBaseline, frame_thumbnail, is_dark, thumbnail_difference,
+)
 
 
 def jpeg(color, size=(192, 108)):
     output = BytesIO()
     Image.new("RGB", size, color=color).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def night_jpeg(noise=0, lamp=False, size=(192, 108)):
+    """The drive with the spotlight off: near-black, the camera's white overlay
+    text at the top, sensor noise, and optionally a plate lamp's worth of light.
+
+    The real black stills of 2026-10-09 measure a thumbnail mean of 7.4.
+    """
+    image = Image.new("RGB", size, color=(6, 6, 6))
+    for x in range(70, 110):
+        image.putpixel((x, 2), (220, 220, 220))
+    for index in range(noise):
+        x, y = (index * 37) % size[0], 10 + (index * 53) % (size[1] - 10)
+        image.putpixel((x, y), (14, 14, 14))
+    if lamp:
+        # A lit plate: roughly the fraction of a 4K frame a 232 px plate covers.
+        for x in range(90, 102):
+            for y in range(60, 63):
+                image.putpixel((x, y), (200, 200, 200))
+    output = BytesIO()
+    image.save(output, format="JPEG")
     return output.getvalue()
 
 
@@ -59,6 +83,50 @@ class SceneBaselineTests(unittest.TestCase):
         scene.observe(jpeg((120, 120, 120)))
         self.assertIsNone(scene.difference(b"not a jpeg"))
         self.assertEqual(thumbnail_difference([], [1]), 1.0)
+
+    def test_a_lit_refresh_does_not_forget_the_dark_drive(self):
+        # 2026-10-09 21:41-21:42: the drive had been dark for an hour, the
+        # spotlight came on with motion a minute before the alarm, the
+        # baseline was refreshed under it, and once the car took the light
+        # away every black frame was "not the idle scene".
+        clock = [1000.0]
+        scene = SceneBaseline(idle_seconds=60, refresh_seconds=30, clock=lambda: clock[0])
+        self.assertTrue(scene.observe(night_jpeg()))
+        self.assertTrue(scene.status()["dark_available"])
+        clock[0] += 30
+        self.assertTrue(scene.observe(jpeg((110, 110, 110))), "the spotlit refresh")
+        black = night_jpeg(noise=40)
+
+        self.assertGreater(scene.difference(black), 0.3, "the lit baseline is no help")
+        self.assertLess(scene.dark_difference(black), 0.03, "the dark one is")
+        status = scene.status()
+        self.assertEqual((status["age_seconds"], status["dark_age_seconds"]), (0.0, 30.0))
+
+    def test_a_dark_frame_is_only_scored_against_a_dark_idle_frame(self):
+        scene = SceneBaseline(clock=lambda: 0.0)
+        self.assertIsNone(scene.dark_difference(night_jpeg()), "no baseline at all")
+        scene.observe(jpeg((110, 110, 110)))
+        self.assertIsNone(scene.dark_difference(night_jpeg()), "no dark baseline yet")
+        scene.observe(night_jpeg(), now=100.0)
+        self.assertIsNone(scene.dark_difference(jpeg((110, 110, 110))), "a lit frame is not dark")
+        self.assertIsNone(scene.dark_difference(b"not a jpeg"))
+        self.assertIsNotNone(scene.dark_difference(night_jpeg(noise=10)))
+
+    def test_a_plate_lamp_is_below_what_a_thumbnail_can_see(self):
+        # Which is why a dark match is never, on its own, "nothing to read":
+        # the sweep asks the reader before it concludes anything from one.
+        scene = SceneBaseline(clock=lambda: 0.0)
+        scene.observe(night_jpeg())
+        lamp = frame_thumbnail(night_jpeg(lamp=True))
+        self.assertTrue(is_dark(lamp))
+        self.assertLess(scene.dark_difference(night_jpeg(lamp=True)), 0.03)
+
+    def test_the_dark_floor_sits_between_the_measured_scenes(self):
+        # Black stills 7.4-7.5; the same drive under the spotlight 71-106.
+        self.assertLess(sum(frame_thumbnail(night_jpeg())) / (96 * 54), DARK_THUMBNAIL_LUMA)
+        self.assertTrue(is_dark(frame_thumbnail(night_jpeg(noise=200))))
+        self.assertFalse(is_dark(frame_thumbnail(jpeg((40, 40, 40)))))
+        self.assertFalse(is_dark(frame_thumbnail(jpeg((110, 110, 110)))))
 
     def test_timings_are_validated(self):
         with self.assertRaises(ValueError):

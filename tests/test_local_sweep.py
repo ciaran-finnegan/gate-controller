@@ -486,6 +486,100 @@ class LocalSweepTests(unittest.TestCase):
         self.assertLess(self.clock.now, 103.0)
         self.assertEqual(sweep.reads, [], "an empty drive is never worth a read")
 
+    class _DarkDrive(FrameSource):
+        """The scene of 2026-10-09 21:42: a spotlit baseline, a black picture."""
+
+        def scene_difference(self, frame):
+            return 0.385
+
+        def dark_scene_difference(self, frame):
+            return 0.0013
+
+    def _dark_capture(self, frames, sweep, *, waiting=30.0):
+        return self._capture(
+            self._DarkDrive(self.clock, frames), sweep, seconds=2.0, fallback=0,
+            waiting=waiting, waiting_fps=2.0, empty_scene=0.03,
+        )
+
+    def test_a_dark_drive_the_reader_finds_nothing_in_ends_the_waiting_after_ten_looks(self):
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
+        sweep = ScriptedSweep({})
+        capture = self._dark_capture(frames, sweep)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("stage=departed_dark frames=%d" % SWEEP_DARK_DEPARTED_FRAMES, output)
+        self.assertIn("reason=departed", output)
+        # The window (2 s) then ten looks at two a second, give or take a slice.
+        self.assertGreaterEqual(self.clock.now, 102.0 + (SWEEP_DARK_DEPARTED_FRAMES - 1) / 2.0)
+        self.assertLess(self.clock.now, 102.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 1.0)
+        self.assertGreaterEqual(len(sweep.reads), SWEEP_DARK_DEPARTED_FRAMES + 1,
+                                "dark frames are read, never skipped unread")
+        self.assertEqual(capture.status()["sweep"]["dark_departed"], 1)
+
+    def test_a_dark_match_before_the_window_closes_counts_for_nothing(self):
+        # Ten dark, unread frames inside the window are not a departure: the
+        # rule is about the waiting phase, and the window ends on its own.
+        frames = [(100.0 + index * 0.1, jpeg(seed=index)) for index in range(300)]
+        capture = self._dark_capture(frames, ScriptedSweep({}), waiting=0.0)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("stage=departed_dark", output)
+        self.assertIn("reason=window", output)
+        self.assertGreaterEqual(self.clock.now, 102.0)
+
+    def test_a_boxed_plate_in_the_dark_starts_the_run_again(self):
+        # A plate lamp: the reader boxes a plate it cannot read a character
+        # of, every few frames. That is a car, and it is read to the cap.
+        # 0.4 s apart so the waiting phase, which looks only at the newest
+        # frame twice a second, sees every one; boxed every fifth, 2 s apart.
+        frames = [(100.0 + index * 0.4, jpeg(seed=index)) for index in range(100)]
+        boxed = SweepRead(
+            status="no_plate", read_ms=170.0,
+            recognition=LocalRecognition(box=(0.45, 0.5, 0.08, 0.03), status="no_plate"),
+        )
+        self.assertIsNotNone(boxed.plate_px)
+        answers = {frame: boxed for index, (_at, frame) in enumerate(frames) if index % 5 == 0}
+        sweep = ScriptedSweep(answers)
+        capture = self._dark_capture(frames, sweep, waiting=12.0)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("stage=departed_dark", output)
+        self.assertIn("reason=wait_cap", output)
+        self.assertGreaterEqual(self.clock.now, 114.0)
+        self.assertEqual(capture.status()["sweep"]["dark_departed"], 0)
+
+    def test_a_busy_reader_neither_counts_toward_nor_breaks_a_dark_run(self):
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
+        # Every other frame the reader is busy; it has said nothing about it.
+        answers = {
+            frame: SweepRead(status="unavailable") for index, (_at, frame) in enumerate(frames)
+            if index % 2
+        }
+        sweep = ScriptedSweep(answers)
+        capture = self._dark_capture(frames, sweep)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("stage=departed_dark frames=%d" % SWEEP_DARK_DEPARTED_FRAMES, output)
+        self.assertIn("reason=departed", output)
+
+    def test_a_failed_read_in_the_dark_is_not_an_empty_drive(self):
+        # Only a read that completed and found nothing counts; an error says
+        # nothing about the picture, and a run of them is read to the cap.
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
+        sweep = ScriptedSweep({frame: SweepRead(status="error") for _at, frame in frames})
+        capture = self._dark_capture(frames, sweep, waiting=8.0)
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("stage=departed_dark", output)
+        self.assertIn("reason=wait_cap", output)
+
     def test_no_more_than_one_authorised_frame_is_ever_outstanding(self):
         frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(12)]
         source = FrameSource(self.clock, frames)

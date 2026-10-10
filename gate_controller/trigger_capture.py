@@ -192,6 +192,20 @@ DEFAULT_SESSION_SECONDS = 90.0
 # the vehicle has gone. One could be a decoder hiccup; three at one a second
 # is three seconds of empty drive.
 SWEEP_DEPARTED_FRAMES = 3
+# The same conclusion in the dark, where the idle baseline is no help on its
+# own. At night the only light is the camera's spotlight, which comes on with
+# motion before the alarm and goes off some 20 s after the last of it, so the
+# baseline was refreshed under it and a black frame never matches it: on
+# 2026-10-09 21:42 the sweep read 152 black frames of a drive the Audi had
+# left (8 Oct 19:27: 157). A black frame does match the newest *dark* idle
+# frame (`SceneBaseline.dark_difference`, measured 0.0013 against 0.03), but a
+# plate lamp is too small to move a thumbnail, so such a frame is still read,
+# and only a read that found neither a plate nor a plate box counts. Ten
+# of those in a row while waiting -- 5 s at two a second, against the 1.5 s
+# the lit rule takes -- is a dark drive with nothing in it to read. A box, a
+# read, a lit frame or a busy reader breaks the run; a car whose plate is
+# lit at all is read to the cap exactly as before.
+SWEEP_DARK_DEPARTED_FRAMES = 10
 # How finely a paced wait is sliced, so a new alarm, an open or a shutdown is
 # noticed within this long however slow the cadence.
 SWEEP_PACE_SLICE_SECONDS = 0.25
@@ -817,6 +831,9 @@ class ClearKeyframeBuffer(HotStreamBuffer):
     def scene_difference(self, frame: bytes) -> float | None:
         return self.scene.difference(frame)
 
+    def dark_scene_difference(self, frame: bytes) -> float | None:
+        return self.scene.dark_difference(frame)
+
     def status(self) -> dict:
         status = super().status()
         status.update({
@@ -874,6 +891,8 @@ class TriggerFrameCapture:
         # although `on` would have held them (`shadow`).
         self._sweep_cloud_held = 0
         self._sweep_waiting_reads = 0
+        # Waiting phases ended by the dark-drive rule (SWEEP_DARK_DEPARTED_FRAMES).
+        self._sweep_dark_departed = 0
         self._sweep_last_read_ms: float | None = None
         self.output_directory = config.output_directory
         self._popen = popen
@@ -1263,6 +1282,9 @@ class TriggerFrameCapture:
         fallback = 0
         fallback_done = False
         consecutive_empty = 0
+        # Dark frames in a row, while waiting, that matched the dark idle
+        # scene *and* the reader found nothing in. See SWEEP_DARK_DEPARTED_FRAMES.
+        consecutive_dark = 0
         # Every frame this sweep has handed to the pipeline, by content. The
         # pipeline's identity for a frame *is* its content, so handing the
         # same bytes over twice can only ever come back `duplicate_event`.
@@ -1566,6 +1588,16 @@ class TriggerFrameCapture:
                         break
                 continue
             consecutive_empty = 0
+            # Not the idle scene the baseline knows -- but at night that may
+            # only mean the spotlight has gone off since the baseline was
+            # taken. Ask the dark baseline too; the answer is used only after
+            # the reader has had this frame, below.
+            dark_difference = self._dark_scene_difference(frame) if waiting else None
+            dark_match = (
+                dark_difference is not None
+                and config.empty_scene_threshold > 0
+                and dark_difference < config.empty_scene_threshold
+            )
             # The session decoder resamples to a fixed rate. When the camera is
             # delivering less than that -- measured at 4.5 fps against a
             # configured 6 -- the resampler makes the difference up by
@@ -1592,6 +1624,23 @@ class TriggerFrameCapture:
             if plate_px is not None:
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
+            # A dark frame that is the unlit idle drive to the baseline and
+            # nothing to the reader: no characters and no box, from a read
+            # that completed. Anything else -- a plate, a box, a lit frame, a
+            # frame the dark baseline cannot speak to -- starts the run again.
+            if dark_match and read.status == "no_plate" and plate_px is None:
+                consecutive_dark += 1
+                if consecutive_dark >= SWEEP_DARK_DEPARTED_FRAMES:
+                    self._sweep_dark_departed += 1
+                    LOGGER.info(
+                        "gate_local_sweep stage=departed_dark frames=%d "
+                        "dark_difference=%.4f waiting_reads=%d",
+                        consecutive_dark, dark_difference, waiting_reads,
+                    )
+                    reason = "departed"
+                    break
+            else:
+                consecutive_dark = 0
             if read.recognised:
                 blank = 0
                 plate_reads += 1
@@ -2254,7 +2303,14 @@ class TriggerFrameCapture:
         return True
 
     def _scene_difference(self, frame: bytes) -> float | None:
-        difference = getattr(self._frame_source, "scene_difference", None)
+        return self._source_difference("scene_difference", frame)
+
+    def _dark_scene_difference(self, frame: bytes) -> float | None:
+        """The frame against the dark idle scene; None unless both are dark."""
+        return self._source_difference("dark_scene_difference", frame)
+
+    def _source_difference(self, name: str, frame: bytes) -> float | None:
+        difference = getattr(self._frame_source, name, None)
         if not callable(difference):
             return None
         try:
@@ -2377,6 +2433,7 @@ class TriggerFrameCapture:
                 "waiting_seconds": self.config.sweep_waiting_seconds,
                 "waiting_fps": self.config.sweep_waiting_fps,
                 "waiting_reads": self._sweep_waiting_reads,
+                "dark_departed": self._sweep_dark_departed,
                 "last_read_ms": (
                     None if self._sweep_last_read_ms is None
                     else round(self._sweep_last_read_ms)
