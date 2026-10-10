@@ -76,6 +76,10 @@ MOVEMENT_LOOKBACK = 12
 #: threshold must have been *heard*, not merely elapsed.
 MIN_HEARD_FRACTION = 0.8
 
+#: The longest segment the recorder can be configured to write
+#: (`GATE_AUDIO_SEGMENTS_SECONDS`, audio_segments.py), plus a minute of slack.
+MAX_SEGMENT_SECONDS = 3660
+
 LIKELY = "likely"
 POSSIBLE = "possible"
 
@@ -169,10 +173,14 @@ def _heard(connection, since: datetime, until: datetime) -> tuple[float, datetim
     pro rata. The second value is the end of the newest scanned span: past it
     nothing has been listened to yet, so nothing past it is silence.
     """
+    # Selected by overlap, not by start: a segment that began before `since`
+    # can cover the whole threshold. The recorder allows segments of up to an
+    # hour (`GATE_AUDIO_SEGMENTS_SECONDS`), so anything that could overlap
+    # started at most that long before.
     rows = connection.execute(
         "SELECT started_at, span_seconds, audio_seconds FROM gate_listening"
-        " WHERE started_at >= ? ORDER BY started_at LIMIT 500",
-        ((since - timedelta(minutes=10)).isoformat(),),
+        " WHERE started_at >= ? AND started_at <= ? ORDER BY started_at LIMIT 500",
+        ((since - timedelta(seconds=MAX_SEGMENT_SECONDS)).isoformat(), until.isoformat()),
     ).fetchall()
     heard = 0.0
     reach = None

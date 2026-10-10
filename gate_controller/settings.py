@@ -100,6 +100,9 @@ class MatchPolicyCache:
         # the schedule and must never be able to change it: nothing about it
         # is validated here, and nothing here raises over it.
         self._left_open_section: object = None
+        self._left_open_path = (
+            self._path.with_name("gate-left-open.json") if self._path is not None else None
+        )
         self._load_cached()
 
     def get(self) -> MatchPolicy:
@@ -139,9 +142,22 @@ class MatchPolicyCache:
             self._last_error = None
 
     def _keep_left_open_section(self, document: object) -> None:
+        """Adopt the envelope's left-open section, and keep it for a restart.
+
+        Persisted on its own, beside the schedule's cache, because the two are
+        accepted independently: an envelope whose schedule is refused is not
+        cached, and restoring the left-open switch from that older cache would
+        undo a change the owner made in the same envelope.
+        """
         section = document.get("gate_left_open") if isinstance(document, dict) else None
+        section = section if isinstance(section, dict) else None
         with self._lock:
-            self._left_open_section = section if isinstance(section, dict) else None
+            changed = section != self._left_open_section
+            self._left_open_section = section
+        if changed and self._left_open_path is not None:
+            encoded = json.dumps({"gate_left_open": section}, sort_keys=True, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) <= MAX_SETTINGS_BYTES:
+                _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
 
     def gate_left_open(self, fallback):
         """The left-open alert's switch and threshold, or ``fallback``.
@@ -214,17 +230,23 @@ class MatchPolicyCache:
         )
 
     def _load_cached_left_open(self) -> None:
-        """The last envelope's left-open section, so a restart keeps it."""
-        if self._path is None or not self._path.exists():
+        """The last left-open section received, so a restart keeps it.
+
+        Its own file first; the schedule's cached envelope only for a board
+        that has never written one.
+        """
+        for path in (self._left_open_path, self._path):
+            if path is None or not path.exists():
+                continue
+            try:
+                if path.stat().st_size > MAX_SETTINGS_BYTES:
+                    continue
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            section = document.get("gate_left_open") if isinstance(document, dict) else None
+            self._left_open_section = section if isinstance(section, dict) else None
             return
-        try:
-            if self._path.stat().st_size > MAX_SETTINGS_BYTES:
-                return
-            document = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        section = document.get("gate_left_open") if isinstance(document, dict) else None
-        self._left_open_section = section if isinstance(section, dict) else None
 
     def _persist(self, document: object) -> None:
         if self._path is None:

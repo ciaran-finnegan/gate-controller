@@ -249,6 +249,38 @@ class LeftOpenThroughTheHeartbeat(unittest.TestCase):
         self.assertEqual(left_open["threshold_minutes"], 30)
         self.assertEqual(left_open["state"], "clear", "12 minutes is inside a 30-minute threshold")
 
+    def test_a_switch_sent_beside_a_refused_schedule_survives_a_restart(self):
+        """The two halves of the envelope are accepted independently."""
+        path = Path(self.directory.name) / "match-policy.json"
+        MatchPolicyCache(path).replace({
+            "controller_id": "primary", "settings_version": 1,
+            "gate_left_open": {"enabled": True, "threshold_minutes": 10},
+        })
+        MatchPolicyCache(path).replace({
+            "controller_id": "primary", "settings_version": 1,
+            "plate_matching": {"schema_version": 99},
+            "gate_left_open": {"enabled": False, "threshold_minutes": 10},
+        })
+
+        restarted = MatchPolicyCache(path)
+
+        self.assertFalse(restarted.gate_left_open(LeftOpenConfig()).enabled)
+        self.assertIsNotNone(restarted.status()["last_error"], "the schedule was refused")
+
+    def test_an_hour_long_segment_that_began_before_the_movement_still_counts(self):
+        """GATE_AUDIO_SEGMENTS_SECONDS may be up to 3600."""
+        self.scan(NINTH_OF_OCTOBER)
+        start = LAST_HEARD - timedelta(minutes=40)
+        record(self.connection, [], [], listening=Listening(({
+            "segment": "gate-long.aac", "started_at": start, "span_seconds": 3600.0,
+            "audio_seconds": 3600.0, "missing_seconds": 0.0,
+        },), ()))
+
+        left_open = self.heartbeat(LAST_HEARD + timedelta(minutes=25))["gate"]["left_open"]
+
+        self.assertEqual(left_open["state"], "open")
+        self.assertEqual(left_open["confidence"], LIKELY)
+
     def test_a_malformed_setting_changes_nothing_about_plate_matching(self):
         """The section shares the schedule's envelope and must never fail it closed."""
         cache = MatchPolicyCache(Path(self.directory.name) / "match-policy.json")
