@@ -12,7 +12,7 @@ from PIL import Image
 
 from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.models import MatchDecision, ProcessingResult
-from gate_controller.trigger_capture import DepartingPlate
+from gate_controller.trigger_capture import ORIGIN_EARLY, DepartingPlate, SweepPassage
 from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
     TriggerFrameCapture,
@@ -427,6 +427,34 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(receding(), "on")
         self.assertEqual(capture.on_camera_event(event(event_type="manual_test")), "skipped_type")
         self.assertEqual(capture.departing_skip(), "on", "a manual test is not a car")
+
+    def test_the_alarm_that_confirms_an_early_passage_keeps_its_measurement(self):
+        # With the early trigger on, the camera's alarm for a passage the
+        # trigger already started is that passage's confirmation, which
+        # `local_sweep` takes as an upgrade: not a new car, nothing to start
+        # over. Once confirmed, the next alarm is a new car as usual.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            min_interval_seconds=1.0, sweep_departing_skip="on",
+        )
+        capture._passage = SweepPassage(ORIGIN_EARLY)
+        judge = capture._passage.departing
+        for width in (320, 320, 200, 190):
+            judge.note(width, clock["now"])
+        self.assertEqual(capture.departing_skip(), "on")
+
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertEqual(capture.departing_skip(), "on", "the confirmation wiped the passage")
+        self.assertEqual(judge.peak_px, 320)
+
+        capture._passage.confirm(clock["now"])
+        capture._queue.get_nowait()  # what the sweep's loop would have taken as the upgrade
+        clock["now"] += 2.0
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip())
+        self.assertEqual(judge.peak_px, 0)
 
     def test_captured_frame_is_injected_with_a_sanitized_matched_trigger(self):
         capture, popen = self.capture([FakeProcess(output=jpeg())])

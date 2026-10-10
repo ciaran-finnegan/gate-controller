@@ -3270,6 +3270,32 @@ class InternetDownTests(unittest.TestCase):
                 sum("cloud_skipped reason=departing" in line for line in journal.output), 3,
             )
 
+    def test_a_departing_frame_the_device_could_not_read_still_never_posts(self):
+        # A later frame of the burst whose on-device pass failed (no state to
+        # carry) must answer "no plate", not fall through to the cloud: the
+        # burst is on the burst thread and a departure never posts.
+        class FailingLater(TwoPhaseRecognizer):
+            def local_pass(self, path, *, trace_id=None, budget=None):
+                passed = super().local_pass(path, trace_id=trace_id, budget=budget)
+                return passed if len(self.local_calls) == 1 else LocalPass(state=None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+            )
+            recognizer = FailingLater(cloud_observation=PlateObservation("12D3456", 0.99))
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertEqual(prepared.offline, "departing")
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "an unread departing frame posted")
+
     def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

@@ -90,6 +90,13 @@ CLOUD_SKIP_SWEEP_READING = "sweep_reading"
 # can decide nothing; the device's read of the frame stands, exactly as for
 # `sweep_reading`. Decided once per burst in `prepare`, before routing.
 CLOUD_SKIP_DEPARTING = "departing"
+# Reasons a burst is kept off the lane for which no frame of it may post at
+# all, even one the device could not read: a departing car's frame the device
+# failed on answers "no plate" rather than falling through to the cloud. (The
+# link-down reasons are different: there the recogniser's own call asks the
+# availability predicate itself, which is how `GATE_LOCAL_OCR_CLOUD=always`
+# still gets its on-device answer.)
+OFFLINE_NEVER_POSTS = frozenset({CLOUD_SKIP_DEPARTING})
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -1452,14 +1459,17 @@ class GateProcessor:
                 if on_start is not None:
                     on_start(started)
                 return attempt.observation
-        if offline is not None and _device_read(attempt):
+        if offline is not None and (
+            _device_read(attempt) or offline in OFFLINE_NEVER_POSTS
+        ):
             # Finished on the burst thread (`PreparedBurst.route_to_cloud_lane`):
             # nothing here may wait on the cloud slot or the network, whatever
             # the link's state is by now. The device's answer stands. (Where
             # the device never read the frame -- `GATE_LOCAL_OCR_CLOUD=always`,
             # or no local reader -- its answer is only to be had from the
             # recogniser's own call, which asks the permit and the predicate
-            # itself, so that call is still made below.)
+            # itself, so that call is still made below -- unless the reason is
+            # one no frame may post under, when "no plate" is the answer.)
             if attempt is not None:
                 attempt.abandon()
             logging.getLogger(__name__).info(

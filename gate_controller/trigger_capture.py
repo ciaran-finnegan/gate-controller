@@ -1118,8 +1118,11 @@ class TriggerFrameCapture:
             # scheduled for it (one inside the minimum interval is not).
             # Whatever the last passage's reads said about its plate receding
             # ends here, not when the sweep gets round to dequeuing anything:
-            # this car's still must not inherit it.
-            self._lapse_departing()
+            # this car's still must not inherit it. The one alarm that is not
+            # a new car is the camera confirming a passage the early trigger
+            # started (`local_sweep` takes it as the upgrade): that passage
+            # keeps what it has measured.
+            self._lapse_departing(unless_confirming=True)
             with self._lock:
                 last = self._last_scheduled_at
                 if last is not None and now - last < self.config.min_interval_seconds:
@@ -1145,12 +1148,20 @@ class TriggerFrameCapture:
         )
         return outcome
 
-    def _lapse_departing(self) -> None:
-        """End the current passage's departure verdict. Never raises."""
+    def _lapse_departing(self, *, unless_confirming: bool = False) -> None:
+        """Start the current passage's departure measurement over. Never raises.
+
+        With ``unless_confirming`` an early-origin passage the camera has not
+        yet confirmed is left alone: the alarm is its confirmation, not a new
+        car.
+        """
         try:
             passage = self._passage
-            if passage is not None:
-                passage.departing.lapse()
+            if passage is None:
+                return
+            if unless_confirming and passage.early and not passage.confirmed:
+                return
+            passage.departing.lapse()
         except Exception:
             return
 
