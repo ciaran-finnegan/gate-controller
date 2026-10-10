@@ -109,3 +109,17 @@ a minute by day; birdsong gives impulses with a high-frequency share above
 8 s of a 19 s opening) and must not be used to arbitrate gate state during a
 test. Full-scale bangs at the moment of a pulse, with no run after, mean the
 motor is stalling against something.
+
+Two things mask the motor, and both were found on 2026-10-10
+([reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md)):
+
+- **The camera's own vehicle audio alarm**, which played for 9-15 s from
+  0.2-1.9 s after every vehicle alarm and clipped the microphone. It is about
+  35 dB louder than the motor, and the scanner recorded it as motor runs. It
+  was switched off on 2026-10-10 at 15:27 IST
+  ([reolink-rlc-811a.md](reolink-rlc-811a.md#vehicle-audio-alarm-switched-off-2026-10-10)).
+  Keep it off.
+- **A diesel idling beside the camera** sits at the motor's own 1.2-3 kHz
+  level (about -47 dBFS), so a waiting car hides the gate. The motor's
+  fingerprint is a line at 1.1-1.5 kHz. On a quiet night it is plain: four
+  runs and a latch were heard on 10 Oct 23:24-01:32 that the scanner missed.

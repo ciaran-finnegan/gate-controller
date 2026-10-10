@@ -235,6 +235,7 @@ The decode-width costs are in Task 1 below.
 ## 8. Anything else
 
 - **9 Oct 21:42-22:22, the gate stood open for 39 minutes.**
+  - **Correction, 10 Oct:** the runs below were re-read at 0.5 s resolution. The 21:42:23 run is the camera's own vehicle audio alarm and the 21:41:38 run is the departing car's engine, so the audio does not support the photocell explanation. See [2026-10-10-gate-jam.md](2026-10-10-gate-jam.md).
   - The audio scanner (`gate_movements`) heard a 17 s motor run at 21:41:38 as the Audi left, then two more runs (21:42:08, 21:42:23) as it was still in the gateway.
   - Then nothing, and no latch clang, until 22:21:47, when the owner drove through the open gate. The Pi sent no pulse all evening (`relay_outcome=not_attempted`) and there was no app command.
   - Why, from the opener's own manual: it is a TOPENS A5132 with auto-close set to about 14 s after fully open. The TOPENS manual says the board "reverse[s] the gate upon first obstruction and stop[s] upon a second sequential obstruction"; its troubleshooting table lists "the gate stop[s] when on the way of opening or closing" as "two sequential photo beam blocked".
