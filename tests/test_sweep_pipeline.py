@@ -795,6 +795,21 @@ class SkippedFrameSampleTests(unittest.TestCase):
                          ["corrupt.jpg", "empty.jpg"])
         self.assertEqual(sorted(self.field(line, "skipped_sample").split(",")), names)
 
+    def test_the_journal_names_only_the_samples_that_survived_the_cap(self):
+        flat = [self.solid(seed) for seed in range(70, 76)]
+        empty = [self.textured(seed) for seed in range(560, 566)]
+        gate = self._gate(answers={}, sweep_seconds=1.2, empty_scene=0.03, max_flat=0.5,
+                          sample_max_files=1)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.08, data) for index, data in enumerate(flat + empty)])
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        self.assertGreaterEqual(int(self.field(line, "skipped_corrupt")), 2)
+        self.assertGreaterEqual(int(self.field(line, "skipped_empty")), 2)
+        names = self._samples(gate)
+        self.assertEqual(len(names), 1, names)
+        self.assertEqual(self.field(line, "skipped_sample"), names[0])
+
     def test_a_sweep_that_reads_everything_keeps_nothing_and_says_so(self):
         frames = [self.textured(seed) for seed in range(530, 536)]
         gate = self._gate(answers={}, sweep_seconds=0.8, empty_scene=0.03, max_flat=0.5)

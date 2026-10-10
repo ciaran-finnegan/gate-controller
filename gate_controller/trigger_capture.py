@@ -1677,7 +1677,9 @@ class TriggerFrameCapture:
             "cloud_hold=%s cloud_held=%d",
             reason, getattr(event, "event_type", "unknown"), frames, reads,
             skipped_empty, skipped_corrupt,
-            ",".join(name for name in skipped_samples.values() if name) or "-", busy,
+            ",".join(self._skipped_samples.still_kept(
+                name for name in skipped_samples.values() if name
+            )) or "-", busy,
             duplicates, reads / max(1e-6, self._clock() - scheduled_at),
             authorised, injected, handovers, handover_blind, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",

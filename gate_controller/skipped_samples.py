@@ -57,6 +57,13 @@ class SkippedFrameSamples:
         except Exception:
             LOGGER.debug("gate_local_sweep stage=skipped_sample_trim_failed", exc_info=True)
 
+    def still_kept(self, names) -> list[str]:
+        """Those of ``names`` still on disk: a later sample can prune an earlier one."""
+        try:
+            return [name for name in names if (self.directory / name).exists()]
+        except Exception:
+            return []
+
     def keep(self, frame: bytes, started_at: datetime, reason: str) -> str | None:
         """Write ``frame`` as the sweep's sample for ``reason``; its file name, or None.
 
