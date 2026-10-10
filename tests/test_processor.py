@@ -3241,6 +3241,35 @@ class InternetDownTests(unittest.TestCase):
             self.assertEqual(result.reason, "no_match")
             self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
 
+    def test_every_frame_of_a_departing_burst_is_answered_on_the_device(self):
+        # A camera burst can carry more than one frame. The burst is kept on
+        # the burst thread, so none of its frames may take the slot or post.
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+                self._jpeg(directory, "third.jpg", 180),
+            )
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertEqual(prepared.offline, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame posted from the burst thread")
+            self.assertEqual(recognizer.local_calls, list(frames), "the device reads every frame")
+            self.assertEqual(
+                sum("cloud_skipped reason=departing" in line for line in journal.output), 3,
+            )
+
     def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

@@ -805,10 +805,14 @@ class DepartingPlate:
         self.noticed = False
 
     def lapse(self) -> None:
-        """End the verdict: the passage it described is over (a new alarm is in)."""
-        self.receding = False
-        self.shrunk = 0
-        self.last_at = None
+        """Start over: a new car is in view, so nothing measured so far is about it.
+
+        The widest plate goes too. An alarm inside the capture's minimum
+        interval starts no new sweep, so the running sweep goes on reading
+        the new car under this same object, and two small reads of a car
+        still far off must not count as a shrink from the last car's peak.
+        """
+        self.__init__()
 
     def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
         """Whether the plate was receding on a read no older than ``grace`` seconds."""

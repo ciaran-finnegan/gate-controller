@@ -353,9 +353,15 @@ class DepartingPlateTests(unittest.TestCase):
         judge.lapse()
         self.assertFalse(judge.receding)
         self.assertFalse(judge.receding_at(103.5))
-        # One more shrunk read is not enough on its own; two are, as always.
+        # The last car's widest plate is gone with it: a new car still far
+        # off is not a shrink from 300 px, however small its first reads.
+        self.assertEqual(judge.peak_px, 0)
         self.assertFalse(judge.note(180, 104.0))
-        self.assertTrue(judge.note(170, 104.5))
+        self.assertFalse(judge.note(170, 104.5))
+        self.assertEqual(judge.peak_px, 180)
+        # It is judged on its own passage from here: grow, then recede.
+        for at, width in enumerate([240, 300, 200, 190]):
+            self.assertEqual(judge.note(width, 105.0 + at), at == 3)
 
     def test_nonsense_widths_change_nothing(self):
         judge = DepartingPlate()

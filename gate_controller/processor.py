@@ -143,7 +143,8 @@ class PreparedBurst:
     cloud_skip: str | None = None
     #: Why this burst, finished on the burst thread, must not touch the cloud
     #: slot or the network for any of its frames; set by
-    #: :meth:`route_to_cloud_lane`. None for a burst the cloud lane finishes.
+    #: :meth:`route_to_cloud_lane`, or by :meth:`GateProcessor.prepare` for a
+    #: departing car. None for a burst the cloud lane finishes.
     offline: str | None = None
     stillness: float | None = None
     #: The answer for a burst the store already holds; nothing else applies.
@@ -507,6 +508,11 @@ class GateProcessor:
             return
         if mode == "on":
             prepared.cloud_skip = CLOUD_SKIP_DEPARTING
+            # `cloud_skip` answers the first frame; a camera burst can carry
+            # more, and the burst is kept on the burst thread. Every frame of
+            # it is answered on the device (`_recognise`, the `offline` path),
+            # so none can take the slot or post from there.
+            prepared.offline = CLOUD_SKIP_DEPARTING
         elif mode == "shadow":
             logging.getLogger(__name__).info(
                 "gate_ocr stage=cloud_skip_shadow would=%s", CLOUD_SKIP_DEPARTING,
