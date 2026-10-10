@@ -1566,8 +1566,19 @@ class TriggerFrameCapture:
                     )
                 continue
             scene_difference = self._scene_difference(frame)
+            # While waiting, a dark frame is never skipped unread, whatever
+            # the baseline says of it. The baseline may itself be dark -- a
+            # quiet night, the alarm before any spotlit refresh -- and a plate
+            # lamp is below what a thumbnail can see, so a black frame that
+            # "is the idle drive" may still hold a lit plate; only the reader
+            # may say there is nothing in it. The dark idle scene is asked
+            # here and its answer used below, once the reader has had the
+            # frame. (A lit frame of the idle drive is still skipped unread,
+            # as it always was, and breaks a dark run.)
+            dark_difference = self._dark_scene_difference(frame) if waiting else None
             if (
-                scene_difference is not None
+                dark_difference is None
+                and scene_difference is not None
                 and config.empty_scene_threshold > 0
                 and scene_difference < config.empty_scene_threshold
             ):
@@ -1578,6 +1589,7 @@ class TriggerFrameCapture:
                         frame, sweep_started_wall, "empty",
                     )
                 consecutive_empty += 1
+                consecutive_dark = 0
                 blank += 1
                 if waiting:
                     # Looked at, even though it was not read: pace the next
@@ -1588,11 +1600,6 @@ class TriggerFrameCapture:
                         break
                 continue
             consecutive_empty = 0
-            # Not the idle scene the baseline knows -- but at night that may
-            # only mean the spotlight has gone off since the baseline was
-            # taken. Ask the dark baseline too; the answer is used only after
-            # the reader has had this frame, below.
-            dark_difference = self._dark_scene_difference(frame) if waiting else None
             dark_match = (
                 dark_difference is not None
                 and config.empty_scene_threshold > 0

@@ -358,7 +358,11 @@ that as well (black against black measures 0.0013). A dark match is **not**
 treated like a lit one: a plate lamp lights about nine of a thumbnail's
 5,184 pixels, below the noise between two black frames, so the frame is still
 read, and only a read that completed with neither characters nor a plate box
-counts. Ten of those in a row (`SWEEP_DARK_DEPARTED_FRAMES`, 5 s at two a
+counts. That holds whichever baseline the frame matches: on a quiet night the
+alarm comes before any spotlit refresh, the idle baseline is itself black,
+and until #204 a black frame "was the empty drive" and three unread looks
+ended the wait, plate lamp or not. While waiting, a dark frame is now never
+skipped unread. Ten of those in a row (`SWEEP_DARK_DEPARTED_FRAMES`, 5 s at two a
 second) end the waiting as `stage=departed_dark ... reason=departed`; a box, a
 read, a lit frame, a busy or failed reader, or no dark idle frame on record
 (a restart mid-passage) breaks the run or leaves the rule out of it, and the

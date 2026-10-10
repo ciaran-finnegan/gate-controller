@@ -769,6 +769,40 @@ class SweepPipelineTests(unittest.TestCase):
         self.assertEqual(gate.sweep_status()["dark_departed"], 0)
         self.assertEqual(gate.relay_calls, [])
 
+    def test_a_boxed_plate_on_a_quiet_night_is_read_to_the_cap_not_skipped_as_empty(self):
+        # The commoner night: no spotlit refresh before the alarm, so the idle
+        # baseline is itself black and every black frame "is the idle drive".
+        # Before #204 that was three unread looks and `departed`, plate lamp
+        # or not. Now a dark frame is read, and a boxed plate keeps it read.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        lit = [frame(seed) for seed in range(800, 812)]
+        black = [dark_frame(seed) for seed in range(812, 872)]
+        gate = self._gate(
+            answers={digest(crop_to_region(data, REGION)): ("", 0.0) for data in black},
+            sweep_seconds=1.0, waiting=9.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        gate.frames.scene = SceneBaseline(idle_seconds=0.0, clock=lambda: 1000.0)
+        self.assertTrue(gate.frames.scene.observe(dark_frame(9000)))
+        self.assertLess(gate.frames.scene_difference(black[0]), 0.03,
+                        "to the ordinary baseline a black frame is the empty drive")
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(lit)]
+        script += [(1.6 + index * 0.25, data) for index, data in enumerate(black)]
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 14.0),
+                logs.text(),
+            )
+            elapsed = monotonic() - started
+        self.assertIn("reason=wait_cap", logs.text())
+        self.assertNotIn("reason=departed", logs.text())
+        self.assertGreater(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 2.0)
+        bands_read = sum(1 for data in black if gate.engine.was_read(crop_to_region(data, REGION)))
+        self.assertGreaterEqual(bands_read, SWEEP_DARK_DEPARTED_FRAMES)
+        self.assertEqual(gate.relay_calls, [])
+
     def test_a_black_drive_with_no_dark_idle_frame_on_record_is_read_to_the_cap(self):
         # The conservative side of the rule: a controller restarted during the
         # passage, or one whose first night this is, has no dark idle frame

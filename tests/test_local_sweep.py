@@ -552,6 +552,95 @@ class LocalSweepTests(unittest.TestCase):
         self.assertGreaterEqual(self.clock.now, 114.0)
         self.assertEqual(capture.status()["sweep"]["dark_departed"], 0)
 
+    class _QuietNight(FrameSource):
+        """A night with no spotlit refresh before the alarm: the idle baseline
+        is itself black. The car sits under the spotlight through the 2 s
+        window; once it is dark again every black frame is the idle drive to
+        *both* baselines."""
+
+        def scene_difference(self, frame):
+            return 0.385 if self._clock() < 102.0 else 0.0013
+
+        def dark_scene_difference(self, frame):
+            return None if self._clock() < 102.0 else 0.0013
+
+    def test_a_dark_frame_is_read_even_when_it_is_the_idle_drive_to_the_baseline(self):
+        # A quiet night: the alarm came before any spotlit refresh, so the
+        # idle baseline is itself black and a black frame matches it. That
+        # used to be three unread looks and "departed", plate lamp or not.
+        # Now the reader sees every dark frame, and ten of its "nothing"
+        # answers are needed.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+
+        QuietNight = self._QuietNight
+
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
+        sweep = ScriptedSweep({})
+        capture = self._capture(
+            QuietNight(self.clock, frames), sweep, seconds=2.0, fallback=0,
+            waiting=30.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("stage=departed_dark frames=%d" % SWEEP_DARK_DEPARTED_FRAMES, output)
+        self.assertGreaterEqual(self.clock.now, 102.0 + (SWEEP_DARK_DEPARTED_FRAMES - 1) / 2.0,
+                                "not three unread looks")
+        waiting_reads = [f for f, _trace in sweep.reads if f in dict((b, a) for a, b in frames)]
+        self.assertGreaterEqual(len(waiting_reads), SWEEP_DARK_DEPARTED_FRAMES)
+        self.assertEqual(capture.status()["skipped"]["empty_scene"], 0,
+                         "no dark frame was skipped unread while waiting")
+
+    def test_a_boxed_plate_on_a_quiet_night_is_read_to_the_cap(self):
+        # The same black baseline, and a plate lamp the thumbnail cannot see
+        # but the reader boxes every few frames: invariant 6 in the dark.
+        QuietNight = self._QuietNight
+
+        frames = [(100.0 + index * 0.4, jpeg(seed=index)) for index in range(100)]
+        boxed = SweepRead(
+            status="no_plate", read_ms=170.0,
+            recognition=LocalRecognition(box=(0.45, 0.5, 0.08, 0.03), status="no_plate"),
+        )
+        answers = {frame: boxed for index, (_at, frame) in enumerate(frames) if index % 5 == 0}
+        capture = self._capture(
+            QuietNight(self.clock, frames), ScriptedSweep(answers), seconds=2.0, fallback=0,
+            waiting=12.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("reason=departed", output)
+        self.assertIn("reason=wait_cap", output)
+        self.assertGreaterEqual(self.clock.now, 114.0)
+
+    def test_a_lit_look_at_the_empty_drive_breaks_a_dark_run(self):
+        # The spotlight comes back on over an empty, lit drive for one look
+        # (that frame matches the lit baseline and is skipped unread, as
+        # ever): the dark run starts again from it.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        frames = [(100.0 + index * 0.5, jpeg(seed=index)) for index in range(60)]
+        lit = {frame for index, (_at, frame) in enumerate(frames) if index % 6 == 0}
+
+        class Flicker(FrameSource):
+            def scene_difference(self, frame):
+                return 0.001 if frame in lit else 0.385
+
+            def dark_scene_difference(self, frame):
+                return None if frame in lit else 0.0013
+
+        sweep = ScriptedSweep({})
+        capture = self._capture(
+            Flicker(self.clock, frames), sweep, seconds=2.0, fallback=0,
+            waiting=10.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("stage=departed_dark", output)
+        self.assertIn("reason=wait_cap", output)
+        self.assertGreater(len(sweep.reads), SWEEP_DARK_DEPARTED_FRAMES,
+                           "the dark frames between the lit looks were all read")
+
     def test_a_busy_reader_neither_counts_toward_nor_breaks_a_dark_run(self):
         from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
         frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
