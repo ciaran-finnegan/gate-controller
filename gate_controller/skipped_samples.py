@@ -45,6 +45,18 @@ class SkippedFrameSamples:
     def enabled(self) -> bool:
         return self.directory is not None and self.max_files > 0 and self.max_bytes > 0
 
+    def trim(self) -> None:
+        """Bring what an earlier run left into the current caps (0 files removes all).
+
+        Called once at start-up, so lowering or disabling the cap takes effect
+        on the samples already on disk. Creates nothing. Never raises.
+        """
+        try:
+            if self.directory is not None and self.directory.is_dir():
+                self._prune(self.directory, keep=None)
+        except Exception:
+            LOGGER.debug("gate_local_sweep stage=skipped_sample_trim_failed", exc_info=True)
+
     def keep(self, frame: bytes, started_at: datetime, reason: str) -> str | None:
         """Write ``frame`` as the sweep's sample for ``reason``; its file name, or None.
 
@@ -66,7 +78,7 @@ class SkippedFrameSamples:
                          exc_info=True)
             return None
 
-    def _prune(self, directory: Path, *, keep: str) -> None:
+    def _prune(self, directory: Path, *, keep: str | None) -> None:
         sizes: list[tuple[str, int]] = []
         for path in directory.glob("*.jpg"):
             try:
@@ -77,7 +89,7 @@ class SkippedFrameSamples:
         total = sum(size for _name, size in sizes)
         count = len(sizes)
         for name, size in sizes:
-            if count <= self.max_files and total <= self.max_bytes:
+            if count <= max(0, self.max_files) and total <= max(0, self.max_bytes):
                 break
             if name == keep:
                 continue

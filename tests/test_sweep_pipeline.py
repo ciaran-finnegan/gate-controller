@@ -842,6 +842,29 @@ class SkippedFrameSampleTests(unittest.TestCase):
             gate.capture._skipped_samples.max_bytes,
         )
 
+    def test_samples_left_by_an_earlier_run_are_trimmed_to_the_cap_at_start(self):
+        """Disabling (0) or lowering the cap removes what a larger one had kept."""
+        for cap, left in ((0, 0), (2, 2)):
+            with tempfile.TemporaryDirectory() as root:
+                samples = Path(root) / "sweep-skipped-frames"
+                samples.mkdir(mode=0o700)
+                for index in range(5):
+                    (samples / f"2026100{index}T000000000Z-empty.jpg").write_bytes(b"x" * 10)
+                capture = TriggerFrameCapture(
+                    TriggerCaptureConfig(
+                        enabled=True, output_directory=Path(root) / "trigger-capture",
+                        skipped_sample_directory=samples, skipped_sample_max_files=cap,
+                    ),
+                    popen=lambda *a, **k: None,
+                )
+                self.assertEqual(len(list(samples.glob("*.jpg"))), left, cap)
+                if left:
+                    self.assertEqual(
+                        sorted(path.name for path in samples.glob("*.jpg")),
+                        ["20261003T000000000Z-empty.jpg", "20261004T000000000Z-empty.jpg"],
+                    )
+                capture.close()
+
     def test_a_directory_that_cannot_be_written_does_not_break_the_sweep(self):
         # The state root is a file, so the directory can never be made.
         blocker = Path(tempfile.mkdtemp()) / "state-is-a-file"

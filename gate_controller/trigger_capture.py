@@ -905,6 +905,7 @@ class TriggerFrameCapture:
             max_files=config.skipped_sample_max_files,
             max_bytes=config.skipped_sample_max_bytes,
         )
+        self._skipped_samples.trim()
         self._unresolved_sessions = 0
         self._below_bar_sessions = 0
         self._last_skip: str | None = None
