@@ -263,8 +263,9 @@ Neither rule touches a person's command from the app, which keeps its
 `operator` role check and its 20 s cooldown (someone watching the camera can
 see what the gate is doing; the plate reader cannot), and neither can add,
 retry or hurry a pulse: each can only withhold one. Nothing here listens to
-the gate: the camera's own siren sounds at every vehicle alarm and an idling
-diesel masks the motor, so sound cannot yet say whether the gate is open.
+the gate: until 2026-10-10 15:27 the camera's own siren sounded at every
+vehicle alarm (now switched off), and an idling diesel still masks the motor,
+so sound cannot yet say whether the gate is open.
 
 - **2026-10-10 10:04-10:13 IST** -- an authorised pickup (`172L66`) waited
   nine minutes at the gate. The camera raised seven vehicle alarms; the Pi

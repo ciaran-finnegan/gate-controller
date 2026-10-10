@@ -24,6 +24,22 @@ From `gate_movements` on the Pi, times in IST:
 | 21:42:34 to 22:21:47 | (none) | No motor run and no latch for 39 minutes. |
 | 22:21:47 | 12 s + 11 s | The owner drives in through the open gate, and it closes. No latch was heard. |
 
+**Re-read on 2026-10-10 at 0.5 s resolution, this table is not what the gate
+did** ([reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md)):
+
+- The 21:42:23 and 22:22:00 "runs" are the camera's own vehicle audio alarm,
+  which played through its speaker from 0.2-0.4 s after each camera alarm and
+  clipped the microphone.
+- The 21:41:38 and 22:21:47 runs are car engines: band +10 to +30 dB, almost
+  no 1.2-8 kHz share.
+- No motor-band run is visible in either burst. So "reversed by the
+  photocell, then open for 39 minutes" is not supported by the audio. It may
+  still be what happened; the audio cannot say.
+- Overnight, motor-like runs at 23:24, 00:25 and 00:26, and a closing run with
+  a latch at 01:32, were heard; the scanner wrote none of them.
+
+The alarm sound was switched off on 2026-10-10 at 15:27 IST.
+
 ## The measurement: what the detector can and cannot see
 
 These figures come from every row the retrained detector (`yamnet-linear-v2`)
@@ -141,6 +157,12 @@ by about 22:11, ten minutes before the owner arrived at 22:21.
   rather than guessing.
 * **Its times run early inside a short segment**, by however much audio the
   camera dropped before the run (gate-audio.md 2g).
+* **It reads what the scanner writes, and the scanner has recorded the
+  camera's alarm sound and car engines as motor runs.** Until 2026-10-10 15:27
+  every vehicle alarm put a 9-15 s "run" into `gate_movements`. That sound is
+  now off, but an engine idling beside the camera still reads as a run and
+  hides the real motor. Until the scanner is fixed, a `likely` or `possible`
+  during a passage says little about the leaves.
 * **The two unverified alerts above may be real.** If someone knows what the
   gate was doing on 2026-10-04 at 16:51 or on 2026-10-08 at 17:30 IST, that
   would settle the false-alert rate.
