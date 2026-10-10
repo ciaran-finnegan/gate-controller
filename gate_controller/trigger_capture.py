@@ -829,8 +829,18 @@ class DepartingPlate:
         self.alarm_at = now
 
     def lapse(self) -> None:
-        """Start the measurement over, the widest plate included."""
-        self.__init__()
+        """Start the measurement over, the widest plate included.
+
+        ``alarm_at`` is left alone: it belongs to :meth:`alarm`, which the
+        webhook thread may call at any moment, and a value saved here and
+        put back afterwards could overwrite a newer alarm.
+        """
+        self.peak_px = 0
+        self.shrunk = 0
+        self.receding = False
+        self.since = None
+        self.last_at = None
+        self.noticed = False
 
     def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
         """Whether the plate was receding on a read no older than ``grace`` seconds."""
@@ -882,9 +892,7 @@ class DepartingPlate:
         except TypeError:
             first_since_alarm = False
         if first_since_alarm:
-            alarm_at = self.alarm_at
             self.lapse()
-            self.alarm_at = alarm_at
         self.last_at = now
         if (
             self.peak_px >= SWEEP_DEPARTING_MIN_PEAK_PX

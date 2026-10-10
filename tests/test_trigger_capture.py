@@ -414,6 +414,23 @@ class DepartingPlateTests(unittest.TestCase):
         self.assertEqual(SweepPassage(ORIGIN_EARLY, started_at=7.5).departing.alarm_at, 7.5)
         self.assertIsNone(SweepPassage().departing.alarm_at)
 
+    def test_starting_over_never_touches_the_alarm_another_thread_may_have_just_set(self):
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        judge.alarm(104.0)
+        # A newer alarm lands while the first post-alarm read is being noted.
+        judge.alarm(104.5)
+        # Captured before the newer alarm: still the car before it, measured on.
+        self.assertTrue(judge.note(180, 104.2))
+        self.assertEqual(judge.alarm_at, 104.5, "the newer alarm was overwritten")
+        self.assertEqual(judge.peak_px, 300)
+        # The first read captured after the newer alarm starts over.
+        self.assertFalse(judge.note(120, 104.8))
+        self.assertEqual(judge.peak_px, 120)
+        judge.lapse()
+        self.assertEqual(judge.alarm_at, 104.5)
+
     def test_a_carried_verdict_answers_the_same_whatever_happens_next(self):
         carried = CarriedDeparture("on")
         self.assertEqual(carried(), "on")
