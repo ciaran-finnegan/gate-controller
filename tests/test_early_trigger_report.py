@@ -199,6 +199,27 @@ class ReportTests(unittest.TestCase):
             report.main(["--database", str(self.path)])
         self.assertIn("from the rows alone", raw.getvalue())
 
+    def test_a_look_that_was_never_asked_is_not_answered_for_by_the_sweep(self):
+        # Under GATE_EARLY_TRIGGER_CONFIRMATION=sweep the looks are `not_asked`
+        # and the sweep's live reads are not what a look at one stale keyframe
+        # would have said: the looks rules are unjudged, vision alone is not.
+        not_asked = {"clip": {"status": "not_asked"}, "plate_look": {"status": "not_asked"},
+                     "decision": {"status": "confirmed", "by": "sweep"}}
+        self.would(BASE, layers=not_asked, sweep={"plate_reads": 3, "reason": "opened"})
+        self.alarm(BASE + 1)
+        self.would(BASE + 900, layers=not_asked, sweep={"plate_reads": 0, "reason": "early_abort"})
+        with closing(sqlite3.connect(str(self.path))) as connection:
+            rows = [row for row in report.load_rows(connection) if row["kind"] == "would_trigger"]
+        self.assertEqual([report.layer_votes(row)["plate"] for row in rows], [None, None])
+        self.assertEqual([report.layer_votes(row)["either"] for row in rows], [None, None])
+        table = {line["rule"]: line["day"] for line in self.summary()["layers"]}
+        looks = table["vision and a confirming look, CLIP or a plate box "
+                      "(GATE_EARLY_TRIGGER_CONFIRMATION=looks)"]
+        self.assertEqual((looks["judged"], looks["unjudged"]), (0, 2))
+        alone = table["vision alone (GATE_EARLY_TRIGGER_CONFIRMATION=sweep: "
+                      "the sweep's own reads confirm)"]
+        self.assertEqual((alone["judged"], alone["false_total"], alone["true_total"]), (2, 1, 1))
+
     def test_in_on_mode_the_early_sweeps_own_reads_are_the_plate_look(self):
         self.would(BASE, sweep={"plate_reads": 3, "reason": "opened"})
         self.alarm(BASE + 1)
