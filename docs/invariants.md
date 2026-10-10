@@ -30,13 +30,16 @@ is read and what is spent.
 A frame whose cloud request was skipped answers "no plate"; the device's
 refused read rides along only as `PlateObservation.review_plate`, which
 matching reads after every rule has refused, to name a near miss, and never
-to grant (#201).
+to grant (#201). That holds for every skip reason, the departure skip
+included.
 
 - `tests/test_matching.py::test_rejects_a_low_confidence_exact_authorised_plate`
 - `tests/test_matching.py::test_an_exact_plate_still_opens_overnight`
 - `tests/test_actuation.py::test_persisted_cooldown_records_the_grant_rather_than_a_denial`
 - `tests/test_near_miss_when_cloud_skipped.py::test_an_exact_authorised_plate_at_full_confidence_is_never_a_grant`
 - `tests/test_near_miss_when_cloud_skipped.py::test_a_confident_misread_is_still_only_a_near_miss`
+- `tests/test_near_miss_when_cloud_skipped.py::test_the_departing_frame_is_denied_and_names_the_dmax`
+- `tests/test_processor.py::test_a_departing_verdict_never_touches_a_frame_the_device_decided`
 
 ## 2. The burst thread never waits on the network
 
@@ -59,6 +62,10 @@ Guards:
 - `tests/test_fast_lane.py::test_a_frame_the_device_can_read_is_decided_while_an_older_cloud_call_waits`
 - `tests/test_fast_lane.py::test_a_burst_kept_off_the_lane_never_waits_on_the_cloud_when_the_breaker_closes`
 - `tests/test_processor.py::test_a_burst_routed_off_the_lane_is_finished_without_the_cloud_after_the_link_returns`
+- `tests/test_fast_lane.py::test_a_departing_burst_is_finished_on_the_burst_thread_without_the_cloud`
+- `tests/test_processor.py::test_a_burst_skipped_as_departing_is_finished_without_the_cloud_when_the_car_turns_back`
+  (the departure verdict is not sticky; the route taken at `prepare` is the
+  route the burst is finished on, whatever the verdict says by then)
 
 ## 3. The gate opens on the Pi's own read with no link to the house
 
@@ -87,7 +94,7 @@ Guards:
 - `tests/test_slow_upload_pipeline.py::test_a_still_that_takes_40_s_to_arrive_is_decided_and_refused_as_stale`
 - `tests/test_slow_upload_pipeline.py::test_a_still_already_half_arrived_when_the_controller_restarts_is_not_fresh`
 
-## 5. Far frames are not sent to the cloud
+## 5. Far frames and departing cars are not sent to the cloud
 
 The cloud reader is billed, one request a second, and slow over the gate's
 link. A frame whose plate is too small to read is not worth a lookup: the
@@ -96,8 +103,23 @@ or it is the last chance, and the camera's own alarm still (taken when the car
 is furthest away) is not sent while a sweep is reading. The Pi's own reader
 still reads every frame -- it is free.
 
+A departing car is not worth a lookup either: it is let out by the gate's
+exit mechanism, not by the Pi, and since 2026-10-05 the cloud had decided no
+opening while 42 of its 107 slow or failed lookups were on departures. The
+sweep's own reads say which it is -- a departing car's plate shrinks as it
+recedes, an arriving car's only grows until it stops -- and while they say so
+the passage's frames and still are decided on the device and not sent
+(`cloud_skipped reason=departing`) once `GATE_LOCAL_SWEEP_DEPARTING_SKIP=on`;
+shipped as `shadow`, which journals what `on` would have kept off the cloud
+and sends exactly as before. An arriving car keeps its cloud fallback, and an
+authorised rear plate the device reads still opens the gate (#171).
+
 - `tests/test_fast_lane.py::test_the_cameras_alarm_still_is_not_sent_to_the_cloud_while_a_sweep_is_reading`
 - `tests/test_fast_lane.py::test_a_sweep_frame_is_never_treated_as_the_cameras_still`
+- `tests/test_departing_pipeline.py::test_a_departing_cars_frames_and_still_post_nothing`
+- `tests/test_departing_pipeline.py::test_an_arriving_car_still_gets_its_cloud_fallback`
+- `tests/test_departing_pipeline.py::test_a_departing_cars_authorised_rear_plate_still_opens_on_the_device`
+- `tests/test_trigger_capture.py::DepartingPlateTests::test_the_2026_10_09_arrival_never_reads_as_receding`
 
 ## 6. A waiting car keeps being read
 

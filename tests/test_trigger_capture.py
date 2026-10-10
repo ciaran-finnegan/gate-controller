@@ -13,6 +13,9 @@ from PIL import Image
 from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.models import MatchDecision, ProcessingResult
 from gate_controller.trigger_capture import (
+    ORIGIN_CAMERA, ORIGIN_EARLY, CarriedDeparture, DepartingPlate, SweepPassage,
+)
+from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
     TriggerFrameCapture,
     load_trigger_capture_config,
@@ -152,6 +155,21 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
 
+    def test_the_departure_skip_ships_in_shadow_and_takes_only_its_three_modes(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.sweep_departing_skip, "shadow")
+        self.assertEqual(TriggerCaptureConfig(enabled=True, output_directory=Path("/x"))
+                         .sweep_departing_skip, "shadow")
+        for raw, mode in (("off", "off"), (" Shadow ", "shadow"), ("ON", "on")):
+            tuned = load_trigger_capture_config(
+                {"GATE_LOCAL_SWEEP_DEPARTING_SKIP": raw}, Path("/uploads"), webhook_enabled=True,
+            )
+            self.assertEqual(tuned.sweep_departing_skip, mode)
+        for raw in ("yes", "1", "exiting", ""):
+            environment = {"GATE_LOCAL_SWEEP_DEPARTING_SKIP": raw}
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
+
     def test_presence_session_is_on_by_default_and_bounded(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
         self.assertEqual(config.presence_window_seconds, 20.0)
@@ -272,6 +290,164 @@ class TriggerCaptureConfigTests(unittest.TestCase):
                     load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
 
 
+class DepartingPlateTests(unittest.TestCase):
+    """The receding-plate rule, on the series the sweep's own reads produce."""
+
+    def _feed(self, widths):
+        judge = DepartingPlate()
+        return judge, [judge.note(width, at) for at, width in enumerate(widths)]
+
+    def test_the_2026_10_09_departures_are_caught_within_two_reads_of_the_peak(self):
+        # 11:58: 321, 203, 222, 203, 188 ... ; 14:33: 229, 333, 321, 279, 247, 229, 209 ...
+        judge, verdicts = self._feed([321, 203, 222, 203, 188, 171, 157, 145])
+        self.assertEqual(verdicts, [False, False, True, True, True, True, True, True])
+        self.assertEqual(judge.since, 2)
+        judge, verdicts = self._feed([229, 333, 321, 279, 247, 229, 209, 190, 172])
+        # 247 is 74 % of 333: not yet. 229 and 209 are the two reads under 70 %.
+        self.assertEqual(verdicts, [False] * 6 + [True] * 3)
+        self.assertEqual(judge.peak_px, 333)
+
+    def test_the_2026_10_09_arrival_never_reads_as_receding(self):
+        # 15:05: the plate grew 138 -> 319 px with a 3.8 % dip at 159 -> 153.
+        widths = [138, 136, 141, 159, 153, 153, 157, 171, 181, 190, 209, 210, 233, 236,
+                  243, 259, 269, 286, 290, 300, 319, 331, 333]
+        judge, verdicts = self._feed(widths)
+        self.assertEqual(verdicts, [False] * len(widths))
+        self.assertIsNone(judge.since)
+
+    def test_a_stopped_car_with_the_detectors_jitter_never_reads_as_receding(self):
+        # The stopped-car rule tolerates an 8 % spread; this tolerates 30 %.
+        judge, verdicts = self._feed([370, 372, 345, 369, 341, 372, 350, 360])
+        self.assertEqual(verdicts, [False] * 8)
+
+    def test_one_shrunk_read_is_not_a_departure(self):
+        judge, verdicts = self._feed([320, 200, 318, 200, 315])
+        self.assertEqual(verdicts, [False] * 5)
+
+    def test_a_car_that_backs_off_and_comes_forward_again_is_no_longer_departing(self):
+        judge, verdicts = self._feed([300, 300, 200, 190, 310, 320])
+        self.assertEqual(verdicts, [False, False, False, True, False, False])
+        self.assertEqual(judge.peak_px, 320)
+
+    def test_a_far_plate_is_not_measured(self):
+        # Below the 150 px peak the shrink of a few pixels is jitter, not a car.
+        judge, verdicts = self._feed([120, 80, 75, 70])
+        self.assertEqual(verdicts, [False] * 4)
+        judge, verdicts = self._feed([150, 105, 100])
+        self.assertEqual(verdicts, [False, False, True])
+
+    def test_a_verdict_is_honoured_for_ten_seconds_after_the_read_that_made_it(self):
+        # The fallback frame and the camera's still reach the processor after
+        # the sweep's window has closed; a passage nobody has read for a while
+        # must not speak for the next car.
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.0))
+        self.assertTrue(judge.receding_at(113.0))
+        self.assertFalse(judge.receding_at(113.1))
+        self.assertFalse(judge.receding_at(99.0), "a clock that went backwards")
+        self.assertFalse(DepartingPlate().receding_at(0.0))
+
+    def test_an_alarm_keeps_the_verdict_for_sweep_frames_and_withdraws_it_from_everything_else(self):
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.5))
+        self.assertTrue(judge.receding_since_alarm(103.5))
+
+        judge.alarm(104.0)
+        # A frame of this car the sweep still holds keeps its verdict...
+        self.assertTrue(judge.receding_at(104.5))
+        # ...and nothing else may borrow it: the next still may be the next car's.
+        self.assertFalse(judge.receding_since_alarm(104.5))
+        self.assertEqual(judge.peak_px, 300, "nothing is forgotten until the next read")
+
+        # The first read after the alarm starts the measurement over: a new
+        # car still far off is not a shrink from the last car's 300 px.
+        self.assertFalse(judge.note(180, 105.0))
+        self.assertEqual(judge.peak_px, 180)
+        self.assertFalse(judge.note(170, 105.5))
+        self.assertFalse(judge.receding_at(105.5))
+        # Judged on its own passage from here: grow, then recede, and the
+        # verdict speaks for stills again because its reads postdate the alarm.
+        for at, width in enumerate([240, 300, 200, 190]):
+            self.assertEqual(judge.note(width, 106.0 + at), at == 3)
+        self.assertTrue(judge.receding_since_alarm(109.5))
+
+    def test_a_read_begun_before_the_alarm_stays_the_last_cars_however_late_it_finishes(self):
+        # Reads are timed by when they began. An alarm that lands while the
+        # reader is busy with a frame of the departing car must not make that
+        # frame the next car's first read and wipe the verdict the sweep's
+        # fallback is about to be handed over with.
+        judge = DepartingPlate()
+        for at, width in enumerate([320, 320, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.2))
+        judge.alarm(103.3)                       # lands mid-read
+        self.assertTrue(judge.note(180, 103.2), "the in-flight read began before the alarm")
+        self.assertEqual(judge.peak_px, 320)
+        self.assertTrue(judge.receding_at(103.5), "the fallback's verdict was wiped")
+        self.assertFalse(judge.receding_since_alarm(103.5))
+        # The first read begun after the alarm is the new car's.
+        self.assertFalse(judge.note(150, 103.6))
+        self.assertEqual(judge.peak_px, 150)
+
+    def test_a_passage_is_bounded_by_the_alarm_that_began_it(self):
+        # The session's first frame can be a keyframe buffered from before
+        # the alarm, showing the last car's big plate as it left. The new
+        # car's first small plates are not a shrink from it.
+        passage = SweepPassage(ORIGIN_CAMERA, started_at=200.0)
+        judge = passage.departing
+        self.assertEqual(judge.alarm_at, 200.0)
+        # Two buffered frames from before the alarm: the last car leaving, big
+        # then smaller. Neither is measured, so no verdict is ever recorded.
+        self.assertFalse(judge.note(330, 199.4))
+        self.assertFalse(judge.note(200, 199.8))
+        self.assertEqual(judge.peak_px, 0)
+        self.assertIsNone(judge.last_at)
+        self.assertFalse(judge.note(150, 200.4))     # the arriving car, far off
+        self.assertFalse(judge.note(150, 200.9))
+        self.assertEqual(judge.peak_px, 150, "the last car's plate counted against this one")
+        self.assertFalse(judge.receding)
+        # The early trigger's passage is bounded the same way.
+        self.assertEqual(SweepPassage(ORIGIN_EARLY, started_at=7.5).departing.alarm_at, 7.5)
+        self.assertIsNone(SweepPassage().departing.alarm_at)
+
+    def test_starting_over_never_touches_the_alarm_another_thread_may_have_just_set(self):
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        judge.alarm(104.0)
+        # A newer alarm lands while the first post-alarm read is being noted.
+        judge.alarm(104.5)
+        # Captured before the newer alarm: still the car before it, measured on.
+        self.assertTrue(judge.note(180, 104.2))
+        self.assertEqual(judge.alarm_at, 104.5, "the newer alarm was overwritten")
+        self.assertEqual(judge.peak_px, 300)
+        # The first read captured after the newer alarm starts over.
+        self.assertFalse(judge.note(120, 104.8))
+        self.assertEqual(judge.peak_px, 120)
+        judge.lapse()
+        self.assertEqual(judge.alarm_at, 104.5)
+
+    def test_a_carried_verdict_answers_the_same_whatever_happens_next(self):
+        carried = CarriedDeparture("on")
+        self.assertEqual(carried(), "on")
+        self.assertEqual(CarriedDeparture("shadow")(), "shadow")
+        self.assertIsNone(CarriedDeparture(None)())
+        self.assertIsNone(CarriedDeparture("off")())
+        self.assertIsNone(CarriedDeparture("yes")())
+
+    def test_nonsense_widths_change_nothing(self):
+        judge = DepartingPlate()
+        judge.note(300); judge.note(300)
+        for width in (None, "wide", 0, -4, float("nan")):
+            self.assertFalse(judge.note(width))
+        self.assertEqual(judge.peak_px, 300)
+        self.assertEqual(judge.shrunk, 0)
+
+
 class TriggerFrameCaptureTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -296,6 +472,86 @@ class TriggerFrameCaptureTests(unittest.TestCase):
             (paths, received_at, trigger)
         ))
         return capture, popen
+
+    def test_any_vehicle_alarm_ends_the_last_passages_departure_verdict(self):
+        # Codex on #205: an alarm inside the minimum interval is not scheduled,
+        # but it is still a car in view, and its still must not be judged by
+        # the car before it. The verdict is honoured for ten seconds otherwise.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            min_interval_seconds=5.0, sweep_departing_skip="on",
+        )
+
+        def receding():
+            judge = capture._passage.departing
+            for width in (320, 320, 200, 190):
+                judge.note(width, clock["now"])
+            return capture.departing_skip()
+
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip())
+
+        clock["now"] += 2.0
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event()), "skipped_interval")
+        self.assertIsNone(capture.departing_skip(), "a rate-limited alarm left the verdict standing")
+
+        clock["now"] += 1.0
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event(event_type="manual_test")), "skipped_type")
+        self.assertEqual(capture.departing_skip(), "on", "a manual test is not a car")
+
+    def test_a_vehicle_alarm_withdraws_the_verdict_only_from_frames_that_do_not_carry_it(self):
+        # The old car's sweep may still hand a frame over after the alarm --
+        # its fallback at `new_event` -- and that frame carries the verdict.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            sweep_departing_skip="on",
+        )
+        passage = capture._passage
+        for width in (320, 320, 200, 190):
+            passage.departing.note(width, clock["now"])
+            clock["now"] += 0.25
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip(), "the next car's still would inherit it")
+        self.assertEqual(capture._departing_mode(passage, since_alarm=False), "on",
+                         "the departing car's own frame lost it")
+
+    def test_the_alarm_that_confirms_an_early_passage_keeps_its_measurement(self):
+        # With the early trigger on, the camera's alarm for a passage the
+        # trigger already started is that passage's confirmation, which
+        # `local_sweep` takes as an upgrade: not a new car, nothing to start
+        # over. Once confirmed, the next alarm is a new car as usual.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            min_interval_seconds=1.0, sweep_departing_skip="on",
+        )
+        capture._passage = SweepPassage(ORIGIN_EARLY)
+        judge = capture._passage.departing
+        for width in (320, 320, 200, 190):
+            judge.note(width, clock["now"])
+        self.assertEqual(capture.departing_skip(), "on")
+
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertEqual(capture.departing_skip(), "on", "the confirmation wiped the passage")
+        self.assertEqual(judge.peak_px, 320)
+
+        capture._passage.confirm(clock["now"])
+        capture._queue.get_nowait()  # what the sweep's loop would have taken as the upgrade
+        clock["now"] += 2.0
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip())
+        # The measurement starts over at the first read after that alarm.
+        clock["now"] += 0.5
+        self.assertFalse(judge.note(180, clock["now"]))
+        self.assertEqual(judge.peak_px, 180)
 
     def test_captured_frame_is_injected_with_a_sanitized_matched_trigger(self):
         capture, popen = self.capture([FakeProcess(output=jpeg())])

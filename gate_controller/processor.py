@@ -84,6 +84,19 @@ CLOUD_SKIP_CLOUD_UNREACHABLE = "cloud_unreachable"
 # The camera's own alarm still, while a sweep is reading the same passage's
 # live stream: the device's read of it stands (`TriggerFrameCapture.camera_still_hold`).
 CLOUD_SKIP_SWEEP_READING = "sweep_reading"
+# The sweep's own reads say the car is leaving -- its plate is shrinking as it
+# recedes up the approach (`TriggerFrameCapture.departing_skip`). A departure
+# is let out by the gate's exit mechanism, not by the Pi, so a lookup on it
+# can decide nothing; the device's read of the frame stands, exactly as for
+# `sweep_reading`. Decided once per burst in `prepare`, before routing.
+CLOUD_SKIP_DEPARTING = "departing"
+# Reasons a burst is kept off the lane for which no frame of it may post at
+# all, even one the device could not read: a departing car's frame the device
+# failed on answers "no plate" rather than falling through to the cloud. (The
+# link-down reasons are different: there the recogniser's own call asks the
+# availability predicate itself, which is how `GATE_LOCAL_OCR_CLOUD=always`
+# still gets its on-device answer.)
+OFFLINE_NEVER_POSTS = frozenset({CLOUD_SKIP_DEPARTING})
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -137,7 +150,8 @@ class PreparedBurst:
     cloud_skip: str | None = None
     #: Why this burst, finished on the burst thread, must not touch the cloud
     #: slot or the network for any of its frames; set by
-    #: :meth:`route_to_cloud_lane`. None for a burst the cloud lane finishes.
+    #: :meth:`route_to_cloud_lane`, or by :meth:`GateProcessor.prepare` for a
+    #: departing car. None for a burst the cloud lane finishes.
     offline: str | None = None
     stillness: float | None = None
     #: The answer for a burst the store already holds; nothing else applies.
@@ -248,7 +262,8 @@ class GateProcessor:
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
                  match_policy=None, min_cloud_request_seconds: float | None = None,
                  cloud_skip_stillness: float | None = None,
-                 farm_machinery=None, internet_reachable=None, camera_still_hold=None):
+                 farm_machinery=None, internet_reachable=None, camera_still_hold=None,
+                 departing=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -318,6 +333,9 @@ class GateProcessor:
         # `TriggerFrameCapture.camera_still_hold`, or None: whether a camera
         # upload is to be kept off the cloud because a sweep is reading.
         self._camera_still_hold = camera_still_hold
+        # `TriggerFrameCapture.departing_skip`, or None: whether the passage
+        # being read is a departing car, whose frames are kept off the cloud.
+        self._departing = departing
         self._recognizer_accepts_internet_reachable = _accepts_keyword(
             self._recognise_call, "internet_reachable", variadic=False,
         )
@@ -358,7 +376,7 @@ class GateProcessor:
                 stillness: float | None = None,
                 local_pass: bool = True,
                 sweep_read=None, cloud_permit=None,
-                camera_upload: bool = False) -> PreparedBurst:
+                camera_upload: bool = False, departing=None) -> PreparedBurst:
         """Take a burst as far as the on-device read without touching the network.
 
         This is the fast lane's half of a decision: the burst's identity, its
@@ -439,6 +457,7 @@ class GateProcessor:
             self._prepare_local_pass(prepared, deadline, stillness, sweep_read)
         if camera_upload:
             self._hold_camera_still(prepared)
+        self._skip_departing(prepared, departing)
         if not prepared.decided:
             # A frame the device could not decide -- read here, or carried in
             # already read by the sweep -- may be a machine with no plate to
@@ -472,6 +491,72 @@ class GateProcessor:
                 "gate_ocr stage=cloud_hold_shadow source=camera_still would=%s",
                 CLOUD_SKIP_SWEEP_READING,
             )
+
+    def _skip_departing(self, prepared: PreparedBurst, carried=None) -> None:
+        """Keep a departing car's frame off the cloud. Never raises.
+
+        ``carried`` is the verdict the frame arrived with -- a sweep frame
+        brings the one it was handed over with, and it wins -- and without
+        one the capture's live predicate is asked (the camera's FTP still).
+        Asked once, here, before the burst is routed: `needs_cloud` and
+        `route_to_cloud_lane` both read ``cloud_skip``, so a verdict that
+        changes after this -- the rule is not sticky -- cannot move a burst
+        between the two lanes or let one finish on the burst thread with a
+        request (#197). Only a frame the device actually read and could not
+        decide, as for the camera still: a device grant on a departing car's
+        rear plate is decided before this and is untouched (#171).
+        """
+        ask = carried if carried is not None else self._departing
+        if ask is None or not _device_read(prepared.local_attempt):
+            return
+        try:
+            mode = ask()
+        except Exception:
+            return
+        if mode == "on":
+            # `cloud_skip` answers the first frame, and only when the device
+            # did not decide it: a decided frame -- a grant, or a confident
+            # read the list refuses -- is answered by that read before any
+            # skip is looked at. A reason already recorded for it (the camera
+            # still held while a sweep reads) stands. A camera burst can carry
+            # more frames, and after a refused read the loop goes on to them,
+            # so the burst as a whole is marked: it is kept on the burst
+            # thread and every frame of it is answered on the device
+            # (`_recognise`, the `offline` path), none taking the slot or
+            # posting from there.
+            if prepared.cloud_skip is None and not prepared.decided:
+                prepared.cloud_skip = CLOUD_SKIP_DEPARTING
+            prepared.offline = CLOUD_SKIP_DEPARTING
+        elif mode == "shadow" and (
+            (prepared.cloud_skip is None and not prepared.decided)
+            or (len(prepared.paths) > 1 and not self._first_frame_grants(prepared))
+        ):
+            # Journalled only where `on` would have changed what is sent: an
+            # undecided first frame no other skip already covers, or a burst
+            # with further frames to keep off the cloud -- unless its first
+            # frame is a device grant, after which nothing else is read. A
+            # decided single frame is answered by its own read either way,
+            # and counting it would overstate what switching the rule on
+            # would save.
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skip_shadow would=%s frames=%d",
+                CLOUD_SKIP_DEPARTING, len(prepared.paths),
+            )
+
+    def _first_frame_grants(self, prepared: PreparedBurst) -> bool:
+        """Whether the first frame's device read names a listed plate. Journal only.
+
+        The grant itself is `process`'s to make, under the band and the
+        cooldown; this is the shadow journal's guess at it, and a guess that
+        cannot be made counts as no grant, so the line is kept.
+        """
+        try:
+            if not prepared.decided:
+                return False
+            plate = getattr(prepared.local_attempt.observation, "plate", None)
+            return bool(plate) and plate in set(self._authorised())
+        except Exception:
+            return False
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
                             stillness: float | None, sweep_read=None) -> None:
@@ -1407,14 +1492,17 @@ class GateProcessor:
                 if on_start is not None:
                     on_start(started)
                 return attempt.observation
-        if offline is not None and _device_read(attempt):
+        if offline is not None and (
+            _device_read(attempt) or offline in OFFLINE_NEVER_POSTS
+        ):
             # Finished on the burst thread (`PreparedBurst.route_to_cloud_lane`):
             # nothing here may wait on the cloud slot or the network, whatever
             # the link's state is by now. The device's answer stands. (Where
             # the device never read the frame -- `GATE_LOCAL_OCR_CLOUD=always`,
             # or no local reader -- its answer is only to be had from the
             # recogniser's own call, which asks the permit and the predicate
-            # itself, so that call is still made below.)
+            # itself, so that call is still made below -- unless the reason is
+            # one no frame may post under, when "no plate" is the answer.)
             if attempt is not None:
                 attempt.abandon()
             logging.getLogger(__name__).info(

@@ -3216,6 +3216,235 @@ class InternetDownTests(unittest.TestCase):
             self.assertFalse(result.opened)
             self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
 
+    def test_a_burst_skipped_as_departing_is_finished_without_the_cloud_when_the_car_turns_back(self):
+        # The departure rule is not sticky: a plate that grows back ends it.
+        # The route was decided on the verdict at `prepare`, so a verdict that
+        # changes before `process` must not let the burst thread post (#197).
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            verdict = {"mode": "on"}
+            processor = self._processor(
+                directory, recognizer, departing=lambda: verdict["mode"],
+            )
+
+            prepared = processor.prepare((frame,))
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            verdict["mode"] = None
+            self.assertFalse(prepared.needs_cloud, "the route is the answer")
+            result = processor.process((frame,), prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
+
+    def test_every_frame_of_a_departing_burst_is_answered_on_the_device(self):
+        # A camera burst can carry more than one frame. The burst is kept on
+        # the burst thread, so none of its frames may take the slot or post.
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+                self._jpeg(directory, "third.jpg", 180),
+            )
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertEqual(prepared.offline, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame posted from the burst thread")
+            self.assertEqual(recognizer.local_calls, list(frames), "the device reads every frame")
+            self.assertEqual(
+                sum("cloud_skipped reason=departing" in line for line in journal.output), 3,
+            )
+
+    def test_a_held_camera_still_of_a_departing_car_keeps_every_frame_off_the_cloud(self):
+        # The camera-still hold records its own reason for the first frame;
+        # the departure must still cover the rest of the burst.
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "still-a.jpg", 100),
+                self._jpeg(directory, "still-b.jpg", 140),
+            )
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(
+                directory, recognizer,
+                camera_still_hold=lambda: "on", departing=lambda: "on",
+            )
+
+            prepared = processor.prepare(frames, camera_upload=True)
+            self.assertEqual(prepared.cloud_skip, "sweep_reading")
+            self.assertEqual(prepared.offline, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame of the still posted")
+
+    def test_a_departing_frame_the_device_could_not_read_still_never_posts(self):
+        # A later frame of the burst whose on-device pass failed (no state to
+        # carry) must answer "no plate", not fall through to the cloud: the
+        # burst is on the burst thread and a departure never posts.
+        class FailingLater(TwoPhaseRecognizer):
+            def local_pass(self, path, *, trace_id=None, budget=None):
+                passed = super().local_pass(path, trace_id=trace_id, budget=budget)
+                return passed if len(self.local_calls) == 1 else LocalPass(state=None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+            )
+            recognizer = FailingLater(cloud_observation=PlateObservation("12D3456", 0.99))
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertEqual(prepared.offline, "departing")
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "an unread departing frame posted")
+
+    def test_the_verdict_a_frame_was_handed_over_with_wins_over_the_live_one(self):
+        # A sweep frame carries the verdict it earned; the capture's live
+        # predicate is for frames that carry none (the camera's still).
+        cloud = PlateObservation("12D3456", 0.99)
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
+            processor = self._processor(directory, recognizer, departing=lambda: None)
+            prepared = processor.prepare((frame,), departing=lambda: "on")
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            processor.process((frame,), prepared=prepared)
+            self.assertEqual(recognizer.cloud_calls, [], "the carried verdict was ignored")
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+            prepared = processor.prepare((frame,), departing=lambda: None)
+            self.assertIsNone(prepared.cloud_skip)
+            self.assertTrue(prepared.route_to_cloud_lane())
+            result = processor.process((frame,), prepared=prepared)
+            self.assertTrue(result.opened, "a frame handed over before the verdict lost its lookup")
+            self.assertEqual(recognizer.cloud_calls, [frame])
+
+    def test_a_refused_read_on_the_first_frame_still_keeps_the_rest_of_a_departing_burst_off_the_cloud(self):
+        # A confident read of a plate the list refuses decides its frame, and
+        # the loop then goes on to the burst's other frames; those must still
+        # be answered on the device.
+        class RefusedThenUnread(TwoPhaseRecognizer):
+            def local_pass(self, path, *, trace_id=None, budget=None):
+                passed = super().local_pass(path, trace_id=trace_id, budget=budget)
+                return passed if len(self.local_calls) == 1 else LocalPass(state={"frame": None})
+
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+            )
+            recognizer = RefusedThenUnread(
+                local_plate="99ZZ9999", local_confidence=0.99,
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertTrue(prepared.decided, "the first frame was decided on the device")
+            self.assertIsNone(prepared.cloud_skip, "a decided frame carries no skip")
+            self.assertEqual(prepared.offline, "departing")
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame posted after a refused read")
+
+    def test_shadow_is_journalled_only_where_on_would_have_changed_what_is_sent(self):
+        def shadow_lines(journal):
+            return [line for line in journal.output if "cloud_skip_shadow" in line]
+
+        # A decided single frame: `on` would send nothing it does not send.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                prepared = processor.prepare((frame,))
+            self.assertEqual(shadow_lines(journal), [])
+            self.assertIsNone(prepared.cloud_skip)
+            processor.process((frame,), prepared=prepared)
+
+        # An undecided frame: `on` would have kept it off the cloud.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(cloud_observation=PlateObservation("12D3456", 0.99))
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                prepared = processor.prepare((frame,))
+            self.assertTrue(any("would=departing frames=1" in line
+                                for line in shadow_lines(journal)), journal.output)
+            self.assertIsNone(prepared.cloud_skip, "shadow must not skip")
+            self.assertTrue(prepared.route_to_cloud_lane())
+            prepared.discard("test")
+
+        # A refused first frame with more behind it: `on` would keep the rest off.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            second = self._jpeg(directory, "second.jpg", 140)
+            recognizer = TwoPhaseRecognizer(local_plate="99ZZ9999", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                prepared = processor.prepare((frame, second))
+            self.assertTrue(any("would=departing frames=2" in line
+                                for line in shadow_lines(journal)), journal.output)
+            self.assertIsNone(prepared.offline)
+            processor.process((frame, second), prepared=prepared)
+
+        # A device grant on the first frame with more behind it: nothing else
+        # is read after a grant, so `on` would send nothing it does not send.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            second = self._jpeg(directory, "second.jpg", 140)
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                prepared = processor.prepare((frame, second))
+            self.assertEqual(shadow_lines(journal), [])
+            result = processor.process((frame, second), prepared=prepared)
+            self.assertTrue(result.opened)
+
+    def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare((frame,))
+            self.assertIsNone(prepared.cloud_skip)
+            self.assertTrue(prepared.decided)
+            result = processor.process((frame,), prepared=prepared)
+
+            self.assertTrue(result.opened, result.reason)
+            self.assertEqual(recognizer.cloud_calls, [])
+
     def test_a_burst_the_lane_takes_is_not_marked_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

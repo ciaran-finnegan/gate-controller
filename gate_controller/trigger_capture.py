@@ -141,6 +141,45 @@ SWEEP_CLOUD_STOPPED_READS = 3
 SWEEP_CLOUD_STOPPED_WINDOW_SECONDS = 2.0
 SWEEP_CLOUD_STOPPED_MIN_SPAN_SECONDS = 1.0
 SWEEP_CLOUD_STOPPED_SPREAD = 0.08
+# A departing car is not sent to the cloud plate reader. It comes from behind
+# the camera and recedes up the approach, so the plate the on-device detector
+# boxes *shrinks* read by read; an arriving car's plate only grows until it
+# stops at the gate, and the gate is opened for departures by the exit
+# mechanism, not by the Pi (the relay still fires for an authorised rear plate
+# the device reads, #171 -- that is a device grant and is untouched here).
+# `DepartingPlate` holds the rule: once the widest plate of the passage is at
+# least SWEEP_DEPARTING_MIN_PEAK_PX wide, SWEEP_DEPARTING_READS consecutive
+# boxed reads each at most (1 - SWEEP_DEPARTING_SHRINK) of it say the car is
+# receding, and `TriggerFrameCapture.departing_skip` tells the processor to
+# keep the passage's frames off the cloud (`cloud_skipped reason=departing`)
+# for as long as the latest read still says so. Measured on 2026-10-09 over
+# the sweep's own reads: two departures shrank 321->100 px and 333->103 px in
+# about five seconds each and were caught 2.1-2.5 s after their widest plate;
+# an arrival grew 138->319 px with its largest dip 3.8 % (159->153), and the
+# stopped-car rule above already tolerates 8 %. Over the 48 passages from 5
+# to 9 October, on the one frame per event the dashboard keeps, the rule
+# fired in 0 of 24 arrivals (16 of them let in) and 6 of 15 departures, the
+# rest showing no boxed plate for it to measure. 30 % is three times the
+# stopped-car spread; 150 px keeps jitter on a far plate from counting; two
+# reads are a quarter of a second at the sweep's rate. The rule is not sticky:
+# a car that backs off and comes forward again is an arrival once its plate
+# grows back, and gets its cloud fallback then. Shipped in `shadow`: the
+# verdict is judged, journalled (`stage=departing mode=shadow`, and
+# `gate_ocr stage=cloud_skip_shadow would=departing` for each frame `on` would
+# have kept off the cloud) and counted, and nothing about what is sent or
+# decided changes until `GATE_LOCAL_SWEEP_DEPARTING_SKIP=on` -- which is for
+# after a week of shadow records has shown no arrival judged a departure. A
+# verdict is only as fresh as
+# the read it came from: it is honoured for SWEEP_DEPARTING_GRACE_SECONDS
+# after that read, which covers the frames the sweep hands over as its window
+# closes (the fallback) and the camera's own still, and then lapses, so a
+# passage nobody read for a while cannot speak for the next car.
+SWEEP_DEPARTING_SKIP_MODES = ("off", "shadow", "on")
+DEFAULT_SWEEP_DEPARTING_SKIP = "shadow"
+SWEEP_DEPARTING_SHRINK = 0.30
+SWEEP_DEPARTING_MIN_PEAK_PX = 150
+SWEEP_DEPARTING_READS = 2
+SWEEP_DEPARTING_GRACE_SECONDS = 10.0
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
 # The waiting phase: once the full-rate window has closed with the gate still
@@ -447,6 +486,10 @@ class TriggerCaptureConfig:
     sweep_cloud_hold: str = DEFAULT_SWEEP_CLOUD_HOLD
     sweep_cloud_min_plate_px: int = DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX
     sweep_cloud_last_chance_seconds: float = DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS
+    # Whether a passage whose plate is shrinking -- a departing car -- is kept
+    # off the cloud: `off`, `shadow` (journal what `on` would skip) or `on`.
+    # See SWEEP_DEPARTING_SHRINK for the rule and its numbers.
+    sweep_departing_skip: str = DEFAULT_SWEEP_DEPARTING_SKIP
     # After the window: keep reading on the device, slowly, while a vehicle is
     # still in the picture and the gate has not opened. 0 seconds disables it.
     # See DEFAULT_SWEEP_WAITING_SECONDS for where the numbers come from.
@@ -603,6 +646,11 @@ def load_trigger_capture_config(
         ),
         0.0, MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS,
     )
+    sweep_departing_skip = str(
+        environment.get("GATE_LOCAL_SWEEP_DEPARTING_SKIP", DEFAULT_SWEEP_DEPARTING_SKIP)
+    ).strip().lower()
+    if sweep_departing_skip not in SWEEP_DEPARTING_SKIP_MODES:
+        raise ValueError("GATE_LOCAL_SWEEP_DEPARTING_SKIP must be 'off', 'shadow' or 'on'")
     sweep_waiting_seconds = _number(
         environment.get(
             "GATE_LOCAL_SWEEP_WAITING_SECONDS", str(DEFAULT_SWEEP_WAITING_SECONDS),
@@ -665,6 +713,7 @@ def load_trigger_capture_config(
         sweep_cloud_hold=sweep_cloud_hold,
         sweep_cloud_min_plate_px=sweep_cloud_min_plate_px,
         sweep_cloud_last_chance_seconds=sweep_cloud_last_chance_seconds,
+        sweep_departing_skip=sweep_departing_skip,
         sweep_waiting_seconds=sweep_waiting_seconds,
         sweep_waiting_fps=sweep_waiting_fps,
         early_max_seconds=early_max_seconds,
@@ -735,6 +784,155 @@ def _is_early(event) -> bool:
     return isinstance(event, EarlyEvent)
 
 
+class DepartingPlate:
+    """Whether the plate the on-device detector boxes is receding: a departing car.
+
+    Fed every boxed read of one passage, in order, in 4K-equivalent pixels
+    (``SweepRead.plate_px``). ``receding`` is true while the latest
+    ``SWEEP_DEPARTING_READS`` reads were each at most
+    ``1 - SWEEP_DEPARTING_SHRINK`` of the widest plate the passage has shown,
+    once that widest plate reached ``SWEEP_DEPARTING_MIN_PEAK_PX``. The widest
+    plate is remembered for the whole passage; the verdict is only as old as
+    the latest read, so a plate that grows back ends it. See the constants for
+    the measurements behind each number.
+    """
+
+    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "alarm_at", "noticed")
+
+    def __init__(self) -> None:
+        self.peak_px = 0
+        self.shrunk = 0
+        self.receding = False
+        #: The sweep clock when the plate was first found receding, or None.
+        self.since: float | None = None
+        #: The sweep clock of the latest boxed read, or None before the first.
+        self.last_at: float | None = None
+        #: The sweep clock of the latest vehicle alarm that was not this
+        #: passage's own, or None: a new car is in view from then on.
+        self.alarm_at: float | None = None
+        #: Whether this passage's recession has been journalled.
+        self.noticed = False
+
+    def alarm(self, now: float | None) -> None:
+        """A new vehicle alarm: a new car is in view.
+
+        Nothing is forgotten here -- a frame of the last car the sweep still
+        holds is handed over with the verdict it earned (:meth:`receding_at`)
+        -- but the verdict no longer speaks for anything that is not a sweep
+        frame (:meth:`receding_since_alarm`), and the measurement starts over
+        at the sweep's next read, which is the first that can be of the new
+        car. An alarm inside the capture's minimum interval starts no new
+        sweep, so that read arrives under this same object, and two small
+        reads of a car still far off must not count as a shrink from the last
+        car's peak.
+        """
+        self.alarm_at = now
+
+    def lapse(self) -> None:
+        """Start the measurement over, the widest plate included.
+
+        ``alarm_at`` is left alone: it belongs to :meth:`alarm`, which the
+        webhook thread may call at any moment, and a value saved here and
+        put back afterwards could overwrite a newer alarm.
+        """
+        self.peak_px = 0
+        self.shrunk = 0
+        self.receding = False
+        self.since = None
+        self.last_at = None
+        self.noticed = False
+
+    def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
+        """Whether the plate was receding on a read no older than ``grace`` seconds."""
+        if not self.receding or self.last_at is None:
+            return False
+        try:
+            return 0.0 <= (now - self.last_at) <= grace
+        except TypeError:
+            return False
+
+    def receding_since_alarm(self, now: float,
+                             grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
+        """:meth:`receding_at`, and no vehicle alarm has come in since that read.
+
+        What a frame that is not the sweep's own -- the camera's still, a
+        presence frame -- is judged by: after an alarm it may be the next
+        car's, and the last car's verdict must not speak for it.
+        """
+        if not self.receding_at(now, grace):
+            return False
+        try:
+            return self.alarm_at is None or self.last_at > self.alarm_at
+        except TypeError:
+            return False
+
+    def note(self, plate_px, now: float | None = None) -> bool:
+        """Take one boxed read; return whether the plate is receding now."""
+        try:
+            width = int(plate_px)
+        except (TypeError, ValueError):
+            return self.receding
+        if width <= 0:
+            return self.receding
+        try:
+            if self.alarm_at is not None and now is not None and now <= self.alarm_at \
+                    and self.last_at is None:
+                # A frame captured before the alarm, in a passage that has
+                # measured nothing yet: a keyframe buffered from before the
+                # passage began, showing whatever car was there last. Not
+                # this car's, so not measured at all.
+                return self.receding
+            # The first read begun since a new car came into view: nothing
+            # measured before it is about this car. A read begun before the
+            # alarm is the last car's, however late it finished.
+            first_since_alarm = (
+                self.alarm_at is not None and now is not None and now > self.alarm_at
+                and (self.last_at is None or self.last_at <= self.alarm_at)
+            )
+        except TypeError:
+            first_since_alarm = False
+        if first_since_alarm:
+            self.lapse()
+        self.last_at = now
+        if (
+            self.peak_px >= SWEEP_DEPARTING_MIN_PEAK_PX
+            and width <= self.peak_px * (1.0 - SWEEP_DEPARTING_SHRINK)
+        ):
+            self.shrunk += 1
+        else:
+            self.shrunk = 0
+        self.peak_px = max(self.peak_px, width)
+        receding = self.shrunk >= SWEEP_DEPARTING_READS
+        if receding and not self.receding:
+            self.since = now
+        self.receding = receding
+        return receding
+
+
+class CarriedDeparture:
+    """The departure verdict a sweep frame was handed over with, frozen.
+
+    What `GateProcessor.prepare` is given as ``departing`` for a frame the
+    sweep injected: the passage's verdict at the moment of the hand-over,
+    answered the same way for as long as the frame lives in the pipeline,
+    whatever the passage's reads or the next alarm say by then.
+    """
+
+    __slots__ = ("verdict",)
+
+    def __init__(self, verdict: str | None) -> None:
+        self.verdict = verdict if verdict in ("on", "shadow") else None
+
+    def __call__(self) -> str | None:
+        return self.verdict
+
+    def __repr__(self) -> str:
+        return f"CarriedDeparture({self.verdict!r})"
+
+
+_NOT_CARRIED = object()
+
+
 class SweepPassage:
     """Whose idea a sweep was, and whether the camera has agreed yet.
 
@@ -749,10 +947,18 @@ class SweepPassage:
     The origin is stated, never inferred from timing.
     """
 
-    def __init__(self, origin: str = ORIGIN_CAMERA):
+    def __init__(self, origin: str = ORIGIN_CAMERA, started_at: float | None = None):
         self.origin = origin if origin in (ORIGIN_CAMERA, ORIGIN_EARLY) else ORIGIN_EARLY
         self._confirmed = self.origin == ORIGIN_CAMERA
         self.confirmed_at: float | None = None
+        #: The passage's plate widths so far, and whether they say the car is
+        #: leaving. Written by the sweep, read by `departing_skip`. Bounded
+        #: from the start by the alarm (or early trigger) that began the
+        #: passage: the session's first frames can be keyframes buffered from
+        #: before it, and a departing car's last big plate in one of those
+        #: must not make the arriving car's first small plates a shrink.
+        self.departing = DepartingPlate()
+        self.departing.alarm(started_at)
 
     @property
     def early(self) -> bool:
@@ -891,6 +1097,7 @@ class TriggerFrameCapture:
         # Frames a cloud hand-over was held back from (`on`), or handed over
         # although `on` would have held them (`shadow`).
         self._sweep_cloud_held = 0
+        self._sweep_departing = 0
         self._sweep_waiting_reads = 0
         # Waiting phases ended by the dark-drive rule (SWEEP_DARK_DEPARTED_FRAMES).
         self._sweep_dark_departed = 0
@@ -908,6 +1115,7 @@ class TriggerFrameCapture:
         self._inject_accepts_stillness = False
         self._inject_accepts_sweep_read = False
         self._inject_accepts_cloud_permit = False
+        self._inject_accepts_departing = False
         self._lock = Lock()
         self._process = None
         self._closed = False
@@ -983,6 +1191,10 @@ class TriggerFrameCapture:
         self._inject_accepts_cloud_permit = _accepts_keyword(
             inject, "cloud_permit", variadic=False,
         )
+        # ...and the departure verdict a sweep frame carries, likewise exact.
+        self._inject_accepts_departing = _accepts_keyword(
+            inject, "departing", variadic=False,
+        )
 
     def on_camera_event(self, event) -> str:
         """Schedule a capture from the webhook thread without blocking it."""
@@ -998,6 +1210,15 @@ class TriggerFrameCapture:
                     note_activity()
                 except Exception:
                     pass
+            # A vehicle alarm is a car in view, whether or not a sweep is
+            # scheduled for it (one inside the minimum interval is not).
+            # Whatever the last passage's reads said about its plate receding
+            # ends here, not when the sweep gets round to dequeuing anything:
+            # this car's still must not inherit it; and the measurement starts
+            # over at the sweep's next read. The one alarm that is not a new
+            # car is the camera confirming a passage the early trigger started
+            # (`local_sweep` takes it as the upgrade).
+            self._note_alarm(unless_confirming=True)
             with self._lock:
                 last = self._last_scheduled_at
                 if last is not None and now - last < self.config.min_interval_seconds:
@@ -1022,6 +1243,42 @@ class TriggerFrameCapture:
             outcome, getattr(event, "event_type", "unknown"),
         )
         return outcome
+
+    def _note_alarm(self, *, unless_confirming: bool = False) -> None:
+        """Tell the current passage's departure rule a new car is in view. Never raises.
+
+        With ``unless_confirming`` an early-origin passage the camera has not
+        yet confirmed is left alone: the alarm is its confirmation, not a new
+        car.
+        """
+        try:
+            passage = self._passage
+            if passage is None:
+                return
+            if unless_confirming and passage.early and not passage.confirmed:
+                return
+            passage.departing.alarm(self._clock())
+        except Exception:
+            return
+
+    def _departing_mode(self, passage, *, since_alarm: bool) -> str | None:
+        """``on``/``shadow`` while ``passage``'s plate is receding, else None. Never raises.
+
+        ``since_alarm`` is for a frame that is not the sweep's own: the
+        verdict must come from a read after the latest vehicle alarm.
+        """
+        mode = self.config.sweep_departing_skip
+        if mode not in ("on", "shadow") or passage is None:
+            return None
+        try:
+            judge = passage.departing
+            now = self._clock()
+            receding = (
+                judge.receding_since_alarm(now) if since_alarm else judge.receding_at(now)
+            )
+        except Exception:
+            return None
+        return mode if receding else None
 
     def _displace_early(self, item) -> bool:
         """Put a camera event in the slot in place of a queued early one. Holds ``_lock``."""
@@ -1064,6 +1321,31 @@ class TriggerFrameCapture:
             return None
         return mode
 
+    def departing_skip(self) -> str | None:
+        """Whether the passage being read is a departing car, right now.
+
+        What a frame that is *not* the sweep's own is judged by -- the
+        camera's FTP still, above all. ``"on"`` or ``"shadow"`` while the
+        sweep's latest read of the passage, no older than
+        ``SWEEP_DEPARTING_GRACE_SECONDS`` and later than the latest vehicle
+        alarm, says the plate is receding (`DepartingPlate`); None otherwise:
+        no passage read lately, a car that is not receding, an alarm raised
+        since (`on_camera_event` notes every one it is given, scheduled or
+        inside the minimum interval, so the next car's still cannot inherit
+        the last car's verdict), or the rule switched off. The sweep's own
+        hand-overs do not come here: each carries the verdict it was handed
+        over with (`CarriedDeparture`), so a frame of the departing car that
+        reaches the pipeline after the next alarm keeps it. Not tied to the
+        session flag either: the camera's still can reach `prepare` after
+        the session has closed. Asked by `GateProcessor.prepare` once per
+        burst, before the burst is routed, so the answer a burst was routed
+        on is the answer it is finished on. Never raises.
+        """
+        try:
+            return self._departing_mode(self._passage, since_alarm=True)
+        except Exception:
+            return None
+
     def on_early_trigger(self, features=None) -> str:
         """Ask for a local-only sweep ahead of the camera's alarm. Never blocks.
 
@@ -1087,6 +1369,7 @@ class TriggerFrameCapture:
                     outcome = "skipped_busy"
                 else:
                     outcome = "scheduled"
+                    self._note_alarm()
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s origin=%s",
             outcome, EARLY_EVENT_TYPE, ORIGIN_EARLY,
@@ -1106,7 +1389,7 @@ class TriggerFrameCapture:
             early = _is_early(event)
             # Every event starts with its own passage, so nothing a previous
             # early sweep left behind can describe this one.
-            self._passage = SweepPassage(ORIGIN_EARLY if early else ORIGIN_CAMERA)
+            self._passage = SweepPassage(ORIGIN_EARLY if early else ORIGIN_CAMERA, scheduled_at)
             self._sweep_upgrade = None
             if early and not (self._early_enabled and self._sweep_ready()):
                 # Only the sweep can keep a frame off the cloud, so an early
@@ -1222,7 +1505,7 @@ class TriggerFrameCapture:
         # Stated, not inferred: a sweep is early-origin because the early
         # trigger asked for it, and stays unconfirmed until the camera's own
         # alarm is taken off the queue below. See `SweepPassage`.
-        passage = SweepPassage(ORIGIN_EARLY if _is_early(event) else ORIGIN_CAMERA)
+        passage = SweepPassage(ORIGIN_EARLY if _is_early(event) else ORIGIN_CAMERA, scheduled_at)
         self._passage = passage
         self._sweep_upgrade = None
         self._early_sweeps += 1 if passage.early else 0
@@ -1328,6 +1611,10 @@ class TriggerFrameCapture:
                 return None
             path = self._inject_bytes(
                 frame, captured_at, event, scheduled_at, source=source, read=read,
+                # The passage's verdict as it stands now travels with the
+                # frame: a frame of this car handed over after the next alarm
+                # is still a frame of this car.
+                departing=self._departing_mode(passage, since_alarm=False),
             )
             if path is not None:
                 handed.add(digest)
@@ -1635,6 +1922,13 @@ class TriggerFrameCapture:
             if plate_px is not None:
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
+                if read.recognised:
+                    # Only a box the recogniser put characters on: a box with
+                    # no text in it is as likely a bumper or a sign as a plate.
+                    # Timed by when the frame was captured, so an alarm that
+                    # lands while this frame of the car waits to be read, or
+                    # is being read, does not make it the next car's first.
+                    self._note_departing(passage, plate_px, captured_at, sweep_started_at)
             # While waiting: a dark frame that is the unlit idle drive to the
             # baseline and nothing to the reader -- no characters and no box,
             # from a read that completed. Anything else -- a plate, a box, a
@@ -1750,6 +2044,29 @@ class TriggerFrameCapture:
         )
         return injected + fallback + handovers
 
+    def _note_departing(self, passage, plate_px: int, read_at: float,
+                        sweep_started_at: float) -> None:
+        """Feed one boxed read to the passage's departure rule; journal the first verdict.
+
+        Under ``off`` nothing is judged, journalled or counted.
+        """
+        mode = self.config.sweep_departing_skip
+        if mode not in ("on", "shadow"):
+            return
+        try:
+            receding = passage.departing.note(plate_px, read_at)
+        except Exception:
+            return
+        if not receding or passage.departing.noticed:
+            return
+        passage.departing.noticed = True
+        self._sweep_departing += 1
+        LOGGER.info(
+            "gate_local_sweep stage=departing mode=%s peak_px=%d plate_px=%d at_ms=%d",
+            mode, passage.departing.peak_px, plate_px,
+            round(max(0.0, self._clock() - sweep_started_at) * 1000),
+        )
+
     def _cloud_reachable(self) -> bool:
         """False only when the probe answers a definite False; see `__init__`."""
         probe = self._internet_reachable
@@ -1825,7 +2142,7 @@ class TriggerFrameCapture:
         return picked
 
     def _inject_bytes(self, frame: bytes, captured_at: float, event, scheduled_at,
-                      *, source: str, read=None) -> Path | None:
+                      *, source: str, read=None, departing=_NOT_CARRIED) -> Path | None:
         """Write ``frame`` privately and hand it to the burst pipeline.
 
         ``read`` is the sweep's own on-device read of this frame. It travels
@@ -1842,7 +2159,9 @@ class TriggerFrameCapture:
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
             return None
         try:
-            injected = self._inject_path(path, event, scheduled_at, started, sweep_read=read)
+            injected = self._inject_path(
+                path, event, scheduled_at, started, sweep_read=read, departing=departing,
+            )
         except Exception:
             self._failure_count += 1
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
@@ -2235,7 +2554,7 @@ class TriggerFrameCapture:
         return (path,)
 
     def _inject_path(self, path: Path, event, scheduled_at, started, *,
-                     sweep_read=None) -> bool:
+                     sweep_read=None, departing=_NOT_CARRIED) -> bool:
         """Hand a written frame to the burst pipeline with its trigger telemetry.
 
         Returns False, having removed the file, when no injector is attached.
@@ -2301,6 +2620,15 @@ class TriggerFrameCapture:
             # answer is no until the camera's own alarm has arrived.
             extra["origin"] = passage.origin
             extra["cloud_permit"] = passage.cloud_allowed
+        if self._inject_accepts_departing:
+            # The departure verdict this frame is judged by, frozen: the one
+            # the sweep handed it over with, or -- for a frame of the passage
+            # the sweep did not read itself -- the passage's now.
+            verdict = (
+                self._departing_mode(passage, since_alarm=True)
+                if departing is _NOT_CARRIED else departing
+            )
+            extra["departing"] = CarriedDeparture(verdict)
         try:
             inject((path,), captured_at, trigger, **extra)
         except Exception:
@@ -2443,6 +2771,8 @@ class TriggerFrameCapture:
                 "cloud_min_plate_px": self.config.sweep_cloud_min_plate_px,
                 "cloud_last_chance_seconds": self.config.sweep_cloud_last_chance_seconds,
                 "cloud_held": self._sweep_cloud_held,
+                "departing_skip": self.config.sweep_departing_skip,
+                "departing": self._sweep_departing,
                 "waiting_seconds": self.config.sweep_waiting_seconds,
                 "waiting_fps": self.config.sweep_waiting_fps,
                 "waiting_reads": self._sweep_waiting_reads,

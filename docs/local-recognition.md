@@ -524,7 +524,72 @@ could not succeed. With no sweep reading -- sweep disabled, its reader
 unavailable, or no alarm to start it -- the still goes to the cloud as before.
 A still the device never read (`GATE_LOCAL_OCR_CLOUD=always`) is untouched.
 
-**Rollout.** On by default since 2026-10-09, after the 2026-10-05/06 passages
+**A departing car** is not sent at all once `GATE_LOCAL_SWEEP_DEPARTING_SKIP`
+is `on` (shipped as `shadow`: see the rollout note at the end of this
+section). It is let out by the gate's exit mechanism, not by the Pi, so
+a lookup on it decides nothing, and since 2026-10-05 the cloud had decided no
+opening while 42 of its 107 slow (250 ms or more) or failed lookups were on
+passages the direction scan marked `exiting`. The sweep's own reads say which
+way the car is going: a departing car comes from behind the camera and recedes
+up the approach, so the plate the device boxes *shrinks* read by read, where
+an arriving car's plate only grows until it stops at the gate. `DepartingPlate`
+in `trigger_capture.py` holds the rule -- the widest plate of the passage is at
+least 150 px (4K-equivalent), and two boxed reads running are each at most 70 %
+of it -- and each frame the sweep hands over carries the verdict as it stood at the
+hand-over (`CarriedDeparture`), so a frame of the departing car that reaches
+the processor after the next alarm -- the fallback at `new_event` -- keeps
+it. A frame the sweep did not hand over itself, the camera's FTP still above
+all, is judged by `TriggerFrameCapture.departing_skip`: `on` while the
+latest read, no older than ten seconds and later than the latest vehicle
+alarm, still says so. `on_camera_event` notes every vehicle alarm it is
+given, scheduled or inside the minimum interval, so the next car's still
+cannot inherit the last car's verdict, and the measurement starts over at the
+sweep's first read after that alarm, so a car arriving inside the interval
+(no new sweep) is not measured against the last car's widest plate. The
+camera's alarm that confirms a passage the early trigger started is that
+passage's own and changes nothing. `GateProcessor.prepare` asks it once per burst, before the
+burst is routed, and records `cloud_skip="departing"`: the frame, or the
+camera's still, is decided on the device's own read and answers "no plate"
+(`gate_ocr stage=cloud_skipped reason=departing`), with the refused read
+carried as `review_plate` for the near miss exactly as every other skip. The
+verdict is journalled once a passage, `gate_local_sweep stage=departing
+mode=on peak_px=... plate_px=... at_ms=...`, and counted in the heartbeat's
+`sweep.departing`.
+
+What it does not touch: a frame the device *decided* -- an authorised rear
+plate still opens the gate on the device, as it always has (#171); a car
+whose plate grows back after shrinking (one that backed off and came forward)
+is an arrival again and gets its fallback; and a departure that shows no boxed
+plate at all is not caught -- on 2026-10-08 at 18:22 one such passage cost
+twelve lookups, and this rule has nothing to measure on it. The first lookup
+on a departure is usually still spent: its plate is biggest when it first
+appears, which releases a hand-over on plate width before any shrink can be
+seen. Measured on 2026-10-09 over the sweep's own reads, two departures
+(321->100 px and 333->103 px in about five seconds each) were caught 2.1-2.5 s
+after their widest plate and the one arrival (138->319 px, largest dip 3.8 %)
+never read as receding; over the one frame per event the dashboard keeps for
+the 48 passages from 5 to 9 October, the rule fired on 0 of 24 arrivals (16 of
+them let in) and 6 of 15 departures. See
+[vehicle-direction.md](vehicle-direction.md) for why no other real-time signal
+exists yet.
+
+*Rollout of the departure skip.* Shipped as `shadow`: the verdict is judged,
+journalled and counted exactly as under `on`, and nothing about what is sent
+or decided changes. Each passage whose plate reads as receding journals
+`gate_local_sweep stage=departing mode=shadow peak_px=... plate_px=...
+at_ms=...`, and each frame `on` would have kept off the cloud journals
+`gate_ocr stage=cloud_skip_shadow would=departing frames=N`. Read a week of
+them against the dashboard's `direction` for the same passages:
+
+```
+journalctl -u gate-controller --since -7d \
+  | grep -E 'stage=departing mode=shadow|cloud_skip_shadow would=departing'
+```
+
+Switch to `on` only when no passage the scan marked `entering` -- and none
+that was let in -- was judged departing. `off` neither judges nor journals.
+
+**Rollout of the hold.** On by default since 2026-10-09, after the 2026-10-05/06 passages
 above showed the far frames costing lookups and, once, the gate's time.
 `shadow` hands over exactly as `off` does and journals what `on` would have
 done: `stage=cloud_held mode=shadow` once a passage, `release=would_hold` on

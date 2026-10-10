@@ -383,6 +383,50 @@ class MainConfigurationTests(unittest.TestCase):
             run_worker.call_args.kwargs["trigger_resolver"], correlator.correlate,
         )
 
+    def test_mains_prepare_wrapper_forwards_every_keyword_the_fast_lane_can_pass(self):
+        # Codex on #205: the wrapper has a fixed keyword list, and a keyword
+        # the worker passes that it does not take is a TypeError on every
+        # sweep frame -- each reported `processing_error` and dropped, the
+        # device-authorised hand-overs that open the gate included.
+        processor = Mock()
+        with patch.dict(
+            os.environ, self.isolated_state_environment(), clear=True
+        ), patch("sys.argv", ["gate-controller"]), patch.object(
+            gate_main, "require_python_version"
+        ), patch.object(
+            gate_main, "PiRelayAdapter", return_value=object()
+        ), patch.object(
+            gate_main, "RelayController"
+        ), patch.object(
+            gate_main, "LocalStore"
+        ), patch.object(
+            gate_main, "AuthorisedPlateCache"
+        ), patch.object(
+            gate_main, "build_background_workers",
+            return_value=((object(),), object(), object()),
+        ), patch.object(
+            gate_main, "PlateRecognizerClient", return_value=object()
+        ), patch.object(
+            gate_main, "GateProcessor", return_value=processor
+        ), patch.object(
+            gate_main, "run_worker"
+        ) as run_worker, no_live_state_access():
+            gate_main.main()
+
+        prepare = run_worker.call_args.kwargs["prepare"]
+        # Everything `worker._process_bursts` can put in `prepare_options`.
+        passed = {
+            "trigger": object(), "idempotency_key": "key", "stillness": 0.001,
+            "sweep_read": object(), "cloud_permit": lambda: True,
+            "camera_upload": False, "departing": lambda: "on",
+        }
+        prepare((Path("/tmp/frame.jpg"),), None, 1.0, None, **passed)
+        forwarded = processor.prepare.call_args.kwargs
+        for name, value in passed.items():
+            if name == "camera_upload":
+                continue
+            self.assertIs(forwarded.get(name), value, f"{name} was not forwarded")
+
     def test_main_feeds_each_finished_burst_to_the_refocus_worker(self):
         """The production `process` closure is what hands frames to the trigger.
 

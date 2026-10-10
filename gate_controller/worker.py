@@ -74,6 +74,12 @@ class BurstIdentity:
     # fields above: it reaches `prepare`, never the wire.
     origin: str = field(default="camera", compare=False)
     cloud_permit: object | None = field(default=None, compare=False, repr=False)
+    # The departure verdict the capture handed this frame over with (a
+    # `trigger_capture.CarriedDeparture`, answering `on`, `shadow` or None),
+    # or None for a frame that carries none and is judged by the capture's
+    # live predicate instead. Internal, like the fields above: it reaches
+    # `prepare`, never the wire.
+    departing: object | None = field(default=None, compare=False, repr=False)
 
     @property
     def camera_event(self) -> tuple | None:
@@ -771,7 +777,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
         superseded = None
 
     def inject_trigger_burst(paths, received_at, trigger, stillness=None,
-                             sweep_read=None, origin="camera", cloud_permit=None):
+                             sweep_read=None, origin="camera", cloud_permit=None,
+                             departing=None):
         # A webhook-triggered clear frame enters the same bounded queue as an
         # FTP burst, with its own content identity and sanitized trigger.
         paths = tuple(Path(path) for path in paths)
@@ -781,7 +788,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
             cloud_permit = _never
         identity = BurstIdentity(
             content_digest(paths[0]), trigger, stillness, sweep_read=sweep_read,
-            origin=origin, cloud_permit=cloud_permit,
+            origin=origin, cloud_permit=cloud_permit, departing=departing,
         )
         enqueue((paths, received_at, monotonic(), datetime.now(timezone.utc), identity))
 
@@ -1096,6 +1103,9 @@ def _process_bursts(
             if identity is not None and identity.cloud_permit is not None:
                 # Likewise: only an early-origin frame has one.
                 prepare_options["cloud_permit"] = identity.cloud_permit
+            if identity is not None and identity.departing is not None:
+                # Likewise: the verdict a sweep frame was handed over with.
+                prepare_options["departing"] = identity.departing
             if identity is None and _accepts_camera_upload(prepare):
                 # An FTP upload from the camera (its alarm still), not a frame
                 # the sweep handed over: see `camera_still_hold`.
