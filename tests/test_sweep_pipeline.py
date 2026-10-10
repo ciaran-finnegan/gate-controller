@@ -101,6 +101,24 @@ def dark_frame(seed: int) -> bytes:
     return output.getvalue()
 
 
+def car_frame(seed: int) -> bytes:
+    """A car stopped at the stop line: one picture, frame after frame.
+
+    Consecutive frames of a stationary car differ by sensor noise alone -- one
+    pixel here, inside the plate band so each band is a distinct file -- which
+    is exactly what let the idle baseline, once it *was* the car (2026-10-10
+    10:05), match every later frame of it to within the empty-scene threshold.
+    """
+    image = Image.new("RGB", FRAME_SIZE, color=(120, 120, 120))
+    for x in range(150, 330):
+        for y in range(60, 200):
+            image.putpixel((x, y), (230, 230, 230))
+    image.putpixel((130 + seed % 200, 10 + seed % 140), (90, 90, 90))
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=92)
+    return output.getvalue()
+
+
 def digest(data: bytes) -> str:
     return sha256(data).hexdigest()
 
@@ -205,6 +223,12 @@ class LiveFrames:
 
     def dark_scene_difference(self, data):
         return None if self.scene is None else self.scene.dark_difference(data)
+
+    def note_activity(self):
+        # As the real frame sources do: the alarm, and a sweep read that boxed
+        # a plate, hold the baseline's refresh off.
+        if self.scene is not None:
+            self.scene.note_activity()
 
 
 class StopHook:
@@ -860,6 +884,80 @@ class SweepPipelineTests(unittest.TestCase):
         self.assertNotIn("stage=departed_dark", logs.text())
         self.assertGreater(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 2.0)
         self.assertEqual(gate.relay_calls, [])
+
+    def test_a_car_waiting_at_the_gate_through_the_idle_refresh_is_read_on_the_next_alarm(self):
+        # 2026-10-10 10:05:38 and 10:07:34 IST: the D-Max `172-L-66` sat at the
+        # stop, half the picture, through the 60 s of quiet after its alarm;
+        # the keyframe decoder adopted it as the idle drive, and the next
+        # alarm's sweep skipped frame after frame of it unread as "empty"
+        # (likewise 9 Oct 12:35 and 8 Oct 10:24). The baseline now shows a
+        # keyframe to the on-device detector first.
+        empty = frame(9100)
+        first_visit = [car_frame(seed) for seed in range(9110, 9122)]
+        second_visit = [car_frame(seed) for seed in range(9130, 9142)]
+        answers = {
+            # The first alarm's reads: confident misreads of an unlisted plate.
+            digest(crop_to_region(data, REGION)): ("172L6", 0.62) for data in first_visit
+        }
+        answers.update({
+            digest(crop_to_region(data, REGION)): ("10CE1990", 0.91) for data in second_visit
+        })
+        gate = self._gate(answers=answers, sweep_seconds=1.0, empty_scene=0.03)
+        clock = [1000.0]
+        # The baseline as the clear stream builds it (`__main__._clear_stream_source`):
+        # the detector probe, through the real recogniser, on the plate band.
+        gate.frames.scene = SceneBaseline(
+            idle_seconds=60.0, refresh_seconds=30.0, clock=lambda: clock[0],
+            vehicle_check=lambda data: gate.local.plate_boxed(crop_to_region(data, REGION)),
+        )
+        self.assertTrue(gate.frames.scene.observe(empty), "the empty drive is the baseline")
+        # The mechanism being guarded against: had the car become the
+        # baseline, every later frame of it would be the empty drive.
+        adopted = SceneBaseline(idle_seconds=0.0, clock=lambda: 0.0)
+        self.assertTrue(adopted.observe(first_visit[-1]))
+        self.assertTrue(all(adopted.difference(data) < 0.03 for data in second_visit))
+
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(first_visit)])
+        with CapturedLogs() as logs:
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 8.0), logs.text(),
+            )
+            first_ended = re.search(r"gate_local_sweep outcome=ended .*", logs.text()).group(0)
+        self.assertEqual(gate.relay_calls, [], "a misread of an unlisted plate opens nothing")
+        self.assertGreater(int(re.search(r" reads=(\d+)", first_ended).group(1)), 0)
+        self.assertIn(" skipped_empty=0 ", first_ended)
+
+        # The car stays. 90 s pass with no alarm, and the recording loop
+        # offers its keyframe -- the car at the stop -- as the idle drive.
+        clock[0] += 90.0
+        adopted = gate.frames.scene.observe(first_visit[-1])
+        scene_status = gate.frames.scene.status()
+
+        sleep(0.6)  # past the capture's own min interval between alarms
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(second_visit)])
+        with CapturedLogs() as logs:
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 8.0), logs.text(),
+            )
+            second_ended = re.search(r"gate_local_sweep outcome=ended .*", logs.text()).group(0)
+            # What the gate did: the car's frames were read, and it was let in.
+            self.assertIn(" skipped_empty=0 ", second_ended, "the waiting car was skipped as the empty drive")
+            self.assertGreater(int(re.search(r" reads=(\d+)", second_ended).group(1)), 0,
+                               "the waiting car's frames were read, not skipped")
+            self.assertTrue(wait_for(gate.opened, 8.0), f"never opened: {gate.outcomes()}\n{logs.text()}")
+        self.assertIn("reason=opened", second_ended)
+        self.assertEqual(gate.capture.status()["skipped"]["empty_scene"], 0)
+        self.assertEqual(gate.relay_calls, ["relay"], "exactly one pulse, for the authorised read")
+        self.assertEqual(gate.opened_result().reason, "exact_match")
+        self.assertEqual(gate.stored(gate.opened_result())["observed_plate"], "10CE1990")
+        self.assertEqual(len(gate.session.calls), 0, "no cloud lookup was needed")
+        # And why: the detector boxed a plate in the offered keyframe, so the
+        # baseline stayed the empty drive and the car differed from it.
+        self.assertFalse(adopted, "a frame the detector boxes a plate in is not the idle drive")
+        self.assertEqual((scene_status["refreshes"], scene_status["refused_vehicle"]), (1, 1))
+        self.assertGreater(gate.frames.scene_difference(second_visit[0]), 0.03)
 
     def test_a_new_alarm_is_not_kept_waiting_by_the_waiting_phase(self):
         frames = [frame(seed) for seed in range(360, 460)]
