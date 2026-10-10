@@ -641,6 +641,54 @@ class LocalSweepTests(unittest.TestCase):
         self.assertGreater(len(sweep.reads), SWEEP_DARK_DEPARTED_FRAMES,
                            "the dark frames between the lit looks were all read")
 
+    class _LightOutInTheWindow(FrameSource):
+        """A black idle baseline, and the spotlight going out 1 s into the
+        2 s window with the car still there. Every frame after that is the
+        idle drive to both baselines."""
+
+        def scene_difference(self, frame):
+            return 0.385 if self._clock() < 101.0 else 0.0013
+
+        def dark_scene_difference(self, frame):
+            return None if self._clock() < 101.0 else 0.0013
+
+    def test_a_spotlight_that_goes_out_in_the_window_does_not_end_the_sweep_unread(self):
+        # Codex, on #204: three dark frames at the window's end used to be
+        # three unread "empty" looks, and the window's close concluded
+        # `departed` before the waiting phase or the reader had a say.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]
+        sweep = ScriptedSweep({})
+        capture = self._capture(
+            self._LightOutInTheWindow(self.clock, frames), sweep, seconds=2.0, fallback=0,
+            waiting=30.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertIn("stage=waiting", output, "the window's close did not conclude anything")
+        self.assertIn("stage=departed_dark frames=%d" % SWEEP_DARK_DEPARTED_FRAMES, output)
+        self.assertGreaterEqual(self.clock.now, 102.0 + (SWEEP_DARK_DEPARTED_FRAMES - 1) / 2.0)
+        self.assertEqual(capture.status()["skipped"]["empty_scene"], 0)
+
+    def test_a_boxed_plate_after_the_spotlight_goes_out_in_the_window_is_read_to_the_cap(self):
+        frames = [(100.0 + index * 0.4, jpeg(seed=index)) for index in range(100)]
+        boxed = SweepRead(
+            status="no_plate", read_ms=170.0,
+            recognition=LocalRecognition(box=(0.45, 0.5, 0.08, 0.03), status="no_plate"),
+        )
+        answers = {frame: boxed for index, (_at, frame) in enumerate(frames) if index % 5 == 0}
+        capture = self._capture(
+            self._LightOutInTheWindow(self.clock, frames), ScriptedSweep(answers), seconds=2.0,
+            fallback=0, waiting=12.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        with self.assertLogs("gate_controller.trigger_capture", level="INFO") as logs:
+            capture.local_sweep(event(), 100.0, Stop(self.clock))
+        output = "\n".join(logs.output)
+        self.assertNotIn("reason=departed", output)
+        self.assertIn("reason=wait_cap", output)
+        self.assertGreaterEqual(self.clock.now, 114.0)
+
     def test_a_busy_reader_neither_counts_toward_nor_breaks_a_dark_run(self):
         from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
         frames = [(100.0 + index * 0.2, jpeg(seed=index)) for index in range(200)]

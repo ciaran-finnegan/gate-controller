@@ -361,12 +361,16 @@ read, and only a read that completed with neither characters nor a plate box
 counts. That holds whichever baseline the frame matches: on a quiet night the
 alarm comes before any spotlit refresh, the idle baseline is itself black,
 and until #204 a black frame "was the empty drive" and three unread looks
-ended the wait, plate lamp or not. While waiting, a dark frame is now never
-skipped unread. Ten of those in a row (`SWEEP_DARK_DEPARTED_FRAMES`, 5 s at two a
-second) end the waiting as `stage=departed_dark ... reason=departed`; a box, a
-read, a lit frame, a busy or failed reader, or no dark idle frame on record
-(a restart mid-passage) breaks the run or leaves the rule out of it, and the
-car is read to the cap as before. The 15 s status counts these under
+ended the wait, plate lamp or not. A dark frame is now never skipped unread,
+in the window or while waiting, so a spotlight that goes out in the window's
+last seconds cannot end the sweep at the window's close either. Ten such
+reads in a row while waiting (`SWEEP_DARK_DEPARTED_FRAMES`, 5 s at two a
+second) end it as `stage=departed_dark ... reason=departed`. A box, a read, a
+lit frame or a failed read starts the run again; a busy reader, which said
+nothing about its frame, neither counts toward the ten nor resets them; with
+no dark idle frame on record (a restart mid-passage) the rule is out of it.
+In every one of those the car is read to the cap as before. The 15 s status
+counts these under
 `recognition.trigger_capture.sweep.dark_departed`.
 
 The cap covers

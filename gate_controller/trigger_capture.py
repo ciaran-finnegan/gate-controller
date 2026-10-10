@@ -203,8 +203,9 @@ SWEEP_DEPARTED_FRAMES = 3
 # and only a read that found neither a plate nor a plate box counts. Ten
 # of those in a row while waiting -- 5 s at two a second, against the 1.5 s
 # the lit rule takes -- is a dark drive with nothing in it to read. A box, a
-# read, a lit frame or a busy reader breaks the run; a car whose plate is
-# lit at all is read to the cap exactly as before.
+# read, a lit frame or a failed read breaks the run; a busy reader, which
+# said nothing about its frame, neither counts nor breaks it; a car whose
+# plate is lit at all is read to the cap exactly as before.
 SWEEP_DARK_DEPARTED_FRAMES = 10
 # How finely a paced wait is sliced, so a new alarm, an open or a shutdown is
 # noticed within this long however slow the cadence.
@@ -1566,16 +1567,19 @@ class TriggerFrameCapture:
                     )
                 continue
             scene_difference = self._scene_difference(frame)
-            # While waiting, a dark frame is never skipped unread, whatever
-            # the baseline says of it. The baseline may itself be dark -- a
-            # quiet night, the alarm before any spotlit refresh -- and a plate
-            # lamp is below what a thumbnail can see, so a black frame that
-            # "is the idle drive" may still hold a lit plate; only the reader
-            # may say there is nothing in it. The dark idle scene is asked
-            # here and its answer used below, once the reader has had the
-            # frame. (A lit frame of the idle drive is still skipped unread,
-            # as it always was, and breaks a dark run.)
-            dark_difference = self._dark_scene_difference(frame) if waiting else None
+            # A dark frame is never skipped unread, whatever the baseline says
+            # of it, in the window or while waiting. The baseline may itself
+            # be dark -- a quiet night, the alarm before any spotlit refresh --
+            # and a plate lamp is below what a thumbnail can see, so a black
+            # frame that "is the idle drive" may still hold a lit plate; only
+            # the reader may say there is nothing in it. That also keeps dark
+            # frames out of `consecutive_empty`, so a spotlight that goes out
+            # in the window's last seconds cannot end the sweep unread at the
+            # window's close. The dark idle scene is asked here and its answer
+            # used below, once the reader has had the frame. (A lit frame of
+            # the idle drive is still skipped unread, as it always was, and
+            # breaks a dark run.)
+            dark_difference = self._dark_scene_difference(frame)
             if (
                 dark_difference is None
                 and scene_difference is not None
@@ -1631,11 +1635,13 @@ class TriggerFrameCapture:
             if plate_px is not None:
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
-            # A dark frame that is the unlit idle drive to the baseline and
-            # nothing to the reader: no characters and no box, from a read
-            # that completed. Anything else -- a plate, a box, a lit frame, a
-            # frame the dark baseline cannot speak to -- starts the run again.
-            if dark_match and read.status == "no_plate" and plate_px is None:
+            # While waiting: a dark frame that is the unlit idle drive to the
+            # baseline and nothing to the reader -- no characters and no box,
+            # from a read that completed. Anything else -- a plate, a box, a
+            # lit frame, a frame the dark baseline cannot speak to -- starts
+            # the run again. (A busy reader never reaches here: it has said
+            # nothing about the frame, so it neither counts nor resets.)
+            if waiting and dark_match and read.status == "no_plate" and plate_px is None:
                 consecutive_dark += 1
                 if consecutive_dark >= SWEEP_DARK_DEPARTED_FRAMES:
                     self._sweep_dark_departed += 1

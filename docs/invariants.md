@@ -120,8 +120,8 @@ read on two frames.
   for this invariant to fail: a car in the dark whose plate is lit at all
   gives the reader a box, and that must keep it being read. The same PR
   closed the older hole on a quiet night, where the baseline is itself black
-  and three *unread* black looks used to end the wait: while waiting, a dark
-  frame always goes to the reader.
+  and three *unread* black looks used to end the wait, or the window: a dark
+  frame always goes to the reader now, in the window and while waiting.
 
 Guards:
 
