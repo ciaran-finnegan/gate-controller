@@ -234,13 +234,11 @@ The decode-width costs are in Task 1 below.
 
 ## 8. Anything else
 
-- **9 Oct 21:42-22:22, the gate stood open for 39 minutes.**
-  - The audio scanner (`gate_movements`) heard a 17 s motor run at 21:41:38 as the Audi left, then two more runs (21:42:08, 21:42:23) as it was still in the gateway.
-  - Then nothing, and no latch clang, until 22:21:47, when the owner drove through the open gate. The Pi sent no pulse all evening (`relay_outcome=not_attempted`) and there was no app command.
-  - Why, from the opener's own manual: it is a TOPENS A5132 with auto-close set to about 14 s after fully open. The TOPENS manual says the board "reverse[s] the gate upon first obstruction and stop[s] upon a second sequential obstruction"; its troubleshooting table lists "the gate stop[s] when on the way of opening or closing" as "two sequential photo beam blocked".
-  - That fits the audio exactly. The exit wand opened the gate (21:41:38), auto-close started about 14 s after full open (21:42:08), the departing car broke the beam (reverse, 21:42:23), and broke it again (stop). A board that has stopped waits for a command; auto-close does not re-arm.
-  - So the board is behaving as designed; the gate can be left open, possibly part-way, whenever a car lingers in the beam.
-  - A notify-only "gate left open" alert now ships (gate-controller#202, access-gate-ui#94). Its one-tap Close requires the user to confirm they can see the gate fully open and not moving (access-gate-ui#95): a pulse into a gate stopped part-way reverses it, and the leaves can cross (2026-09-21).
+- **9 Oct 21:42-22:22: what the gate did is unknown.**
+  - **Corrected 10 Oct.** This section first said the gate stood open for 39 minutes after the photocell reversed an interrupted auto-close. Re-read at 0.5 s resolution ([2026-10-10-gate-jam.md](2026-10-10-gate-jam.md)), the scanner's three rows are not motor runs. The 21:41:38 row is the departing Audi's engine (band +10 to +30 dB, almost no 1.2-8 kHz share). The 21:42:23 row is the camera's own vehicle alarm sound, which clipped the microphone from 0.2 s after the alarm. No motor-band run is visible in the burst.
+  - So the audio cannot say whether the exit wand opened the gate, whether the auto-close ran or was reversed, or whether the gate stood open until 22:22. The Pi sent no pulse all evening (`relay_outcome=not_attempted`) and there was no app command; those facts stand.
+  - The TOPENS manual's photocell behaviour still holds: the first block reverses the gate, a second sequential block stops it, and auto-close does not re-arm. A gate *can* be left open that way; this evening is not shown to be an instance.
+  - The notify-only "gate left open" alert (gate-controller#202, access-gate-ui#94, #95) was built on this reading. Its rule is unvalidated until it is replayed on audio recorded with the alarm sound off (it was switched off on 10 Oct at 15:27); see [../gate-left-open.md](../gate-left-open.md).
 - **Link loss is diurnal.**
   - Mean Pi→router loss by hour (IST), 5-9 Oct: 00-06 h 5-8 %, 08 h 18 %, 09-14 h 34-40 %, 15-17 h 27-29 %, 19-22 h 7-11 %.
   - A constant load such as the NVR recording the camera around the clock does not by itself explain a daily shape.
