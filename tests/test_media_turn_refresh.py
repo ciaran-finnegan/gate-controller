@@ -140,13 +140,15 @@ class MediaTurnRefreshTests(unittest.TestCase):
         # (2026-10-10). Exit 75 is retried in minutes; exit 1 waits for the
         # timer, whose OnUnitInactiveSec counts from a failed run too.
         self.assertEqual(75, EXIT_TRY_AGAIN)
-        # Only exit 75 is retried: a general on-failure policy would also
-        # retry a flock setup error, a start timeout or a signal.
-        self.assertEqual("no", service["Service"].get("Restart"))
-        self.assertEqual([str(EXIT_TRY_AGAIN)],
-                         service["Service"].get("RestartForceExitStatus").split())
+        # RestartForceExitStatus= is refused on a Type=oneshot unit by systemd
+        # 252-255 (the unit would not load at all), so the retry is
+        # on-failure with the helper's permanent failure, exit 1, excluded.
+        self.assertEqual("on-failure", service["Service"].get("Restart"))
         self.assertEqual("2min", service["Service"].get("RestartSec"))
-        self.assertNotIn("RestartPreventExitStatus", service["Service"])
+        prevented = service["Service"].get("RestartPreventExitStatus").split()
+        self.assertIn("1", prevented)
+        self.assertNotIn(str(EXIT_TRY_AGAIN), prevented)
+        self.assertNotIn("RestartForceExitStatus", service["Service"])
         self.assertNotIn("SuccessExitStatus", service["Service"])
         self.assertEqual("0", service["Unit"].get("StartLimitIntervalSec"))
         self.assertEqual("4h", timer["Timer"].get("OnUnitInactiveSec"))

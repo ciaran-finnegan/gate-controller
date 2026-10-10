@@ -1675,9 +1675,11 @@ minutes until someone ran `systemctl reset-failed` by hand. Now:
 - The transcoder `Wants=` the gateway rather than `Requires=` it, so a failed
   gateway start cannot end the transcoder's own retries; it reconnects within
   10 s of the gateway coming back.
-- The TURN refresh retries every 2 minutes only on exit 75 (Cloudflare could
-  not be reached, or another run holds the lock), and otherwise waits for its
-  timer (below).
+- The TURN refresh retries every 2 minutes when Cloudflare could not be
+  reached or another run holds the lock (exit 75), and waits for its timer on
+  a permanent failure (exit 1; below).
+- The gateway `Wants=` the auth sidecar rather than `Requires=` it, for the
+  same reason as the transcoder.
 
 `tests/test_service_restart_policy.py` fails if a long-running unit can give up
 again. `file-monitor.service` is not yet covered: it still has a 5-in-60 s start
@@ -1781,10 +1783,12 @@ opportunities after a failed run before a 24-hour credential expires. A run
 that could not reach Cloudflare at all -- no route, DNS, a timeout, HTTP 408,
 429 or 5xx, which is what the run 2 minutes after a power cut sees while the
 network is late -- exits 75, as does a lock another run is holding, and systemd
-retries exactly that every 2 minutes (`RestartForceExitStatus=75`, `Restart=no`)
-until it gets through. Any other ending (a refused token, a rejected response, a
-rollback, a lock-file error, a start timeout) waits for the timer, because
-retrying it would only restart the gateway again. Each successful run
+retries it every 2 minutes until it gets through. A failure the helper reports
+as permanent (a refused token, a rejected response, a rollback) exits 1 and
+waits for the timer, because retrying it would only restart the gateway again.
+(`RestartForceExitStatus=75` would retry exit 75 alone, but systemd refuses it on
+a `Type=oneshot` unit, so the unit uses `Restart=on-failure` with
+`RestartPreventExitStatus=1`.) Each successful run
 requests a 24-hour credential from Cloudflare with the `gate-mate-pi` custom
 identifier.
 

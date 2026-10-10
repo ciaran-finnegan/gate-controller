@@ -2,7 +2,11 @@
 Description=Isolated Gate MediaMTX gateway
 After=network-online.target gate-media-auth.service
 Wants=network-online.target
-Requires=gate-media-auth.service
+# Wants=, not Requires=: a failed start of the auth sidecar would otherwise
+# fail this start job as a dependency failure, which Restart= never retries
+# (the transcoder was stranded exactly so on 2026-10-10). Without the sidecar
+# MediaMTX's external authentication fails closed, and this keeps retrying.
+Wants=gate-media-auth.service
 # Never give up starting. After a power cut the Pi can boot before the
 # powerline link is up (NetworkManager-wait-online then fails and
 # network-online.target is reached anyway); on 2026-10-10 a start limit of

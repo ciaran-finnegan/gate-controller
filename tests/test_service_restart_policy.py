@@ -47,13 +47,6 @@ def _long_running(parser):
     return parser.get("Service", "Type", fallback="simple") in LONG_RUNNING_TYPES
 
 
-def _never_gives_up(parser):
-    return (
-        parser.get("Service", "Restart", fallback="no") == "always"
-        and parser.get("Unit", "StartLimitIntervalSec", fallback=None) == "0"
-    )
-
-
 class RestartPolicyTests(unittest.TestCase):
     def test_the_media_and_camera_services_are_among_the_units_checked(self):
         checked = {path.name for path in _units() if _long_running(_read(path))}
@@ -86,27 +79,19 @@ class RestartPolicyTests(unittest.TestCase):
                 self.assertRegex(restart_seconds, r"^([5-9]|[1-5][0-9]|60)s$",
                                  "pace retries between 5 s and 60 s")
 
-    def test_no_long_running_service_requires_one_whose_start_can_fail_for_good(self):
-        # A Requires=/BindsTo= on a unit that is still allowed to give up turns
-        # its start-limit failure into a dependency failure here, which
-        # Restart= does not retry. Requiring a unit that never gives up is
-        # accepted: its start job can then only fail for a configuration
-        # fault (a missing environment file), not for a late network.
-        retrying = {
-            path.name for path in _units()
-            if _long_running(_read(path)) and _never_gives_up(_read(path))
-        }
+    def test_no_long_running_service_hard_requires_another_gate_unit(self):
+        # A Requires=/BindsTo= on another gate unit turns any failed start of
+        # that unit -- a start limit, a missing file, one bad attempt before
+        # it recovers on its own -- into a dependency failure here, which
+        # Restart= never retries: the dependent stays failed even after the
+        # prerequisite has restarted successfully. On 2026-10-10 the
+        # transcoder was stranded exactly so. Use Wants= with After=.
         for path in _units():
             parser = _read(path)
             if not _long_running(parser) or path.name in EXEMPT:
                 continue
             for key in ("Requires", "BindsTo"):
                 for required in parser.get("Unit", key, fallback="").split():
-                    if not required.startswith("gate-"):
-                        continue
-                    with self.subTest(unit=path.name, requires=required):
-                        self.assertIn(required, retrying)
-
-
-if __name__ == "__main__":
-    unittest.main()
+                    with self.subTest(unit=path.name, key=key, requires=required):
+                        self.assertFalse(required.startswith("gate-"),
+                                         f"{path.name} {key}={required}")
