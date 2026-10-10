@@ -230,8 +230,9 @@ def decision_of(row: dict) -> str:
 
 
 RULES = (
-    ("vision alone", ()),
-    ("vision and a confirming look, CLIP or a plate box (the shipped rule)", ("either",)),
+    ("vision alone (GATE_EARLY_TRIGGER_CONFIRMATION=sweep: the sweep's own reads confirm)", ()),
+    ("vision and a confirming look, CLIP or a plate box (GATE_EARLY_TRIGGER_CONFIRMATION=looks)",
+     ("either",)),
     ("vision and CLIP sees a vehicle", ("clip",)),
     ("vision and a plate box in the first looks", ("plate",)),
     ("vision and a vehicle sound rising (audio-armed vision)", ("audio",)),

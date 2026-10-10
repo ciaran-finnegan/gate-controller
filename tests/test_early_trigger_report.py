@@ -91,7 +91,8 @@ class ReportTests(unittest.TestCase):
         self.would(BASE + 1800, layers=empty)
         self.would(BASE + 2400, layers={"clip": {"status": "skipped_busy"}})
         table = {line["rule"]: line["day"] for line in self.summary()["layers"]}
-        alone = table["vision alone"]
+        alone = table["vision alone (GATE_EARLY_TRIGGER_CONFIRMATION=sweep: "
+                      "the sweep's own reads confirm)"]
         self.assertEqual((alone["false_total"], alone["true_total"], alone["false_removed"]), (3, 2, 0))
         clip = table["vision and CLIP sees a vehicle"]
         self.assertEqual((clip["false_removed"], clip["false_total"], clip["true_lost"]), (2, 2, 0))
@@ -150,7 +151,8 @@ class ReportTests(unittest.TestCase):
         self.would(BASE + 1200, layers={"clip": {"status": "ok", "empty": 0.02},
                                         "plate_look": {"status": "skipped_busy"}})
         table = {line["rule"]: line["day"] for line in self.summary()["layers"]}
-        shipped = table["vision and a confirming look, CLIP or a plate box (the shipped rule)"]
+        shipped = table["vision and a confirming look, CLIP or a plate box "
+                        "(GATE_EARLY_TRIGGER_CONFIRMATION=looks)"]
         self.assertEqual((shipped["false_removed"], shipped["false_total"], shipped["true_lost"],
                           shipped["judged"]), (1, 2, 0, 3))
 

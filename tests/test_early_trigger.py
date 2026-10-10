@@ -125,6 +125,10 @@ def stub_layers(*, clip_empty=None, plate_box=None, clock=None, deadline=0.5):
 
 
 CONFIRMED = {"status": "confirmed", "by": "clip", "waited_ms": 120, "deadline_ms": 500}
+#: The decision path before 2026-10-10, for the tests that are about the looks' wait.
+LOOKS = {"GATE_EARLY_TRIGGER_CONFIRMATION": "looks"}
+#: Every would-trigger of the second shadow fortnight, with the looks' recorded answers.
+SHADOW_RECORD = Path(__file__).parent / "fixtures" / "early_trigger" / "shadow-2026-10-05-to-10.json"
 
 
 class SpyCapture:
@@ -196,6 +200,18 @@ class WorkerHarness:
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_the_confirmation_is_the_sweep_unless_the_looks_are_asked_for_by_name(self):
+        self.assertEqual(load_config({}).confirmation, "sweep")
+        self.assertEqual(load_config({"GATE_EARLY_TRIGGER_CONFIRMATION": "looks"}).confirmation,
+                         "looks")
+        self.assertEqual(load_config({"GATE_EARLY_TRIGGER_CONFIRMATION": " Looks "}).confirmation,
+                         "looks")
+        with self.assertLogs("gate_controller.early_trigger", level="WARNING") as logs:
+            self.assertEqual(load_config({"GATE_EARLY_TRIGGER_CONFIRMATION": "clip"}).confirmation,
+                             "sweep")
+        self.assertIn("GATE_EARLY_TRIGGER_CONFIRMATION='clip' status=rejected using=sweep",
+                      logs.output[0])
+
     def test_the_codes_default_is_off_and_a_typo_is_off_too(self):
         self.assertEqual(load_config({}).mode, "off")
         self.assertFalse(load_config({}).enabled)
@@ -368,18 +384,22 @@ class ShadowTests(unittest.TestCase):
 
 
 class ActingTests(unittest.TestCase):
-    """``on``: what reaches the capture, and only after a confirming look.
+    """``on``: what reaches the capture, and on whose say-so.
 
-    Before the first shadow day the worker acted on the vision rule alone;
-    ``test_on_asks_the_capture_for_a_sweep`` used to pass with no layers at
-    all. Seven false day triggers in thirteen minutes of cloud shade, all
-    cleared by the second looks, changed that: the same test now has to give
-    the worker a look that sees a vehicle.
+    Before the first shadow day the worker acted on the vision rule alone.
+    Seven false day triggers in thirteen minutes of cloud shade, all cleared
+    by the second looks, put the looks on the decision path
+    (``GATE_EARLY_TRIGGER_CONFIRMATION=looks``). The second shadow fortnight
+    then showed the looks never answering inside their bound on the Pi and
+    wrong when they did (``ShadowRecordTests``), so the default became
+    ``sweep``: the vision rule starts the local-only sweep at once and the
+    sweep's own reads are the second look. The ``looks`` tests pass the old
+    setting by name.
     """
 
     def test_on_asks_the_capture_for_a_sweep_once_a_look_confirms_and_records_both(self):
         capture = SpyCapture()
-        harness = WorkerHarness(self, "on", capture=capture,
+        harness = WorkerHarness(self, "on", capture=capture, environment=LOOKS,
                                 layers=stub_layers(clip_empty=0.02, plate_box=False)).run()
         self.assertEqual(len(capture.calls), 1)
         self.assertIn("blob_fraction", capture.calls[0])
@@ -399,7 +419,7 @@ class ActingTests(unittest.TestCase):
 
     def test_a_plate_box_confirms_when_the_tower_sees_nothing(self):
         capture = SpyCapture()
-        harness = WorkerHarness(self, "on", capture=capture,
+        harness = WorkerHarness(self, "on", capture=capture, environment=LOOKS,
                                 layers=stub_layers(clip_empty=0.99, plate_box=True)).run()
         self.assertEqual(len(capture.calls), 1)
         row = harness.rows()[0]
@@ -409,7 +429,7 @@ class ActingTests(unittest.TestCase):
     def test_an_unconfirmed_would_trigger_starts_nothing_and_says_why(self):
         capture = SpyCapture()
         with self.assertLogs("gate_controller.early_trigger", level="INFO") as logs:
-            harness = WorkerHarness(self, "on", capture=capture,
+            harness = WorkerHarness(self, "on", capture=capture, environment=LOOKS,
                                     layers=stub_layers(clip_empty=0.9998, plate_box=False)).run()
         self.assertEqual(capture.calls, [], "the capture was asked on vision alone")
         row = harness.rows()[0]
@@ -425,17 +445,18 @@ class ActingTests(unittest.TestCase):
         self.assertEqual(harness.worker.status()["unconfirmed"], 1)
         self.assertEqual(harness.worker.status()["confirmed"], 0)
 
-    def test_without_any_look_at_all_on_starts_nothing(self):
+    def test_without_any_look_at_all_the_looks_rule_starts_nothing(self):
         capture = SpyCapture()
-        harness = WorkerHarness(self, "on", capture=capture).run()
+        harness = WorkerHarness(self, "on", capture=capture, environment=LOOKS).run()
         self.assertEqual(capture.calls, [])
         self.assertEqual(harness.rows()[0]["action"], "skipped_unavailable")
-        harness = WorkerHarness(self, "on", capture=SpyCapture(), layers=stub_layers()).run()
+        harness = WorkerHarness(self, "on", capture=SpyCapture(), environment=LOOKS,
+                                layers=stub_layers()).run()
         self.assertEqual(harness.rows()[0]["action"], "skipped_unavailable")
 
     def test_shadow_records_the_decision_too_and_still_acts_on_nothing(self):
         capture = SpyCapture()
-        harness = WorkerHarness(self, "shadow", capture=capture,
+        harness = WorkerHarness(self, "shadow", capture=capture, environment=LOOKS,
                                 layers=stub_layers(clip_empty=0.02, plate_box=True)).run()
         self.assertEqual(capture.calls, [])
         row = harness.rows()[0]
@@ -445,12 +466,63 @@ class ActingTests(unittest.TestCase):
     def test_looks_the_rate_cap_refuses_leave_the_trigger_unconfirmed(self):
         capture = SpyCapture()
         harness = WorkerHarness(self, "on", capture=capture, environment={
-            "GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE": "0",
+            "GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE": "0", **LOOKS,
         }, layers=ConfirmationLayers(per_minute=0, deadline_seconds=0.5)).run()
         self.assertEqual(capture.calls, [])
         row = harness.rows()[0]
         self.assertEqual(row["action"], "skipped_disabled")
         self.assertEqual(harness.layers_of(row)["clip"]["status"], "skipped_disabled")
+
+    def test_with_the_sweep_as_the_confirmation_on_asks_the_capture_at_once_and_asks_no_look(self):
+        """The default: the vision rule's would-trigger reaches the capture with no look and no wait."""
+        capture = SpyCapture()
+        # Both looks would have said no. Neither is asked.
+        looks = stub_layers(clip_empty=0.9998, plate_box=False)
+        with self.assertLogs("gate_controller.early_trigger", level="INFO") as logs:
+            harness = WorkerHarness(self, "on", capture=capture, layers=looks).run()
+        self.assertEqual(harness.config.confirmation, "sweep")
+        self.assertEqual(len(capture.calls), 1)
+        self.assertIn("blob_fraction", capture.calls[0])
+        row = harness.rows()[0]
+        self.assertEqual((row["mode"], row["action"]), ("on", "scheduled"))
+        layers = harness.layers_of(row)
+        self.assertEqual(json.loads(row["features"])["verdict"], "trigger")
+        self.assertEqual(layers["decision"], {"status": "confirmed", "by": "sweep",
+                                              "waited_ms": 0, "deadline_ms": 0})
+        self.assertEqual((layers["clip"]["status"], layers["plate_look"]["status"]),
+                         ("not_asked", "not_asked"))
+        configured = next(line for line in logs.output if "stage=configured" in line)
+        self.assertIn("confirmation=sweep confirm_s=0.5", configured)
+        line = next(line for line in logs.output if "stage=would_trigger" in line)
+        self.assertIn("action=scheduled confirmation=confirmed by=sweep waited_ms=0", line)
+        self.assertEqual((harness.worker.status()["confirmed"],
+                          harness.worker.status()["unconfirmed"]), (1, 0))
+        # What the sweep then made of it is the record, as before.
+        capture.observer({"reason": "early_abort", "upgraded": False, "reads": 0,
+                          "plate_reads": 0})
+        self.assertEqual(json.loads(harness.rows()[0]["sweep"])["reason"], "early_abort")
+
+    def test_with_the_sweep_as_the_confirmation_no_look_at_all_is_no_obstacle(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture).run()
+        self.assertEqual(len(capture.calls), 1)
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "scheduled")
+        self.assertEqual(harness.layers_of(row)["clip"]["status"], "unavailable")
+
+    def test_in_shadow_the_looks_still_run_for_the_record_and_nothing_is_started(self):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "shadow", capture=capture,
+                                layers=stub_layers(clip_empty=0.9998, plate_box=False)).run()
+        self.assertEqual(capture.calls, [])
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "none")
+        layers = harness.layers_of(row)
+        # The decision is what `on` would have done; the looks are what shadow can measure.
+        self.assertEqual(layers["decision"]["by"], "sweep")
+        self.assertIs(layers["clip"]["vehicle"], False)
+        self.assertEqual(layers["plate_look"]["status"], "ok")
+        self.assertFalse(layers["plate_look"]["plate_box"])
 
     def _observation(self):
         return early_trigger.Observation("trigger", True, "day", {"blob_fraction": 0.1})
@@ -538,7 +610,7 @@ class ConfirmationTests(unittest.TestCase):
     """The wait is bounded, ends at the first yes, and ends when the camera speaks."""
 
     def _worker(self, layers):
-        harness = WorkerHarness(self, "on", capture=SpyCapture(), layers=layers)
+        harness = WorkerHarness(self, "on", capture=SpyCapture(), layers=layers, environment=LOOKS)
         harness.worker._clock = time.monotonic
         return harness.worker
 
@@ -618,6 +690,37 @@ class ConfirmationTests(unittest.TestCase):
         release.set()
         alarm.join(2.0)
 
+    def test_a_late_yes_reaches_the_row_not_just_the_confirmation(self):
+        """The second fortnight's record had no `plate_late` although four true triggers earned one."""
+        release = Event()
+
+        def slow_plate(frame):
+            release.wait(5.0)
+            return Read(box=True)
+
+        layers = ConfirmationLayers(plate_frame=lambda: b"jpeg", plate_read=slow_plate,
+                                    deadline_seconds=0.1, sleep=lambda s: None)
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture, layers=layers, environment=LOOKS)
+        harness.worker._clock = time.monotonic
+        harness.worker._would_trigger(
+            early_trigger.Observation("trigger", True, "day", {
+                "blob_fraction": 0.1, "changed_fraction": 0.1, "scatter": 0.0, "mean_luma": 100.0,
+                "luma_jump": 0.0, "peak": 200, "persistence": 2, "cx": 0.1, "cy": 0.4,
+                "blob_contrast": -0.5, "blob_spread": 0.5, "scene_difference": 0.05}))
+        self.assertEqual(capture.calls, [])
+        row = harness.rows()[0]
+        self.assertEqual(row["action"], "skipped_unconfirmed")
+        self.assertIsNone(harness.layers_of(row)["decision"]["by"])
+        release.set()
+        for _ in range(200):
+            if "plate_look" in harness.layers_of(harness.rows()[0]):
+                break
+            time.sleep(0.01)
+        decision = harness.layers_of(harness.rows()[0])["decision"]
+        self.assertEqual((decision["status"], decision["by"]), ("unconfirmed", "plate_late"))
+        self.assertEqual(decision["deadline_ms"], 100)
+
     def test_a_late_yes_is_written_down_as_late(self):
         confirmation = Confirmation(deadline_seconds=0.01)
         self.assertEqual(confirmation.wait()["status"], "unconfirmed")
@@ -628,6 +731,140 @@ class ConfirmationTests(unittest.TestCase):
         started = time.monotonic()
         self.assertEqual(settled.wait()["status"], "skipped_rate")
         self.assertLess(time.monotonic() - started, 0.1, "a settled answer is not waited on")
+
+
+class RecordedLooks:
+    """The two looks exactly as the shadow record has them: each answer at the millisecond it came.
+
+    Stands in for :class:`ConfirmationLayers`. A yes that came inside the
+    bound confirms; one that came after it is the late yes the record writes
+    down; a look that was ``skipped_busy`` is whatever it managed before a
+    real sweep took the reader. Nothing runs and nothing waits in real time:
+    the Confirmation is settled before the worker asks, so the wait returns
+    at once with the answer the Pi's own timing gave.
+    """
+
+    def __init__(self, deadline_seconds):
+        self.deadline_seconds = deadline_seconds
+        self.recorded: dict = {}
+        self.asked = 0
+
+    def set_clip_look(self, clip_look):
+        pass
+
+    def begin(self, done):
+        self.asked += 1
+        confirmation = Confirmation(deadline_seconds=self.deadline_seconds)
+        clip = self.recorded.get("clip") or {}
+        plate = self.recorded.get("plate_look") or {}
+        answers = []
+        if early_trigger.clip_sees_vehicle(clip) and clip.get("ms") is not None:
+            answers.append((clip["ms"], "clip"))
+        for read in plate.get("reads") or []:
+            if read.get("plate_box") and read.get("ms") is not None:
+                answers.append((read["ms"], "plate"))
+                break
+        answers.sort()
+        if answers and answers[0][0] <= self.deadline_seconds * 1000:
+            confirmation.confirm(answers[0][1])
+        else:
+            confirmation.cancel("unconfirmed")
+        done({"clip": clip, "plate_look": plate})
+        return confirmation
+
+
+class ShadowRecordTests(unittest.TestCase):
+    """The confirmation rules against the second shadow fortnight, through the worker's own decision path.
+
+    ``SHADOW_RECORD`` is every would-trigger of the record the second report
+    was run over (2026-10-05 14:00 to 10-10 06:30 UTC; 82 would-triggers, 24
+    of them followed by the camera's alarm; 77.6 h of day and 36.2 h of night
+    watched), with the vision rule's features and the two looks' recorded
+    answers and timings. Each is replayed through
+    ``EarlyTriggerWorker._would_trigger`` in ``on`` with a spy capture, so
+    what is counted is what reached the capture, not a vote tallied beside the
+    code. The numbers are the ones in docs/early-trigger.md.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.record = json.loads(SHADOW_RECORD.read_text())["would_triggers"]
+
+    def replay(self, environment, looks=None):
+        capture = SpyCapture()
+        harness = WorkerHarness(self, "on", capture=capture, environment={
+            "GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS": "5",
+            "GATE_EARLY_TRIGGER_MAX_PER_HOUR": "120", **environment,
+        }, layers=looks)
+        harness.clock.step = 0.0
+        reached: dict = {}
+        logging.disable(logging.INFO)
+        try:
+            for row in self.record:
+                harness.clock.now += 60.0
+                if looks is not None:
+                    looks.recorded = row["layers"]
+                before = len(capture.calls)
+                harness.worker._would_trigger(
+                    early_trigger.Observation("trigger", True, row["light"], dict(row["features"])))
+                if len(capture.calls) > before:
+                    key = (row["light"], row["verdict"])
+                    reached[key] = reached.get(key, 0) + 1
+        finally:
+            logging.disable(logging.NOTSET)
+        return reached, harness
+
+    def test_the_record_is_what_the_report_was_run_over(self):
+        light_verdict = {}
+        for row in self.record:
+            key = (row["light"], row["verdict"])
+            light_verdict[key] = light_verdict.get(key, 0) + 1
+        self.assertEqual(light_verdict, {("day", "true"): 15, ("day", "false"): 33,
+                                         ("night", "true"): 9, ("night", "false"): 25})
+
+    def test_the_sweep_as_the_confirmation_keeps_every_true_trigger_and_sweeps_every_false_one(self):
+        reached, harness = self.replay({}, looks=RecordedLooks(0.5))
+        self.assertEqual(reached, {("day", "true"): 15, ("night", "true"): 9,
+                                   ("day", "false"): 33, ("night", "false"): 25})
+        # The cost, in plain sight: 58 local-only sweeps of an empty lane, or of
+        # a person or the floodlight, in 113.8 h -- 0.43 an hour by day and
+        # 0.69 by night, each ending in about a second on an empty lane and
+        # after GATE_EARLY_TRIGGER_MAX_SECONDS otherwise, sending nothing.
+        rows = harness.rows()
+        self.assertEqual(len(rows), 82)
+        self.assertTrue(all(row["action"] == "scheduled" for row in rows))
+        self.assertTrue(all(harness.layers_of(row)["clip"]["status"] == "not_asked" for row in rows),
+                        "the sweep is the look: nothing else is decoded or read")
+        self.assertTrue(all(harness.layers_of(row)["decision"]["waited_ms"] == 0 for row in rows),
+                        "the lead is not spent waiting")
+
+    def test_the_looks_inside_their_half_second_confirmed_nothing_on_the_pi(self):
+        reached, _harness = self.replay(LOOKS, looks=RecordedLooks(0.5))
+        self.assertEqual(reached, {}, "the shipped bound let a would-trigger through")
+        clip_ms = [row["layers"]["clip"]["ms"] for row in self.record
+                   if row["layers"].get("clip", {}).get("ms") is not None]
+        first_plate_ms = [row["layers"]["plate_look"]["reads"][0]["ms"] for row in self.record
+                          if (row["layers"].get("plate_look", {}).get("reads") or [{}])[0].get("ms")]
+        # Why: on the Pi neither look ever answered inside 500 ms.
+        self.assertEqual((len(clip_ms), min(clip_ms), max(clip_ms)), (81, 539, 773))
+        self.assertEqual((len(first_plate_ms), min(first_plate_ms), max(first_plate_ms)),
+                         (81, 668, 1000))
+
+    def test_a_longer_wait_for_the_looks_keeps_few_true_triggers_and_passes_people(self):
+        # Within 1 s both looks have answered once; 3 s is the longest wait
+        # the setting allows and all three plate looks. Neither keeps a night
+        # arrival (headlights read as `empty`, the plate is unlit), both pass
+        # the same nine day false triggers (people, whom the image tower
+        # calls a vehicle), and the median day lead is 1.2 s, so the wait is
+        # longer than what it is protecting.
+        for deadline, expected in (
+            (1.0, {("day", "true"): 6, ("day", "false"): 9, ("night", "false"): 3}),
+            (3.0, {("day", "true"): 9, ("day", "false"): 9, ("night", "false"): 3}),
+        ):
+            reached, _harness = self.replay(
+                {**LOOKS, "GATE_EARLY_TRIGGER_CONFIRM_SECONDS": str(deadline)},
+                looks=RecordedLooks(deadline))
+            self.assertEqual(reached, expected, f"deadline {deadline}")
 
 
 class LayerTests(unittest.TestCase):

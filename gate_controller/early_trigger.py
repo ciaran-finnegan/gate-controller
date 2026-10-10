@@ -29,14 +29,21 @@ persists, does not shrink and lights the ground around it, with diffuse light
 two are separate detectors with separate thresholds, chosen by the measured
 luma of the background.
 
-**What confirms it.** A would-trigger of the vision rule is not, on its own, a
-decision. Two looks that already ran in shadow are now on the decision path:
+**What confirms it.** ``GATE_EARLY_TRIGGER_CONFIRMATION=sweep|looks``. With
+``sweep`` (the default since the second shadow fortnight) the sweep itself is
+the second look: a would-trigger of the vision rule starts it at once, its
+own reads of live frames on the device decide, and the quick abort ends it on
+an empty lane. With ``looks`` two second looks stand in front of the sweep:
 the farm-machinery image tower shown a square of the clear stream around the
 lane (does it see a vehicle class, not ``empty``?) and the local plate reader
-shown the plate band (is there a plate box?). Either confirms; both are asked
+shown the plate band (is there a plate box?); either confirms, both are asked
 in parallel and waited for no longer than ``GATE_EARLY_TRIGGER_CONFIRM_SECONDS``
-(0.5). The vision rule's own verdict, the looks and the final decision are
-recorded separately, so the report can still measure the raw rule.
+(0.5). Measured on the Pi over 2026-10-05 to 10 the looks never answered
+inside that bound (539-1000 ms), and unbounded they said ``empty`` to a car
+front at the fence gap and to every night arrival, and "vehicle" to people
+(``docs/early-trigger.md``). In ``shadow`` the looks still run for the record
+whichever is set. The vision rule's own verdict, the looks and the final
+decision are recorded separately, so the report can still measure each.
 
 **What it may do.** ``GATE_EARLY_TRIGGER=off|shadow|on``; the code's default is
 ``off``. In ``shadow`` it journals and records and touches nothing. In ``on`` a
@@ -90,6 +97,7 @@ ENV_MAX_PER_HOUR = "GATE_EARLY_TRIGGER_MAX_PER_HOUR"
 ENV_BACKOFF = "GATE_EARLY_TRIGGER_BACKOFF_SECONDS"
 ENV_LAYERS_PER_MINUTE = "GATE_EARLY_TRIGGER_LAYERS_PER_MINUTE"
 ENV_CONFIRM_SECONDS = "GATE_EARLY_TRIGGER_CONFIRM_SECONDS"
+ENV_CONFIRMATION = "GATE_EARLY_TRIGGER_CONFIRMATION"
 ENV_THUMBNAILS = "GATE_EARLY_TRIGGER_THUMBNAILS"
 ENV_THUMBNAIL_MAX = "GATE_EARLY_TRIGGER_THUMBNAIL_MAX"
 ENV_THUMBNAIL_DAYS = "GATE_EARLY_TRIGGER_THUMBNAIL_DAYS"
@@ -147,9 +155,31 @@ DEFAULT_LAYERS_PER_MINUTE = 4
 #: 108 ms embed) and a single plate look is a decode and a ~200 ms read. The
 #: two run in parallel, so the first answer is about half a second away and
 #: half a second is the bound. Every second here is a second off the lead,
-#: so it is a bound, not a target: the wait ends at the first "yes".
+#: so it is a bound, not a target: the wait ends at the first "yes". Only
+#: the ``looks`` confirmation below waits at all; and over 2026-10-05 to 10
+#: the looks never answered inside this bound (539-1000 ms), see there.
 DEFAULT_CONFIRM_SECONDS = 0.5
 MAX_CONFIRM_SECONDS = 3.0
+#: What stands between the vision rule and the sweep in ``on``. ``looks``: the
+#: CLIP look or the plate look must say "vehicle" inside the bound above.
+#: ``sweep``: nothing does -- the sweep is the second look. It reads live
+#: frames at 5 fps on the device, the quick abort ends it on an empty lane in
+#: about a second, it sends nothing anywhere, and it costs the lead nothing.
+#: Measured on the shadow record of 2026-10-05 to 10 (82 would-triggers, 24 of
+#: them true; docs/early-trigger.md): on the Pi the CLIP look answered in
+#: 539-773 ms and the first plate look in 668-1000 ms, so inside the 0.5 s
+#: bound ``looks`` confirmed none of the 24. Unbounded, the looks kept 9 of 15
+#: by day and 0 of 9 by night, passed 9 of 33 false by day (people, whom the
+#: image tower calls a vehicle), and the wait they need is longer than the
+#: 1.2 s median day lead. The looks see a keyframe up to a second old; the
+#: sweep sees the frame. ``looks`` is kept so the old path can be chosen back.
+CONFIRM_BY_LOOKS, CONFIRM_BY_SWEEP = "looks", "sweep"
+CONFIRMATIONS = (CONFIRM_BY_LOOKS, CONFIRM_BY_SWEEP)
+DEFAULT_CONFIRMATION = CONFIRM_BY_SWEEP
+#: The layers' status when the sweep is the confirmation and they were not
+#: consulted: the sweep owns the decoder and the plate reader from the moment
+#: it starts, and its own report (``note_sweep``) is the better record.
+LOOK_NOT_ASKED = "not_asked"
 #: A CLIP look whose ``empty`` share is at or under this sees a vehicle class.
 #: On the Pi's real frames a car in the lane read ``empty`` 0.03 and the
 #: empty lane 0.997-1.0 (eight looks on 2026-09-22), so the line has room on
@@ -278,6 +308,7 @@ class EarlyTriggerConfig:
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
     layers_per_minute: int = DEFAULT_LAYERS_PER_MINUTE
     confirm_seconds: float = DEFAULT_CONFIRM_SECONDS
+    confirmation: str = DEFAULT_CONFIRMATION
     thumbnails: bool = True
     thumbnail_max: int = DEFAULT_THUMBNAIL_MAX
     thumbnail_days: float = DEFAULT_THUMBNAIL_DAYS
@@ -360,6 +391,12 @@ def load_config(environment=None, state_directory: Path | None = None) -> EarlyT
         LOGGER.warning("gate_early_trigger %s=%r %s=%r status=rejected using=%s",
                        ENV_HOURS, hours, ENV_TIMEZONE, zone, DEFAULT_HOURS)
         hours, zone = DEFAULT_HOURS, DEFAULT_TIMEZONE
+    confirmation = str(environment.get(ENV_CONFIRMATION) or "").strip().lower()
+    if confirmation and confirmation not in CONFIRMATIONS:
+        LOGGER.warning("gate_early_trigger %s=%r status=rejected using=%s",
+                       ENV_CONFIRMATION, confirmation, DEFAULT_CONFIRMATION)
+    if confirmation not in CONFIRMATIONS:
+        confirmation = DEFAULT_CONFIRMATION
     return EarlyTriggerConfig(
         mode=mode, patch=patch,
         source_url=str(environment.get(ENV_SOURCE) or "").strip() or DEFAULT_SOURCE_URL,
@@ -373,6 +410,7 @@ def load_config(environment=None, state_directory: Path | None = None) -> EarlyT
             environment, ENV_LAYERS_PER_MINUTE, DEFAULT_LAYERS_PER_MINUTE, 0, 30)),
         confirm_seconds=_bounded(
             environment, ENV_CONFIRM_SECONDS, DEFAULT_CONFIRM_SECONDS, 0.1, MAX_CONFIRM_SECONDS),
+        confirmation=confirmation,
         thumbnails=str(environment.get(ENV_THUMBNAILS) or "true").strip().lower()
         not in ("0", "false", "no", "off"),
         thumbnail_max=int(_bounded(environment, ENV_THUMBNAIL_MAX, DEFAULT_THUMBNAIL_MAX, 0, 5000)),
@@ -1075,6 +1113,14 @@ class Confirmation:
                     "deadline_ms": self.deadline_ms}
 
 
+def _with_late_yes(decision: dict, confirmation: Confirmation | None) -> dict:
+    """The decision as made, plus a yes that came after the wait (``*_late``), if one did."""
+    if confirmation is None or decision.get("by") is not None:
+        return decision
+    late = confirmation.record().get("by")
+    return {**decision, "by": late} if late else decision
+
+
 def clip_sees_vehicle(answer: dict | None) -> bool | None:
     """The CLIP look's vote: True, False, or None when it gave no opinion."""
     if not answer or answer.get("status") != "ok":
@@ -1262,8 +1308,10 @@ class EarlyTriggerWorker:
     over in every mode and *called* only in ``on``: :meth:`_act` is the one
     place this module reaches anything that can start work, and in ``shadow``
     it returns before it gets there. In ``on`` it is reached only with a
-    confirmed would-trigger: vision, and then the image tower or the plate
-    reader agreeing within ``confirm_seconds``.
+    confirmed would-trigger: the vision rule, and then -- with
+    ``confirmation=looks`` -- the image tower or the plate reader agreeing
+    within ``confirm_seconds``; with ``confirmation=sweep`` the vision rule
+    alone, because the sweep it asks for is the second look.
     """
 
     def __init__(self, config: EarlyTriggerConfig, *, capture=None, activity=None,
@@ -1375,10 +1423,10 @@ class EarlyTriggerWorker:
             return
         LOGGER.info(
             "gate_early_trigger stage=configured mode=%s patch=%s fps=%g source=%s hours=%s "
-            "min_interval_s=%g max_per_hour=%d confirm_s=%g%s",
+            "min_interval_s=%g max_per_hour=%d confirmation=%s confirm_s=%g%s",
             self.config.mode, self.config.patch.as_env(), self.config.detector.fps,
             "sub_stream", self.config.hours_text, self.config.min_interval_seconds,
-            self.config.max_per_hour, self.config.confirm_seconds,
+            self.config.max_per_hour, self.config.confirmation, self.config.confirm_seconds,
             "" if self.config.requested_mode is None
             else f" requested={self.config.requested_mode}",
         )
@@ -1488,7 +1536,12 @@ class EarlyTriggerWorker:
 
         def annotate(row_id, layers, decision):
             if store is not None:
-                store.annotate(row_id, layers={**layers, "decision": decision})
+                # The decision stands as it was made; the one thing a look
+                # that finished after the wait can add is that it would have
+                # said yes (`clip_late` / `plate_late`), which the report
+                # needs to say what a longer wait would have bought.
+                store.annotate(row_id, layers={
+                    **layers, "decision": _with_late_yes(decision, pending.get("confirmation"))})
 
         def done(layers):
             # The full record of both looks, once they have finished; the
@@ -1500,7 +1553,7 @@ class EarlyTriggerWorker:
                 row_id, decision = pending["row"]
             annotate(row_id, layers, decision)
 
-        decision = self._confirm(done)
+        decision = self._confirm(done, pending)
         action = self._act(observation, decision)
         LOGGER.info(
             "gate_early_trigger stage=would_trigger source=vision mode=%s light=%s action=%s "
@@ -1532,13 +1585,36 @@ class EarlyTriggerWorker:
         if action == "scheduled":
             self._pending_sweep_row = row
 
-    def _confirm(self, done) -> dict:
-        """Start the layers and wait, bounded, for one to see a vehicle."""
+    def _confirm(self, done, pending: dict | None = None) -> dict:
+        """Decide whether this would-trigger may reach the capture.
+
+        ``confirmation=sweep``: it may, at once. The sweep is the second look,
+        so nothing is waited for; in ``on`` the looks are not even asked (the
+        sweep owns the decoder and the reader from the moment it starts, and
+        its own report is the record), and in ``shadow`` they still run on
+        their own threads for the record, with nobody waiting on them.
+
+        ``confirmation=looks``: start the layers and wait, bounded, for one to
+        see a vehicle. The :class:`Confirmation` is left in ``pending`` (when
+        given) so a look that answers after the wait can still be written
+        down as late.
+        """
+        if self.config.confirmation == CONFIRM_BY_SWEEP:
+            if self._layers is None or self.config.mode == MODE_ON:
+                status = "unavailable" if self._layers is None else LOOK_NOT_ASKED
+                done({"clip": {"status": status}, "plate_look": {"status": status}})
+            else:
+                self._layers.begin(done)
+            self._confirmed += 1
+            return {"status": "confirmed", "by": CONFIRM_BY_SWEEP, "waited_ms": 0,
+                    "deadline_ms": 0}
         if self._layers is None:
             confirmation = Confirmation("unavailable")
             done({"clip": {"status": "unavailable"}, "plate_look": {"status": "unavailable"}})
         else:
             confirmation = self._layers.begin(done)
+        if pending is not None:
+            pending["confirmation"] = confirmation
         self._confirmation = confirmation
         try:
             decision = confirmation.wait(self._clock)
@@ -1553,9 +1629,12 @@ class EarlyTriggerWorker:
     def _act(self, observation: Observation, decision: dict) -> str:
         """Ask for a local-only sweep. In ``shadow`` this is where it stops.
 
-        In ``on`` it goes no further without a confirmed decision: the vision
-        rule alone fired seven times in thirteen minutes of cloud shade on
-        its first shadow morning, and a second look cleared every one.
+        In ``on`` it goes no further without a confirmed decision. With
+        ``confirmation=looks`` that is a second look's "vehicle" inside the
+        bound; with ``confirmation=sweep`` the vision rule's would-trigger is
+        confirmed as it stands, and the sweep it asks for -- local reads of
+        live frames, the quick abort on an empty lane, nothing sent -- is the
+        second look. The caps below hold either way.
         """
         if self.config.mode != MODE_ON:
             return "none"
