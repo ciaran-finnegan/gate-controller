@@ -4,7 +4,11 @@
 rollout is a day of `shadow` on the Pi, then the report below, then `on`.
 Issue #107 is the background; #106 is the audio half of it. The first shadow
 day was 2026-09-22; what it showed and what changed because of it is
-[below](#the-first-shadow-day-2026-09-22).
+[below](#the-first-shadow-day-2026-09-22). The second shadow fortnight,
+2026-09-23 to 10-10, took the confirming looks off the decision path:
+`GATE_EARLY_TRIGGER_CONFIRMATION=sweep` (the default) makes the sweep itself
+the second look; the measurements are
+[below](#the-second-shadow-fortnight-2026-09-23-to-10-10).
 
 ## The geometry that motivates it
 
@@ -191,13 +195,18 @@ would make every passing headlight visible from the road.
 `shadow` journals and records. It reaches nothing: the capture's
 `on_early_trigger` refuses (`disabled`) unless the mode is `on`, whoever calls.
 
-`on`: a would-trigger that a second look has **confirmed** (next section)
-asks the production `TriggerFrameCapture` for a sweep, through the same
-`local_sweep` as a camera alarm, with the origin **stated**
-(`SweepPassage.origin = "early"`), never inferred from timing. An unconfirmed
-one asks for nothing and is recorded as `skipped_unconfirmed`. Same local
-reader, same match policy, same bars, same carried-read path, same cooldown.
-Until the camera's alarm arrives, such a sweep:
+`on`: a would-trigger that passes confirmation asks the production
+`TriggerFrameCapture` for a sweep, through the same `local_sweep` as a camera
+alarm, with the origin **stated** (`SweepPassage.origin = "early"`), never
+inferred from timing. With `GATE_EARLY_TRIGGER_CONFIRMATION=sweep` (the
+default) every would-trigger of the vision rule passes and asks at once, and
+the sweep is the confirmation; with `looks` only a would-trigger a second
+look has confirmed inside the bound asks, and an unconfirmed one asks for
+nothing and is recorded as `skipped_unconfirmed` (see
+[Layers](#what-is-recorded)). Either way the ask is subject to the hours,
+the minimum interval and the hourly cap under **Caps** below. Same local reader,
+same match policy, same bars, same carried-read path, same cooldown. Until
+the camera's alarm arrives, such a sweep:
 
 - makes no cloud hand-over and no fallback hand-over (`hand_over` refuses any
   source but `sweep`, and the two call sites are gated as well);
@@ -241,8 +250,9 @@ even read, so that costs a decoder start and five thumbnails, about a second,
 whatever caused the trigger. A frame with something in it and no plate *yet*
 does not count: that is a vehicle still turning in.
 
-**Caps.** `GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5): how long a would-trigger
-waits for a confirming look before it is judged unconfirmed.
+**Caps.** `GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5): with
+`GATE_EARLY_TRIGGER_CONFIRMATION=looks`, how long a would-trigger waits for a
+confirming look before it is judged unconfirmed; with `sweep` nothing waits.
 `GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS` (20, the camera's own
 floor). `GATE_EARLY_TRIGGER_MAX_PER_HOUR` (12) *unconfirmed* sweeps in any
 hour, then a stand-down of `GATE_EARLY_TRIGGER_BACKOFF_SECONDS` (1800) that
@@ -290,20 +300,34 @@ JPEG, about 6 KB, in `early-trigger-thumbnails/`. At most 500 files
 (`GATE_EARLY_TRIGGER_THUMBNAIL_MAX`) and none older than 7 days
 (`GATE_EARLY_TRIGGER_THUMBNAIL_DAYS`): **about 3 MB**. They go nowhere.
 
-**Layers, on the decision path.** Each would-trigger of the vision rule is
-shown to two second looks, in parallel, on their own threads; each is timed,
-and each is `skipped_busy` the moment a vehicle has the controller. Either
-one saying "vehicle" confirms the would-trigger; the worker waits for that at
-most `GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5 s), and the wait ends at the
-first "yes", when both have said "no", or the instant the camera's own alarm
+**Layers, and the setting that puts them on the decision path.**
+`GATE_EARLY_TRIGGER_CONFIRMATION=sweep|looks`, default `sweep` since
+2026-10-10 ([why](#the-second-shadow-fortnight-2026-09-23-to-10-10)). With
+`sweep`, a would-trigger of the vision rule reaches the capture at once in
+`on`: the decision block says `confirmed` / `by: sweep` / `waited_ms: 0`, the
+looks are `not_asked` (the sweep owns the clear-stream decoder and the plate
+reader from the moment it starts), and the sweep's own report -- reads, plate
+boxes, how it ended -- is annotated onto the row when it ends. The sweep is a
+better second look than either layer: it reads live frames at 5 fps rather
+than a keyframe up to a second old, it costs the lead nothing, the quick abort
+ends it in about a second on an empty lane, and it sends nothing. In `shadow`
+the looks still run for the record, with nobody waiting on them, and the
+decision block says what `on` would have done.
+
+With `looks`, each would-trigger of the vision rule is shown to two second
+looks, in parallel, on their own threads; each is timed, and each is
+`skipped_busy` the moment a vehicle has the controller. Either one saying
+"vehicle" confirms the would-trigger; the worker waits for that at most
+`GATE_EARLY_TRIGGER_CONFIRM_SECONDS` (0.5 s), and the wait ends at the first
+"yes", when both have said "no", or the instant the camera's own alarm
 arrives (there is then nothing left to lead). In `on` only a confirmed
-would-trigger reaches the capture. The record keeps three things apart: the
-vision rule's own evidence (`features`, whose `verdict` is `trigger`), what
-the looks said and the decision made on them (`layers`, with a `decision`
-block: `confirmed` / `unconfirmed` / `cancelled_camera_alarm` / why the looks
-never ran, which layer answered, and the milliseconds waited), and what was
-done (`action`). So the raw vision rule stays measurable after the layer is
-in the way of it.
+would-trigger reaches the capture. Either way the record keeps three things
+apart: the vision rule's own evidence (`features`, whose `verdict` is
+`trigger`), what the looks said and the decision made on them (`layers`, with
+a `decision` block: `confirmed` / `unconfirmed` / `cancelled_camera_alarm` /
+why the looks never ran, which layer answered, and the milliseconds waited),
+and what was done (`action`). So the raw vision rule stays measurable
+whatever is in the way of it.
 
 - *CLIP look.* The farm-machinery image tower, already loaded, shown a
   **square around the lane** (`lane_square`), not the frame: the tower looks
@@ -321,20 +345,27 @@ in the way of it.
 - *Plate look.* Would the local detector find a plate box? The first look is
   what can confirm inside the bound; the second and third (0.4 s apart)
   carry on for the record, so a "yes" that came late is written down as
-  `plate_late` and the report can say what a longer wait would have bought.
+  `plate_late` (or `clip_late`) in the row's decision block and the report
+  can say what a longer wait would have bought. Until 2026-10-10 the late
+  "yes" reached the `Confirmation` but not the row, which is why the second
+  fortnight's record has none although four true triggers earned one.
   In `on` the early sweep's own reads are then the answer.
 
 **The added latency, measured.** On the Pi on 2026-09-22 the CLIP look took
 455-530 ms end to end (one clear-stream keyframe decode, about 0.3 s, then the
 108 ms embed) and the three plate looks 2.5-2.9 s together, so a single one is
-about 0.55 s including its decode. The two run at once, so the first answer is
-about half a second away and the bound is half a second: a confirmed
-would-trigger costs the lead up to 0.5 s; an unconfirmed one costs nothing but
-a sweep that would have been false. The wait is on the detector's own thread,
-which misses at most two samples while the detector is `occupied` anyway; it
-holds no lock, and the camera's alarm on the webhook thread is never behind
-it -- it cancels it. If the looks are refused (rate, busy, running, disabled)
-or unavailable, the would-trigger is unconfirmed at once, with no wait.
+about 0.55 s including its decode. The two run at once, so the first answer
+was taken to be about half a second away and the bound was set at half a
+second. **Over the second fortnight it was not:** on 81 would-triggers the
+CLIP look took 539-773 ms (median 587) and the first plate look 668-1000 ms
+(median 743), so at 0.5 s neither ever answered in time and the `looks` rule
+confirmed nothing. With `looks` a confirmed would-trigger costs the lead the
+wait; an unconfirmed one costs nothing but a sweep that would have been
+false. The wait is on the detector's own thread, which misses at most two
+samples while the detector is `occupied` anyway; it holds no lock, and the
+camera's alarm on the webhook thread is never behind it -- it cancels it. If
+the looks are refused (rate, busy, running, disabled) or unavailable, the
+would-trigger is unconfirmed at once, with no wait.
 
 ## The first shadow day (2026-09-22)
 
@@ -362,6 +393,144 @@ layers on the decision path, and the report's split. The seven pairs, the two
 vehicle pairs and the point source are in `tests/fixtures/early_trigger/` and
 the detector is run over them.
 
+## The second shadow fortnight (2026-09-23 to 10-10)
+
+The report was run over 2026-10-05 14:00 to 10-10 06:30 UTC, the stretch after
+the Pi caught up with `master` on 5 Oct: 77.6 h of day and 36.2 h of night from
+the journal's status lines, 82 would-triggers, 24 of them followed by the
+camera's alarm within a minute (15 by day, 9 by night) and 58 not (33 by day,
+25 by night: **0.43 and 0.69 an hour** for the vision rule alone). Lead over
+the camera, median: **1.2 s by day** (p10 0.3, p90 3.4), **3.1 s by night**
+(p10 2.0, p90 4.2). Those 82 rows, with the vision rule's features and the two
+looks' recorded answers and timings, are
+`tests/fixtures/early_trigger/shadow-2026-10-05-to-10.json`;
+`tests/test_early_trigger.py::ShadowRecordTests` replays them through the
+worker's own decision path, and the numbers below are what reached the
+capture.
+
+**What the looks did on the decision path: nothing.** Of the 24 true
+would-triggers the rule as shipped (CLIP or a plate box within 0.5 s)
+confirmed none; of the 58 false, none. Three causes, in order of weight:
+
+1. *The bound is under the looks' latency on this Pi.* The CLIP look took
+   539-773 ms (median 587) and the first plate look 668-1000 ms (median 743),
+   on all 81 would-triggers the looks ran for; the 2026-09-22 figure of
+   455-530 ms was eight looks on a quiet day. One confirmation in the whole
+   record since 22 Sep (2026-10-02 11:25, CLIP in 432 ms). 22 of the 24 true
+   triggers were `unconfirmed` at 500 ms and 2 `cancelled_camera_alarm`
+   (the alarm arrived 183 and 283 ms into the wait). The record's decision
+   block also never says `plate_late` or `clip_late`, although four true day
+   triggers got a plate box at 1.8-2.9 s: the decision was written when the
+   wait ended and a yes after it reached the `Confirmation` but not the row.
+   Fixed with this change, for the `looks` setting.
+2. *Unbounded, the CLIP look is wrong both ways.* It says `empty` (0.98-1.0)
+   to a car front coming through the far fence gap -- 11 of the 15 day true
+   triggers -- and to all 9 night ones, where a headlight bloom in a black
+   lane square is nothing it knows; and it says a vehicle class to people in
+   the lane: 9 of the 33 day false triggers passed it, six of them people
+   walking (hi-vis and all), the others a car the camera did not alarm on.
+3. *The plate look is right but late, and it looks at a stale picture.* It
+   boxed no plate on any false trigger but one (a car the camera ignored,
+   10-06 07:29). On the true ones its first look (0.7-1.0 s) found a box in 5
+   of 15 by day: a car front at the gap is 120-190 px of plate at the edge of
+   the band, and the look decodes the newest clear-stream *keyframe*, which
+   at the camera's 1 s interval is anywhere up to a second old, so the first
+   look can be seeing the lane as it was before the trigger. By the third
+   look (2.7-3.0 s) 8 of 15; 8 of the 15 were `skipped_busy`, cut short
+   because the camera's own alarm had arrived and a real sweep took the
+   reader. By night it boxed nothing in 9: the headlights bloom, the plate is
+   unlit. A plate box that comes at 2 s is behind a 1.2 s lead.
+
+What the pictures show. The 9 true night triggers are headlight blooms at the
+gap with the lane lit by the car (4), or the lane lit by the PIR floodlight
+with the fence posts' shadows thrown across it as the car trips it (5). The
+25 false: the same floodlight coming on with nothing in the lane (10 --
+identical rows: a 3-5% blob at the lit near fence post, x 0.05-0.07, speed 0,
+median rise 50-68), passing cars' beams through the gap (9, sweeping right to
+left, `track_dx` -0.10 to -0.17), and a few small sources. The 33 day false:
+beams through the gap at dawn and dusk (13: a blob uniformly *brighter* than
+the gravel with no darker cell in it), people (6), cars the camera did not
+alarm on or the same car twice (4), two flat grey decoder frames, shade, and a
+handful of small dark blobs at the gap that look exactly like a car front and
+are most likely cars passing on the road beyond.
+
+**Every rule measured, on this record.** False passed / true kept, by light;
+the lead column is the median left to the true triggers that were within 6 s
+of the alarm (10 by day, 4 by night), after the wait the rule needs:
+
+| Rule | Day: false passed, true kept | Night: false passed, true kept | Useful lead left |
+| --- | --- | --- | --- |
+| Looks within 0.5 s (as shipped) | 0 / 33, 0 / 15 | 0 / 25, 0 / 9 | nothing kept |
+| Looks within 1.0 s | 9 / 33, 6 / 15 | 3 / 25, 0 / 9 | -0.5 s |
+| Looks within 3.0 s (the setting's maximum) | 9 / 33, 9 / 15 | 3 / 25, 0 / 9 | -0.3 s |
+| CLIP alone, unbounded | 9 / 33, 4 / 15 | 3 / 25, 0 / 9 | 0.1 s |
+| A plate box in any look, unbounded | 1 / 33, 8 / 15 | 0 / 25, 0 / 9 | -0.7 s |
+| **Vision alone; the sweep confirms (the default now)** | **33 / 33, 15 / 15** | **25 / 25, 9 / 9** | **1.2 s day, 3.1 s night: all of it** |
+| Vision + refuse a blob uniformly brighter than the gravel (contrast > 0.4, no darker cell) | 20 / 33, 15 / 15 | 25 / 25, 9 / 9 | all |
+| Vision + night: the source must move or grow (speed >= 0.02 or growth >= 1.5) | 33 / 33, 15 / 15 | 12 / 25, 8 / 9 | all |
+| Vision + night: refuse whole patch lit (`shift` >= 20) | -- | 2 / 25, 2 / 9 | none useful |
+| Vision + night: refuse a leftward sweep (`track_dx` <= -0.1) | -- | 17 / 25, 9 / 9 | all |
+
+No rule that waits for a second look keeps a night arrival, and by day the
+wait any look needs is longer than the lead it is there to protect. Nothing
+measurable at the moment of the trigger keeps 0 false *and* the true ones: a
+person and a car front at the gap are the same size, darkness and stillness
+in one sample; what tells them apart is the next second of frames, which is
+exactly what the sweep reads.
+
+**So the sweep is the confirmation.** `GATE_EARLY_TRIGGER_CONFIRMATION=sweep`
+is the default: `on` asks for the local-only sweep the moment the vision rule
+fires, subject only to the hours, the 20 s minimum interval and the hourly
+cap, and the bar of "0 false passed" is met where it matters --
+nothing false reaches the cloud, the owner's Activity list or the relay --
+rather than at the sweep. What a false sweep costs, on this record:
+
+- *CPU.* A sweep of an empty lane (the beams, the glitches, the shade: about
+  25 of the 58) hits the quick abort in about a second, ~1.5 core-seconds.
+  One with something in the lane (a person, the floodlit lane, a car the
+  camera did not alarm on: about 33) runs its `GATE_EARLY_TRIGGER_MAX_SECONDS`
+  (6 s) reading on the device, ~9 core-seconds. About 330 core-seconds in
+  113.8 h, **0.08% of one core**; worst case all of them long, 0.13%. The
+  worst rolling hour in the window held 5 false by day and 4 by night, against
+  the cap of 12.
+- *Blind time.* The detector is stopped while a sweep runs and for 7 s after
+  it (5 s settle, 2 s re-base): 8-13 s per false sweep, about 10 minutes in
+  113.8 h, 0.15% of the time. A real arrival in that window is detected by the
+  camera as today, and an arrival *during* a false sweep upgrades it in place,
+  with the decoder already warm.
+- *Lookups, events, notifications, the relay:* none. The sweep's cloud routes
+  are refused until the camera's alarm (`tests/test_early_trigger_pipeline.py`),
+  an unconfirmed sweep writes no access-log event, and the relay moves only on
+  an exact authorised on-device read -- which an empty lane, a beam, a person
+  or the floodlight cannot produce. A departing car's rear plate is the one
+  thing in the lane that can, and that is the camera-alarm path's question as
+  much as this one's (#171): the early sweep's frames go through the same
+  `local_sweep`, processor and match policy, and under `looks` the plate look
+  would have confirmed a rear plate just the same.
+- *The caps still hold.* `GATE_EARLY_TRIGGER_MIN_INTERVAL_SECONDS` (20) and
+  the hourly cap of 12 unconfirmed sweeps with its doubling backoff are
+  unchanged. On this record no true trigger had a false one in the 20 s before
+  it. A bad hour -- the first shadow day's 7 in 13 minutes of shade before the
+  `illumination` rule; 3 Oct's 24 in an hour of sun patches on the gravel,
+  which that rule does not catch because they are brighter, not darker --
+  stands the feature down for half an hour, which is today's behaviour.
+
+**Not shipped, and what to watch.** The two detector rules in the table that
+cost nothing here -- "a blob uniformly brighter than the gravel with no darker
+cell is light" (removes 13 of 33 day false; the whole record since 22 Sep has
+one true trigger it would refuse, a pale flank filling the patch at
+2026-09-23 14:28 with the plate already boxed) and the night move-or-grow rule
+(removes 13 of 25, costs 1 of 9) -- are fitted to 15 and 9 true triggers and
+are not in the code; the sweep aborts the beams in a second anyway. If `on`
+shows the floodlight's ten sweeps a night or the dusk beams filling the hourly
+cap, the brighter-blob rule is the one to add first, with
+`GATE_EARLY_TRIGGER_HOURS` as the blunt tool. Watch, in the report: `false
+that PASSED it` is now the vision rule's own rate (the bar below is 6 an
+hour); the `sweep` column's `reason` (`early_abort` against
+`early_unconfirmed`) says which kind of false sweep is being paid for and
+`first_plate_ms` what the sweep sees that the looks did not; and
+`stage=backoff` in the journal says the cap was hit.
+
 ## The report, and what would justify `on`
 
 ```sh
@@ -378,10 +547,13 @@ rule alone and then **split**: removed by the confirmation layer, *passed* it
 false ones bucketed by their evidence (whole patch lit; fast source; small
 source; scattered change; brightness change; large region; compact region),
 seconds saved to the first good read (an upper bound: it assumes the plate was
-legible that much earlier), and the **layer table**: for vision alone, the
-shipped rule (CLIP or plate box), and each combination with CLIP, plate box
-and audio, false triggers removed, true ones lost, lead kept. It works on a
-private copy and never writes to the record.
+legible that much earlier), and the **layer table**: for vision alone (which
+is what the `sweep` setting acts on), the `looks` rule (CLIP or plate box),
+and each combination with CLIP, plate box and audio, false triggers removed,
+true ones lost, lead kept. The split and the `PASSED` rate follow the
+worker's own decision block, so under `sweep` they are the vision rule's own
+numbers and under `looks` the looks'. It works on a private copy and never
+writes to the record.
 
 The hours a rate is over: `--journal /path/to/journal.txt` reads the
 `stage=status` lines' cumulative sample counts (at the `fps=` of the
@@ -405,12 +577,14 @@ Proposed bar for `on`, per light, over at least 20 passages:
 - median lead **1.5 s or more** (under that the decoder's one-second start
   eats it);
 - misses **no more than 1 in 20** while armed;
-- false triggers that **pass the confirmation layer** no more than 6 an hour
+- false triggers that **pass the confirmation** no more than 6 an hour
   by day and 6 by night with the quick abort (about 1.5 core-seconds each:
   0.25% of a core), and no more than the hourly cap of 12 *ever*; and the
-  layer costing no true trigger its lead. A false sweep costs CPU only, never a lookup,
+  confirmation costing no true trigger its lead. A false sweep costs CPU only, never a lookup,
   which is why the number can be this generous; it is the farm-machinery model
-  and the audio scanner it must not starve, not the bill.
+  and the audio scanner it must not starve, not the bill. Under `sweep` this
+  is the vision rule's own false rate: 0.43 an hour by day and 0.69 by night
+  on the second fortnight, worst hour 5 and 4.
 
 If night fails and day passes: `GATE_EARLY_TRIGGER_HOURS=07:00-19:00`.
 
@@ -434,11 +608,16 @@ would be YAMNet's vehicle classes held for 3 s, about 1% of a core. The table's
 - No real night arrival: the night thresholds -- the speed gate and the spill
   floor above all -- are reasoned, not measured. The point source that set
   the size floor is in the fixtures; the floodlit frame is not.
-- The confirmation bound of 0.5 s is set from eight measured looks on one
-  day. A `plate_late` or `clip_late` in the record is the sign it is too
-  short.
+- The `looks` bound of 0.5 s was set from eight measured looks on one day and
+  is now known to be under this Pi's look latency (539-1000 ms over 81). If
+  the looks are ever put back on the decision path the bound needs a second
+  at least, which is most of the day lead; a `plate_late` or `clip_late` in
+  the record is the sign the bound in force is too short.
 - Whether the sub stream runs later than the main one. The report measures
   lead against the webhook, which is what matters.
-- Whether the first frames of a real early sweep read as "empty scene" and
-  trip the quick abort before the camera speaks. Only `on` can show it; the
-  cost if so is today's behaviour, not worse.
+- What a real early sweep reads in its first second: whether the first frames
+  read as "empty scene" and trip the quick abort before the camera speaks, and
+  whether a car front at the gap gives the sweep a plate box the plate look's
+  stale keyframe never had. Only `on` can show it; the record's `sweep` column
+  (`reason`, `plate_reads`, `first_plate_ms`) is where it will appear, and the
+  cost if the abort fires early is today's behaviour, not worse.

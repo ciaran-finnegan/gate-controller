@@ -61,8 +61,8 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from gate_controller.early_trigger import (  # noqa: E402
-    DEFAULT_FPS, KIND_CAMERA_ALARM, KIND_WOULD_TRIGGER, USEFUL_LEAD_SECONDS, clip_sees_vehicle,
-    correlate, ensure_schema,
+    DEFAULT_FPS, KIND_CAMERA_ALARM, KIND_WOULD_TRIGGER, LOOK_NOT_ASKED, USEFUL_LEAD_SECONDS,
+    clip_sees_vehicle, correlate, ensure_schema,
 )
 from gate_controller.gate_audio_detect import BANDS  # noqa: E402
 
@@ -197,7 +197,12 @@ def layer_votes(row: dict) -> dict:
     votes = {"clip": clip_sees_vehicle(clip), "plate": None, "audio": None, "either": None}
     if plate.get("status") == "ok":
         votes["plate"] = bool(plate.get("plate_box"))
-    elif sweep:
+    elif plate.get("status") != LOOK_NOT_ASKED and sweep:
+        # Under `looks` in `on` the plate look is `skipped_busy` the moment
+        # the confirmed sweep takes the reader, and the sweep's reads are
+        # what it would have found. Under `sweep` the look was never asked
+        # (`not_asked`), and the sweep's live multi-frame reads are not what
+        # a look at one stale keyframe would have said: no opinion.
         votes["plate"] = bool(sweep.get("plate_reads"))
     if audio.get("status") == "ok":
         votes["audio"] = audio.get("onset_lead_seconds") is not None
@@ -230,8 +235,9 @@ def decision_of(row: dict) -> str:
 
 
 RULES = (
-    ("vision alone", ()),
-    ("vision and a confirming look, CLIP or a plate box (the shipped rule)", ("either",)),
+    ("vision alone (GATE_EARLY_TRIGGER_CONFIRMATION=sweep: the sweep's own reads confirm)", ()),
+    ("vision and a confirming look, CLIP or a plate box (GATE_EARLY_TRIGGER_CONFIRMATION=looks)",
+     ("either",)),
     ("vision and CLIP sees a vehicle", ("clip",)),
     ("vision and a plate box in the first looks", ("plate",)),
     ("vision and a vehicle sound rising (audio-armed vision)", ("audio",)),
