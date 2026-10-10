@@ -2,14 +2,35 @@
 Description=Refresh isolated Gate MediaMTX Cloudflare TURN credentials
 Wants=network-online.target
 After=network-online.target
+# The retries below are minutes apart, so this can never hit a start limit;
+# 0 makes sure a burst of manual starts cannot leave the timer's next run
+# refused either.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 User=root
 Group=root
 Environment=PYTHONPATH=/usr/local/lib/gate-media
-ExecStart=/usr/bin/flock --wait 10 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
+ExecStart=/usr/bin/flock --wait 10 -E 75 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
 TimeoutStartSec=150s
+# The helper exits 75 when Cloudflare could not be reached (no route, DNS,
+# timeout, HTTP 408/429/5xx), and flock exits 75 when it could not take the
+# lock -- the boot-time run after a power cut, when the network is late, is
+# the usual case. Those are retried every 2 minutes rather than waiting 4 h
+# for the timer. Exit 1 is every other failure the helper itself reports (a
+# bad secret, a refused credential, a rollback); retrying would only restart
+# the gateway again, so those wait for the timer, which still fires 4 h after
+# a failed run exactly as after a successful one.
+#
+# RestartForceExitStatus=75 with Restart=no would say "75 only" exactly, but
+# systemd (252 on the Pi, and through 255) refuses RestartForceExitStatus= on
+# a Type=oneshot unit and leaves it unloadable, so on-failure with exit 1
+# excluded it is. Other endings (a flock setup error, a start timeout) are
+# retried too; neither touches the gateway.
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=2min
 UMask=0077
 StateDirectory=gate-media
 StateDirectoryMode=0700
