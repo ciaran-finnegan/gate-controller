@@ -376,7 +376,7 @@ class GateProcessor:
                 stillness: float | None = None,
                 local_pass: bool = True,
                 sweep_read=None, cloud_permit=None,
-                camera_upload: bool = False) -> PreparedBurst:
+                camera_upload: bool = False, departing=None) -> PreparedBurst:
         """Take a burst as far as the on-device read without touching the network.
 
         This is the fast lane's half of a decision: the burst's identity, its
@@ -457,7 +457,7 @@ class GateProcessor:
             self._prepare_local_pass(prepared, deadline, stillness, sweep_read)
         if camera_upload:
             self._hold_camera_still(prepared)
-        self._skip_departing(prepared)
+        self._skip_departing(prepared, departing)
         if not prepared.decided:
             # A frame the device could not decide -- read here, or carried in
             # already read by the sweep -- may be a machine with no plate to
@@ -492,9 +492,12 @@ class GateProcessor:
                 CLOUD_SKIP_SWEEP_READING,
             )
 
-    def _skip_departing(self, prepared: PreparedBurst) -> None:
+    def _skip_departing(self, prepared: PreparedBurst, carried=None) -> None:
         """Keep a departing car's frame off the cloud. Never raises.
 
+        ``carried`` is the verdict the frame arrived with -- a sweep frame
+        brings the one it was handed over with, and it wins -- and without
+        one the capture's live predicate is asked (the camera's FTP still).
         Asked once, here, before the burst is routed: `needs_cloud` and
         `route_to_cloud_lane` both read ``cloud_skip``, so a verdict that
         changes after this -- the rule is not sticky -- cannot move a burst
@@ -503,13 +506,14 @@ class GateProcessor:
         decide, as for the camera still: a device grant on a departing car's
         rear plate is decided before this and is untouched (#171).
         """
+        ask = carried if carried is not None else self._departing
         if (
-            self._departing is None or prepared.decided
+            ask is None or prepared.decided
             or not _device_read(prepared.local_attempt)
         ):
             return
         try:
-            mode = self._departing()
+            mode = ask()
         except Exception:
             return
         if mode == "on":

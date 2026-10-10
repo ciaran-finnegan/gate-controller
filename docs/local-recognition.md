@@ -534,10 +534,19 @@ up the approach, so the plate the device boxes *shrinks* read by read, where
 an arriving car's plate only grows until it stops at the gate. `DepartingPlate`
 in `trigger_capture.py` holds the rule -- the widest plate of the passage is at
 least 150 px (4K-equivalent), and two boxed reads running are each at most 70 %
-of it -- and `TriggerFrameCapture.departing_skip` answers `on` while the latest
-read, no older than ten seconds, still says so (the sweep's last hand-overs
-and the camera's still can reach the processor after the session has closed;
-a passage nobody has read for longer cannot speak for the next car). `GateProcessor.prepare` asks it once per burst, before the
+of it -- and each frame the sweep hands over carries the verdict as it stood at the
+hand-over (`CarriedDeparture`), so a frame of the departing car that reaches
+the processor after the next alarm -- the fallback at `new_event` -- keeps
+it. A frame the sweep did not hand over itself, the camera's FTP still above
+all, is judged by `TriggerFrameCapture.departing_skip`: `on` while the
+latest read, no older than ten seconds and later than the latest vehicle
+alarm, still says so. `on_camera_event` notes every vehicle alarm it is
+given, scheduled or inside the minimum interval, so the next car's still
+cannot inherit the last car's verdict, and the measurement starts over at the
+sweep's first read after that alarm, so a car arriving inside the interval
+(no new sweep) is not measured against the last car's widest plate. The
+camera's alarm that confirms a passage the early trigger started is that
+passage's own and changes nothing. `GateProcessor.prepare` asks it once per burst, before the
 burst is routed, and records `cloud_skip="departing"`: the frame, or the
 camera's still, is decided on the device's own read and answers "no plate"
 (`gate_ocr stage=cloud_skipped reason=departing`), with the refused read

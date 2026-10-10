@@ -206,10 +206,12 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertIn("gate_local_sweep outcome=ended reason=opened", text)
         self.assertEqual(gate.sweep_status()["departing"], 1)
 
-    def test_a_new_alarm_ends_the_last_cars_verdict_before_its_sweep_begins(self):
+    def test_a_new_alarm_withdraws_the_verdict_from_the_next_cars_still_but_not_from_the_last_cars_frames(self):
         # The next alarm is queued by the webhook thread and dequeued by the
         # sweep's loop later; its camera still can reach the processor in
         # between, and must not be kept off the cloud by the car before it.
+        # The departing car's own sweep, halted by that alarm, still hands
+        # its fallback frame over -- and that frame keeps its verdict.
         frames, widths = receding_passage(range(260, 268))
         answers = {
             digest(crop_to_region(data, REGION)): (STRANGER, 0.40) for data in frames
@@ -217,8 +219,9 @@ class DepartingPipelineTests(unittest.TestCase):
         cloud = CloseOnlyCloud()
         gate = self.gate = departing_gate(
             self, widths_by_frame=widths, answers=answers, cloud=cloud,
-            sweep_seconds=4.0, cloud_frames=5,
+            sweep_seconds=4.0, cloud_frames=5, fallback=1,
         )
+        cloud.readable = {digest(gate.pipeline_bytes(data)) for data in frames}
         gate.frames.script([(0.05 + index * 0.15, data) for index, data in enumerate(frames)])
 
         with CapturedLogs() as logs:
@@ -233,9 +236,17 @@ class DepartingPipelineTests(unittest.TestCase):
             gate.alarm()
             self.assertIsNone(gate.capture.departing_skip(), "the next car inherited the verdict")
             self.assertTrue(wait_for(
+                lambda: "outcome=ended reason=new_event" in logs.text(), 6.0,
+            ), logs.text())
+            self.assertTrue(wait_for(
                 lambda: logs.text().count("gate_local_sweep outcome=ended") >= 2, 12.0,
             ), logs.text())
+            wait_for(lambda: gate.outcomes(), 4.0)
 
+        text = logs.text()
+        self.assertIn("source=sweep_fallback", text, "the halted sweep handed nothing over")
+        self.assertIn("gate_ocr stage=cloud_skipped reason=departing", text)
+        self.assertEqual(cloud.posted, [], f"the departing car's frame was paid for:\n{text}")
         self.assertEqual(gate.relay_calls, [])
 
     def test_shadow_journals_the_skip_and_sends_the_frame_as_before(self):

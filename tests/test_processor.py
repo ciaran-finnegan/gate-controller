@@ -3322,6 +3322,32 @@ class InternetDownTests(unittest.TestCase):
             self.assertEqual(len(recognizer.local_calls), 2)
             self.assertEqual(recognizer.cloud_calls, [], "an unread departing frame posted")
 
+    def test_the_verdict_a_frame_was_handed_over_with_wins_over_the_live_one(self):
+        # A sweep frame carries the verdict it earned; the capture's live
+        # predicate is for frames that carry none (the camera's still).
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            cloud = PlateObservation("12D3456", 0.99)
+
+            recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
+            processor = self._processor(directory, recognizer, departing=lambda: None)
+            prepared = processor.prepare((frame,), departing=lambda: "on")
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            processor.process((frame,), prepared=prepared)
+            self.assertEqual(recognizer.cloud_calls, [], "the carried verdict was ignored")
+
+            recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
+            processor = self._processor(
+                directory, recognizer, database="other.db", departing=lambda: "on",
+            )
+            prepared = processor.prepare((frame,), departing=lambda: None)
+            self.assertIsNone(prepared.cloud_skip)
+            self.assertTrue(prepared.route_to_cloud_lane())
+            result = processor.process((frame,), prepared=prepared)
+            self.assertTrue(result.opened, "a frame handed over before the verdict lost its lookup")
+            self.assertEqual(recognizer.cloud_calls, [frame])
+
     def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

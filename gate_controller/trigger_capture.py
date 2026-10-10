@@ -791,7 +791,7 @@ class DepartingPlate:
     the measurements behind each number.
     """
 
-    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "noticed")
+    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "alarm_at", "noticed")
 
     def __init__(self) -> None:
         self.peak_px = 0
@@ -801,17 +801,29 @@ class DepartingPlate:
         self.since: float | None = None
         #: The sweep clock of the latest boxed read, or None before the first.
         self.last_at: float | None = None
+        #: The sweep clock of the latest vehicle alarm that was not this
+        #: passage's own, or None: a new car is in view from then on.
+        self.alarm_at: float | None = None
         #: Whether this passage's recession has been journalled.
         self.noticed = False
 
-    def lapse(self) -> None:
-        """Start over: a new car is in view, so nothing measured so far is about it.
+    def alarm(self, now: float | None) -> None:
+        """A new vehicle alarm: a new car is in view.
 
-        The widest plate goes too. An alarm inside the capture's minimum
-        interval starts no new sweep, so the running sweep goes on reading
-        the new car under this same object, and two small reads of a car
-        still far off must not count as a shrink from the last car's peak.
+        Nothing is forgotten here -- a frame of the last car the sweep still
+        holds is handed over with the verdict it earned (:meth:`receding_at`)
+        -- but the verdict no longer speaks for anything that is not a sweep
+        frame (:meth:`receding_since_alarm`), and the measurement starts over
+        at the sweep's next read, which is the first that can be of the new
+        car. An alarm inside the capture's minimum interval starts no new
+        sweep, so that read arrives under this same object, and two small
+        reads of a car still far off must not count as a shrink from the last
+        car's peak.
         """
+        self.alarm_at = now
+
+    def lapse(self) -> None:
+        """Start the measurement over, the widest plate included."""
         self.__init__()
 
     def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
@@ -823,6 +835,21 @@ class DepartingPlate:
         except TypeError:
             return False
 
+    def receding_since_alarm(self, now: float,
+                             grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
+        """:meth:`receding_at`, and no vehicle alarm has come in since that read.
+
+        What a frame that is not the sweep's own -- the camera's still, a
+        presence frame -- is judged by: after an alarm it may be the next
+        car's, and the last car's verdict must not speak for it.
+        """
+        if not self.receding_at(now, grace):
+            return False
+        try:
+            return self.alarm_at is None or self.last_at > self.alarm_at
+        except TypeError:
+            return False
+
     def note(self, plate_px, now: float | None = None) -> bool:
         """Take one boxed read; return whether the plate is receding now."""
         try:
@@ -831,6 +858,18 @@ class DepartingPlate:
             return self.receding
         if width <= 0:
             return self.receding
+        try:
+            stale = self.alarm_at is not None and (
+                self.last_at is None or self.last_at <= self.alarm_at
+            )
+        except TypeError:
+            stale = False
+        if stale:
+            # The first read since a new car came into view: nothing measured
+            # before it is about this car.
+            alarm_at = self.alarm_at
+            self.lapse()
+            self.alarm_at = alarm_at
         self.last_at = now
         if (
             self.peak_px >= SWEEP_DEPARTING_MIN_PEAK_PX
@@ -845,6 +884,30 @@ class DepartingPlate:
             self.since = now
         self.receding = receding
         return receding
+
+
+class CarriedDeparture:
+    """The departure verdict a sweep frame was handed over with, frozen.
+
+    What `GateProcessor.prepare` is given as ``departing`` for a frame the
+    sweep injected: the passage's verdict at the moment of the hand-over,
+    answered the same way for as long as the frame lives in the pipeline,
+    whatever the passage's reads or the next alarm say by then.
+    """
+
+    __slots__ = ("verdict",)
+
+    def __init__(self, verdict: str | None) -> None:
+        self.verdict = verdict if verdict in ("on", "shadow") else None
+
+    def __call__(self) -> str | None:
+        return self.verdict
+
+    def __repr__(self) -> str:
+        return f"CarriedDeparture({self.verdict!r})"
+
+
+_NOT_CARRIED = object()
 
 
 class SweepPassage:
@@ -1024,6 +1087,7 @@ class TriggerFrameCapture:
         self._inject_accepts_stillness = False
         self._inject_accepts_sweep_read = False
         self._inject_accepts_cloud_permit = False
+        self._inject_accepts_departing = False
         self._lock = Lock()
         self._process = None
         self._closed = False
@@ -1099,6 +1163,10 @@ class TriggerFrameCapture:
         self._inject_accepts_cloud_permit = _accepts_keyword(
             inject, "cloud_permit", variadic=False,
         )
+        # ...and the departure verdict a sweep frame carries, likewise exact.
+        self._inject_accepts_departing = _accepts_keyword(
+            inject, "departing", variadic=False,
+        )
 
     def on_camera_event(self, event) -> str:
         """Schedule a capture from the webhook thread without blocking it."""
@@ -1118,11 +1186,11 @@ class TriggerFrameCapture:
             # scheduled for it (one inside the minimum interval is not).
             # Whatever the last passage's reads said about its plate receding
             # ends here, not when the sweep gets round to dequeuing anything:
-            # this car's still must not inherit it. The one alarm that is not
-            # a new car is the camera confirming a passage the early trigger
-            # started (`local_sweep` takes it as the upgrade): that passage
-            # keeps what it has measured.
-            self._lapse_departing(unless_confirming=True)
+            # this car's still must not inherit it; and the measurement starts
+            # over at the sweep's next read. The one alarm that is not a new
+            # car is the camera confirming a passage the early trigger started
+            # (`local_sweep` takes it as the upgrade).
+            self._note_alarm(unless_confirming=True)
             with self._lock:
                 last = self._last_scheduled_at
                 if last is not None and now - last < self.config.min_interval_seconds:
@@ -1148,8 +1216,8 @@ class TriggerFrameCapture:
         )
         return outcome
 
-    def _lapse_departing(self, *, unless_confirming: bool = False) -> None:
-        """Start the current passage's departure measurement over. Never raises.
+    def _note_alarm(self, *, unless_confirming: bool = False) -> None:
+        """Tell the current passage's departure rule a new car is in view. Never raises.
 
         With ``unless_confirming`` an early-origin passage the camera has not
         yet confirmed is left alone: the alarm is its confirmation, not a new
@@ -1161,9 +1229,28 @@ class TriggerFrameCapture:
                 return
             if unless_confirming and passage.early and not passage.confirmed:
                 return
-            passage.departing.lapse()
+            passage.departing.alarm(self._clock())
         except Exception:
             return
+
+    def _departing_mode(self, passage, *, since_alarm: bool) -> str | None:
+        """``on``/``shadow`` while ``passage``'s plate is receding, else None. Never raises.
+
+        ``since_alarm`` is for a frame that is not the sweep's own: the
+        verdict must come from a read after the latest vehicle alarm.
+        """
+        mode = self.config.sweep_departing_skip
+        if mode not in ("on", "shadow") or passage is None:
+            return None
+        try:
+            judge = passage.departing
+            now = self._clock()
+            receding = (
+                judge.receding_since_alarm(now) if since_alarm else judge.receding_at(now)
+            )
+        except Exception:
+            return None
+        return mode if receding else None
 
     def _displace_early(self, item) -> bool:
         """Put a camera event in the slot in place of a queued early one. Holds ``_lock``."""
@@ -1209,29 +1296,27 @@ class TriggerFrameCapture:
     def departing_skip(self) -> str | None:
         """Whether the passage being read is a departing car, right now.
 
-        ``"on"`` or ``"shadow"`` while the sweep's latest read of the passage,
-        no older than ``SWEEP_DEPARTING_GRACE_SECONDS``, says the plate is
-        receding (`DepartingPlate`); None otherwise: no passage read lately, a
-        car that is not receding, a vehicle alarm raised since (`on_camera_event`
-        lapses the verdict on every one it is given, scheduled or inside the
-        minimum interval, so the next car's still cannot inherit it), or the
-        rule switched off. Not tied to the session
-        flag, because the sweep's last hand-overs -- the fallback at the
-        window's end -- and the camera's still can reach `prepare` after the
-        session has closed. Asked by `GateProcessor.prepare` once per
+        What a frame that is *not* the sweep's own is judged by -- the
+        camera's FTP still, above all. ``"on"`` or ``"shadow"`` while the
+        sweep's latest read of the passage, no older than
+        ``SWEEP_DEPARTING_GRACE_SECONDS`` and later than the latest vehicle
+        alarm, says the plate is receding (`DepartingPlate`); None otherwise:
+        no passage read lately, a car that is not receding, an alarm raised
+        since (`on_camera_event` notes every one it is given, scheduled or
+        inside the minimum interval, so the next car's still cannot inherit
+        the last car's verdict), or the rule switched off. The sweep's own
+        hand-overs do not come here: each carries the verdict it was handed
+        over with (`CarriedDeparture`), so a frame of the departing car that
+        reaches the pipeline after the next alarm keeps it. Not tied to the
+        session flag either: the camera's still can reach `prepare` after
+        the session has closed. Asked by `GateProcessor.prepare` once per
         burst, before the burst is routed, so the answer a burst was routed
         on is the answer it is finished on. Never raises.
         """
-        mode = self.config.sweep_departing_skip
-        if mode not in ("on", "shadow"):
-            return None
         try:
-            passage = self._passage
-            if passage is None or not passage.departing.receding_at(self._clock()):
-                return None
+            return self._departing_mode(self._passage, since_alarm=True)
         except Exception:
             return None
-        return mode
 
     def on_early_trigger(self, features=None) -> str:
         """Ask for a local-only sweep ahead of the camera's alarm. Never blocks.
@@ -1256,7 +1341,7 @@ class TriggerFrameCapture:
                     outcome = "skipped_busy"
                 else:
                     outcome = "scheduled"
-                    self._lapse_departing()
+                    self._note_alarm()
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s origin=%s",
             outcome, EARLY_EVENT_TYPE, ORIGIN_EARLY,
@@ -1498,6 +1583,10 @@ class TriggerFrameCapture:
                 return None
             path = self._inject_bytes(
                 frame, captured_at, event, scheduled_at, source=source, read=read,
+                # The passage's verdict as it stands now travels with the
+                # frame: a frame of this car handed over after the next alarm
+                # is still a frame of this car.
+                departing=self._departing_mode(passage, since_alarm=False),
             )
             if path is not None:
                 handed.add(digest)
@@ -2017,7 +2106,7 @@ class TriggerFrameCapture:
         return picked
 
     def _inject_bytes(self, frame: bytes, captured_at: float, event, scheduled_at,
-                      *, source: str, read=None) -> Path | None:
+                      *, source: str, read=None, departing=_NOT_CARRIED) -> Path | None:
         """Write ``frame`` privately and hand it to the burst pipeline.
 
         ``read`` is the sweep's own on-device read of this frame. It travels
@@ -2034,7 +2123,9 @@ class TriggerFrameCapture:
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
             return None
         try:
-            injected = self._inject_path(path, event, scheduled_at, started, sweep_read=read)
+            injected = self._inject_path(
+                path, event, scheduled_at, started, sweep_read=read, departing=departing,
+            )
         except Exception:
             self._failure_count += 1
             LOGGER.exception("gate_trigger_capture outcome=error source=%s", source)
@@ -2427,7 +2518,7 @@ class TriggerFrameCapture:
         return (path,)
 
     def _inject_path(self, path: Path, event, scheduled_at, started, *,
-                     sweep_read=None) -> bool:
+                     sweep_read=None, departing=_NOT_CARRIED) -> bool:
         """Hand a written frame to the burst pipeline with its trigger telemetry.
 
         Returns False, having removed the file, when no injector is attached.
@@ -2493,6 +2584,15 @@ class TriggerFrameCapture:
             # answer is no until the camera's own alarm has arrived.
             extra["origin"] = passage.origin
             extra["cloud_permit"] = passage.cloud_allowed
+        if self._inject_accepts_departing:
+            # The departure verdict this frame is judged by, frozen: the one
+            # the sweep handed it over with, or -- for a frame of the passage
+            # the sweep did not read itself -- the passage's now.
+            verdict = (
+                self._departing_mode(passage, since_alarm=True)
+                if departing is _NOT_CARRIED else departing
+            )
+            extra["departing"] = CarriedDeparture(verdict)
         try:
             inject((path,), captured_at, trigger, **extra)
         except Exception:

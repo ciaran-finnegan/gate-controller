@@ -12,7 +12,9 @@ from PIL import Image
 
 from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.models import MatchDecision, ProcessingResult
-from gate_controller.trigger_capture import ORIGIN_EARLY, DepartingPlate, SweepPassage
+from gate_controller.trigger_capture import (
+    ORIGIN_EARLY, CarriedDeparture, DepartingPlate, SweepPassage,
+)
 from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
     TriggerFrameCapture,
@@ -345,23 +347,39 @@ class DepartingPlateTests(unittest.TestCase):
         self.assertFalse(judge.receding_at(99.0), "a clock that went backwards")
         self.assertFalse(DepartingPlate().receding_at(0.0))
 
-    def test_a_lapsed_verdict_is_gone_until_the_plate_recedes_again(self):
+    def test_an_alarm_keeps_the_verdict_for_sweep_frames_and_withdraws_it_from_everything_else(self):
         judge = DepartingPlate()
         for at, width in enumerate([300, 300, 200, 190]):
             judge.note(width, 100.0 + at)
         self.assertTrue(judge.receding_at(103.5))
-        judge.lapse()
-        self.assertFalse(judge.receding)
-        self.assertFalse(judge.receding_at(103.5))
-        # The last car's widest plate is gone with it: a new car still far
-        # off is not a shrink from 300 px, however small its first reads.
-        self.assertEqual(judge.peak_px, 0)
-        self.assertFalse(judge.note(180, 104.0))
-        self.assertFalse(judge.note(170, 104.5))
+        self.assertTrue(judge.receding_since_alarm(103.5))
+
+        judge.alarm(104.0)
+        # A frame of this car the sweep still holds keeps its verdict...
+        self.assertTrue(judge.receding_at(104.5))
+        # ...and nothing else may borrow it: the next still may be the next car's.
+        self.assertFalse(judge.receding_since_alarm(104.5))
+        self.assertEqual(judge.peak_px, 300, "nothing is forgotten until the next read")
+
+        # The first read after the alarm starts the measurement over: a new
+        # car still far off is not a shrink from the last car's 300 px.
+        self.assertFalse(judge.note(180, 105.0))
         self.assertEqual(judge.peak_px, 180)
-        # It is judged on its own passage from here: grow, then recede.
+        self.assertFalse(judge.note(170, 105.5))
+        self.assertFalse(judge.receding_at(105.5))
+        # Judged on its own passage from here: grow, then recede, and the
+        # verdict speaks for stills again because its reads postdate the alarm.
         for at, width in enumerate([240, 300, 200, 190]):
-            self.assertEqual(judge.note(width, 105.0 + at), at == 3)
+            self.assertEqual(judge.note(width, 106.0 + at), at == 3)
+        self.assertTrue(judge.receding_since_alarm(109.5))
+
+    def test_a_carried_verdict_answers_the_same_whatever_happens_next(self):
+        carried = CarriedDeparture("on")
+        self.assertEqual(carried(), "on")
+        self.assertEqual(CarriedDeparture("shadow")(), "shadow")
+        self.assertIsNone(CarriedDeparture(None)())
+        self.assertIsNone(CarriedDeparture("off")())
+        self.assertIsNone(CarriedDeparture("yes")())
 
     def test_nonsense_widths_change_nothing(self):
         judge = DepartingPlate()
@@ -428,6 +446,24 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         self.assertEqual(capture.on_camera_event(event(event_type="manual_test")), "skipped_type")
         self.assertEqual(capture.departing_skip(), "on", "a manual test is not a car")
 
+    def test_a_vehicle_alarm_withdraws_the_verdict_only_from_frames_that_do_not_carry_it(self):
+        # The old car's sweep may still hand a frame over after the alarm --
+        # its fallback at `new_event` -- and that frame carries the verdict.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            sweep_departing_skip="on",
+        )
+        passage = capture._passage
+        for width in (320, 320, 200, 190):
+            passage.departing.note(width, clock["now"])
+            clock["now"] += 0.25
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip(), "the next car's still would inherit it")
+        self.assertEqual(capture._departing_mode(passage, since_alarm=False), "on",
+                         "the departing car's own frame lost it")
+
     def test_the_alarm_that_confirms_an_early_passage_keeps_its_measurement(self):
         # With the early trigger on, the camera's alarm for a passage the
         # trigger already started is that passage's confirmation, which
@@ -454,7 +490,10 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         clock["now"] += 2.0
         self.assertEqual(capture.on_camera_event(event()), "scheduled")
         self.assertIsNone(capture.departing_skip())
-        self.assertEqual(judge.peak_px, 0)
+        # The measurement starts over at the first read after that alarm.
+        clock["now"] += 0.5
+        self.assertFalse(judge.note(180, clock["now"]))
+        self.assertEqual(judge.peak_px, 180)
 
     def test_captured_frame_is_injected_with_a_sanitized_matched_trigger(self):
         capture, popen = self.capture([FakeProcess(output=jpeg())])
