@@ -34,7 +34,11 @@ until someone frees it by hand. That is exactly what happened on 2026-09-21.
 6. The production cooldowns exist for these reasons: automatic actuations wait
    `GATE_ACTUATION_COOLDOWN_SECONDS` (90 s, longer than a full cycle) after
    any pulse; app commands wait `GATE_COMMAND_COOLDOWN_SECONDS` (20 s). Do not
-   lower either for a test.
+   lower either for a test. And a car gets one automatic pulse while it stays
+   in view, however many alarms it raises (`GATE_REPULSE_UNSEEN_MINUTES`,
+   10 min; invariant 12) -- on 2026-10-10 a waiting pickup was pulsed four
+   times through cooldown expiries and the leaves crossed again.
+   `GATE_AUTOMATIC_OPEN=off` pauses automatic opening altogether.
 7. A test harness that sends real pulses must refuse to run without an explicit
    confirmation flag, must log every command it sends, and must be reviewed
    against rules 1-5 by a person before it runs for real. The audio-following

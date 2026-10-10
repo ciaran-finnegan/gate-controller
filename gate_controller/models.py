@@ -96,7 +96,32 @@ class GateEvent:
     #: told a car was refused when it had just been let in. It is a local
     #: column only: ``LocalStore._event_payload`` does not select it, so it
     #: never reaches the ingest contract, which would reject the unknown key.
+    #:
+    #: Since 2026-10-10 it also holds ``"repulse_hold"`` -- the gate was
+    #: already pulsed for this plate and the car has not left the picture
+    #: since (``ActuationCoordinator``, docs/invariants.md 12) -- and
+    #: ``"automatic_paused"``, the owner's switch against any automatic open.
     actuation_outcome: str | None = None
+    #: On a denial, the authorised plate the refused read was closest to
+    #: (``MatchDecision.near_miss_plate``), or ``None``. Record-only, and local
+    #: only like ``actuation_outcome``: the one-pulse-per-car hold counts a
+    #: near miss attributed to a plate as that plate still being in view, so
+    #: a car whose trailing characters misread cannot be pulsed again for it.
+    #: Never a grant, and never on the wire.
+    near_miss_plate: str | None = None
+
+
+@dataclass(frozen=True)
+class RepulseHold:
+    """Why an automatic pulse for ``plate`` is being withheld.
+
+    The relay was pulsed for this plate at ``pulsed_at`` and the plate has
+    been in view since: every gap between sightings, and from the last one to
+    now, is within the unseen window. ``last_seen_at`` is the newest sighting.
+    """
+    plate: str
+    pulsed_at: datetime
+    last_seen_at: datetime
 
 
 @dataclass(frozen=True)

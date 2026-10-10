@@ -201,11 +201,11 @@ class CooldownGrantWireTests(unittest.TestCase):
         store.bind_pending_outbox_controller("primary")
         return store, granted, coalesced
 
-    def _matched(self, key, at):
+    def _matched(self, key, at, plate="131D2696"):
         return GateEvent(
             source="ocr", reason="exact_match", opened=False, idempotency_key=key,
-            received_at=at, decision_at=at, authorised_plate="131D2696",
-            observed_plate="131D2696", ocr_confidence=0.999,
+            received_at=at, decision_at=at, authorised_plate=plate,
+            observed_plate=plate, ocr_confidence=0.999,
         )
 
     def _payload(self, store, event_id):
@@ -304,10 +304,13 @@ class CooldownGrantWireTests(unittest.TestCase):
             # coalesced record at NOW+2 s would still be inside it if it
             # counted -- which is the whole point of the test.
             next_car = self.NOW + timedelta(seconds=91)
+            # The convoy's second car is a different car: the first one, still
+            # in view 91 s after its pulse, is held (docs/invariants.md 12).
             reopened = ActuationCoordinator(
                 store, OpenRelay(), clock=lambda: next_car,
                 monotonic_clock=lambda: 191.0, boot_id="boot-1",
-            ).actuate(self._matched("image:next-car", next_car), outbox_payload={})
+            ).actuate(self._matched("image:next-car", next_car, plate="10CE1990"),
+                      outbox_payload={})
 
         self.assertFalse(
             after_the_pulse, "the coalesced frame never worked the relay"

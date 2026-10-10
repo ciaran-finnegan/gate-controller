@@ -219,8 +219,13 @@ reads are recorded as grants but do not pulse again for
 `GATE_ACTUATION_COOLDOWN_SECONDS` (default 90, longer than the measured
 open-hold-close cycle), because the operator's input is step-by-step and a
 second pulse closes or stops the gate. A person's open command from the app
-uses the shorter `GATE_COMMAND_COOLDOWN_SECONDS` (default 20). See
-`docs/deployment.md`, "Relay Cooldown".
+uses the shorter `GATE_COMMAND_COOLDOWN_SECONDS` (default 20). And one car
+gets one automatic pulse: once the relay has pulsed for a plate, no plate read
+pulses for it again until that plate has been out of the record for
+`GATE_REPULSE_UNSEEN_MINUTES` (default 10), however many camera alarms it
+raises while it waits; `GATE_AUTOMATIC_OPEN=off` pauses automatic opening
+altogether, leaving the app's gate button. See `docs/deployment.md`, "Relay
+Cooldown" and "One Car, One Automatic Pulse", and `docs/invariants.md` 12.
 
 Image work is bounded and freshness checked. Startup JPEGs older than
 `GATE_MAX_IMAGE_AGE_SECONDS`, coalesced queue entries, OCR failures, no-plate

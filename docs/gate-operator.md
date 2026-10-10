@@ -45,6 +45,28 @@ normal cycle after that was 18:59 IST. The controller's diagnosis at the time
 
 The gate failed shut, not open. That is the only thing that went right.
 
+## The second incident, 2026-10-10
+
+The same failure from the plate reader, with no test involved. An authorised
+pickup (`172L66`) waited about nine minutes at the gate, 10:04-10:13 IST. The
+camera raised seven vehicle alarms (10:04:11, 10:05:38, 10:06:44, 10:07:34,
+10:08:14, 10:12:36, 10:13:01) and the Pi pulsed the relay **four times for
+the one car**: 10:04:13.9 (a sweep frame), 10:06:45.8 (the next alarm's sweep
+frame), 10:08:18.0 (the camera's 4K still of the 10:08:14 alarm, 92 s after
+the previous pulse -- the sweep frame of the same alarm had been refused by
+the cooldown at +89.6 s, and the still 2.4 s later passed) and 10:12:37.0 (a
+sweep frame). Every read between was refused only by the 90 s cooldown; its
+expiry was a clean slate, every alarm started a new passage, and nothing
+carried "this plate was already let in and is still here" from one to the
+next. Each later pulse landed on a gate whose state nobody knew; the leaves
+crossed and the gate jammed. The full review is
+[reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md).
+
+The fix is rule 7 below and [invariant 12](invariants.md): one car, one
+automatic pulse, however long it waits and however many alarms it raises --
+and a pause switch for automatic opening. Neither adds a pulse; both only
+withhold one.
+
 ## Rules
 
 1. A pulse is safe only into a gate that is provably shut and still: a
@@ -67,6 +89,14 @@ The gate failed shut, not open. That is the only thing that went right.
    the operator board has an open-only input (TOPENS `OPSW`+`COM`), move the
    relay to it. That input cannot stop or close the gate. Until then, the
    direction work (#171) must keep departing cars from pulsing at all.
+7. One car, one automatic pulse. Once the relay has pulsed for a plate, no
+   plate read pulses for it again until that plate has been out of the record
+   for `GATE_REPULSE_UNSEEN_MINUTES` (10 min), whatever the cooldown says: a
+   car waiting through alarm after alarm gets exactly one pulse. The refused
+   grants are recorded (`actuation_outcome = "repulse_hold"`) and journalled.
+   `GATE_AUTOMATIC_OPEN=off` pauses automatic opening altogether. Neither
+   touches a person's command from the app. Neither is to be lowered or
+   switched off for a test.
 
 ## Reading the gate from sound
 

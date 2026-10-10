@@ -1308,3 +1308,203 @@ class OutboxBacklogAgeTests(unittest.TestCase):
         self.assertIsNone(store.oldest_pending_outbox_age_seconds())
         self.assertEqual(0, store.pending_outbox_count())
         self.assertIsInstance(event_id, int)
+
+
+class RepulseHoldQueryTests(unittest.TestCase):
+    """`LocalStore.repulse_hold`: the one-pulse-per-car hold's record walk.
+
+    The coordinator asks this under the actuation lock, on the way to the
+    relay (docs/invariants.md 12). The behaviour it feeds is tested through
+    the whole path in tests/test_one_pulse_per_car.py and
+    tests/test_gate_jam_2026_10_10.py; here are the shapes of record the walk
+    has to read correctly.
+    """
+
+    T0 = datetime(2026, 10, 10, 9, 4, 13, tzinfo=timezone.utc)
+    TEN = timedelta(minutes=10)
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = LocalStore(Path(directory.name) / "gate.db")
+        self.keys = 0
+
+    def _row(self, at_seconds, *, plate="172L66", opened=True, pulsed=True, outcome=None,
+             observed=None, near_miss=None, source="ocr", reason="exact_match",
+             relay_instant=True):
+        self.keys += 1
+        at = self.T0 + timedelta(seconds=at_seconds)
+        return self.store.record_event(GateEvent(
+            source=source, reason=reason, opened=opened, idempotency_key=f"row-{self.keys}",
+            received_at=at, decision_at=at,
+            relay_activated_at=(at if pulsed and relay_instant else None),
+            authorised_plate=plate, observed_plate=observed,
+            actuation_outcome=outcome, near_miss_plate=near_miss,
+        ))
+
+    def _hold(self, now_seconds, plate="172L66", unseen=TEN):
+        return self.store.repulse_hold(plate, self.T0 + timedelta(seconds=now_seconds), unseen)
+
+    def test_no_pulse_no_hold(self):
+        self._row(0, pulsed=False, opened=False, reason="no_match")
+        self.assertIsNone(self._hold(60))
+
+    def test_a_pulse_holds_its_plate_for_the_window(self):
+        self._row(0)
+        hold = self._hold(599)
+        self.assertEqual((hold.plate, hold.pulsed_at, hold.last_seen_at), ("172L66", self.T0, self.T0))
+        self.assertIsNone(self._hold(601), "unseen for the window: the hold has lapsed")
+
+    def test_sightings_chain_the_hold_forward(self):
+        self._row(0)
+        self._row(400, pulsed=False, outcome="cooldown")      # a cooldown grant
+        self._row(900, pulsed=False, outcome="repulse_hold")  # a held grant
+        hold = self._hold(1400)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold.pulsed_at, self.T0)
+        self.assertEqual(hold.last_seen_at, self.T0 + timedelta(seconds=900))
+        self.assertIsNone(self._hold(1501))
+
+    def test_a_gap_longer_than_the_window_breaks_the_chain_for_good(self):
+        self._row(0)
+        self._row(700, pulsed=False, opened=False, reason="no_match", observed="172L66")
+        self._row(800, pulsed=False, opened=False, reason="no_match", observed="172L66")
+        self.assertIsNone(self._hold(850), "sightings after a lapse anchor nothing")
+
+    def test_an_observed_read_and_a_near_miss_both_count_as_seen(self):
+        self._row(0)
+        self._row(500, plate=None, pulsed=False, opened=False, reason="no_match",
+                  observed="172L66")
+        self._row(1000, plate=None, pulsed=False, opened=False, reason="no_match",
+                  observed="172L61", near_miss="172L66")
+        self.assertIsNotNone(self._hold(1500))
+        self.assertIsNone(self._hold(1601))
+
+    def test_other_plates_neither_break_nor_extend_the_chain(self):
+        self._row(0)
+        for at in range(30, 1200, 30):
+            self._row(at, plate="131D2696", pulsed=False, opened=False, reason="no_match",
+                      observed="131D2696")
+        self.assertIsNone(self._hold(700), "another car's reads kept this one's hold alive")
+        self.assertIsNotNone(self._hold(400))
+
+    def test_a_pulse_for_another_plate_is_not_this_plates_anchor(self):
+        self._row(0, plate="131D2696")
+        self.assertIsNone(self._hold(60))
+        self.assertIsNotNone(self._hold(60, plate="131D2696"))
+
+    def test_a_persons_pulse_has_no_plate_and_anchors_nothing(self):
+        self._row(0, plate=None, source="remote_command", reason="remote_command")
+        self._row(30, pulsed=False, opened=False, reason="no_match", observed="172L66")
+        self.assertIsNone(self._hold(60))
+
+    def test_a_relay_that_reports_no_instant_is_still_a_pulse(self):
+        """The same clause `_was_opened_since` has: an opened row that did not
+        skip the relay worked it, timestamp or no timestamp."""
+        self._row(0, relay_instant=False)
+        hold = self._hold(60)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold.pulsed_at, self.T0)
+
+    def test_an_attempt_the_process_died_in_is_a_pulse_for_the_hold(self):
+        """The relay may have fired: recovery writes `indeterminate_claim`,
+        `opened=0`, and the claim keeps its `activation_attempt_at`. The cooldown
+        counts that; so does the hold, or the car could be pulsed again once the
+        cooldown had expired -- the very repeat the hold exists to stop."""
+        at = self.T0
+        event = GateEvent(
+            source="local", reason="exact_match", opened=False, idempotency_key="image:died",
+            received_at=at, decision_at=at, authorised_plate="172L66", observed_plate="172L66",
+        )
+        claim = self.store.claim_actuation("image:died", at, event=event)
+        self.store.mark_actuation_attempt(
+            claim, at, event=event, attempted_monotonic=100.0, boot_id="boot-1",
+        )
+        # The process dies here. The next start recovers the claim.
+        self.assertEqual(LocalStore(self.store.path).recover_interrupted_actuations(), 1)
+
+        hold = self._hold(400)
+        self.assertIsNotNone(hold, "an attempt that may have pulsed anchors no hold")
+        self.assertEqual(hold.pulsed_at, self.T0)
+        self.assertIsNone(self._hold(601))
+
+    def test_an_interruption_before_any_attempt_is_not_a_pulse(self):
+        at = self.T0
+        event = GateEvent(
+            source="local", reason="exact_match", opened=False, idempotency_key="image:early",
+            received_at=at, decision_at=at, authorised_plate="172L66", observed_plate="172L66",
+        )
+        self.store.claim_actuation("image:early", at, event=event)
+        self.assertEqual(LocalStore(self.store.path).recover_interrupted_actuations(), 1)
+        self.assertIsNone(self._hold(60), "the relay was never asked")
+
+    def test_plates_are_compared_in_normalised_form(self):
+        self._row(0, plate="172-l-66")
+        self.assertIsNotNone(self._hold(60, plate="172L66"))
+        self.assertIsNotNone(self._hold(60, plate=" 172 L 66 "))
+
+    def test_a_zero_or_negative_window_or_an_empty_plate_is_no_hold(self):
+        self._row(0)
+        self.assertIsNone(self._hold(60, unseen=timedelta(0)))
+        self.assertIsNone(self._hold(60, unseen=timedelta(seconds=-1)))
+        self.assertIsNone(self._hold(60, plate=""))
+        self.assertIsNone(self._hold(60, plate="---"))
+
+    def test_the_newest_pulse_is_the_anchor(self):
+        self._row(0)
+        self._row(2000)  # let in again after being away
+        hold = self._hold(2100)
+        self.assertEqual(hold.pulsed_at, self.T0 + timedelta(seconds=2000))
+
+    def test_the_walk_stops_at_the_first_gap_rather_than_reading_history(self):
+        """Older rows are never read past a gap: the query is bounded by the chain."""
+        for at in range(0, 86400, 600):
+            self._row(at, plate="131D2696", pulsed=False, opened=False, reason="no_match",
+                      observed="131D2696")
+        real_connect = self.store._connect
+        counted = []
+
+        def counting_connect():
+            connection = real_connect()
+            counted.append(connection.set_trace_callback)
+            return connection
+
+        with mock.patch.object(self.store, "_connect", counting_connect):
+            self.assertIsNone(self._hold(86400 + 60))
+        self.assertEqual(len(counted), 1)
+
+    def test_the_near_miss_column_is_added_to_an_existing_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "gate.db"
+            _write_legacy_events_database(database)
+
+            store = LocalStore(database)
+
+            with closing(sqlite3.connect(database)) as connection:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+                existing = connection.execute("SELECT near_miss_plate FROM events").fetchall()
+                indexes = {row[1] for row in connection.execute("PRAGMA index_list(events)")}
+            self.assertIn("near_miss_plate", columns)
+            self.assertEqual(existing, [(None,)])
+            self.assertIn("events_received_at", indexes)
+            # And the legacy opened row -- a pulse with the plate observed -- is
+            # an anchor for that plate, as it is a pulse for the cooldown.
+            hold = store.repulse_hold(
+                "10CE1990", datetime(2026, 8, 13, 10, 5, tzinfo=timezone.utc), self.TEN,
+            )
+            self.assertIsNotNone(hold, "an existing opened row still holds its plate")
+            self.assertEqual(hold.pulsed_at, datetime(2026, 8, 13, 10, 0, 1, tzinfo=timezone.utc))
+
+    def test_a_pending_event_carries_its_near_miss_across_a_restart(self):
+        now = datetime(2026, 10, 10, 9, 0, tzinfo=timezone.utc)
+        event = GateEvent(
+            source="ocr", reason="no_match", opened=False, idempotency_key="image:miss",
+            received_at=now, decision_at=now, observed_plate="172L61", near_miss_plate="172L66",
+        )
+        encoded = _encode_pending_event(event)
+        self.assertEqual(_decode_pending_event(encoded).near_miss_plate, "172L66")
+        # Absent, not null, when there is none: an older decoder never sees the key.
+        self.assertNotIn("near_miss_plate", json.loads(_encode_pending_event(
+            GateEvent(source="ocr", reason="exact_match", opened=False,
+                      idempotency_key="image:clean", received_at=now)
+        )))

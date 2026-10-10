@@ -12,8 +12,10 @@ from urllib.parse import urlparse
 
 from .audio import PromptPlayer
 from .actuation import (
-    DEFAULT_AUTOMATIC_COOLDOWN, DEFAULT_COMMAND_COOLDOWN, ActuationCoordinator,
+    DEFAULT_AUTOMATIC_COOLDOWN, DEFAULT_COMMAND_COOLDOWN, DEFAULT_REPULSE_UNSEEN,
+    ActuationCoordinator,
 )
+from .automatic_open import load_config as load_automatic_open_config
 from .agricultural import build_policy as build_farm_machinery_policy
 from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_seconds
 from .authorisation import (
@@ -89,6 +91,12 @@ MAX_ACTUATION_COOLDOWN_SECONDS = 600.0
 #: pulse and a double-tap in the app.
 MIN_COMMAND_COOLDOWN_SECONDS = 5.0
 MAX_COMMAND_COOLDOWN_SECONDS = 600.0
+#: Bounds on GATE_REPULSE_UNSEEN_MINUTES, the one-pulse-per-car hold. 0 is
+#: accepted only as an explicit "off"; otherwise at least a minute and at most
+#: a day. The window has to outlast the gaps between one waiting car's camera
+#: alarms (4 min 22 s was the longest on 2026-10-10).
+MIN_REPULSE_UNSEEN_MINUTES = 1.0
+MAX_REPULSE_UNSEEN_MINUTES = 1440.0
 MANAGED_RELEASES_ROOT = Path("/opt/gate-controller-deploy/releases")
 MANAGED_RELEASE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
@@ -137,12 +145,23 @@ def main() -> None:
     # lock the pipeline takes, observes no actuation, and is never consulted by
     # a gate decision. It only writes segments a later job cuts windows from.
     audio_segments = _audio_segment_recorder(os.environ)
+    # The app's settings envelope, cached beside the database. Built before
+    # the coordinator because the coordinator reads the owner's pause switch
+    # from it (automatic_open.py), with the environment as the fallback.
+    match_policy = MatchPolicyCache(
+        Path(arguments.database).resolve().parent / "match-policy.json"
+    )
+    automatic_open_defaults = load_automatic_open_config(os.environ)
     # One coordinator, shared by the recognition pipeline and the command
-    # server, so both windows are measured from the same last pulse.
+    # server, so both windows are measured from the same last pulse -- and so
+    # the one-pulse-per-car hold and the pause switch sit on the one path
+    # every automatic grant takes (docs/invariants.md 12).
     automatic_cooldown, command_cooldown = actuation_cooldowns(os.environ)
     coordinator = ActuationCoordinator(
         store, relay, automatic_cooldown, activation_observer=audio_capture,
         command_cooldown=command_cooldown,
+        repulse_unseen=repulse_unseen(os.environ),
+        automatic_open=lambda: _automatic_open_config(match_policy, automatic_open_defaults),
     )
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
@@ -165,9 +184,6 @@ def main() -> None:
         # Read through a lambda, not bound here: a store that cannot answer
         # must make the corpus stand down, not stop the controller starting.
         pending_events=lambda: store.pending_outbox_count(),
-    )
-    match_policy = MatchPolicyCache(
-        Path(arguments.database).resolve().parent / "match-policy.json"
     )
     plate_region = parse_plate_region(os.environ.get("GATE_PLATE_REGION"))
     # Off unless GATE_LOCAL_OCR_MODE is set: nothing is imported or loaded.
@@ -750,6 +766,63 @@ def actuation_cooldowns(environment) -> tuple[timedelta, timedelta]:
     return automatic, command
 
 
+def repulse_unseen(environment) -> timedelta | None:
+    """The one-pulse-per-car hold's unseen window, or None for off.
+
+    ``GATE_REPULSE_UNSEEN_MINUTES`` (default 10) is how long a plate the relay
+    has already pulsed for must be out of the record before a plate read may
+    pulse for it again. ``0`` switches the hold off -- the rollback for this
+    rule, and only ever set on purpose. Anything else outside 1..1440 or
+    unreadable is rejected whole, logged at ERROR and replaced by the shipped
+    default, exactly as the cooldowns are: a controller that is down opens
+    for nobody, and the default is the value the 2026-10-10 jam was measured
+    against.
+    """
+    raw = str(environment.get("GATE_REPULSE_UNSEEN_MINUTES", "") or "").strip()
+    if not raw:
+        return DEFAULT_REPULSE_UNSEEN
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        minutes = math.nan
+    if minutes == 0:
+        logging.getLogger(__name__).warning(
+            "repulse_hold key=GATE_REPULSE_UNSEEN_MINUTES status=disabled"
+        )
+        return None
+    if not math.isfinite(minutes) or not (
+        MIN_REPULSE_UNSEEN_MINUTES <= minutes <= MAX_REPULSE_UNSEEN_MINUTES
+    ):
+        logging.getLogger(__name__).error(
+            "repulse_hold key=GATE_REPULSE_UNSEEN_MINUTES status=rejected allowed=0,%g..%g "
+            "using_default_minutes=%g",
+            MIN_REPULSE_UNSEEN_MINUTES, MAX_REPULSE_UNSEEN_MINUTES,
+            DEFAULT_REPULSE_UNSEEN.total_seconds() / 60.0,
+        )
+        return DEFAULT_REPULSE_UNSEEN
+    return timedelta(minutes=minutes)
+
+
+def _automatic_open_config(match_policy, defaults):
+    """The pause switch: the app's setting, else the board's environment.
+
+    Read from the settings envelope through the same cache that holds the
+    plate-matching schedule; the parse can never raise into, or change, that
+    schedule, and nothing here raises either -- a reader that fails leaves
+    the environment's value in force.
+    """
+    from .automatic_open import AutomaticOpenConfig
+
+    fallback = defaults if defaults is not None else AutomaticOpenConfig()
+    reader = getattr(match_policy, "automatic_open", None)
+    if not callable(reader):
+        return fallback
+    try:
+        return reader(fallback)
+    except Exception:
+        return fallback
+
+
 def _cooldown_seconds(environment, key: str, default: timedelta,
                       minimum: float, maximum: float) -> timedelta:
     raw = str(environment.get(key, "") or "").strip()
@@ -962,7 +1035,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
             metrics=metrics, cloud_breaker=cloud_breaker, camera_focus=camera_focus,
-            left_open_defaults=left_open_defaults,
+            left_open_defaults=left_open_defaults, coordinator=coordinator,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -1125,6 +1198,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
                        cloud_breaker=None, camera_focus=None, left_open_defaults=None,
+                       coordinator=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -1200,7 +1274,25 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
         status["authorisation"] = authorised.status()
     if match_policy is not None:
         status["match_policy"] = match_policy.status()
+    # Additive, like `camera_focus`: what withholds automatic pulses -- the
+    # owner's pause switch and the one-pulse-per-car hold -- so the dashboard
+    # can show a paused gate once the Worker learns the block.
+    actuation_status = _actuation_status(coordinator)
+    if actuation_status is not None:
+        status["actuation"] = actuation_status
     return status
+
+
+def _actuation_status(coordinator) -> dict | None:
+    """The coordinator's view of its own withholding rules, or None."""
+    read_status = getattr(coordinator, "status", None)
+    if not callable(read_status):
+        return None
+    try:
+        measured = read_status()
+    except Exception:
+        return None
+    return measured if isinstance(measured, dict) else None
 
 
 def _webhook_status(webhook) -> dict | None:

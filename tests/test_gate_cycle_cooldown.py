@@ -22,8 +22,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from gate_controller.__main__ import actuation_cooldowns
+from gate_controller.__main__ import actuation_cooldowns, repulse_unseen
 from gate_controller.actuation import ActuationCoordinator
+from gate_controller.automatic_open import load_config as load_automatic_open
 from gate_controller.command_server import DirectCommandExecutor
 from gate_controller.models import PlateObservation
 from gate_controller.processor import GateProcessor
@@ -79,10 +80,13 @@ class GateCycleCooldownTests(unittest.TestCase):
         relay = RelayController(
             self.gpio, sleeper=lambda _seconds: None, clock=self.wall_clock,
         )
+        automatic_open = load_automatic_open(environment)
         self.coordinator = ActuationCoordinator(
             self.store, relay, automatic, clock=self.wall_clock,
             monotonic_clock=self.monotonic_clock, boot_id=boot_id,
             command_cooldown=command,
+            repulse_unseen=repulse_unseen(environment),
+            automatic_open=lambda: automatic_open,
         )
         self.processor = GateProcessor(
             recognizer=self.reader, store=self.store, relay=relay,
@@ -154,7 +158,16 @@ class GateCycleCooldownTests(unittest.TestCase):
                 self.assert_cooldown_grant(self.plate_read(at))
         self.assertEqual(self.gpio.pulses, 1)
 
+    #: The cooldown measured on its own. Since 2026-10-10 the one-pulse-per-car
+    #: hold (tests/test_one_pulse_per_car.py) would refuse the re-pulse of a plate
+    #: that has stayed in view, so the tests that time the *window* switch it off
+    #: on purpose; that is what GATE_REPULSE_UNSEEN_MINUTES=0 is for.
+    COOLDOWN_ONLY = {"GATE_REPULSE_UNSEEN_MINUTES": "0"}
+
     def test_the_same_plate_pulses_again_once_the_cycle_is_certainly_over(self):
+        """The window's end, with the hold off: the hold is the subject of
+        test_one_pulse_per_car.py, and with it on this read is withheld."""
+        self.build(self.COOLDOWN_ONLY)
         self.plate_read(0)
         self.assert_cooldown_grant(self.plate_read(65))
 
@@ -202,6 +215,7 @@ class GateCycleCooldownTests(unittest.TestCase):
 
     def test_a_human_pulse_restarts_the_automatic_window(self):
         """Plate at 0, person at +25 s: a plate at +95 s is 70 s after a pulse."""
+        self.build(self.COOLDOWN_ONLY)
         self.plate_read(0)
         self.human_command(25)
         self.assertEqual(self.gpio.pulses, 2)
@@ -247,6 +261,7 @@ class GateCycleCooldownTests(unittest.TestCase):
         self.build({
             "GATE_ACTUATION_COOLDOWN_SECONDS": "120",
             "GATE_COMMAND_COOLDOWN_SECONDS": "10",
+            **self.COOLDOWN_ONLY,
         })
         self.plate_read(0)
 

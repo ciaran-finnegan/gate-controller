@@ -15,6 +15,7 @@ import gate_controller.__main__ as gate_main
 from gate_controller.__main__ import (
     _quiet_window, _shutdown_controller, actuation_cooldowns,
     build_background_workers, build_reolink_trigger_pipeline, default_runtime_paths,
+    repulse_unseen,
 )
 from gate_controller.actuation import ActuationCoordinator
 from gate_controller.authorisation import AuthorisationRefreshWorker, AuthorisedPlateCache
@@ -695,6 +696,85 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertEqual(for_plates.automatic_cooldown, timedelta(seconds=75))
         self.assertEqual(for_plates.command_cooldown, timedelta(seconds=15))
         self.assertEqual(processor_cooldown, timedelta(seconds=75))
+
+    def test_repulse_unseen_defaults_to_ten_minutes_and_takes_bounded_values(self):
+        self.assertEqual(repulse_unseen({}), timedelta(minutes=10))
+        self.assertEqual(repulse_unseen({"GATE_REPULSE_UNSEEN_MINUTES": " "}), timedelta(minutes=10))
+        for value in ("1", "2.5", "10", "1440"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    repulse_unseen({"GATE_REPULSE_UNSEEN_MINUTES": value}),
+                    timedelta(minutes=float(value)),
+                )
+
+    def test_repulse_unseen_is_switched_off_only_by_an_explicit_zero(self):
+        with self.assertLogs("gate_controller.__main__", level="WARNING") as logs:
+            self.assertIsNone(repulse_unseen({"GATE_REPULSE_UNSEEN_MINUTES": "0"}))
+        self.assertIn("key=GATE_REPULSE_UNSEEN_MINUTES status=disabled", "\n".join(logs.output))
+
+    def test_a_rejected_repulse_unseen_is_logged_and_keeps_the_ten_minutes(self):
+        for value in ("0.5", "-1", "1441", "nan", "inf", "-inf", "ten", "10m", "1e9"):
+            with self.subTest(value=value), self.assertLogs(
+                "gate_controller.__main__", level="ERROR"
+            ) as logs:
+                self.assertEqual(
+                    repulse_unseen({"GATE_REPULSE_UNSEEN_MINUTES": value}), timedelta(minutes=10),
+                )
+            self.assertIn("key=GATE_REPULSE_UNSEEN_MINUTES status=rejected", "\n".join(logs.output))
+
+    def test_the_example_environment_documents_the_one_pulse_per_car_settings(self):
+        root = Path(gate_main.__file__).resolve().parent.parent
+        example = dict(
+            line.split("=", 1)
+            for line in (root / ".env.example").read_text(encoding="utf-8").splitlines()
+            if line.startswith(("GATE_REPULSE_UNSEEN_MINUTES", "GATE_AUTOMATIC_OPEN"))
+        )
+        documentation = (root / "docs/deployment.md").read_text(encoding="utf-8")
+
+        self.assertEqual(sorted(example), ["GATE_AUTOMATIC_OPEN", "GATE_REPULSE_UNSEEN_MINUTES"])
+        self.assertEqual(repulse_unseen(example), repulse_unseen({}))
+        self.assertEqual(example["GATE_AUTOMATIC_OPEN"], "on")
+        self.assertIn("| `GATE_REPULSE_UNSEEN_MINUTES` | `10` |", documentation)
+        self.assertIn("| `GATE_AUTOMATIC_OPEN` | `on` |", documentation)
+
+    def test_main_hands_the_coordinator_the_hold_and_the_pause_switch(self):
+        _for_commands, for_plates, _ = self._coordinators_main_hands_out()
+        self.assertEqual(for_plates.repulse_unseen, timedelta(minutes=10))
+        self.assertTrue(for_plates.automatic_open_config().enabled)
+
+        _for_commands, for_plates, _ = self._coordinators_main_hands_out(
+            GATE_REPULSE_UNSEEN_MINUTES="0", GATE_AUTOMATIC_OPEN="off",
+        )
+        self.assertIsNone(for_plates.repulse_unseen)
+        self.assertFalse(for_plates.automatic_open_config().enabled)
+        self.assertEqual(for_plates.automatic_open_config().source, "environment")
+        self.assertEqual(for_plates.status()["automatic_open"], False)
+
+    def test_the_heartbeat_reports_what_withholds_automatic_pulses(self):
+        store = self.create_store()
+        prompt = Mock(available=False)
+
+        class Coordinator:
+            def status(self):
+                return {"automatic_open": False, "automatic_open_source": "app",
+                        "repulse_unseen_minutes": 10.0}
+
+        class Broken:
+            def status(self):
+                raise RuntimeError("boom")
+
+        status = gate_main._controller_status(store, prompt, {}, coordinator=Coordinator())
+
+        self.assertEqual(status["actuation"], {
+            "automatic_open": False, "automatic_open_source": "app",
+            "repulse_unseen_minutes": 10.0,
+        })
+        # Absent when there is no coordinator, and a status that raises never
+        # costs the heartbeat.
+        self.assertNotIn("actuation", gate_main._controller_status(store, prompt, {}))
+        self.assertNotIn("actuation", gate_main._controller_status(
+            store, prompt, {}, coordinator=Broken(),
+        ))
 
     def test_main_starts_on_the_safe_default_when_the_cooldown_is_nonsense(self):
         with self.assertLogs("gate_controller.__main__", level="ERROR"):

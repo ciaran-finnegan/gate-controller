@@ -702,7 +702,8 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
                hot_frame_provider=None, trigger_capture=None, on_result=None,
                prepare=None,
                upload_stall_seconds: float = DEFAULT_UPLOAD_STALL_SECONDS,
-               upload_max_seconds: float = DEFAULT_UPLOAD_MAX_SECONDS) -> None:
+               upload_max_seconds: float = DEFAULT_UPLOAD_MAX_SECONDS,
+               wall_clock=None) -> None:
     """Watch completed JPEG uploads and process ranked bursts without blocking collection.
 
     With ``prepare`` (the processor's fast-lane half of a decision) the burst
@@ -712,6 +713,11 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
 
     ``upload_stall_seconds`` and ``upload_max_seconds`` bound how long an FTP
     upload that is still arriving is waited for (`CompletedImageHandler`).
+
+    ``wall_clock`` stamps an FTP upload's ``received_at`` -- the instant the
+    freshness rule and the one-pulse-per-car hold read. Production leaves it
+    to the real clock; a test that replays a nine-minute passage sets it so
+    the still and the processor agree about what time it is.
     """
     bursts = BoundedBurstQueue(max_pending_bursts)
     note_result = getattr(trigger_capture, "note_result", None)
@@ -798,6 +804,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     collector = BurstCollector(
         enqueue, quiet_window=quiet_window,
         ranker=lambda paths: rank_images(paths, max_bytes=max_candidate_bytes),
+        arrival_clock=wall_clock,
         include_received_at=True, include_decision_started_at=True,
         include_processing_started_at=True,
         include_idempotency_key=True,
@@ -806,6 +813,7 @@ def run_worker(directory: Path, emit, quiet_window: float = 0.5,
     )
     handler = CompletedImageHandler(
         collector,
+        arrival_clock=wall_clock,
         on_rejected=(
             lambda path, reason: report_pre_ocr_skip((path,), reason)
         ) if on_skipped else None,
