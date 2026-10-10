@@ -195,14 +195,16 @@ would make every passing headlight visible from the road.
 `shadow` journals and records. It reaches nothing: the capture's
 `on_early_trigger` refuses (`disabled`) unless the mode is `on`, whoever calls.
 
-`on`: a would-trigger the confirmation has passed asks the production
+`on`: a would-trigger that passes confirmation asks the production
 `TriggerFrameCapture` for a sweep, through the same `local_sweep` as a camera
 alarm, with the origin **stated** (`SweepPassage.origin = "early"`), never
 inferred from timing. With `GATE_EARLY_TRIGGER_CONFIRMATION=sweep` (the
-default) every would-trigger of the vision rule asks at once, and the sweep
-is the confirmation; with `looks` only one a second look has confirmed inside
-the bound asks, and an unconfirmed one asks for nothing and is recorded as
-`skipped_unconfirmed` (see [Layers](#what-is-recorded)). Same local reader,
+default) every would-trigger of the vision rule passes and asks at once, and
+the sweep is the confirmation; with `looks` only a would-trigger a second
+look has confirmed inside the bound asks, and an unconfirmed one asks for
+nothing and is recorded as `skipped_unconfirmed` (see
+[Layers](#what-is-recorded)). Either way the ask is subject to the hours,
+the minimum interval and the hourly cap under **Caps** below. Same local reader,
 same match policy, same bars, same carried-read path, same cooldown. Until
 the camera's alarm arrives, such a sweep:
 
@@ -477,8 +479,9 @@ in one sample; what tells them apart is the next second of frames, which is
 exactly what the sweep reads.
 
 **So the sweep is the confirmation.** `GATE_EARLY_TRIGGER_CONFIRMATION=sweep`
-is the default: `on` starts the local-only sweep on the vision rule's
-would-trigger, and the bar of "0 false passed" is met where it matters --
+is the default: `on` asks for the local-only sweep the moment the vision rule
+fires, subject only to the hours, the 20 s minimum interval and the hourly
+cap, and the bar of "0 false passed" is met where it matters --
 nothing false reaches the cloud, the owner's Activity list or the relay --
 rather than at the sweep. What a false sweep costs, on this record:
 

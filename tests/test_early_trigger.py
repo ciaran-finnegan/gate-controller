@@ -212,6 +212,18 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("GATE_EARLY_TRIGGER_CONFIRMATION='clip' status=rejected using=sweep",
                       logs.output[0])
 
+    def test_the_bound_and_the_confirmation_reach_the_layers_the_controller_builds(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        worker = build_worker({
+            "GATE_EARLY_TRIGGER": "shadow", "GATE_EARLY_TRIGGER_CONFIRM_SECONDS": "1.5",
+            "GATE_EARLY_TRIGGER_CONFIRMATION": "looks",
+        }, state_directory=Path(directory.name))
+        self.assertEqual(worker.config.confirmation, "looks")
+        self.assertEqual(worker._layers.deadline_seconds, 1.5)
+        self.assertEqual(worker._layers.begin(lambda layers: None).deadline_ms, 1500)
+        worker.close()
+
     def test_the_codes_default_is_off_and_a_typo_is_off_too(self):
         self.assertEqual(load_config({}).mode, "off")
         self.assertFalse(load_config({}).enabled)
