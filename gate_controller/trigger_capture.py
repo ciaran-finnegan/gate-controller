@@ -1110,6 +1110,12 @@ class TriggerFrameCapture:
                     note_activity()
                 except Exception:
                     pass
+            # A vehicle alarm is a car in view, whether or not a sweep is
+            # scheduled for it (one inside the minimum interval is not).
+            # Whatever the last passage's reads said about its plate receding
+            # ends here, not when the sweep gets round to dequeuing anything:
+            # this car's still must not inherit it.
+            self._lapse_departing()
             with self._lock:
                 last = self._last_scheduled_at
                 if last is not None and now - last < self.config.min_interval_seconds:
@@ -1129,11 +1135,6 @@ class TriggerFrameCapture:
                         outcome = "scheduled"
                     if outcome == "scheduled":
                         self._last_scheduled_at = now
-                        # A new alarm is a new car. Whatever the last passage's
-                        # reads said about its plate receding ends here, not
-                        # when the sweep gets round to dequeuing this one:
-                        # the new car's still must not inherit it.
-                        self._lapse_departing()
         LOGGER.info(
             "gate_trigger_capture outcome=%s event_type=%s",
             outcome, getattr(event, "event_type", "unknown"),
@@ -1196,9 +1197,10 @@ class TriggerFrameCapture:
         ``"on"`` or ``"shadow"`` while the sweep's latest read of the passage,
         no older than ``SWEEP_DEPARTING_GRACE_SECONDS``, says the plate is
         receding (`DepartingPlate`); None otherwise: no passage read lately, a
-        car that is not receding, a new alarm accepted since (`on_camera_event`
-        lapses the verdict the moment it queues one, so the next car's still
-        cannot inherit it), or the rule switched off. Not tied to the session
+        car that is not receding, a vehicle alarm raised since (`on_camera_event`
+        lapses the verdict on every one it is given, scheduled or inside the
+        minimum interval, so the next car's still cannot inherit it), or the
+        rule switched off. Not tied to the session
         flag, because the sweep's last hand-overs -- the fallback at the
         window's end -- and the camera's still can reach `prepare` after the
         session has closed. Asked by `GateProcessor.prepare` once per

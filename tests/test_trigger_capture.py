@@ -391,6 +391,37 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         ))
         return capture, popen
 
+    def test_any_vehicle_alarm_ends_the_last_passages_departure_verdict(self):
+        # Codex on #205: an alarm inside the minimum interval is not scheduled,
+        # but it is still a car in view, and its still must not be judged by
+        # the car before it. The verdict is honoured for ten seconds otherwise.
+        clock = {"now": 100.0}
+        capture, _popen = self.capture([], clock=lambda: clock["now"])
+        capture.config = TriggerCaptureConfig(
+            enabled=True, output_directory=self.root / ".trigger-capture",
+            min_interval_seconds=5.0, sweep_departing_skip="on",
+        )
+
+        def receding():
+            judge = capture._passage.departing
+            for width in (320, 320, 200, 190):
+                judge.note(width, clock["now"])
+            return capture.departing_skip()
+
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event()), "scheduled")
+        self.assertIsNone(capture.departing_skip())
+
+        clock["now"] += 2.0
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event()), "skipped_interval")
+        self.assertIsNone(capture.departing_skip(), "a rate-limited alarm left the verdict standing")
+
+        clock["now"] += 1.0
+        self.assertEqual(receding(), "on")
+        self.assertEqual(capture.on_camera_event(event(event_type="manual_test")), "skipped_type")
+        self.assertEqual(capture.departing_skip(), "on", "a manual test is not a car")
+
     def test_captured_frame_is_injected_with_a_sanitized_matched_trigger(self):
         capture, popen = self.capture([FakeProcess(output=jpeg())])
 
