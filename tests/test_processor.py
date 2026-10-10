@@ -3270,6 +3270,32 @@ class InternetDownTests(unittest.TestCase):
                 sum("cloud_skipped reason=departing" in line for line in journal.output), 3,
             )
 
+    def test_a_held_camera_still_of_a_departing_car_keeps_every_frame_off_the_cloud(self):
+        # The camera-still hold records its own reason for the first frame;
+        # the departure must still cover the rest of the burst.
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "still-a.jpg", 100),
+                self._jpeg(directory, "still-b.jpg", 140),
+            )
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(
+                directory, recognizer,
+                camera_still_hold=lambda: "on", departing=lambda: "on",
+            )
+
+            prepared = processor.prepare(frames, camera_upload=True)
+            self.assertEqual(prepared.cloud_skip, "sweep_reading")
+            self.assertEqual(prepared.offline, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame of the still posted")
+
     def test_a_departing_frame_the_device_could_not_read_still_never_posts(self):
         # A later frame of the burst whose on-device pass failed (no state to
         # carry) must answer "no plate", not fall through to the cloud: the

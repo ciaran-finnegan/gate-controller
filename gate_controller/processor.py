@@ -505,7 +505,6 @@ class GateProcessor:
         """
         if (
             self._departing is None or prepared.decided
-            or prepared.cloud_skip is not None
             or not _device_read(prepared.local_attempt)
         ):
             return
@@ -514,11 +513,14 @@ class GateProcessor:
         except Exception:
             return
         if mode == "on":
-            prepared.cloud_skip = CLOUD_SKIP_DEPARTING
-            # `cloud_skip` answers the first frame; a camera burst can carry
-            # more, and the burst is kept on the burst thread. Every frame of
-            # it is answered on the device (`_recognise`, the `offline` path),
-            # so none can take the slot or post from there.
+            # A reason already recorded for the first frame (the camera still
+            # held while a sweep reads) stands; the burst is departing either
+            # way. `cloud_skip` answers the first frame only, a camera burst
+            # can carry more, and the burst is kept on the burst thread: every
+            # frame of it is answered on the device (`_recognise`, the
+            # `offline` path), so none can take the slot or post from there.
+            if prepared.cloud_skip is None:
+                prepared.cloud_skip = CLOUD_SKIP_DEPARTING
             prepared.offline = CLOUD_SKIP_DEPARTING
         elif mode == "shadow":
             logging.getLogger(__name__).info(
