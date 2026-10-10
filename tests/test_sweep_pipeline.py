@@ -42,6 +42,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from gate_controller.actuation import ActuationCoordinator
 from gate_controller.images import measure_flat_fraction
 from gate_controller.local_recognizer import (
     EngineRead, EngineResult, LocalRecognition, LocalRecognizer, LocalRecognizerConfig,
@@ -225,8 +226,19 @@ class Gate:
     def __init__(self, test, *, answers, cloud=None, sweep_seconds=1.0, waiting=0.0,
                  waiting_fps=2.0, cloud_frames=0, fallback=0, policy=None,
                  processor_policy=None, empty_scene=0.0, authorised=AUTHORISED,
-                 max_flat=0.0, sample_directory="default", sample_max_files=50):
+                 max_flat=0.0, sample_directory="default", sample_max_files=50,
+                 clock=None, monotonic_clock=None, coordinator_options=None,
+                 presence_frames=0, presence_seconds=0.0, presence_spacing=0.2):
+        """``clock`` / ``monotonic_clock`` and ``coordinator_options`` are for
+        replaying a passage that took minutes: every component that stamps or
+        judges a time -- the processor, the coordinator, the sweep's
+        hand-overs, the FTP upload handler and the camera alarm -- reads the
+        one clock, so a test can move it between alarms. Left unset, the
+        controller is wired exactly as `__main__` wires it, with the
+        processor building its own coordinator.
+        """
         self.test = test
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
         self.uploads = root / "uploads"
@@ -255,13 +267,26 @@ class Gate:
             plate_region=REGION, match_policy=pipeline_policy,
         )
         self.store = LocalStore(root / "gate.db")
+        relay = RecordingRelay(self.relay_calls)
+        self.coordinator = None
+        if coordinator_options is not None or clock is not None or monotonic_clock is not None:
+            # The same coordinator the processor would build, with the clocks
+            # and windows the test asks for (the gate cycle cooldown, the
+            # one-pulse-per-car hold, the owner's pause switch).
+            options = dict(coordinator_options or {})
+            options.setdefault("clock", self.clock)
+            if monotonic_clock is not None:
+                options.setdefault("monotonic_clock", monotonic_clock)
+            options.setdefault("boot_id", "boot-under-test")
+            self.coordinator = ActuationCoordinator(self.store, relay, **options)
         self.processor = GateProcessor(
-            recognizer=self.client, store=self.store, relay=RecordingRelay(self.relay_calls),
+            recognizer=self.client, store=self.store, relay=relay,
             # The shipped automatic cooldown (the gate's whole cycle), which
             # is what refuses a second pulse for the same passage.
             authorised=lambda: authorised,
             decision_timeout=7.0, min_cloud_request_seconds=1.0,
             match_policy=pipeline_policy,
+            clock=clock, coordinator=self.coordinator,
         )
         self.capture = TriggerFrameCapture(
             TriggerCaptureConfig(
@@ -270,7 +295,10 @@ class Gate:
                 sweep_max_fps=10.0, sweep_fallback_frames=fallback,
                 sweep_cloud_frames=cloud_frames, sweep_cloud_spacing_seconds=0.5,
                 sweep_waiting_seconds=waiting, sweep_waiting_fps=waiting_fps,
-                presence_max_frames=0, empty_scene_threshold=empty_scene,
+                presence_max_frames=presence_frames,
+                presence_window_seconds=presence_seconds,
+                presence_spacing_seconds=presence_spacing,
+                empty_scene_threshold=empty_scene,
                 max_flat_fraction=max_flat, min_interval_seconds=0.5,
                 skipped_sample_directory=(
                     self.samples if sample_directory == "default" else sample_directory
@@ -282,6 +310,7 @@ class Gate:
                 self.local, authorised=lambda: authorised, match_policy=sweep_policy,
                 plate_region=REGION,
             ),
+            wall_clock=clock,
         )
         self.hook = StopHook()
         self._thread = Thread(target=self._run, daemon=True, name="gate-under-test")
@@ -293,6 +322,7 @@ class Gate:
             self.uploads, self.processor.process, quiet_window=0.1, poll_interval=0.01,
             background_workers=(self.capture, self.hook), trigger_capture=self.capture,
             prepare=self.processor.prepare, on_result=self._on_result,
+            wall_clock=self.clock,
         )
 
     def _on_result(self, paths, result):
@@ -301,7 +331,7 @@ class Gate:
 
     def alarm(self):
         """The camera's vehicle alarm, exactly as the webhook delivers it."""
-        now = datetime.now(timezone.utc)
+        now = self.clock()
         outcome = self.capture.on_camera_event(SanitizedCameraEvent(
             event_id=f"event-{monotonic()}", event_type="vehicle", rule_id="front_gate",
             received_at=now, event_at=now,

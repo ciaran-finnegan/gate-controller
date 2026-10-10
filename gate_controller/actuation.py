@@ -1,10 +1,14 @@
 import inspect
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from time import monotonic
 
-from .models import ActuationExecution, GateEvent
+from .automatic_open import AutomaticOpenConfig
+from .models import ActuationExecution, GateEvent, RepulseHold
+
+LOGGER = logging.getLogger(__name__)
 
 
 #: How long after ANY relay pulse an automatic actuation is refused.
@@ -27,10 +31,34 @@ DEFAULT_AUTOMATIC_COOLDOWN = timedelta(seconds=90)
 #: and they can see what the gate is doing; the plate reader cannot.
 DEFAULT_COMMAND_COOLDOWN = timedelta(seconds=20)
 
+#: How long a plate must be out of the record before the relay may pulse for
+#: it again automatically.
+#:
+#: 2026-10-10, 10:04-10:13 IST: an authorised pickup waited nine minutes at
+#: the gate. The camera raised seven vehicle alarms; the Pi pulsed the relay
+#: four times for the one car (10:04:13.9, 10:06:45.8, 10:08:18.0,
+#: 10:12:37.0), every read between refused only by the 90 s cooldown and the
+#: first read after each expiry let through. The relay is on the operator's
+#: step-by-step input, so a pulse into a gate whose state is unknown stops
+#: or reverses it: the leaves crossed and the gate jammed. Nothing carried
+#: "this plate was already let in and is still here" from one alarm to the
+#: next; this does. A car that has stayed in the picture gets exactly one
+#: automatic pulse; once it has not been seen for this long the hold lapses.
+DEFAULT_REPULSE_UNSEEN = timedelta(minutes=10)
+
 #: Event sources with a person behind them. Everything else -- the recognition
 #: pipeline, and any source added later that nobody thought to list here --
 #: gets the automatic window, which is the safe side to be wrong on.
 HUMAN_COMMAND_SOURCES = frozenset({"remote_command"})
+
+#: The ``actuation_outcome`` of a grant the one-pulse-per-car hold refused.
+REPULSE_HOLD = "repulse_hold"
+#: The ``actuation_outcome`` and ``reason`` of a grant refused because the
+#: owner has paused automatic opening.
+AUTOMATIC_PAUSED = "automatic_paused"
+#: Every terminal outcome that is a decision the coordinator chose not to act
+#: on: the relay was not asked, and nothing was attempted.
+WITHHELD_OUTCOMES = frozenset({"cooldown", REPULSE_HOLD, AUTOMATIC_PAUSED})
 
 
 class ActuationCoordinator:
@@ -38,9 +66,23 @@ class ActuationCoordinator:
 
     def __init__(self, store, relay, cooldown: timedelta = DEFAULT_AUTOMATIC_COOLDOWN,
                  clock=None, monotonic_clock=None, boot_id: str | None = None,
-                 activation_observer=None, *, command_cooldown: timedelta | None = None):
+                 activation_observer=None, *, command_cooldown: timedelta | None = None,
+                 repulse_unseen: timedelta | None = DEFAULT_REPULSE_UNSEEN,
+                 automatic_open=None):
         self._store = store
         self._relay = relay
+        # The one-pulse-per-car hold (docs/invariants.md 12): ``None`` or a
+        # zero window switches it off, which only an operator setting
+        # GATE_REPULSE_UNSEEN_MINUTES=0 on purpose does.
+        self._repulse_unseen = (
+            repulse_unseen if repulse_unseen is not None and repulse_unseen > timedelta(0)
+            else None
+        )
+        # The owner's pause switch: a callable answering an
+        # ``AutomaticOpenConfig`` (or a bare bool), re-read on every automatic
+        # grant so the app's setting takes effect without a restart. ``None``
+        # is a controller with no switch: automatic opening is on.
+        self._automatic_open = automatic_open
         # ``cooldown`` is the automatic window. The command window is never
         # longer than it unless a caller says so explicitly, so a coordinator
         # built with ``cooldown=0`` has no window for anyone.
@@ -68,6 +110,67 @@ class ActuationCoordinator:
     @property
     def command_cooldown(self) -> timedelta:
         return self._command_cooldown
+
+    @property
+    def repulse_unseen(self) -> timedelta | None:
+        """The one-pulse-per-car hold's unseen window, or None when it is off."""
+        return self._repulse_unseen
+
+    def automatic_open_config(self) -> AutomaticOpenConfig:
+        """The pause switch as it stands now. Never raises; a broken reader is ``on``.
+
+        A reader that fails answers nothing about the owner's wishes, and the
+        shipped behaviour is the fallback the environment's loader already
+        chose. ``main`` wraps the app's setting so this is belt and braces.
+        """
+        reader = self._automatic_open
+        if reader is None:
+            return AutomaticOpenConfig()
+        try:
+            answer = reader() if callable(reader) else reader
+        except Exception:
+            LOGGER.warning("gate_actuation automatic_open=unreadable using=on", exc_info=True)
+            return AutomaticOpenConfig()
+        if isinstance(answer, AutomaticOpenConfig):
+            return answer
+        if isinstance(answer, bool):
+            return AutomaticOpenConfig(enabled=answer, source="environment")
+        return AutomaticOpenConfig()
+
+    def status(self) -> dict:
+        """The heartbeat's view of what withholds automatic pulses.
+
+        Additive: the Gate Mate Worker narrows the heartbeat to the keys it
+        knows and drops this block until it learns it.
+        """
+        automatic = self.automatic_open_config()
+        return {
+            "automatic_open": automatic.enabled,
+            "automatic_open_source": automatic.source,
+            "repulse_unseen_minutes": (
+                self._repulse_unseen.total_seconds() / 60.0
+                if self._repulse_unseen is not None else None
+            ),
+            "automatic_cooldown_seconds": self._cooldown.total_seconds(),
+            "command_cooldown_seconds": self._command_cooldown.total_seconds(),
+        }
+
+    def _is_automatic(self, event: GateEvent, command_ack) -> bool:
+        return command_ack is None and event.source not in HUMAN_COMMAND_SOURCES
+
+    def _repulse_hold(self, event: GateEvent, now: datetime) -> RepulseHold | None:
+        """The hold on this plate, if any. Raises if the store cannot answer.
+
+        Only for an automatic grant that names an authorised plate: a human
+        command has no plate and is never held, and an appearance grant
+        (farm machinery) has none either and keeps only the cooldown.
+        """
+        if self._repulse_unseen is None or not event.authorised_plate:
+            return None
+        query = getattr(self._store, "repulse_hold", None)
+        if not callable(query):
+            return None
+        return query(event.authorised_plate, now, self._repulse_unseen)
 
     def _cooldown_for(self, event: GateEvent, command_ack) -> timedelta:
         """The window this request has to clear, measured from the last pulse.
@@ -101,18 +204,6 @@ class ActuationCoordinator:
                                          terminal.status, terminal.detail)
             claim_time = event.decision_at or self._clock()
             cooldown = self._cooldown_for(event, command_ack)
-            try:
-                monotonic_now = self._monotonic_clock()
-                claim = self._store.claim_actuation(
-                    key, claim_time, claim_time - cooldown,
-                    monotonic_cutoff=monotonic_now - cooldown.total_seconds(),
-                    boot_id=self._boot_id,
-                    event=event, outbox_payload=outbox_payload,
-                    command_ack=command_ack,
-                )
-            except Exception:
-                return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
-                                          "actuation_inhibit_error")
 
             def inhibition_now():
                 """The relay-path preconditions, asked before crediting a grant.
@@ -131,6 +222,58 @@ class ActuationCoordinator:
                 if pre_activation_inhibit is None:
                     return None
                 return pre_activation_inhibit()
+
+            def withhold(terminal: GateEvent, outcome: str) -> ActuationExecution:
+                """Record a grant the coordinator chose not to act on, and say so.
+
+                Before the claim, like a persisted cooldown: nothing is
+                attempted, so nothing is claimed, and the row carries the
+                decision with ``actuation_outcome`` naming what withheld it.
+                The same bar as a pulse is asked first, for the same reason
+                the cooldown asks it.
+                """
+                inhibition = inhibition_now()
+                if inhibition is not None:
+                    inhibited = _inhibited_event(event, key, self._clock(), inhibition[1])
+                    event_id = self._store.record_terminal_outcome(
+                        inhibited, status=inhibition[0], detail=inhibition[1],
+                        outbox_payload=outbox_payload, command_ack=command_ack,
+                    )
+                    return ActuationExecution(
+                        False, inhibition[1], event_id, inhibition[0], inhibition[1]
+                    )
+                event_id = self._store.record_terminal_outcome(
+                    terminal, status="failed", detail=outcome,
+                    outbox_payload=outbox_payload, command_ack=command_ack,
+                )
+                return ActuationExecution(False, outcome, event_id, "failed", outcome)
+
+            automatic = self._is_automatic(event, command_ack)
+            if automatic and not (pause := self.automatic_open_config()).enabled:
+                # The owner's switch, asked first and before any claim: every
+                # automatic path -- sweep frame, FTP still, presence frame,
+                # early sweep, appearance grant -- converges on this method
+                # and nothing routes round it. A person's command from the
+                # app is not asked.
+                LOGGER.warning(
+                    "gate_actuation outcome=%s source=%s plate=%s setting_source=%s key=%s",
+                    AUTOMATIC_PAUSED, event.source, event.authorised_plate or "-",
+                    pause.source, key,
+                )
+                return withhold(_paused_event(event, key, claim_time), AUTOMATIC_PAUSED)
+
+            try:
+                monotonic_now = self._monotonic_clock()
+                claim = self._store.claim_actuation(
+                    key, claim_time, claim_time - cooldown,
+                    monotonic_cutoff=monotonic_now - cooldown.total_seconds(),
+                    boot_id=self._boot_id,
+                    event=event, outbox_payload=outbox_payload,
+                    command_ack=command_ack,
+                )
+            except Exception:
+                return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
+                                          "actuation_inhibit_error")
 
             if claim.status == "cooldown":
                 inhibition = inhibition_now()
@@ -173,6 +316,52 @@ class ActuationCoordinator:
                         False, "indeterminate_claim", None, "failed", "indeterminate_claim"
                     )
                 return ActuationExecution(False, detail, event_id, status, detail)
+            if automatic:
+                # The one-pulse-per-car hold (docs/invariants.md 12), asked
+                # after both cooldowns on purpose: a read inside the gate's
+                # own cycle is still "cooldown", the truth it has always been,
+                # and "repulse_hold" names exactly the pulses the cooldown
+                # would have let through. The claim is held and finalized
+                # here like an in-process cooldown, with nothing attempted.
+                try:
+                    hold = self._repulse_hold(event, claim_time)
+                except Exception:
+                    # The store could not say whether this car was already let
+                    # in. Fail closed, as a claim that cannot be written does;
+                    # the claim row is left for recovery to write off.
+                    LOGGER.error(
+                        "gate_actuation outcome=actuation_inhibit_error stage=repulse_hold key=%s",
+                        key, exc_info=True,
+                    )
+                    return ActuationExecution(False, "actuation_inhibit_error", None, "failed",
+                                              "actuation_inhibit_error")
+                if hold is not None:
+                    LOGGER.warning(
+                        "gate_actuation outcome=%s plate=%s pulsed_at=%s last_seen_at=%s "
+                        "unseen_minutes=%g source=%s key=%s",
+                        REPULSE_HOLD, hold.plate, hold.pulsed_at.isoformat(),
+                        hold.last_seen_at.isoformat(),
+                        self._repulse_unseen.total_seconds() / 60.0, event.source, key,
+                    )
+                    inhibition = inhibition_now()
+                    if inhibition is None:
+                        terminal = _cooldown_event(event, key, claim_time, REPULSE_HOLD)
+                        status, detail = "failed", REPULSE_HOLD
+                    else:
+                        terminal = _inhibited_event(event, key, self._clock(), inhibition[1])
+                        status, detail = inhibition
+                    try:
+                        event_id = self._store.finalize_actuation(
+                            claim, terminal, terminal_status=status,
+                            terminal_detail=detail, outbox_payload=outbox_payload,
+                            command_ack=command_ack,
+                            retain_activation_attempt=False,
+                        )
+                    except Exception:
+                        return ActuationExecution(
+                            False, "indeterminate_claim", None, "failed", "indeterminate_claim"
+                        )
+                    return ActuationExecution(False, detail, event_id, status, detail)
             try:
                 self._store.mark_actuation_attempt(
                     claim, claim_time, event=event, outbox_payload=outbox_payload,
@@ -287,7 +476,8 @@ class ActuationCoordinator:
             self._store.ensure_outbox(event_id, payload)
 
 
-def _cooldown_event(event: GateEvent, key: str, claim_time: datetime) -> GateEvent:
+def _cooldown_event(event: GateEvent, key: str, claim_time: datetime,
+                    outcome: str = "cooldown") -> GateEvent:
     """The record of a decision that was granted while the gate was already open.
 
     The relay is not pulsed a second time, but nothing about the *decision*
@@ -301,12 +491,36 @@ def _cooldown_event(event: GateEvent, key: str, claim_time: datetime) -> GateEve
     relay is carried by ``actuation_outcome`` locally, by the null
     ``relay_activated_at`` on the wire, and by ``telemetry.actuation``
     (``claim="cooldown"``, ``attempted=false``) for anyone reading the detail.
+
+    The one-pulse-per-car hold writes the same shape with
+    ``outcome="repulse_hold"``: the gate was opened for this plate, minutes
+    rather than seconds ago, and the car has not left the picture since. The
+    decision is still the grant it was; only the pulse is withheld.
     """
     return GateEvent(
         source=event.source, reason=event.reason, opened=True, idempotency_key=key,
         received_at=event.received_at, decision_at=claim_time,
         authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
-        ocr_confidence=event.ocr_confidence, actuation_outcome="cooldown",
+        ocr_confidence=event.ocr_confidence, actuation_outcome=outcome,
+        near_miss_plate=event.near_miss_plate,
+    )
+
+
+def _paused_event(event: GateEvent, key: str, at: datetime) -> GateEvent:
+    """The record of a grant refused because automatic opening is paused.
+
+    Not a cooldown row: the gate was *not* opened for this car, by this
+    event or any earlier one, so ``opened=True`` would be the lie the
+    cooldown change took out of the record. It is written as a denial named
+    ``automatic_paused``, with the plate and the score the reader gave it,
+    and ``actuation_outcome`` says the same so the local record is unambiguous.
+    """
+    return GateEvent(
+        source=event.source, reason=AUTOMATIC_PAUSED, opened=False, idempotency_key=key,
+        received_at=event.received_at, decision_at=at,
+        authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
+        ocr_confidence=event.ocr_confidence, actuation_outcome=AUTOMATIC_PAUSED,
+        near_miss_plate=event.near_miss_plate,
     )
 
 
@@ -325,7 +539,7 @@ def _inhibited_event(event: GateEvent, key: str, at: datetime, reason: str) -> G
         source=event.source, reason=reason, opened=False, idempotency_key=key,
         received_at=event.received_at, decision_at=at,
         authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
-        ocr_confidence=event.ocr_confidence,
+        ocr_confidence=event.ocr_confidence, near_miss_plate=event.near_miss_plate,
     )
 
 

@@ -13,7 +13,9 @@ from queue import Empty, Queue
 from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
-from .actuation import DEFAULT_AUTOMATIC_COOLDOWN, ActuationCoordinator
+from .actuation import (
+    AUTOMATIC_PAUSED, DEFAULT_AUTOMATIC_COOLDOWN, WITHHELD_OUTCOMES, ActuationCoordinator,
+)
 from .agricultural import EVENT_REASON as FARM_MACHINERY_REASON
 from .agricultural import EVENT_SOURCE as APPEARANCE_SOURCE
 from .direction import passage_key
@@ -844,6 +846,7 @@ class GateProcessor:
                 authorised_plate=decision.authorised_plate,
                 observed_plate=decision.observed_plate,
                 ocr_confidence=_measured_confidence(decision),
+                near_miss_plate=_near_miss_plate(decision),
             )
         if admitted_by_appearance:
             trace.mark_decision("allowed", FARM_MACHINERY_REASON)
@@ -905,7 +908,9 @@ class GateProcessor:
             actuation_kwargs["on_deactivation"] = trace.mark_relay_finished
         with self._actuation_lock:
             execution = self._coordinator.actuate(event, **actuation_kwargs)
-        if execution.reason in FINAL_INHIBITION_REASONS:
+        if execution.reason in FINAL_INHIBITION_REASONS or execution.reason == AUTOMATIC_PAUSED:
+            # A grant the owner's pause switch refused is recorded, and told
+            # to the app, as the denial it is: the gate did not open for it.
             trace.revise_decision("denied", execution.reason)
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._keep_appearance(appearance, self._finish_result(
@@ -1936,7 +1941,21 @@ def _denied_event(key, received_at, decision_at, reason, decision=None):
         authorised_plate=decision.authorised_plate if decision else None,
         observed_plate=decision.observed_plate if decision else None,
         ocr_confidence=_measured_confidence(decision),
+        near_miss_plate=_near_miss_plate(decision),
     )
+
+
+def _near_miss_plate(decision: MatchDecision | None) -> str | None:
+    """The authorised plate a refused read was nearest to, for the local record.
+
+    Record-only: it is what lets the one-pulse-per-car hold count a misread of
+    a plate it has already pulsed for as that car still being in view. Never
+    on the wire, never a grant.
+    """
+    if decision is None:
+        return None
+    plate = getattr(decision, "near_miss_plate", None)
+    return plate if isinstance(plate, str) and plate else None
 
 
 def _measured_confidence(decision: MatchDecision | None) -> float | None:
@@ -1969,8 +1988,10 @@ def _is_fresh(now: datetime, received_at: datetime, max_age: timedelta) -> bool:
 def _actuation_telemetry(execution) -> tuple[str, bool, str]:
     if execution.opened:
         return "claimed", True, "activated"
-    if execution.reason == "cooldown":
-        return "cooldown", False, "not_attempted"
+    if execution.reason in WITHHELD_OUTCOMES:
+        # cooldown, repulse_hold, automatic_paused: a decision the coordinator
+        # chose not to act on. The relay was never asked.
+        return execution.reason, False, "not_attempted"
     if execution.reason == "actuation_inhibit_error":
         return "claim_error", False, "not_attempted"
     if execution.reason == "relay_latched":

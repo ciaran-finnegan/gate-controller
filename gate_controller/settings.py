@@ -23,7 +23,9 @@ expects::
 
 The envelope may also carry ``"gate_left_open": {"enabled": true,
 "threshold_minutes": 10}``, the owner's switch for the notify-only left-open
-alert (docs/gate-left-open.md). It is kept raw and parsed only when read; a
+alert (docs/gate-left-open.md), and ``"automatic_open": {"enabled": false}``,
+the owner's pause switch against automatic opening (automatic_open.py,
+docs/invariants.md 12). Each is kept raw and parsed only when read; a
 malformed one is ignored and can never change or reject the schedule.
 
 Like the authorised-plate snapshot, a good document is cached on disk so a
@@ -49,6 +51,7 @@ from pathlib import Path
 from threading import Event, Lock
 from urllib.parse import urlencode
 
+from .automatic_open import is_valid_section as _valid_automatic_open
 from .cloud_health import TransitionLogger
 from .match_policy import (
     DEFAULT_POLICY,
@@ -62,6 +65,21 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_SETTINGS_BYTES = 16 * 1024
 SETTINGS_VERSION = 1
+#: The envelope's side sections and the file each is cached in beside the
+#: schedule's cache. Each is adopted independently of the schedule and of the
+#: others, and parsed only by its own module when read.
+SIDE_SECTIONS = {
+    "gate_left_open": "gate-left-open.json",
+    "automatic_open": "automatic-open.json",
+}
+#: A section with a validator is adopted only when it is well formed: one
+#: that is present and malformed keeps the previous value rather than
+#: falling back, because for a switch that can only withhold pulses a typo
+#: must not be the thing that resumes them. An absent section still means
+#: "no setting" and falls back to the board's environment.
+SECTION_VALIDATORS = {
+    "automatic_open": _valid_automatic_open,
+}
 #: The heartbeat carries the rejection reason so the owner can see *why* the
 #: gate fell closed. It is bounded because the heartbeat payload is.
 MAX_ERROR_LENGTH = 200
@@ -95,14 +113,18 @@ class MatchPolicyCache:
         self._configured = False
         self._refreshed_at: datetime | None = None
         self._last_error: str | None = None
-        # The envelope's `gate_left_open` object, kept raw and parsed only when
-        # read (gate_left_open.config_from_settings). It rides the same poll as
-        # the schedule and must never be able to change it: nothing about it
-        # is validated here, and nothing here raises over it.
-        self._left_open_section: object = None
-        self._left_open_path = (
-            self._path.with_name("gate-left-open.json") if self._path is not None else None
-        )
+        # The envelope's side sections -- `gate_left_open` and
+        # `automatic_open` -- kept raw and parsed only when read
+        # (gate_left_open.config_from_settings, automatic_open.config_from_settings).
+        # They ride the same poll as the schedule and must never be able to
+        # change it: nothing about them is validated here, and nothing here
+        # raises over them. Each is persisted in its own file beside the
+        # schedule's cache, so a restart keeps it.
+        self._sections: dict[str, object] = {name: None for name in SIDE_SECTIONS}
+        self._section_paths = {
+            name: (self._path.with_name(filename) if self._path is not None else None)
+            for name, filename in SIDE_SECTIONS.items()
+        }
         self._load_cached()
 
     def get(self) -> MatchPolicy:
@@ -119,11 +141,12 @@ class MatchPolicyCache:
         to once the cloud serves something readable again, and the marker, not
         its absence, is what keeps the gate closed in the meantime.
         """
-        if not self._keep_left_open_section(document) and isinstance(document, dict):
-            # The section was refused; the schedule beside it is judged, and
-            # cached, without it, so an oversized alert setting can neither
-            # stick nor stop a good schedule surviving a restart.
-            document = {key: value for key, value in document.items() if key != "gate_left_open"}
+        for name in SIDE_SECTIONS:
+            if not self._keep_section(document, name) and isinstance(document, dict):
+                # The section was refused; the schedule beside it is judged,
+                # and cached, without it, so an oversized setting can neither
+                # stick nor stop a good schedule surviving a restart.
+                document = {key: value for key, value in document.items() if key != name}
         try:
             policy = policy_from_settings(document)
         except MatchPolicyError as error:
@@ -145,28 +168,38 @@ class MatchPolicyCache:
             self._refreshed_at = self._clock()
             self._last_error = None
 
-    def _keep_left_open_section(self, document: object) -> bool:
-        """Adopt the envelope's left-open section, and keep it for a restart.
+    def _keep_section(self, document: object, name: str) -> bool:
+        """Adopt one of the envelope's side sections, and keep it for a restart.
 
         Persisted on its own, beside the schedule's cache, because the two are
         accepted independently: an envelope whose schedule is refused is not
-        cached, and restoring the left-open switch from that older cache would
-        undo a change the owner made in the same envelope.
+        cached, and restoring the switch from that older cache would undo a
+        change the owner made in the same envelope.
         """
-        section = document.get("gate_left_open") if isinstance(document, dict) else None
-        section = section if isinstance(section, dict) else None
-        encoded = json.dumps({"gate_left_open": section}, sort_keys=True, separators=(",", ":"))
+        present = isinstance(document, dict) and name in document
+        raw = document.get(name) if present else None
+        validator = SECTION_VALIDATORS.get(name)
+        if validator is not None and present and not validator(raw):
+            LOGGER.warning("%s settings malformed; keeping the previous ones", name)
+            return True
+        section = raw if isinstance(raw, dict) else None
+        encoded = json.dumps({name: section}, sort_keys=True, separators=(",", ":"))
         if len(encoded.encode("utf-8")) > MAX_SETTINGS_BYTES:
             # Not adopted at all: one that cannot be kept would be undone by
-            # the next restart. The two real fields are a few dozen bytes.
-            LOGGER.warning("left-open alert settings too large; keeping the previous ones")
+            # the next restart. The real fields are a few dozen bytes.
+            LOGGER.warning("%s settings too large; keeping the previous ones", name)
             return False
         with self._lock:
-            changed = section != self._left_open_section
-            self._left_open_section = section
-        if changed and self._left_open_path is not None:
-            _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
+            changed = section != self._sections.get(name)
+            self._sections[name] = section
+        path = self._section_paths.get(name)
+        if changed and path is not None:
+            _write_atomically(path, encoded, f"cache the {name} settings")
         return True
+
+    def _section(self, name: str):
+        with self._lock:
+            return self._sections.get(name)
 
     def gate_left_open(self, fallback):
         """The left-open alert's switch and threshold, or ``fallback``.
@@ -176,9 +209,18 @@ class MatchPolicyCache:
         """
         from .gate_left_open import config_from_settings
 
-        with self._lock:
-            section = self._left_open_section
-        return config_from_settings(section, fallback)
+        return config_from_settings(self._section("gate_left_open"), fallback)
+
+    def automatic_open(self, fallback):
+        """The owner's pause switch against automatic opening, or ``fallback``.
+
+        Independent of the schedule in the same way: a malformed section
+        leaves ``fallback`` -- the board's environment -- in force, and the
+        plate-matching policy untouched. It can only ever withhold a pulse.
+        """
+        from .automatic_open import config_from_settings
+
+        return config_from_settings(self._section("automatic_open"), fallback)
 
     def mark_refresh_error(self, error: Exception) -> None:
         with self._lock:
@@ -206,7 +248,8 @@ class MatchPolicyCache:
             }
 
     def _load_cached(self) -> None:
-        self._load_cached_left_open()
+        for name in SIDE_SECTIONS:
+            self._load_cached_section(name)
         rejection = self._read_rejection()
         if rejection is not None:
             # The cloud was serving a document this controller refused when it
@@ -238,13 +281,13 @@ class MatchPolicyCache:
             self._path.stat().st_mtime, timezone.utc
         )
 
-    def _load_cached_left_open(self) -> None:
-        """The last left-open section received, so a restart keeps it.
+    def _load_cached_section(self, name: str) -> None:
+        """The last side section received, so a restart keeps it.
 
         Its own file first; the schedule's cached envelope only for a board
         that has never written one.
         """
-        for path in (self._left_open_path, self._path):
+        for path in (self._section_paths.get(name), self._path):
             if path is None or not path.exists():
                 continue
             try:
@@ -253,8 +296,8 @@ class MatchPolicyCache:
                 document = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            section = document.get("gate_left_open") if isinstance(document, dict) else None
-            self._left_open_section = section if isinstance(section, dict) else None
+            section = document.get(name) if isinstance(document, dict) else None
+            self._sections[name] = section if isinstance(section, dict) else None
             return
 
     def _persist(self, document: object) -> None:

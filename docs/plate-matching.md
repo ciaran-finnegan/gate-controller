@@ -204,6 +204,17 @@ same Cloudflare Access service token as the plate snapshot.
   as a marker: the gate stays closed and the reason becomes generic.
 - `plate_matching` may be absent. That means "no schedule configured" and
   keeps today's behaviour.
+- The envelope may carry two more objects, each adopted independently of the
+  schedule and of each other, each cached in its own file beside
+  `match-policy.json`, and neither able to change or reject the schedule:
+  `gate_left_open` (`{"enabled": bool, "threshold_minutes": 3..240}`,
+  docs/gate-left-open.md) and `automatic_open` (`{"enabled": bool}`, the
+  owner's pause switch against automatic opening, docs/deployment.md "One Car,
+  One Automatic Pulse"). The Worker does not write `automatic_open` yet; that
+  is the key it will need. A malformed `automatic_open` keeps the previous
+  value rather than falling back -- for a switch that can only withhold pulses,
+  a typo must not be the thing that resumes them -- and an absent one means
+  the board's `GATE_AUTOMATIC_OPEN` decides.
 
 ## Failing Closed
 

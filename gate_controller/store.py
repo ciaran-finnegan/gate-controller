@@ -3,10 +3,11 @@ import logging
 import sqlite3
 import time
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .models import ActuationClaim, GateEvent, TerminalOutcome
+from .matching import normalise_plate
+from .models import ActuationClaim, GateEvent, RepulseHold, TerminalOutcome
 from .telemetry import EventTelemetry, MAX_DELIVERY_ATTEMPT, MAX_DURATION_MS
 
 
@@ -34,20 +35,23 @@ _EVENTS_COLUMNS_DDL = """
                     relay_activated_at TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
                     opened INTEGER NOT NULL, idempotency_key TEXT UNIQUE, authorised_plate TEXT,
                     observed_plate TEXT, ocr_confidence REAL,
-                    actuation_outcome TEXT
+                    actuation_outcome TEXT, near_miss_plate TEXT
 """
 _EVENTS_COLUMNS = (
     "id", "received_at", "decision_at", "relay_activated_at", "source", "reason",
     "opened", "idempotency_key", "authorised_plate", "observed_plate",
-    "ocr_confidence", "actuation_outcome",
+    "ocr_confidence", "actuation_outcome", "near_miss_plate",
 )
 #: Dropping the table drops its indexes with it, so the rebuild recreates
-#: exactly these two.
+#: exactly these. The third is the one-pulse-per-car hold's: it walks the
+#: events newest first, under the actuation lock, on the way to the relay.
 _EVENTS_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS events_relay_cooldown"
     " ON events (opened, relay_activated_at)",
     "CREATE INDEX IF NOT EXISTS events_received_cooldown"
     " ON events (opened, received_at)",
+    "CREATE INDEX IF NOT EXISTS events_received_at"
+    " ON events (received_at)",
 )
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +69,73 @@ class LocalStore:
     def was_opened_since(self, cutoff: datetime) -> bool:
         with closing(self._connect()) as connection:
             return self._was_opened_since(connection, cutoff)
+
+    def repulse_hold(self, plate: str, now: datetime, unseen: timedelta) -> RepulseHold | None:
+        """Whether the relay already pulsed for ``plate`` and it has not left since.
+
+        The 2026-10-10 jam: one car, four pulses in nine minutes, each read
+        of its plate refused only by the 90 s cooldown and the next one let
+        through once that had expired. The relay drives the operator's
+        step-by-step input, so the second pulse into a gate whose state is
+        unknown stops or reverses it, and the leaves crossed.
+
+        A hold is anchored on the newest event that pulsed the relay for
+        ``plate`` -- a pulse being what :meth:`_was_opened_since` counts as
+        one: a ``relay_activated_at``, or a granted row that did not skip the
+        relay (``actuation_outcome`` null), for a relay that reports activation
+        without an instant -- and is alive while the plate has been *seen*
+        since with no gap longer than ``unseen``: seen means any event naming
+        it -- the plate it was granted on, the plate a reader observed, or
+        the authorised plate a refused read was nearest to
+        (``near_miss_plate``) -- including the grants this hold and the
+        cooldown refused. Once the plate has been out of the record for
+        ``unseen`` the hold lapses, and a later sighting with no new pulse
+        behind it starts nothing.
+
+        Walked newest first, so it reads only the rows inside the chain and
+        stops at the first gap. Plates are compared in the matcher's own
+        normalised form. Wall clock throughout: the record is the store's
+        timestamps, and this is a rule over minutes, not seconds. Raises on a
+        store failure; the coordinator fails closed on that.
+        """
+        wanted = normalise_plate(plate or "")
+        if not wanted or unseen <= timedelta(0):
+            return None
+        now = _as_utc(now)
+        previous = now
+        last_seen = None
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                SELECT received_at, decision_at, relay_activated_at, opened, actuation_outcome,
+                       authorised_plate, observed_plate, near_miss_plate
+                FROM events ORDER BY received_at DESC
+                """
+            )
+            for (received_at, decision_at, relay_activated_at, opened, outcome,
+                 authorised, observed, near_miss) in cursor:
+                seen_at = _parse_timestamp(received_at)
+                if previous - seen_at > unseen:
+                    # Everything older is older still: the chain breaks here,
+                    # before any pulse for this plate was reached.
+                    return None
+                if not any(
+                    normalise_plate(value or "") == wanted
+                    for value in (authorised, observed, near_miss)
+                ):
+                    continue
+                if last_seen is None:
+                    last_seen = seen_at
+                if relay_activated_at is not None or (opened and outcome is None):
+                    return RepulseHold(
+                        plate=wanted,
+                        pulsed_at=_parse_timestamp(
+                            relay_activated_at or decision_at or received_at
+                        ),
+                        last_seen_at=last_seen,
+                    )
+                previous = seen_at
+        return None
 
     def claim_actuation(self, idempotency_key: str, claimed_at: datetime,
                         cooldown_cutoff: datetime | None = None, *,
@@ -1025,13 +1096,14 @@ class LocalStore:
             INSERT INTO events (
                 received_at, decision_at, relay_activated_at, source, reason, opened,
                 idempotency_key, authorised_plate, observed_plate, ocr_confidence,
-                actuation_outcome
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                actuation_outcome, near_miss_plate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (_timestamp(event.received_at), _optional_timestamp(event.decision_at),
              _optional_timestamp(event.relay_activated_at), event.source, event.reason,
              int(event.opened), event.idempotency_key, event.authorised_plate,
-             event.observed_plate, event.ocr_confidence, event.actuation_outcome),
+             event.observed_plate, event.ocr_confidence, event.actuation_outcome,
+             event.near_miss_plate),
         )
         return cursor.lastrowid
 
@@ -1049,7 +1121,7 @@ class LocalStore:
 
         SQLite cannot relax a column constraint in place, so the table is
         rebuilt around it: every row and every score is copied across
-        untouched, the two `events` indexes are recreated (dropping a table
+        untouched, the `events` indexes are recreated (dropping a table
         drops its indexes), and only the constraint changes. Dropping and
         re-adding `events` is safe because nothing here turns on
         `PRAGMA foreign_keys`; the REFERENCES clauses in `outbox`,
@@ -1134,6 +1206,7 @@ class LocalStore:
                 );
                 {_EVENTS_INDEX_DDL[0]};
                 {_EVENTS_INDEX_DDL[1]};
+                {_EVENTS_INDEX_DDL[2]};
                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_per_event ON outbox (event_id);
                 CREATE INDEX IF NOT EXISTS event_telemetry_created_at
                     ON event_telemetry (created_at);
@@ -1240,6 +1313,10 @@ class LocalStore:
                 # what those rows meant: none of them was a granted decision that
                 # skipped the relay.
                 connection.execute("ALTER TABLE events ADD COLUMN actuation_outcome TEXT")
+            if "near_miss_plate" not in event_columns:
+                # NULL on every older row: no near miss was recorded for them,
+                # so none of them extends a one-pulse-per-car hold.
+                connection.execute("ALTER TABLE events ADD COLUMN near_miss_plate TEXT")
             if any(
                 row[1] == "ocr_confidence" and row[3]
                 for row in connection.execute("PRAGMA table_info(events)")
@@ -1473,6 +1550,10 @@ def _encode_pending_event(event: GateEvent) -> str:
     # "no score" either way.
     if event.ocr_confidence is not None:
         payload["ocr_confidence"] = event.ocr_confidence
+    # Absent, not null, for the same reason: an older decoder ignores a key
+    # it does not know and a null would be a value it never expected.
+    if event.near_miss_plate is not None:
+        payload["near_miss_plate"] = event.near_miss_plate
     return json.dumps(payload, sort_keys=True)
 
 
@@ -1494,7 +1575,12 @@ def _decode_pending_event(encoded: str) -> GateEvent:
         # a claim recovered after a restart must not invent one: `null` and a
         # key an older build never wrote both come back as `None`.
         ocr_confidence=_optional_confidence(payload.get("ocr_confidence")),
+        near_miss_plate=_optional_plate(payload.get("near_miss_plate")),
     )
+
+
+def _optional_plate(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _optional_confidence(value: object) -> float | None:

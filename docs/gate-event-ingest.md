@@ -62,13 +62,21 @@ processor closed between the match and the actuation, the event is recorded as
 `decision_timeout`, `processor_closed`) rather than as a cooldown grant. Only an
 un-inhibited match in cooldown gets the row above.
 
-The local `events` table carries one extra column the wire does not:
-`actuation_outcome`, `"cooldown"` on exactly these records and NULL everywhere
-else. It is not in `LocalStore._event_payload`, so it never reaches the
-contract. It exists because `LocalStore._was_opened_since` — which decides the
-cooldown itself — must count real relay pulses only. Without it, each coalesced
-frame of a burst would slide the cooldown window forward and could suppress the
-next vehicle's own grant.
+The local `events` table carries two extra columns the wire does not.
+`actuation_outcome` is `"cooldown"` on exactly these records, and since
+2026-10-10 `"repulse_hold"` on a grant the one-pulse-per-car hold refused
+(same shape: `opened=true`, the match reason, no `relay_activated_at`,
+`telemetry.actuation.claim = "repulse_hold"`) and `"automatic_paused"` on a
+grant the owner's pause switch refused -- that one is a denial on the wire,
+`opened=false, reason="automatic_paused"`, because the gate did not open for
+the car at all (see `docs/deployment.md`, "One Car, One Automatic Pulse"). NULL
+everywhere else. `near_miss_plate` is the authorised plate a refused read was
+nearest to, on denials only; the hold counts it as that plate still being in
+view. Neither is in `LocalStore._event_payload`, so neither reaches the
+contract. `actuation_outcome` exists because `LocalStore._was_opened_since` —
+which decides the cooldown itself — must count real relay pulses only. Without
+it, each coalesced frame of a burst would slide the cooldown window forward and
+could suppress the next vehicle's own grant.
 
 ### Runbook: rolling back past this release
 
@@ -109,6 +117,8 @@ recorded, and the nine cooldown rows are the ones this change moves.
 | `exact_match` / `two_frame_ocr_confusion` | 8 | yes | granted; the relay pulsed |
 | `farm_machinery` (`source=appearance`) | — | model, not reader | granted on appearance, not on a plate: recognisable agricultural machinery standing at the gate. `authorised_plate` is always null. Only with `GATE_AGRI_ADMIT=on`; see `docs/agricultural-admit.md` |
 | `exact_match` **during cooldown** | 9 | yes | **granted**; the gate was already open, so the relay was not pulsed again. Recorded as `denied / cooldown` before this change |
+| `exact_match` **under the one-pulse-per-car hold** | — | yes | **granted**; the relay already pulsed for this plate and the car has not left the picture since, so it is not pulsed again (`actuation_outcome = "repulse_hold"`, `telemetry.actuation.claim = "repulse_hold"`). Since 2026-10-10, `docs/invariants.md` 12 |
+| `automatic_paused` | — | yes | the plate matched, and the owner has paused automatic opening (`GATE_AUTOMATIC_OPEN=off` or the app's switch); the gate did not open. `authorised_plate` and the score are kept |
 | `no_match` | 80 | yes | a genuine no-read, or a correct refusal of a plate that is not authorised |
 | `decision_timeout` | 19 | sometimes | the frame spent its whole decision budget queued behind the Plate Recognizer 1 req/s throttle |
 | `queue_coalesced` | 10 | **no** | the controller declined to spend a cloud call on a car it had just let in. Also what the worker's `gate_burst stage=skipped cause=event_already_opened` records |

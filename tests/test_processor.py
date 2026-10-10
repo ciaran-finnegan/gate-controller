@@ -16,6 +16,7 @@ import gate_controller.processor as processor_module
 from gate_controller.models import PlateObservation, RelayResult
 from gate_controller.ocr import LocalPass, OcrResponseError
 from gate_controller.outbox import EvidenceSpool, OutboxWorker
+from gate_controller.actuation import ActuationCoordinator
 from gate_controller.processor import GateProcessor
 from gate_controller.relay import RelayController
 from gate_controller.store import LocalStore
@@ -2129,12 +2130,21 @@ class GateProcessorTests(unittest.TestCase):
             calls = []
             now = [datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)]
             authorised = AuthorisedPlateCache(csv_path)
+            store = LocalStore(root / "gate.db")
+            relay = RecordingRelay(calls)
             processor = GateProcessor(
                 recognizer=StaticRecognizer(PlateObservation("12D3456", 0.95)),
-                store=LocalStore(root / "gate.db"), relay=RecordingRelay(calls),
+                store=store, relay=relay,
                 authorised=authorised.get,
                 cooldown=timedelta(seconds=0),
                 clock=lambda: now[0],
+                # The subject is the authorisation refresh, so the same car is
+                # read three times in two seconds; the one-pulse-per-car hold
+                # (docs/invariants.md 12) would otherwise withhold the third.
+                coordinator=ActuationCoordinator(
+                    store, relay, timedelta(seconds=0), lambda: now[0],
+                    repulse_unseen=None,
+                ),
             )
 
             self.assertTrue(processor.process((first,)).opened)
@@ -2156,11 +2166,18 @@ class GateProcessorTests(unittest.TestCase):
             image.write_bytes(b"first upload")
             calls = []
             now = [datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)]
+            store, relay = LocalStore(root / "gate.db"), RecordingRelay(calls)
             processor = self._processor(
-                LocalStore(root / "gate.db"), RecordingRelay(calls),
+                store, relay,
                 StaticRecognizer(PlateObservation("12D3456", 0.95)),
                 cooldown=timedelta(seconds=0),
                 clock=lambda: now[0],
+                # The subject is content identity, not the car: the same plate
+                # a second later would otherwise be held (docs/invariants.md 12).
+                coordinator=ActuationCoordinator(
+                    store, relay, timedelta(seconds=0), lambda: now[0],
+                    repulse_unseen=None,
+                ),
             )
 
             first = processor.process((image,))

@@ -22,10 +22,11 @@ case through the real path.
 
 See [gate-operator.md](gate-operator.md) and the hard rules in `CLAUDE.md`.
 Every open needs an exact match against the authorised list under the band
-in force, a fresh frame, the cooldown, and the actuation claim. Nothing added
-for speed or spend -- the sweep, the cloud hold, the conclusive-read rule, the
-early trigger -- may open the gate on anything else; those only decide what
-is read and what is spent.
+in force, a fresh frame, the cooldown, the one-car-one-pulse hold
+(invariant 12), and the actuation claim. Nothing added for speed or spend --
+the sweep, the cloud hold, the conclusive-read rule, the early trigger -- may
+open the gate on anything else; those only decide what is read and what is
+spent.
 
 A frame whose cloud request was skipped answers "no plate"; the device's
 refused read rides along only as `PlateObservation.review_plate`, which
@@ -237,3 +238,60 @@ Guards:
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_it_never_reaches_the_relay_or_the_actuation_coordinator`
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_the_check_imports_nothing_that_can_move_the_gate`
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_a_malformed_setting_changes_nothing_about_plate_matching`
+
+## 12. One car, one automatic pulse
+
+Once the relay has pulsed for a plate, no automatic grant pulses for it again
+while that plate stays in the record: it is held until the plate has been
+unseen for `GATE_REPULSE_UNSEEN_MINUTES` (10). "Seen" is any event naming the
+plate -- the plate a grant matched, the plate a reader observed, or the
+authorised plate a refused read was nearest to -- including the grants the
+hold itself and the cooldown refuse, so a car waiting through alarm after
+alarm gets exactly one pulse, and a car that has gone and come back gets
+another. Different plates are independent. The hold sits in the
+`ActuationCoordinator`, the one object every automatic path -- sweep frame,
+FTP still, presence frame, early sweep, appearance grant -- goes through, and
+it is derived from the store on every grant, so a restart keeps it. It is in
+addition to the 90 s cooldown, which stands as it was.
+
+The owner can also pause automatic opening altogether: `GATE_AUTOMATIC_OPEN=off`,
+or `automatic_open: {"enabled": false}` in the app's settings envelope, refuses
+every automatic grant at the same point and records it as `automatic_paused`.
+A malformed setting changes nothing.
+
+Neither rule touches a person's command from the app, which keeps its
+`operator` role check and its 20 s cooldown (someone watching the camera can
+see what the gate is doing; the plate reader cannot), and neither can add,
+retry or hurry a pulse: each can only withhold one. Nothing here listens to
+the gate: the camera's own siren sounds at every vehicle alarm and an idling
+diesel masks the motor, so sound cannot yet say whether the gate is open.
+
+- **2026-10-10 10:04-10:13 IST** -- an authorised pickup (`172L66`) waited
+  nine minutes at the gate. The camera raised seven vehicle alarms; the Pi
+  pulsed the relay four times for the one car (10:04:13.9, 10:06:45.8,
+  10:08:18.0 -- the camera's still, 2.4 s after its sweep frame had been
+  refused by the cooldown at +89.6 s -- and 10:12:37.0). Every read between
+  was refused only by the cooldown, whose expiry was a clean slate; every
+  alarm started a new passage, and nothing carried "this plate was already let
+  in and is still here" from one to the next. A pulse into a gate whose state
+  is unknown stops or reverses it (invariant 1, [gate-operator.md](gate-operator.md));
+  the leaves crossed and the gate jammed ([the review](reviews/2026-10-10-gate-jam.md)).
+
+Guards:
+
+- `tests/test_gate_jam_2026_10_10.py::JamReplayTests::test_the_waiting_dmax_gets_one_pulse_for_its_seven_alarms`
+  (the morning replayed through alarm → sweep → processor → coordinator →
+  relay, with the camera's still of every alarm)
+- `tests/test_gate_jam_2026_10_10.py::JamReplayTests::test_the_same_car_back_after_the_window_is_let_in_again`
+- `tests/test_gate_jam_2026_10_10.py::JamReplayTests::test_a_person_can_still_open_the_gate_while_the_car_is_held`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_a_car_that_stays_in_view_gets_exactly_one_automatic_pulse`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_refused_reads_keep_the_hold_alive_for_as_long_as_the_car_stays`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_a_different_authorised_plate_arriving_during_the_hold_gets_its_own_pulse`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_a_near_miss_read_of_the_plate_counts_as_the_car_still_being_there`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_a_controller_restart_mid_hold_keeps_the_hold`
+- `tests/test_one_pulse_per_car.py::OnePulsePerCarTests::test_an_app_command_during_the_hold_still_pulses`
+- `tests/test_gate_jam_2026_10_10.py::AutomaticOpenPausedReplayTests::test_a_sweep_frame_and_the_cameras_still_are_both_refused_but_a_person_is_not`
+- `tests/test_gate_jam_2026_10_10.py::AutomaticOpenPausedReplayTests::test_an_early_sweeps_frame_is_refused_too`
+- `tests/test_gate_jam_2026_10_10.py::AutomaticOpenPausedReplayTests::test_a_presence_frame_is_refused_too`
+- `tests/test_one_pulse_per_car.py::AutomaticOpenPauseTests::test_every_automatic_source_is_refused_at_the_coordinator`
+- `tests/test_one_pulse_per_car.py::AutomaticOpenPauseTests::test_a_malformed_app_setting_changes_nothing`

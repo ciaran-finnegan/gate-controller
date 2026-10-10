@@ -168,6 +168,78 @@ automatic window, exactly as they were for the first 20 s before. With the
 default that is the first 90 s of uptime; the app's open command is available
 after 20 s.
 
+## One Car, One Automatic Pulse
+
+The cooldown is a window of seconds, and it treats its own expiry as a clean
+slate. On 2026-10-10 that was not enough ([the review](reviews/2026-10-10-gate-jam.md),
+[invariant 12](invariants.md)): an authorised pickup waited nine minutes at
+the gate, the camera raised seven vehicle alarms, and the Pi pulsed the relay
+four times for the one car -- every read between refused only by the 90 s
+cooldown, and the first read after each expiry let through. A pulse into a
+gate whose state is unknown stops or reverses it; the leaves crossed.
+
+So, in addition to the cooldown and in the same place (the
+`ActuationCoordinator`, which every automatic path goes through), once the
+relay has pulsed for a plate no automatic grant pulses for it again while the
+plate stays in the record:
+
+| Variable | Default | Accepted | What it does |
+| --- | --- | --- | --- |
+| `GATE_REPULSE_UNSEEN_MINUTES` | `10` | `0`, or 1 to 1440 | How long a plate the relay has pulsed for must go unseen before an automatic grant may pulse for it again. `0` switches the hold off |
+| `GATE_AUTOMATIC_OPEN` | `on` | `on`, `off` | The owner's pause switch. `off` refuses every automatic grant; the app's gate button still works |
+
+**The hold.** A plate is *seen* by any event that names it: the plate a grant
+matched, the plate a reader observed, or the authorised plate a refused read
+was nearest to (a misread of the trailing characters, as the D-Max's were, is
+still that car). The grants the hold itself and the cooldown refuse are
+sightings too, so a car waiting thirty minutes through alarm after alarm gets
+exactly one pulse. Once the plate has been out of the record for the window
+the hold lapses, and a later sighting with no new pulse behind it starts
+nothing. Different plates are independent: a second authorised car arriving
+during the first car's hold gets its own pulse (after the 90 s cooldown) and
+then its own hold. It is derived from the `events` table on every grant, so a
+restart -- or a reboot -- changes nothing. It is on the wall clock; the
+cooldown keeps its monotonic guard for the seconds after a reboot.
+
+A refused grant is recorded exactly as a cooldown grant is: `opened=true`, the
+match reason, the plate and the score, no `relay_activated_at`, and
+`actuation_outcome = "repulse_hold"` locally with `telemetry.actuation`
+`{claim: "repulse_hold", attempted: false, relay_outcome: "not_attempted"}`
+on the wire. Inside the gate's own cycle the record still says `cooldown`;
+`repulse_hold` names exactly the pulses the cooldown would have let through.
+The journal says `gate_actuation outcome=repulse_hold plate=... pulsed_at=...
+last_seen_at=... unseen_minutes=10`, and the sweep ends its session on it
+(`reason=final_repulse_hold`).
+
+A person's command from the app is never held: it keeps its `operator` role
+check and its 20 s cooldown, because someone watching the camera can see what
+the gate is doing and the plate reader cannot. An appearance grant (farm
+machinery) names no plate and keeps only the cooldown.
+
+**The pause switch.** `GATE_AUTOMATIC_OPEN=off` refuses every automatic grant
+-- sweep frames, the camera's FTP still, presence frames, early sweeps, farm
+machinery -- before any claim is made, and records each as the denial it is:
+`opened=false`, `reason="automatic_paused"`, the plate and the score kept,
+`actuation_outcome = "automatic_paused"`. The gate did not open for that car,
+by this event or any earlier one, so it is not written as a grant. The app's
+Settings page can set the same switch through the settings envelope the
+controller polls, as `automatic_open: {"enabled": bool}` beside
+`gate_left_open` (the Worker side of that is not built yet; this is the key it
+will write). The environment is the fallback for a board with no app setting,
+and the app's value survives a restart (`automatic-open.json` beside the
+schedule's cache). A malformed section from the app keeps the previous value
+rather than falling back, because a typo must not be what resumes automatic
+opening; an absent section means the board's environment decides.
+
+The heartbeat carries an `actuation` block -- `automatic_open`,
+`automatic_open_source` (`default` / `environment` / `app`),
+`repulse_unseen_minutes`, `automatic_cooldown_seconds`,
+`command_cooldown_seconds` -- which the app drops until it allow-lists it.
+
+Both settings are rejected whole when unreadable, logged at ERROR and
+replaced by the shipped default, exactly as the cooldowns are. Neither can add
+a pulse: each can only withhold one.
+
 ## FTP Upload Ownership
 
 Bootstrap adds `ftp-user` to the `gate-controller` group, configures
@@ -545,6 +617,7 @@ already; nothing here invents one.
 | `network` | the last completed probe cycle: `mode`, `skipped_reason`, `age_seconds`, `hops.lan` / `hops.router` (`state`, `loss`, `samples`, `min_ms` / `p50_ms` / `p95_ms` / `max_ms` / `mean_ms` / `jitter_ms`), `hops.internet` (`state`, `dns_ms`, `connect_ms`, `tls_ms`, `total_ms`, `age_seconds`), `interface` (`name`, `link_mbps`, receive/transmit bytes, packets, dropped and error **rates**, `receive_dropped_pct`) |
 | `cloud` | `heartbeat_rtt_ms`, `heartbeat_consecutive_failures`, `plates_consecutive_failures`, `oldest_pending_outbox_age_s`, and the cloud plate reader's circuit breaker: `cloud_breaker` (`closed` / `open` / `half_open`) and `cloud_breaker_until` (wall time, only while open) -- see [local-recognition.md](local-recognition.md#when-the-link-is-lossy-rather-than-down-the-circuit-breaker); the app drops both until it allow-lists them |
 | `recognition.trigger_capture` | the presence and skip counters described in `reolink-rlc-810a.md` |
+| `actuation` | what withholds automatic pulses: `automatic_open` and `automatic_open_source` (the owner's pause switch, `default` / `environment` / `app`), `repulse_unseen_minutes` (the one-pulse-per-car hold, null when off), `automatic_cooldown_seconds`, `command_cooldown_seconds` -- see "One Car, One Automatic Pulse" |
 | `corpus` | `local` (bytes, records, pruned, discarded), `upload` (`pending`, `oldest_pending_age_s`, `last_success_at`, `consecutive_failures`, `last_blocked_by`, `outage_probes`, `last_attempt_reason`, `retention_hold`) and `backpressure` (`quiet_window_seconds`, `quiet_for_seconds`, `busy`) |
 
 Everything here degrades to an absent field rather than to a healthy-looking
