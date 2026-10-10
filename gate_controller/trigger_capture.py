@@ -37,6 +37,10 @@ from .images import measure_flat_fraction, measure_frame_quality
 from .matching import normalise_plate
 from .plate_region import PlateRegion, parse_plate_region
 from .scene import SceneBaseline
+from .skipped_samples import (
+    DEFAULT_SKIPPED_SAMPLE_BYTES, DEFAULT_SKIPPED_SAMPLE_FILES, MAX_SKIPPED_SAMPLE_FILES,
+    SkippedFrameSamples,
+)
 from .telemetry import TriggerTelemetry
 
 
@@ -395,6 +399,13 @@ class TriggerCaptureConfig:
     # Skip frames whose plate band is mostly one flat colour: a picture the
     # decoder could not finish, not a scene. 0 disables.
     max_flat_fraction: float = DEFAULT_MAX_FLAT_FRACTION
+    # The first frame of each kind (empty scene, corrupt) the sweep skips, kept
+    # for review in this owner-only directory: at most this many files and
+    # bytes, oldest pruned. None, or 0 files, keeps nothing. See
+    # `skipped_samples`.
+    skipped_sample_directory: Path | None = None
+    skipped_sample_max_files: int = DEFAULT_SKIPPED_SAMPLE_FILES
+    skipped_sample_max_bytes: int = DEFAULT_SKIPPED_SAMPLE_BYTES
     # What a read must carry before the presence session concludes it is
     # looking at a different vehicle and stops offering frames. It gates no
     # actuation: see DEFAULT_CONCLUSIVE_READ_CONFIDENCE.
@@ -597,9 +608,15 @@ def load_trigger_capture_config(
         environment.get("GATE_EARLY_TRIGGER_ABORT_FRAMES", str(DEFAULT_EARLY_ABORT_FRAMES)),
         0, MAX_EARLY_ABORT_FRAMES,
     )
+    skipped_sample_files = _integer(
+        environment.get("GATE_SWEEP_SKIPPED_SAMPLE_FILES", str(DEFAULT_SKIPPED_SAMPLE_FILES)),
+        0, MAX_SKIPPED_SAMPLE_FILES,
+    )
     return TriggerCaptureConfig(
         enabled=enabled and webhook_enabled,
         output_directory=output_directory,
+        skipped_sample_directory=Path(state_root) / "sweep-skipped-frames",
+        skipped_sample_max_files=skipped_sample_files,
         source_url=source_url,
         timeout_seconds=timeout,
         min_interval_seconds=min_interval,
@@ -883,6 +900,11 @@ class TriggerFrameCapture:
         self._skipped_empty = 0
         self._skipped_clipped = 0
         self._skipped_corrupt = 0
+        self._skipped_samples = SkippedFrameSamples(
+            config.skipped_sample_directory,
+            max_files=config.skipped_sample_max_files,
+            max_bytes=config.skipped_sample_max_bytes,
+        )
         self._unresolved_sessions = 0
         self._below_bar_sessions = 0
         self._last_skip: str | None = None
@@ -1184,6 +1206,11 @@ class TriggerFrameCapture:
         self._sweep_upgrade = None
         self._early_sweeps += 1 if passage.early else 0
         sweep_started_at = scheduled_at
+        # Why this sweep's frames went unread, and the first frame of each
+        # reason, kept for a person to look at (see `skipped_samples`).
+        sweep_started_wall = self._wall_clock()
+        skipped_empty = skipped_corrupt = 0
+        skipped_samples: dict[str, str | None] = {}
         early_deadline = scheduled_at + min(config.early_max_seconds, config.sweep_seconds)
         blank = plate_reads = 0
         first_plate_read: int | None = None
@@ -1509,6 +1536,11 @@ class TriggerFrameCapture:
                 and flat_fraction > config.max_flat_fraction
             ):
                 self._skipped_corrupt += 1
+                skipped_corrupt += 1
+                if "corrupt" not in skipped_samples:
+                    skipped_samples["corrupt"] = self._skipped_samples.keep(
+                        frame, sweep_started_wall, "corrupt",
+                    )
                 continue
             scene_difference = self._scene_difference(frame)
             if (
@@ -1517,6 +1549,11 @@ class TriggerFrameCapture:
                 and scene_difference < config.empty_scene_threshold
             ):
                 self._skipped_empty += 1
+                skipped_empty += 1
+                if "empty" not in skipped_samples:
+                    skipped_samples["empty"] = self._skipped_samples.keep(
+                        frame, sweep_started_wall, "empty",
+                    )
                 consecutive_empty += 1
                 blank += 1
                 if waiting:
@@ -1622,6 +1659,7 @@ class TriggerFrameCapture:
                 "frames": frames, "reads": reads, "plate_reads": plate_reads,
                 "first_plate_read": first_plate_read, "first_plate_ms": first_plate_ms,
                 "blank_frames": blank, "authorised": authorised, "injected": injected,
+                "skipped_empty": skipped_empty, "skipped_corrupt": skipped_corrupt,
                 "cloud_handovers": handovers, "fallback": fallback,
                 "best_score": None if best is None else round(best[0], 3),
                 "elapsed_ms": round(max(0.0, self._clock() - sweep_started_at) * 1000),
@@ -1631,11 +1669,14 @@ class TriggerFrameCapture:
             # nothing handed on; that is the design, not a fault to warn about.
             logging.INFO if injected or fallback or unconfirmed else logging.WARNING,
             "gate_local_sweep outcome=ended reason=%s event_type=%s frames=%d reads=%d "
-            "busy=%d duplicates=%d read_fps=%.1f authorised=%d injected=%d "
+            "skipped_empty=%d skipped_corrupt=%d skipped_sample=%s busy=%d "
+            "duplicates=%d read_fps=%.1f authorised=%d injected=%d "
             "cloud_handovers=%d blind_handovers=%d fallback=%d "
             "best_plate=%s best_score=%s elapsed_ms=%d waiting_reads=%d "
             "cloud_hold=%s cloud_held=%d",
-            reason, getattr(event, "event_type", "unknown"), frames, reads, busy,
+            reason, getattr(event, "event_type", "unknown"), frames, reads,
+            skipped_empty, skipped_corrupt,
+            ",".join(name for name in skipped_samples.values() if name) or "-", busy,
             duplicates, reads / max(1e-6, self._clock() - scheduled_at),
             authorised, injected, handovers, handover_blind, fallback, best_plate or "-",
             "-" if best is None else f"{best[0]:.3f}",

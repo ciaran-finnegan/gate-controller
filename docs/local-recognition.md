@@ -357,6 +357,27 @@ the Pi `GATE_PRESENCE_WINDOW_SECONDS=12` is measured from the alarm, so after
 a 10 s sweep the presence session had 2 s left against a 3 s spacing and never
 took a frame; the waiting phase is what reads now.
 
+**Why a sweep's frames went unread.** The sweep skips a frame without reading
+it when the picture shows the idle drive (`GATE_EMPTY_SCENE_THRESHOLD`)
+or its plate band is one flat colour, a frame the decoder never finished
+(`GATE_TRIGGER_CAPTURE_MAX_FLAT_FRACTION`). Those used to be lifetime counters only, so a sweep
+that ended `frames=10 reads=0` (8 Oct 10:24 IST, an arriving Audi that only
+the camera's 4K FTP still let in; likewise `frames=27` on 8 Oct 09:15 and
+`frames=31` on 9 Oct 11:59) could not be traced to a test. The `outcome=ended`
+line now carries `skipped_empty=N skipped_corrupt=N` for that sweep alone
+(the early sweep's report has the same two counts), and
+`skipped_sample=<file>[,<file>]` names the first frame of each kind it
+skipped, or `-`. The frames are JPEGs in `<state root>/sweep-skipped-frames/`
+(`/var/lib/gate-controller/sweep-skipped-frames/`), named by the sweep's start
+in UTC and the reason (`20261008T092415123Z-empty.jpg`), owner-only (0700
+directory, 0600 files). At most `GATE_SWEEP_SKIPPED_SAMPLE_FILES` files (50;
+0 keeps none) and 24 MB are kept, oldest pruned first by the name, never by the
+wall clock. Writing one is a single small file write inside a try: a failure
+is a debug line (`stage=skipped_sample_failed`), never a stopped sweep, and it
+is attempted once per reason per sweep. Look at the frame: an empty-scene
+skip of a frame with a car in it means the threshold or the idle baseline is
+wrong; a corrupt skip of a good frame means that threshold is.
+
 **The cloud lane is not first come, first served.** A frame the device found
 a plate in goes ahead of any it found nothing in (`worker.CloudLane`). In that
 passage 6 of the 8 frames the sweep handed to the cloud had no plate the
@@ -708,6 +729,7 @@ processor will honour) and never on a fuzzy one.
 | `GATE_LOCAL_OCR_MODEL_DIR` | `/var/lib/gate-controller/models` | Where the ONNX weights are cached. |
 | `GATE_LOCAL_SWEEP_WAITING_SECONDS` | `80` | After the sweep window closes with the gate shut and a vehicle still in the picture, how long the on-device reader keeps looking. Bounded 0-120 and by `GATE_SESSION_SECONDS` (90); `0` disables. See "The sweep's read travels with its frame". |
 | `GATE_LOCAL_SWEEP_WAITING_FPS` | `2` | Reads a second while waiting (0.2-3). |
+| `GATE_SWEEP_SKIPPED_SAMPLE_FILES` | `50` | Skipped frames kept for review (0 keeps none). |
 | `GATE_LOCAL_SWEEP_CLOUD_HOLD` | `on` | `off`, `shadow` or `on`: whether the sweep's cloud hand-overs wait for a plate worth a lookup, and whether the camera's own alarm still is kept off the cloud while a sweep is reading the live stream. See "Frames not worth a lookup *yet*". |
 | `GATE_LOCAL_SWEEP_CLOUD_MIN_PLATE_PX` | `232` | The plate width, in 4K-equivalent pixels (0-3840), at which a hand-over may go. |
 | `GATE_LOCAL_SWEEP_CLOUD_LAST_CHANCE_SECONDS` | `3` | How long before the sweep window's end the hold lifts (0-30); the waiting phase is always a last chance. |
