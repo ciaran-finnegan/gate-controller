@@ -108,6 +108,8 @@ class MediaTurnRefreshTests(unittest.TestCase):
                 "/usr/bin/flock",
                 "--wait",
                 "10",
+                "-E",
+                "75",
                 "/var/lib/gate-media/turn-refresh.lock",
                 "/usr/bin/python3",
                 "/usr/local/lib/gate-media/gate_media_turn_refresh.py",

@@ -1866,7 +1866,7 @@ operations `read camera` and `publish gate`; all other RTSP requests fail.
 Browser WHEP remains a tokenized `read gate` operation.
 
 If the camera or private RTSP path disappears, ffmpeg exits and systemd retries
-it every five seconds. Start-rate lockout is disabled for this isolated unit so
+it every ten seconds. Start-rate lockout is disabled for this isolated unit so
 an extended camera outage cannot leave audio permanently failed after MediaMTX
 recovers; the fixed delay still bounds retry cadence.
 

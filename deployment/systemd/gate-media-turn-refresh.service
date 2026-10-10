@@ -12,7 +12,7 @@ Type=oneshot
 User=root
 Group=root
 Environment=PYTHONPATH=/usr/local/lib/gate-media
-ExecStart=/usr/bin/flock --wait 10 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
+ExecStart=/usr/bin/flock --wait 10 -E 75 /var/lib/gate-media/turn-refresh.lock /usr/bin/python3 /usr/local/lib/gate-media/gate_media_turn_refresh.py
 TimeoutStartSec=150s
 # The helper exits 75 when Cloudflare could not be reached (no route, DNS,
 # timeout, HTTP 5xx/429) -- the boot-time run after a power cut, when the
