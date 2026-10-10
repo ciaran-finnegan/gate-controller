@@ -93,11 +93,16 @@ The third rule fired four times over the 2.72 weeks, at every threshold from
 | 2026-09-21 08:07 | 9, 15, 8 s | 9.9 h | The remote test that crossed the leaves ([gate-operator.md](gate-operator.md)). The gate was not shut properly, and someone needed to look. |
 | 2026-10-04 16:51 | 23, 8, 32 s | 10.5 h | Unverified. |
 | 2026-10-08 17:30 | 25, 11, 35 s | 1.9 h | Unverified. |
-| 2026-10-09 21:42 | 17, 9, 11 s | 39 min | The gate left open. |
+| 2026-10-09 21:42 | 17, 9, 11 s | 39 min | Unverified. Re-read on 2026-10-10: the 11 s run is the camera's alarm sound and the 17 s run a car engine; no motor-band run is visible. |
 
-Two of the four are known to be real, so the **false-alert rate is at most
-0.7 a week**. Merging runs that are less than 5 s apart, to remove the
-detector's split runs, leaves only the two known-real alerts. It is not done,
+Only one of the four (2026-09-21) is known to be real, so **up to three of
+four may be false: at most about 1.1 false alerts a week** over the 2.72 weeks.
+An earlier version of this page counted 2026-10-09 as real and gave 0.7 a week.
+Until 2026-10-10 15:27 the camera's own alarm sound was recorded as a motor
+run at every vehicle alarm, so any of these bursts may contain one; treat the
+rule as unvalidated until it has been replayed on audio recorded with the sound
+off. Merging runs that are less than 5 s apart, to remove the detector's split
+runs, leaves only the 2026-09-21 and 2026-10-09 bursts. It is not done,
 because a fast reversal and a split run can both leave a gap of a second or
 two, and merging would hide the reversal the rule depends on.
 
