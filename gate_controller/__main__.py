@@ -31,6 +31,7 @@ from .early_trigger import load_mode as load_early_trigger_mode
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
+from .gate_left_open import load_config as load_left_open_config
 from .local_sweep import LocalSweepReader
 from .net_probe import NetProbeWorker, load_net_probe_config
 from .ocr import MAX_UPLOAD_WIDTH, MIN_UPLOAD_WIDTH
@@ -895,6 +896,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
     if camera_stale_seconds <= 0:
         raise ValueError("GATE_CAMERA_STALE_SECONDS must be greater than zero")
     telemetry_retention_days = _telemetry_retention_days(environment)
+    left_open_defaults = load_left_open_config(environment)
     # `main` builds the probe itself, so the pipeline can hold its answer;
     # without one handed in, it is built here exactly as before.
     if net_probe is None:
@@ -951,6 +953,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             net_probe=net_probe, heartbeat=heartbeat_worker, plates=plates_worker,
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
             metrics=metrics, cloud_breaker=cloud_breaker, camera_focus=camera_focus,
+            left_open_defaults=left_open_defaults,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -999,6 +1002,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         hot_stream=hot_stream, local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity, camera_focus=camera_focus,
+        left_open_defaults=left_open_defaults,
     )
 
 
@@ -1111,7 +1115,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        trigger_capture=None, webhook=None, net_probe=None,
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
-                       cloud_breaker=None, camera_focus=None,
+                       cloud_breaker=None, camera_focus=None, left_open_defaults=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -1154,7 +1158,10 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     webhook_status = _webhook_status(webhook)
     if webhook_status is not None:
         status["recognition"]["webhook"] = webhook_status
-    gate = _gate_sound_status(store)
+    gate = _gate_sound_status(
+        store, left_open_config=_left_open_config(match_policy, left_open_defaults),
+        now=now,
+    )
     if gate is not None:
         status["gate"] = gate
     host = _host_status(host_metrics, net_probe)
@@ -1257,7 +1264,27 @@ def _age_seconds(timestamp: str | None, now: datetime) -> float | None:
     return round(max(0.0, age.total_seconds()), 1)
 
 
-def _gate_sound_status(store) -> dict | None:
+def _left_open_config(match_policy, defaults):
+    """The left-open alert's switch and threshold: the app's, else the board's.
+
+    Read from the settings envelope the controller already polls, through the
+    same cache that holds the plate-matching schedule; the parse can never
+    raise into, or change, that schedule. A controller with no cloud settings
+    keeps its environment's defaults.
+    """
+    from .gate_left_open import LeftOpenConfig
+
+    fallback = defaults if defaults is not None else LeftOpenConfig()
+    reader = getattr(match_policy, "gate_left_open", None)
+    if not callable(reader):
+        return fallback
+    try:
+        return reader(fallback)
+    except Exception:
+        return fallback
+
+
+def _gate_sound_status(store, *, left_open_config=None, now=None) -> dict | None:
     """What the microphone says the gate did, or None when nothing has scanned.
 
     Read-only and best-effort: the heartbeat must go out whether or not the
@@ -1270,7 +1297,7 @@ def _gate_sound_status(store) -> dict | None:
 
     try:
         with closing(sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)) as connection:
-            return gate_state(connection)
+            return gate_state(connection, now=now, left_open_config=left_open_config)
     except Exception:
         return None
 

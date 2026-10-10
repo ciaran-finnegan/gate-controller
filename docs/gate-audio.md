@@ -948,6 +948,22 @@ heartbeat, so these are safe to send today and invisible there until that list
 names them (suggested ceilings: 86,400 for the three durations, 10,000 for the
 count).
 
+## 2h. Left Open: The First Thing A Person Is Told
+
+The heartbeat's `gate` block now carries a `left_open` object (see
+[gate-left-open.md](gate-left-open.md)). It is the first output of this
+detector that is pushed to a phone, so it is built only on what the
+measurement supports. A latch was heard on 10 of 22 recorded commanded
+cycles, and over a third of real cycles produce one motor run or none. That
+rules out "no latch, then silence" as an alert: it would fire 8 times a week.
+What is reliable is the interrupted closing: three or more runs, an odd
+number, and no latch on the last. Over 2.72 weeks of history that rule fired
+four times, two of which are known to be real.
+
+It is notify only. It reads `gate_movements` and `gate_listening` on the
+heartbeat's read-only connection and returns a dictionary. It can never
+reach the relay ([invariant 11](invariants.md)).
+
 ## 3. What Is Proposed
 
 The detector above exists and is tested. What does **not** exist yet is the

@@ -21,6 +21,11 @@ expects::
       }
     }
 
+The envelope may also carry ``"gate_left_open": {"enabled": true,
+"threshold_minutes": 10}``, the owner's switch for the notify-only left-open
+alert (docs/gate-left-open.md). It is kept raw and parsed only when read; a
+malformed one is ignored and can never change or reject the schedule.
+
 Like the authorised-plate snapshot, a good document is cached on disk so a
 restart without the cloud keeps the schedule the owner configured. Unlike that
 snapshot, a *missing* document is not an error: it means no schedule has been
@@ -90,6 +95,11 @@ class MatchPolicyCache:
         self._configured = False
         self._refreshed_at: datetime | None = None
         self._last_error: str | None = None
+        # The envelope's `gate_left_open` object, kept raw and parsed only when
+        # read (gate_left_open.config_from_settings). It rides the same poll as
+        # the schedule and must never be able to change it: nothing about it
+        # is validated here, and nothing here raises over it.
+        self._left_open_section: object = None
         self._load_cached()
 
     def get(self) -> MatchPolicy:
@@ -106,6 +116,7 @@ class MatchPolicyCache:
         to once the cloud serves something readable again, and the marker, not
         its absence, is what keeps the gate closed in the meantime.
         """
+        self._keep_left_open_section(document)
         try:
             policy = policy_from_settings(document)
         except MatchPolicyError as error:
@@ -126,6 +137,23 @@ class MatchPolicyCache:
             self._configured = True
             self._refreshed_at = self._clock()
             self._last_error = None
+
+    def _keep_left_open_section(self, document: object) -> None:
+        section = document.get("gate_left_open") if isinstance(document, dict) else None
+        with self._lock:
+            self._left_open_section = section if isinstance(section, dict) else None
+
+    def gate_left_open(self, fallback):
+        """The left-open alert's switch and threshold, or ``fallback``.
+
+        Notify only, and independent of the schedule: a malformed section
+        leaves ``fallback`` in force and the plate-matching policy untouched.
+        """
+        from .gate_left_open import config_from_settings
+
+        with self._lock:
+            section = self._left_open_section
+        return config_from_settings(section, fallback)
 
     def mark_refresh_error(self, error: Exception) -> None:
         with self._lock:
@@ -153,6 +181,7 @@ class MatchPolicyCache:
             }
 
     def _load_cached(self) -> None:
+        self._load_cached_left_open()
         rejection = self._read_rejection()
         if rejection is not None:
             # The cloud was serving a document this controller refused when it
@@ -183,6 +212,19 @@ class MatchPolicyCache:
         self._refreshed_at = datetime.fromtimestamp(
             self._path.stat().st_mtime, timezone.utc
         )
+
+    def _load_cached_left_open(self) -> None:
+        """The last envelope's left-open section, so a restart keeps it."""
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            if self._path.stat().st_size > MAX_SETTINGS_BYTES:
+                return
+            document = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        section = document.get("gate_left_open") if isinstance(document, dict) else None
+        self._left_open_section = section if isinstance(section, dict) else None
 
     def _persist(self, document: object) -> None:
         if self._path is None:
