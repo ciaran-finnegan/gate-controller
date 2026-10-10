@@ -527,9 +527,17 @@ class GateProcessor:
             if prepared.cloud_skip is None and not prepared.decided:
                 prepared.cloud_skip = CLOUD_SKIP_DEPARTING
             prepared.offline = CLOUD_SKIP_DEPARTING
-        elif mode == "shadow":
+        elif mode == "shadow" and (
+            (prepared.cloud_skip is None and not prepared.decided) or len(prepared.paths) > 1
+        ):
+            # Journalled only where `on` would have changed what is sent: an
+            # undecided first frame no other skip already covers, or a burst
+            # with further frames to keep off the cloud. A decided single
+            # frame is answered by its own read either way, and counting it
+            # would overstate what switching the rule on would save.
             logging.getLogger(__name__).info(
-                "gate_ocr stage=cloud_skip_shadow would=%s", CLOUD_SKIP_DEPARTING,
+                "gate_ocr stage=cloud_skip_shadow would=%s frames=%d",
+                CLOUD_SKIP_DEPARTING, len(prepared.paths),
             )
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
