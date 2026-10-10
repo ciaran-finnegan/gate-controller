@@ -151,13 +151,17 @@ class MatchPolicyCache:
         """
         section = document.get("gate_left_open") if isinstance(document, dict) else None
         section = section if isinstance(section, dict) else None
+        encoded = json.dumps({"gate_left_open": section}, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_SETTINGS_BYTES:
+            # Not adopted at all: one that cannot be kept would be undone by
+            # the next restart. The two real fields are a few dozen bytes.
+            LOGGER.warning("left-open alert settings too large; keeping the previous ones")
+            return
         with self._lock:
             changed = section != self._left_open_section
             self._left_open_section = section
         if changed and self._left_open_path is not None:
-            encoded = json.dumps({"gate_left_open": section}, sort_keys=True, separators=(",", ":"))
-            if len(encoded.encode("utf-8")) <= MAX_SETTINGS_BYTES:
-                _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
+            _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
 
     def gate_left_open(self, fallback):
         """The left-open alert's switch and threshold, or ``fallback``.

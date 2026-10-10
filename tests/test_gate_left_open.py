@@ -281,6 +281,18 @@ class LeftOpenThroughTheHeartbeat(unittest.TestCase):
         self.assertEqual(left_open["state"], "open")
         self.assertEqual(left_open["confidence"], LIKELY)
 
+    def test_a_section_too_large_to_keep_is_not_adopted(self):
+        path = Path(self.directory.name) / "match-policy.json"
+        cache = MatchPolicyCache(path)
+        cache.replace({"controller_id": "primary", "settings_version": 1,
+                       "gate_left_open": {"enabled": False, "threshold_minutes": 10}})
+        cache.replace({"controller_id": "primary", "settings_version": 1,
+                       "gate_left_open": {"enabled": True, "threshold_minutes": 10,
+                                          "padding": "x" * 20000}})
+
+        self.assertFalse(cache.gate_left_open(LeftOpenConfig()).enabled)
+        self.assertFalse(MatchPolicyCache(path).gate_left_open(LeftOpenConfig()).enabled)
+
     def test_a_malformed_setting_changes_nothing_about_plate_matching(self):
         """The section shares the schedule's envelope and must never fail it closed."""
         cache = MatchPolicyCache(Path(self.directory.name) / "match-policy.json")
