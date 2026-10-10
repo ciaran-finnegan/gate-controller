@@ -155,9 +155,11 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
 
-    def test_the_departure_skip_is_on_by_default_and_takes_only_its_three_modes(self):
+    def test_the_departure_skip_ships_in_shadow_and_takes_only_its_three_modes(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
-        self.assertEqual(config.sweep_departing_skip, "on")
+        self.assertEqual(config.sweep_departing_skip, "shadow")
+        self.assertEqual(TriggerCaptureConfig(enabled=True, output_directory=Path("/x"))
+                         .sweep_departing_skip, "shadow")
         for raw, mode in (("off", "off"), (" Shadow ", "shadow"), ("ON", "on")):
             tuned = load_trigger_capture_config(
                 {"GATE_LOCAL_SWEEP_DEPARTING_SKIP": raw}, Path("/uploads"), webhook_enabled=True,

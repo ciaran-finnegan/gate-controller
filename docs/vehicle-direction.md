@@ -279,7 +279,9 @@ So `trigger_capture.DepartingPlate` applies that rule to the sweep's reads,
 says the plate is receding, and `GateProcessor.prepare` asks it once per
 burst, before routing, and keeps the passage's frames and the camera's still
 off the cloud (`gate_ocr stage=cloud_skipped reason=departing`;
-`GATE_LOCAL_SWEEP_DEPARTING_SKIP=off|shadow|on`, on by default). The frame is
+`GATE_LOCAL_SWEEP_DEPARTING_SKIP=off|shadow|on`, shipped as `shadow`, which
+judges and journals and changes nothing it sends, until a week of records
+shows no arrival judged a departure). The frame is
 decided on the device's read and answers "no plate", with the refused read
 carried as `review_plate` for the near miss like every other skip. It is not
 sticky -- a plate that grows back ends it -- and it never touches a frame the

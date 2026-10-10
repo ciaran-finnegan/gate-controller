@@ -163,13 +163,19 @@ SWEEP_CLOUD_STOPPED_SPREAD = 0.08
 # stopped-car spread; 150 px keeps jitter on a far plate from counting; two
 # reads are a quarter of a second at the sweep's rate. The rule is not sticky:
 # a car that backs off and comes forward again is an arrival once its plate
-# grows back, and gets its cloud fallback then. A verdict is only as fresh as
+# grows back, and gets its cloud fallback then. Shipped in `shadow`: the
+# verdict is judged, journalled (`stage=departing mode=shadow`, and
+# `gate_ocr stage=cloud_skip_shadow would=departing` for each frame `on` would
+# have kept off the cloud) and counted, and nothing about what is sent or
+# decided changes until `GATE_LOCAL_SWEEP_DEPARTING_SKIP=on` -- which is for
+# after a week of shadow records has shown no arrival judged a departure. A
+# verdict is only as fresh as
 # the read it came from: it is honoured for SWEEP_DEPARTING_GRACE_SECONDS
 # after that read, which covers the frames the sweep hands over as its window
 # closes (the fallback) and the camera's own still, and then lapses, so a
 # passage nobody read for a while cannot speak for the next car.
 SWEEP_DEPARTING_SKIP_MODES = ("off", "shadow", "on")
-DEFAULT_SWEEP_DEPARTING_SKIP = "on"
+DEFAULT_SWEEP_DEPARTING_SKIP = "shadow"
 SWEEP_DEPARTING_SHRINK = 0.30
 SWEEP_DEPARTING_MIN_PEAK_PX = 150
 SWEEP_DEPARTING_READS = 2

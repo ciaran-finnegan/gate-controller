@@ -109,8 +109,10 @@ opening while 42 of its 107 slow or failed lookups were on departures. The
 sweep's own reads say which it is -- a departing car's plate shrinks as it
 recedes, an arriving car's only grows until it stops -- and while they say so
 the passage's frames and still are decided on the device and not sent
-(`cloud_skipped reason=departing`). An arriving car keeps its cloud fallback,
-and an authorised rear plate the device reads still opens the gate (#171).
+(`cloud_skipped reason=departing`) once `GATE_LOCAL_SWEEP_DEPARTING_SKIP=on`;
+shipped as `shadow`, which journals what `on` would have kept off the cloud
+and sends exactly as before. An arriving car keeps its cloud fallback, and an
+authorised rear plate the device reads still opens the gate (#171).
 
 - `tests/test_fast_lane.py::test_the_cameras_alarm_still_is_not_sent_to_the_cloud_while_a_sweep_is_reading`
 - `tests/test_fast_lane.py::test_a_sweep_frame_is_never_treated_as_the_cameras_still`

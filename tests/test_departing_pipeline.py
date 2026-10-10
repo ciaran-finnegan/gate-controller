@@ -42,9 +42,10 @@ def departing_gate(test, *, widths_by_frame, answers, mode="on", hold="on",
                    last_chance=1.0, **options):
     """The harness's gate with the departure rule in ``mode`` and plates boxed.
 
-    The processor is given the capture's ``departing_skip`` the way ``main``
-    gives it: the capture does not exist until the gate is built, so the
-    predicate reaches through to it once it does.
+    ``mode=None`` leaves the rule at its shipped default. The processor is
+    given the capture's ``departing_skip`` the way ``main`` gives it: the
+    capture does not exist until the gate is built, so the predicate reaches
+    through to it once it does.
     """
     widths = {
         digest(crop_to_region(data, REGION)): width for data, width in widths_by_frame.items()
@@ -59,7 +60,8 @@ def departing_gate(test, *, widths_by_frame, answers, mode="on", hold="on",
         harness, "TriggerCaptureConfig",
         partial(
             TriggerCaptureConfig, sweep_cloud_hold=hold, sweep_cloud_min_plate_px=300,
-            sweep_cloud_last_chance_seconds=last_chance, sweep_departing_skip=mode,
+            sweep_cloud_last_chance_seconds=last_chance,
+            **({} if mode is None else {"sweep_departing_skip": mode}),
         ),
     ), mock.patch.object(
         harness, "ScriptedEngine", partial(BoxingEngine, widths=widths),
@@ -248,6 +250,31 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertIn("gate_ocr stage=cloud_skipped reason=departing", text)
         self.assertEqual(cloud.posted, [], f"the departing car's frame was paid for:\n{text}")
         self.assertEqual(gate.relay_calls, [])
+
+    def test_the_shipped_default_judges_and_journals_and_sends_exactly_as_before(self):
+        # Shipped in shadow: a departure's frames still go to the cloud, and
+        # the journal says what `on` would have kept back.
+        frames, widths = receding_passage(range(270, 278))
+        answers = {
+            digest(crop_to_region(data, REGION)): (STRANGER, 0.40) for data in frames
+        }
+        cloud = CloseOnlyCloud()
+        gate = self.gate = departing_gate(
+            self, widths_by_frame=widths, answers=answers, cloud=cloud, mode=None,
+            sweep_seconds=4.0, cloud_frames=5, fallback=1,
+        )
+        self.assertEqual(gate.sweep_status()["departing_skip"], "shadow")
+
+        with CapturedLogs() as logs:
+            self._run_passage(gate, frames, logs)
+            self.assertTrue(wait_for(lambda: cloud.posted, 4.0), logs.text())
+
+        text = logs.text()
+        self.assertIn("gate_local_sweep stage=departing mode=shadow", text)
+        self.assertIn("gate_ocr stage=cloud_skip_shadow would=departing", text)
+        self.assertNotIn("stage=cloud_skipped reason=departing", text)
+        self.assertEqual(gate.relay_calls, [])
+        self.assertEqual(gate.sweep_status()["departing"], 1)
 
     def test_shadow_journals_the_skip_and_sends_the_frame_as_before(self):
         frames, widths = receding_passage(range(240, 248))

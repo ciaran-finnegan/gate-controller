@@ -524,8 +524,9 @@ could not succeed. With no sweep reading -- sweep disabled, its reader
 unavailable, or no alarm to start it -- the still goes to the cloud as before.
 A still the device never read (`GATE_LOCAL_OCR_CLOUD=always`) is untouched.
 
-**A departing car** is not sent at all (`GATE_LOCAL_SWEEP_DEPARTING_SKIP`,
-on by default). It is let out by the gate's exit mechanism, not by the Pi, so
+**A departing car** is not sent at all once `GATE_LOCAL_SWEEP_DEPARTING_SKIP`
+is `on` (shipped as `shadow`: see the rollout note at the end of this
+section). It is let out by the gate's exit mechanism, not by the Pi, so
 a lookup on it decides nothing, and since 2026-10-05 the cloud had decided no
 opening while 42 of its 107 slow (250 ms or more) or failed lookups were on
 passages the direction scan marked `exiting`. The sweep's own reads say which
@@ -572,7 +573,23 @@ them let in) and 6 of 15 departures. See
 [vehicle-direction.md](vehicle-direction.md) for why no other real-time signal
 exists yet.
 
-**Rollout.** On by default since 2026-10-09, after the 2026-10-05/06 passages
+*Rollout of the departure skip.* Shipped as `shadow`: the verdict is judged,
+journalled and counted exactly as under `on`, and nothing about what is sent
+or decided changes. Each passage whose plate reads as receding journals
+`gate_local_sweep stage=departing mode=shadow peak_px=... plate_px=...
+at_ms=...`, and each frame `on` would have kept off the cloud journals
+`gate_ocr stage=cloud_skip_shadow would=departing frames=N`. Read a week of
+them against the dashboard's `direction` for the same passages:
+
+```
+journalctl -u gate-controller --since -7d \
+  | grep -E 'stage=departing mode=shadow|cloud_skip_shadow would=departing'
+```
+
+Switch to `on` only when no passage the scan marked `entering` -- and none
+that was let in -- was judged departing. `off` neither judges nor journals.
+
+**Rollout of the hold.** On by default since 2026-10-09, after the 2026-10-05/06 passages
 above showed the far frames costing lookups and, once, the gate's time.
 `shadow` hands over exactly as `off` does and journals what `on` would have
 done: `stage=cloud_held mode=shadow` once a passage, `release=would_hold` on
