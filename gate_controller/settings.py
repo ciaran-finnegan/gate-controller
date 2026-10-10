@@ -181,7 +181,21 @@ class MatchPolicyCache:
         validator = SECTION_VALIDATORS.get(name)
         if validator is not None and present and not validator(raw):
             LOGGER.warning("%s settings malformed; keeping the previous ones", name)
-            return True
+            # Refused, so the caller strips it from the envelope before the
+            # schedule is cached: the malformed section must not be what a
+            # restart reads back. And the value being kept must outlive the
+            # restart on its own: a board whose only copy was the schedule's
+            # cached envelope (no side file yet) would otherwise lose it to
+            # that very strip. Materialise it now.
+            with self._lock:
+                retained = self._sections.get(name)
+            path = self._section_paths.get(name)
+            if retained is not None and path is not None and not path.exists():
+                _write_atomically(
+                    path, json.dumps({name: retained}, sort_keys=True, separators=(",", ":")),
+                    f"cache the {name} settings",
+                )
+            return False
         section = raw if isinstance(raw, dict) else None
         encoded = json.dumps({name: section}, sort_keys=True, separators=(",", ":"))
         if len(encoded.encode("utf-8")) > MAX_SETTINGS_BYTES:

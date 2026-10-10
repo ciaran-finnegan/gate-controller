@@ -80,11 +80,16 @@ class LocalStore:
         unknown stops or reverses it, and the leaves crossed.
 
         A hold is anchored on the newest event that pulsed the relay for
-        ``plate`` -- a pulse being what :meth:`_was_opened_since` counts as
-        one: a ``relay_activated_at``, or a granted row that did not skip the
+        ``plate``. A pulse is everything :meth:`_was_opened_since` counts as
+        one: a ``relay_activated_at``; a granted row that did not skip the
         relay (``actuation_outcome`` null), for a relay that reports activation
-        without an instant -- and is alive while the plate has been *seen*
-        since with no gap longer than ``unseen``: seen means any event naming
+        without an instant; or a claim that kept its ``activation_attempt_at``,
+        which is how an attempt the process died in the middle of (recovered
+        as ``indeterminate_claim``, ``opened`` false) and a relay that reported
+        a failure after being energised are remembered. The relay *may* have
+        fired in those, and for the hold that is a pulse. The hold is alive
+        while the plate has been *seen* since the pulse with no gap longer
+        than ``unseen``: seen means any event naming
         it -- the plate it was granted on, the plate a reader observed, or
         the authorised plate a refused read was nearest to
         (``near_miss_plate``) -- including the grants this hold and the
@@ -107,13 +112,16 @@ class LocalStore:
         with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
-                SELECT received_at, decision_at, relay_activated_at, opened, actuation_outcome,
-                       authorised_plate, observed_plate, near_miss_plate
-                FROM events ORDER BY received_at DESC
+                SELECT e.received_at, e.decision_at, e.relay_activated_at, e.opened,
+                       e.actuation_outcome, e.authorised_plate, e.observed_plate,
+                       e.near_miss_plate, c.activation_attempt_at
+                FROM events AS e
+                LEFT JOIN actuation_claims AS c ON c.event_id = e.id
+                ORDER BY e.received_at DESC
                 """
             )
             for (received_at, decision_at, relay_activated_at, opened, outcome,
-                 authorised, observed, near_miss) in cursor:
+                 authorised, observed, near_miss, attempted_at) in cursor:
                 seen_at = _parse_timestamp(received_at)
                 if previous - seen_at > unseen:
                     # Everything older is older still: the chain breaks here,
@@ -126,11 +134,12 @@ class LocalStore:
                     continue
                 if last_seen is None:
                     last_seen = seen_at
-                if relay_activated_at is not None or (opened and outcome is None):
+                if (relay_activated_at is not None or (opened and outcome is None)
+                        or attempted_at is not None):
                     return RepulseHold(
                         plate=wanted,
                         pulsed_at=_parse_timestamp(
-                            relay_activated_at or decision_at or received_at
+                            relay_activated_at or attempted_at or decision_at or received_at
                         ),
                         last_seen_at=last_seen,
                     )
@@ -1208,6 +1217,8 @@ class LocalStore:
                 {_EVENTS_INDEX_DDL[1]};
                 {_EVENTS_INDEX_DDL[2]};
                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_one_per_event ON outbox (event_id);
+                CREATE INDEX IF NOT EXISTS actuation_claims_event_id
+                    ON actuation_claims (event_id);
                 CREATE INDEX IF NOT EXISTS event_telemetry_created_at
                     ON event_telemetry (created_at);
                 -- What the microphone heard the gate do, which is not the same

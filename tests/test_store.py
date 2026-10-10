@@ -1406,6 +1406,38 @@ class RepulseHoldQueryTests(unittest.TestCase):
         self.assertIsNotNone(hold)
         self.assertEqual(hold.pulsed_at, self.T0)
 
+    def test_an_attempt_the_process_died_in_is_a_pulse_for_the_hold(self):
+        """The relay may have fired: recovery writes `indeterminate_claim`,
+        `opened=0`, and the claim keeps its `activation_attempt_at`. The cooldown
+        counts that; so does the hold, or the car could be pulsed again once the
+        cooldown had expired -- the very repeat the hold exists to stop."""
+        at = self.T0
+        event = GateEvent(
+            source="local", reason="exact_match", opened=False, idempotency_key="image:died",
+            received_at=at, decision_at=at, authorised_plate="172L66", observed_plate="172L66",
+        )
+        claim = self.store.claim_actuation("image:died", at, event=event)
+        self.store.mark_actuation_attempt(
+            claim, at, event=event, attempted_monotonic=100.0, boot_id="boot-1",
+        )
+        # The process dies here. The next start recovers the claim.
+        self.assertEqual(LocalStore(self.store.path).recover_interrupted_actuations(), 1)
+
+        hold = self._hold(400)
+        self.assertIsNotNone(hold, "an attempt that may have pulsed anchors no hold")
+        self.assertEqual(hold.pulsed_at, self.T0)
+        self.assertIsNone(self._hold(601))
+
+    def test_an_interruption_before_any_attempt_is_not_a_pulse(self):
+        at = self.T0
+        event = GateEvent(
+            source="local", reason="exact_match", opened=False, idempotency_key="image:early",
+            received_at=at, decision_at=at, authorised_plate="172L66", observed_plate="172L66",
+        )
+        self.store.claim_actuation("image:early", at, event=event)
+        self.assertEqual(LocalStore(self.store.path).recover_interrupted_actuations(), 1)
+        self.assertIsNone(self._hold(60), "the relay was never asked")
+
     def test_plates_are_compared_in_normalised_form(self):
         self._row(0, plate="172-l-66")
         self.assertIsNotNone(self._hold(60, plate="172L66"))

@@ -92,6 +92,27 @@ class SettingsSectionTests(unittest.TestCase):
         self.assertFalse(MatchPolicyCache(self.path).automatic_open(self.FALLBACK).enabled,
                          "a malformed section was persisted over the good one")
 
+    def test_a_pause_known_only_from_the_schedules_cache_survives_a_malformed_update(self):
+        """A board whose only copy of the switch is the cached envelope (no side
+        file yet): a malformed update must neither persist itself over that copy
+        nor strip it away, or a restart would quietly resume automatic opening."""
+        cache = MatchPolicyCache(self.path)
+        cache.replace({**ENVELOPE, "automatic_open": {"enabled": False}})
+        side_file = self.path.with_name("automatic-open.json")
+        side_file.unlink()
+        self.assertEqual(json.loads(self.path.read_text())["automatic_open"], {"enabled": False})
+        loaded = MatchPolicyCache(self.path)
+        self.assertFalse(loaded.automatic_open(self.FALLBACK).enabled, "loaded from the envelope")
+
+        with self.assertLogs("gate_controller.settings", level="WARNING"):
+            loaded.replace({**ENVELOPE, "automatic_open": {"enabled": "resume"}})
+
+        self.assertFalse(loaded.automatic_open(self.FALLBACK).enabled)
+        self.assertNotIn("automatic_open", json.loads(self.path.read_text()),
+                         "the malformed section was cached with the schedule")
+        self.assertEqual(json.loads(side_file.read_text()), {"automatic_open": {"enabled": False}})
+        self.assertFalse(MatchPolicyCache(self.path).automatic_open(self.FALLBACK).enabled)
+
     def test_an_envelope_without_the_section_means_the_board_decides(self):
         cache = MatchPolicyCache(self.path)
         cache.replace({**ENVELOPE, "automatic_open": {"enabled": False}})

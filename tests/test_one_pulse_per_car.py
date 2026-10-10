@@ -302,6 +302,29 @@ class OnePulsePerCarTests(OnePulsePerCarHarness):
         self.assert_withheld(self.plate_read(400), REPULSE_HOLD)
         self.assertEqual(self.gpio.pulses, 1)
 
+    def test_a_pulse_the_process_died_recording_still_holds_the_car(self):
+        """The relay fires, the store fails before the row is written, the
+        controller restarts and recovers an `indeterminate_claim`. The car is
+        still outside; it is held, not pulsed again."""
+        real_finalize = self.store.finalize_actuation
+
+        def dying_finalize(*args, **kwargs):
+            self.store.finalize_actuation = real_finalize
+            raise RuntimeError("power cut after the pulse")
+
+        self.store.finalize_actuation = dying_finalize
+        died = self.plate_read(0)
+        self.assertEqual(died.reason, "indeterminate_claim")
+        self.assertEqual(self.gpio.pulses, 1, "the relay had already fired")
+
+        # What main does at every start.
+        self.assertEqual(self.store.recover_interrupted_actuations(), 1)
+        self.build({}, boot_id="boot-2", uptime_at_start=500.0)
+
+        self.assert_withheld(self.plate_read(200), REPULSE_HOLD)
+        self.assert_withheld(self.plate_read(500), REPULSE_HOLD)
+        self.assertEqual(self.gpio.pulses, 1)
+
     def test_an_app_command_during_the_hold_still_pulses(self):
         """A person watching the camera is not held; they keep their own 20 s window."""
         self.plate_read(0)
