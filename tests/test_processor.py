@@ -3325,10 +3325,9 @@ class InternetDownTests(unittest.TestCase):
     def test_the_verdict_a_frame_was_handed_over_with_wins_over_the_live_one(self):
         # A sweep frame carries the verdict it earned; the capture's live
         # predicate is for frames that carry none (the camera's still).
+        cloud = PlateObservation("12D3456", 0.99)
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")
-            cloud = PlateObservation("12D3456", 0.99)
-
             recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
             processor = self._processor(directory, recognizer, departing=lambda: None)
             prepared = processor.prepare((frame,), departing=lambda: "on")
@@ -3337,10 +3336,10 @@ class InternetDownTests(unittest.TestCase):
             processor.process((frame,), prepared=prepared)
             self.assertEqual(recognizer.cloud_calls, [], "the carried verdict was ignored")
 
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
             recognizer = TwoPhaseRecognizer(cloud_observation=cloud)
-            processor = self._processor(
-                directory, recognizer, database="other.db", departing=lambda: "on",
-            )
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
             prepared = processor.prepare((frame,), departing=lambda: None)
             self.assertIsNone(prepared.cloud_skip)
             self.assertTrue(prepared.route_to_cloud_lane())
@@ -3379,40 +3378,43 @@ class InternetDownTests(unittest.TestCase):
             self.assertEqual(recognizer.cloud_calls, [], "a later frame posted after a refused read")
 
     def test_shadow_is_journalled_only_where_on_would_have_changed_what_is_sent(self):
+        def shadow_lines(journal):
+            return [line for line in journal.output if "cloud_skip_shadow" in line]
+
+        # A decided single frame: `on` would send nothing it does not send.
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")
-            second = self._jpeg(directory, "second.jpg", 140)
-
-            # A decided single frame: `on` would send nothing it does not send.
             recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
             processor = self._processor(directory, recognizer, departing=lambda: "shadow")
-            with self.assertNoLogs("gate_controller.processor", level="INFO"):
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
                 prepared = processor.prepare((frame,))
+            self.assertEqual(shadow_lines(journal), [])
             self.assertIsNone(prepared.cloud_skip)
             processor.process((frame,), prepared=prepared)
 
-            # An undecided frame: `on` would have kept it off the cloud.
+        # An undecided frame: `on` would have kept it off the cloud.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
             recognizer = TwoPhaseRecognizer(cloud_observation=PlateObservation("12D3456", 0.99))
-            processor = self._processor(
-                directory, recognizer, database="b.db", departing=lambda: "shadow",
-            )
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
             with self.assertLogs("gate_controller.processor", level="INFO") as journal:
                 prepared = processor.prepare((frame,))
-            self.assertTrue(any("cloud_skip_shadow would=departing frames=1" in line
-                                for line in journal.output), journal.output)
+            self.assertTrue(any("would=departing frames=1" in line
+                                for line in shadow_lines(journal)), journal.output)
             self.assertIsNone(prepared.cloud_skip, "shadow must not skip")
             self.assertTrue(prepared.route_to_cloud_lane())
             prepared.discard("test")
 
-            # A decided first frame with more behind it: `on` would keep the rest off.
+        # A decided first frame with more behind it: `on` would keep the rest off.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            second = self._jpeg(directory, "second.jpg", 140)
             recognizer = TwoPhaseRecognizer(local_plate="99ZZ9999", local_confidence=0.99)
-            processor = self._processor(
-                directory, recognizer, database="c.db", departing=lambda: "shadow",
-            )
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
             with self.assertLogs("gate_controller.processor", level="INFO") as journal:
                 prepared = processor.prepare((frame, second))
-            self.assertTrue(any("cloud_skip_shadow would=departing frames=2" in line
-                                for line in journal.output), journal.output)
+            self.assertTrue(any("would=departing frames=2" in line
+                                for line in shadow_lines(journal)), journal.output)
             self.assertIsNone(prepared.offline)
             processor.process((frame, second), prepared=prepared)
 
