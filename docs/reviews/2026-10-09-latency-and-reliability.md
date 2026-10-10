@@ -125,7 +125,7 @@ alarm:
 
 | Vehicle | Arrival passages | Opened | Alarm → relay | Misreads within 2 characters |
 | --- | --- | --- | --- | --- |
-| Audi Q5 `131D2696` | 9 | 8 (the miss, 4739, was a departure) | 4.4, 4.7, 5.2, 5.7, 7.4, 8.6, 10.5, 11.2 s | `131D2686` ×1 |
+| Audi Q5 `131D2696` | 8 | 8 | 4.4, 4.7, 5.2, 5.7, 7.4, 8.6, 10.5, 11.2 s | `131D2686` ×1 |
 | D-Max `172L66` | 4 | 3 | 4.7, 6.4, 67.7 s | `172L61` ×5, `172L699`, `J72L69` |
 | Landcruiser `11WH2397` | 3 | 3 | 4.3, 5.5, 8.4 s | none |
 | Yeti `10CE1990` | 3 | 3 | 2.7, 4.3, 4.9 s | `10CE990`, `10CE1991`, `10CE1930` |
@@ -135,7 +135,7 @@ review measured why: its plate is 197-274 px at the stop, under the
 ~240-280 px where the other cars' reads succeed, and when it stops close the
 plate is cut by the right edge of the picture (x 0.94-0.97). Its misreads are
 the trailing `66`, the smallest and most edge-cut characters. Every vehicle
-except the D-Max has fewer than five passages here.
+except the Audi has fewer than five passages here. (The Audi's departure 4739, which the Pi correctly did not open, is not counted.)
 
 The other failed passages in this window, identified from the photos, are not
 household arrivals and were correctly refused:
@@ -254,7 +254,7 @@ The decode-width costs are in Task 1 below.
 
 | # | Change | Expected gain | Cost / risk | Who | Invariants |
 | --- | --- | --- | --- | --- | --- |
-| 1 | **More pixels on the D-Max's plate at the stop** (the stop-position re-aim in [reolink-rlc-811a.md](../reolink-rlc-811a.md), or a mark on the drive where it should stop) | The one household failure mode: a 53 s wait and a 67 s wait in 4 passages | Camera aim is a camera write in daylight with the gate quiet; everything else must be re-checked after it | User | 7 |
+| 1 | **More pixels on the D-Max's plate where it waits: a stop mark on the drive about 3-5 m out**, so it stops inside the readable zone (plate within about 45 degrees of the lens). Not a re-aim to the stop: from this mount a car at the gate is 40-90 degrees off and unreadable, so the camera stays aimed at the approach ([reolink-rlc-811a.md](../reolink-rlc-811a.md#capture-at-the-stop)) | The one household failure mode: a 53 s wait and a 67 s wait in 4 passages | A painted mark or marker post; no camera change | User | none |
 | 2 | **The TOPENS board stops the gate on a second photocell block and does not re-close** (manual: "reverse the gate upon first obstruction and stop upon a second sequential obstruction"), so ship a notify-only "gate left open" alert | 39 min open on 9 Oct; an alert within ~10 min (1.5 a week on history, about 0.7 false) | The alert never pulses; its Close button needs the user to confirm they can see the gate fully open, because a pulse into a gate stopped part-way can cross the leaves | Done: #202, access-gate-ui#94, #95 | 1, 3, 11 |
 | 3 | **Journal skip counts per sweep** (`skipped_empty`, `skipped_corrupt` on `outcome=ended`), and keep one skipped frame per sweep for review | Explains the daytime sweeps that read nothing, one of which a 4K still rescued | Journal and disk only | Done: #203 | none |
 | 4 | **End the waiting phase on a dark, plate-less scene.** The idle baseline was captured while the floodlight was on, so no black frame could match it | 70-80 s of pointless reads per night departure, now ~5 s | Invariant 6 kept: a dark frame is never skipped unread, and a plate box restarts the count; new guards listed under invariant 6 | Done: #204 | 6 |
