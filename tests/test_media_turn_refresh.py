@@ -140,11 +140,13 @@ class MediaTurnRefreshTests(unittest.TestCase):
         # (2026-10-10). Exit 75 is retried in minutes; exit 1 waits for the
         # timer, whose OnUnitInactiveSec counts from a failed run too.
         self.assertEqual(75, EXIT_TRY_AGAIN)
-        self.assertEqual("on-failure", service["Service"].get("Restart"))
+        # Only exit 75 is retried: a general on-failure policy would also
+        # retry a flock setup error, a start timeout or a signal.
+        self.assertEqual("no", service["Service"].get("Restart"))
+        self.assertEqual([str(EXIT_TRY_AGAIN)],
+                         service["Service"].get("RestartForceExitStatus").split())
         self.assertEqual("2min", service["Service"].get("RestartSec"))
-        prevented = service["Service"].get("RestartPreventExitStatus").split()
-        self.assertIn("1", prevented)
-        self.assertNotIn(str(EXIT_TRY_AGAIN), prevented)
+        self.assertNotIn("RestartPreventExitStatus", service["Service"])
         self.assertNotIn("SuccessExitStatus", service["Service"])
         self.assertEqual("0", service["Unit"].get("StartLimitIntervalSec"))
         self.assertEqual("4h", timer["Timer"].get("OnUnitInactiveSec"))
@@ -489,7 +491,7 @@ configure_turn_refresh_timer
             self.assertEqual([], service.calls)
 
     def test_only_a_busy_or_failing_cloudflare_answer_is_worth_retrying(self):
-        for code, retryable in ((500, True), (503, True), (429, True),
+        for code, retryable in ((500, True), (503, True), (429, True), (408, True),
                                 (400, False), (401, False), (403, False), (404, False)):
             class Refusing:
                 def open(self, request, *, timeout, code=code):

@@ -125,7 +125,7 @@ def fetch_ice_servers(key_id: str, api_token: str):
     except HTTPError as error:
         # A refusal (bad token, unknown key) will not change in two minutes;
         # an overloaded or failing service may.
-        if error.code == 429 or error.code >= 500:
+        if error.code in (408, 429) or error.code >= 500:
             raise TurnRequestUnavailable("TURN credential request failed") from error
         raise TurnRefreshError("TURN credential request failed") from error
     except (URLError, OSError, TimeoutError) as error:
