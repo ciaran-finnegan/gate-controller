@@ -169,6 +169,9 @@ class ClearStreamSource:
     def scene_difference(self, frame: bytes) -> float | None:
         return self.scene.difference(frame)
 
+    def dark_scene_difference(self, frame: bytes) -> float | None:
+        return self.scene.dark_difference(frame)
+
     def latest(self, *, after: float | None = None) -> tuple[bytes, float] | None:
         """A live session frame newer than ``after``; otherwise the newest keyframe."""
         with self._session_lock:

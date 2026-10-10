@@ -52,6 +52,7 @@ from gate_controller.ocr import PlateRecognizerClient
 from gate_controller.plate_region import PlateRegion
 from gate_controller.processor import GateProcessor
 from gate_controller.reolink_events import SanitizedCameraEvent
+from gate_controller.scene import SceneBaseline
 from gate_controller.store import LocalStore
 from gate_controller.trigger_capture import TriggerCaptureConfig, TriggerFrameCapture
 from gate_controller.worker import run_worker
@@ -78,6 +79,22 @@ def frame(seed: int) -> bytes:
     image = Image.new("RGB", FRAME_SIZE, color=(seed * 7 % 256, seed * 13 % 256, 90))
     for x in range(0, FRAME_SIZE[0], 16):
         image.putpixel((x, (seed * 3 + x) % FRAME_SIZE[1]), (255, 255, 255))
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=92)
+    return output.getvalue()
+
+
+def dark_frame(seed: int) -> bytes:
+    """The drive with the camera's spotlight off: black but for the overlay text.
+
+    The black stills of 2026-10-09 21:42 measure a thumbnail mean of 7.4 and
+    differ from one another by 0.0013; this is that picture, one pixel of
+    sensor noise per seed so each frame is a distinct file.
+    """
+    image = Image.new("RGB", FRAME_SIZE, color=(6, 6, 6))
+    for x in range(180, 300):
+        image.putpixel((x, 4), (220, 220, 220))
+    image.putpixel((seed % FRAME_SIZE[0], 20 + seed % 200), (16, 16, 16))
     output = BytesIO()
     image.save(output, format="JPEG", quality=92)
     return output.getvalue()
@@ -115,6 +132,8 @@ class ScriptedEngine:
         plate, score = self.answers.get(key, (None, 0.0))
         if plate is None:
             return EngineResult(width=360, height=162, decode_ms=2, detect_ms=15)
+        # An empty plate is what the engine gives for a plate it boxed but
+        # could not read a character of: a box, no text, status `no_plate`.
         return EngineResult(
             reads=(EngineRead(plate=plate, confidence=score, detection_confidence=0.9,
                               box=(100, 60, 220, 100), mean_confidence=min(1.0, score + 0.05)),),
@@ -141,6 +160,9 @@ class LiveFrames:
         self.sessions = 0
         self.stopped = []
         self.empty = set()  # digests of frames that show the idle scene
+        # A real SceneBaseline, when a test wants the scene judged as the
+        # keyframe decoder would judge it, rather than by the script above.
+        self.scene = None
 
     def script(self, frames):
         with self._lock:
@@ -176,7 +198,12 @@ class LiveFrames:
         return available[-1] if available else None
 
     def scene_difference(self, data):
+        if self.scene is not None:
+            return self.scene.difference(data)
         return 0.0 if digest(data) in self.empty else 0.5
+
+    def dark_scene_difference(self, data):
+        return None if self.scene is None else self.scene.dark_difference(data)
 
 
 class StopHook:
@@ -653,6 +680,156 @@ class SweepPipelineTests(unittest.TestCase):
         # Two a second for two seconds, give or take the one in flight.
         self.assertLessEqual(gate.sweep_status()["waiting_reads"], 5)
         self.assertGreaterEqual(gate.sweep_status()["waiting_reads"], 2)
+
+    def _night(self, gate):
+        """The scene as the decoder had it at 21:42:23 on 2026-10-09.
+
+        The drive had been dark for an hour (the dark idle frame), then the
+        spotlight came on with motion a minute before the alarm and the
+        baseline was refreshed under it (the lit idle frame).
+        """
+        clock = [1000.0]
+        gate.frames.scene = SceneBaseline(
+            idle_seconds=0.0, refresh_seconds=30.0, clock=lambda: clock[0],
+        )
+        self.assertTrue(gate.frames.scene.observe(dark_frame(9000)))
+        clock[0] += 30.0
+        self.assertTrue(gate.frames.scene.observe(frame(901)))
+        black = dark_frame(9001)
+        self.assertGreater(gate.frames.scene_difference(black), 0.3,
+                           "against the spotlit baseline a black frame is never empty")
+        self.assertLess(gate.frames.dark_scene_difference(black), 0.03)
+
+    def test_a_black_drive_after_the_spotlight_goes_off_ends_the_waiting_as_departed(self):
+        # 2026-10-09 21:42: the Audi departed under the spotlight; the light
+        # went off within 25 s and the sweep read 152 black frames to its
+        # 80 s cap because black never matched the spotlit baseline.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        lit = [frame(seed) for seed in range(500, 512)]
+        black = [dark_frame(seed) for seed in range(512, 560)]
+        gate = self._gate(answers={}, sweep_seconds=1.0, waiting=14.0, waiting_fps=2.0,
+                          empty_scene=0.03)
+        self._night(gate)
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(lit)]
+        script += [(1.6 + index * 0.25, data) for index, data in enumerate(black)]
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 14.0),
+                logs.text(),
+            )
+            elapsed = monotonic() - started
+        self.assertIn("gate_local_sweep stage=departed_dark", logs.text())
+        self.assertIn("gate_local_sweep outcome=ended reason=departed", logs.text())
+        self.assertNotIn("reason=wait_cap", logs.text())
+        # Ten looks at two a second after the window, not the whole cap.
+        self.assertLess(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 3.0)
+        # The black frames were read, not skipped blind: a plate lamp is
+        # below what the thumbnail can see, so only the reader may say no.
+        # (The engine is handed the plate band, so that is what it saw.)
+        bands_read = sum(1 for data in black if gate.engine.was_read(crop_to_region(data, REGION)))
+        self.assertGreaterEqual(bands_read, SWEEP_DARK_DEPARTED_FRAMES)
+        self.assertEqual(gate.sweep_status()["dark_departed"], 1)
+        self.assertEqual(gate.relay_calls, [])
+
+    def test_a_car_in_the_dark_whose_plate_is_boxed_is_read_to_the_cap(self):
+        # Invariant 6 in the dark: the same black drive, but the reader boxes
+        # a plate it cannot read a character of (a plate lamp, no spotlight).
+        # Nothing may end that passage before the cap.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        lit = [frame(seed) for seed in range(600, 612)]
+        black = [dark_frame(seed) for seed in range(612, 672)]
+        # The engine sees the plate band of each frame; a boxed, unread plate
+        # is an empty plate text.
+        gate = self._gate(
+            answers={digest(crop_to_region(data, REGION)): ("", 0.0) for data in black},
+            sweep_seconds=1.0, waiting=9.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        self._night(gate)
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(lit)]
+        script += [(1.6 + index * 0.25, data) for index, data in enumerate(black)]
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 14.0),
+                logs.text(),
+            )
+            elapsed = monotonic() - started
+        self.assertIn("reason=wait_cap", logs.text())
+        self.assertNotIn("reason=departed", logs.text())
+        self.assertNotIn("stage=departed_dark", logs.text())
+        # Long past where an unboxed black drive would have ended it.
+        self.assertGreater(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 2.0)
+        bands_read = sum(1 for data in black if gate.engine.was_read(crop_to_region(data, REGION)))
+        self.assertGreaterEqual(bands_read, SWEEP_DARK_DEPARTED_FRAMES)
+        self.assertEqual(gate.sweep_status()["dark_departed"], 0)
+        self.assertEqual(gate.relay_calls, [])
+
+    def test_a_boxed_plate_on_a_quiet_night_is_read_to_the_cap_not_skipped_as_empty(self):
+        # The commoner night: no spotlit refresh before the alarm, so the idle
+        # baseline is itself black and every black frame "is the idle drive".
+        # Before #204 that was three unread looks and `departed`, plate lamp
+        # or not. Now a dark frame is read, and a boxed plate keeps it read.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        lit = [frame(seed) for seed in range(800, 812)]
+        black = [dark_frame(seed) for seed in range(812, 872)]
+        gate = self._gate(
+            answers={digest(crop_to_region(data, REGION)): ("", 0.0) for data in black},
+            sweep_seconds=1.0, waiting=9.0, waiting_fps=2.0, empty_scene=0.03,
+        )
+        gate.frames.scene = SceneBaseline(idle_seconds=0.0, clock=lambda: 1000.0)
+        self.assertTrue(gate.frames.scene.observe(dark_frame(9000)))
+        self.assertLess(gate.frames.scene_difference(black[0]), 0.03,
+                        "to the ordinary baseline a black frame is the empty drive")
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(lit)]
+        script += [(1.6 + index * 0.25, data) for index, data in enumerate(black)]
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 14.0),
+                logs.text(),
+            )
+            elapsed = monotonic() - started
+        self.assertIn("reason=wait_cap", logs.text())
+        self.assertNotIn("reason=departed", logs.text())
+        self.assertGreater(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 2.0)
+        bands_read = sum(1 for data in black if gate.engine.was_read(crop_to_region(data, REGION)))
+        self.assertGreaterEqual(bands_read, SWEEP_DARK_DEPARTED_FRAMES)
+        self.assertEqual(gate.relay_calls, [])
+
+    def test_a_black_drive_with_no_dark_idle_frame_on_record_is_read_to_the_cap(self):
+        # The conservative side of the rule: a controller restarted during the
+        # passage, or one whose first night this is, has no dark idle frame
+        # and keeps the old behaviour.
+        from gate_controller.trigger_capture import SWEEP_DARK_DEPARTED_FRAMES
+        lit = [frame(seed) for seed in range(700, 712)]
+        black = [dark_frame(seed) for seed in range(712, 772)]
+        gate = self._gate(answers={}, sweep_seconds=1.0, waiting=9.0, waiting_fps=2.0,
+                          empty_scene=0.03)
+        gate.frames.scene = SceneBaseline(idle_seconds=0.0, clock=lambda: 1000.0)
+        self.assertTrue(gate.frames.scene.observe(frame(901)))
+        self.assertIsNone(gate.frames.dark_scene_difference(black[0]))
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(lit)]
+        script += [(1.6 + index * 0.25, data) for index, data in enumerate(black)]
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            started = monotonic()
+            gate.alarm()
+            self.assertTrue(
+                wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 14.0),
+                logs.text(),
+            )
+            elapsed = monotonic() - started
+        self.assertIn("reason=wait_cap", logs.text())
+        self.assertNotIn("stage=departed_dark", logs.text())
+        self.assertGreater(elapsed, 1.0 + SWEEP_DARK_DEPARTED_FRAMES / 2.0 + 2.0)
+        self.assertEqual(gate.relay_calls, [])
 
     def test_a_new_alarm_is_not_kept_waiting_by_the_waiting_phase(self):
         frames = [frame(seed) for seed in range(360, 460)]

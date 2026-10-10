@@ -342,7 +342,38 @@ it is a fact about a file, not about a vehicle) and the reader goes on at
 alarm started (`GATE_SESSION_SECONDS`, 90). It stops on an open, a conclusive
 denial, a new alarm, three consecutive frames of empty drive, or the cap:
 `gate_local_sweep stage=waiting ...`, then `outcome=ended
-reason=opened|departed|wait_cap|new_event|... waiting_reads=N`. The cap covers
+reason=opened|departed|wait_cap|new_event|... waiting_reads=N`.
+
+"Empty drive" is a frame within `GATE_EMPTY_SCENE_THRESHOLD` of the idle
+baseline, and at night the baseline needs a second reading. The drive's only
+light after dark is the camera's spotlight, which comes on with motion before
+the alarm and goes off some 20 s after the last of it, so the baseline is
+refreshed under it (an early-trigger observation does not count as activity)
+and a black frame never matches it: on 2026-10-09 21:42 the departing Audi
+took the light with it and the sweep read 152 black frames to the cap
+(thumbnail mean 7.4 against the lit baseline's 106, difference 0.385; 8 Oct
+19:27 was the same, 157 reads). The keyframe decoder therefore also keeps the
+newest *dark* idle frame, and while waiting a dark frame is scored against
+that as well (black against black measures 0.0013). A dark match is **not**
+treated like a lit one: a plate lamp lights about nine of a thumbnail's
+5,184 pixels, below the noise between two black frames, so the frame is still
+read, and only a read that completed with neither characters nor a plate box
+counts. That holds whichever baseline the frame matches: on a quiet night the
+alarm comes before any spotlit refresh, the idle baseline is itself black,
+and until #204 a black frame "was the empty drive" and three unread looks
+ended the wait, plate lamp or not. A dark frame is now never skipped unread,
+in the window or while waiting, so a spotlight that goes out in the window's
+last seconds cannot end the sweep at the window's close either. Ten such
+reads in a row while waiting (`SWEEP_DARK_DEPARTED_FRAMES`, 5 s at two a
+second) end it as `stage=departed_dark ... reason=departed`. A box, a read, a
+lit frame or a failed read starts the run again; a busy reader, which said
+nothing about its frame, neither counts toward the ten nor resets them; with
+no dark idle frame on record (a restart mid-passage) the rule is out of it.
+In every one of those the car is read to the cap as before. The 15 s status
+counts these under
+`recognition.trigger_capture.sweep.dark_departed`.
+
+The cap covers
 the passage above (first authorisable read at +30.8 s) with room to spare:
 until 2026-10-05 it was 30 s at one read a second, and in the 36 h to that
 evening three sweeps ended `wait_cap` with the car still at the gate (an Audi

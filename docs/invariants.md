@@ -110,11 +110,28 @@ read on two frames.
   cloud misread (`1SU2U` at 0.811) could end a passage. Fixed by #196.
 - **2026-10-07 18:35** -- a pickup stopped too close for its plate to be found
   was let in at +66 s when it moved; the old 40 s cap would have missed it.
+- **2026-10-09 21:42** -- the other direction: an Audi departed under the
+  camera's spotlight, the light went off, and the sweep read 152 black frames
+  to the cap because the idle baseline had been refreshed under the spotlight
+  and black never matched it (8 Oct 19:27: 157). The dark-drive rule (#204)
+  ends the waiting when a dark frame matches the newest *dark* idle frame
+  **and** the reader found neither characters nor a plate box in it, ten
+  looks running. It is a second way to say "gone", so it is also a new way
+  for this invariant to fail: a car in the dark whose plate is lit at all
+  gives the reader a box, and that must keep it being read. The same PR
+  closed the older hole on a quiet night, where the baseline is itself black
+  and three *unread* black looks used to end the wait, or the window: a dark
+  frame always goes to the reader now, in the window and while waiting.
 
 Guards:
 
 - `tests/test_local_sweep.py::LocalSweepTests::test_with_the_shipped_defaults_a_car_still_at_the_gate_at_65_s_is_still_read`
 - `tests/test_trigger_capture.py::test_a_confident_read_in_no_registration_shape_never_ends_the_passage`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_car_in_the_dark_whose_plate_is_boxed_is_read_to_the_cap`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_boxed_plate_on_a_quiet_night_is_read_to_the_cap_not_skipped_as_empty`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_black_drive_with_no_dark_idle_frame_on_record_is_read_to_the_cap`
+- `tests/test_local_sweep.py::LocalSweepTests::test_a_boxed_plate_in_the_dark_starts_the_run_again`
+- `tests/test_local_sweep.py::LocalSweepTests::test_a_failed_read_in_the_dark_is_not_an_empty_drive`
 
 ## 7. The camera lens is never left changed
 
