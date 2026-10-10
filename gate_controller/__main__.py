@@ -198,7 +198,9 @@ def main() -> None:
         os.environ, Path(arguments.database).resolve().parent,
         webhook_enabled=load_reolink_webhook_config(os.environ).enabled,
     )
-    clear_keyframes = _clear_stream_source(trigger_capture_config)
+    clear_keyframes = _clear_stream_source(
+        trigger_capture_config, local_recognizer=local_recognizer, plate_region=plate_region,
+    )
     # The network probe is built here, ahead of everything that asks it,
     # because three things below share its one answer: the sweep asks it
     # before handing a frame to the cloud, the processor before queueing a
@@ -579,16 +581,21 @@ def _training_corpus(environment):
 
 
 
-def _clear_stream_source(config):
+def _clear_stream_source(config, local_recognizer=None, plate_region=None):
     """The clear-stream frame source for webhook capture, or None when off.
 
     "compressed" (default) records packets and decodes only for events;
-    "decoded" keeps the older continuously decoding keyframe ring.
+    "decoded" keeps the older continuously decoding keyframe ring. Either
+    way the idle-scene baseline asks the on-device detector before it adopts
+    a keyframe, so a car waiting at the gate never becomes "the empty drive"
+    (scene.py; 2026-10-10 10:05). Without a local recogniser there is no
+    detector to ask and the baseline refreshes as it always did.
     """
     if not (config.enabled and config.hot_keyframes):
         return None
+    vehicle_check = _baseline_vehicle_check(local_recognizer, plate_region)
     if config.clear_stream_mode == "decoded":
-        return ClearKeyframeBuffer(config)
+        return ClearKeyframeBuffer(config, vehicle_check=vehicle_check)
     from .clear_stream_source import ClearStreamSource
     from .trigger_capture import decoder_filters, decoder_input_arguments
     return ClearStreamSource(
@@ -599,7 +606,25 @@ def _clear_stream_source(config):
         session_fps=config.session_fps,
         session_seconds=config.session_seconds,
         source_fps=config.source_fps,
+        vehicle_check=vehicle_check,
     )
+
+
+def _baseline_vehicle_check(local_recognizer, plate_region):
+    """The detector probe the scene baseline asks of a frame, or None.
+
+    The detector sees the plate band exactly as the sweep hands it over
+    (``crop_to_region``), so what it clears for the baseline is what the sweep
+    would have been able to read.
+    """
+    if local_recognizer is None or not getattr(local_recognizer, "enabled", False):
+        return None
+    from .local_sweep import crop_to_region
+
+    def plate_boxed(frame: bytes) -> bool | None:
+        return local_recognizer.plate_boxed(crop_to_region(frame, plate_region))
+
+    return plate_boxed
 
 
 

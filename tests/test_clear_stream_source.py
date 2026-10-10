@@ -406,3 +406,59 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertEqual(source.latest(after=None), (decoded, 100.0))
         never.set()
         source.stop_session("test")
+
+    def test_a_keyframe_the_detector_boxes_a_plate_in_is_never_adopted_as_the_idle_drive(self):
+        # 2026-10-10 10:05: the D-Max waited at the stop through two 30 s
+        # refreshes with no alarm, and the recording loop's refresh adopted it.
+        # The refresh now shows the keyframe to the detector first, on this
+        # same thread, and keeps the old baseline when it boxes a plate.
+        empty = jpeg((120, 120, 120), size=(192, 108))
+        car = jpeg((235, 235, 235), size=(192, 108))
+        decoded = [empty, car, car]
+        asked = []
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            return FakeProcess(output=decoded.pop(0))
+
+        def vehicle_check(frame):
+            asked.append(frame)
+            return frame == car
+
+        source, popen = self.source(factory, vehicle_check=vehicle_check)
+        source.ring.feed(STREAM)
+        with self.assertLogs("gate_controller.scene", level="INFO") as logs:
+            source._maybe_refresh_baseline()            # idle: the empty drive
+            self.clock[0] += 90.0                        # the car has stood there since
+            source._maybe_refresh_baseline()            # the keyframe is the car: refused
+            self.clock[0] += 30.0
+            source._maybe_refresh_baseline()            # and again
+        self.assertEqual(asked, [empty, car, car])
+        self.assertEqual(source.scene.status()["refreshes"], 1)
+        self.assertEqual(source.scene.status()["refused_vehicle"], 2)
+        self.assertGreater(source.scene_difference(car), 0.03, "the car differs from the idle drive: read")
+        self.assertLess(source.scene_difference(empty), 0.03)
+        self.assertEqual(source.status()["scene"]["refused_vehicle"], 2)
+        self.assertEqual(len(logs.output), 1, "one journal line for the run of refusals")
+        self.assertIn("outcome=refresh_refused reason=plate_box", logs.output[0])
+
+    def test_the_detector_is_not_asked_while_a_session_is_reading(self):
+        # The refresh never runs during a session, so the sweep's frames never
+        # find the one worker taken by a baseline probe.
+        asked = []
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            process = FakeProcess()
+            process.stdout = Stdout([])
+            return process
+
+        source, popen = self.source(factory, vehicle_check=lambda frame: asked.append(frame) or False)
+        source.ring.feed(STREAM)
+        self.assertTrue(source.start_session())
+        self.clock[0] += 60.0
+        source._maybe_refresh_baseline()
+        self.assertEqual(asked, [])
+        source.stop_session("test")
