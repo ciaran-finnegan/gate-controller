@@ -174,3 +174,27 @@ then fails every run -- and a failing suite blocks every deploy (invariant 9).
 Guards:
 
 - `tests/test_early_trigger.py::test_pictures_are_aged_by_when_they_were_taken_not_by_the_wall_clock`
+
+## 11. Nothing that watches the gate can move it
+
+The sound scanner and the left-open check (`gate_left_open.py`) report what
+the gate seems to be doing; they never act on it. Neither imports the relay,
+the actuation coordinator or the command server. Neither sends a command or
+retries one, and nothing they report reaches the decision path. The only
+closing action the left-open alert offers is a person pressing the app's
+existing gate button. That goes through the app's command route, its
+`operator` role check and the 20 s command cooldown, exactly as a manual open
+does.
+
+- **2026-09-21** -- an audio-following harness decided the gate was "not
+  provably shut" and sent three recovery pulses, crossing the leaves; the gate
+  could not open until someone freed them by hand ([gate-operator.md](gate-operator.md)).
+- **2026-10-09** -- the gate stood open for 39 minutes after an interrupted
+  auto-close. The alert built for this (docs/gate-left-open.md) is notify-only
+  for the reason above.
+
+Guards:
+
+- `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_it_never_reaches_the_relay_or_the_actuation_coordinator`
+- `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_the_check_imports_nothing_that_can_move_the_gate`
+- `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_a_malformed_setting_changes_nothing_about_plate_matching`

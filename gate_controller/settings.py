@@ -21,6 +21,11 @@ expects::
       }
     }
 
+The envelope may also carry ``"gate_left_open": {"enabled": true,
+"threshold_minutes": 10}``, the owner's switch for the notify-only left-open
+alert (docs/gate-left-open.md). It is kept raw and parsed only when read; a
+malformed one is ignored and can never change or reject the schedule.
+
 Like the authorised-plate snapshot, a good document is cached on disk so a
 restart without the cloud keeps the schedule the owner configured. Unlike that
 snapshot, a *missing* document is not an error: it means no schedule has been
@@ -90,6 +95,14 @@ class MatchPolicyCache:
         self._configured = False
         self._refreshed_at: datetime | None = None
         self._last_error: str | None = None
+        # The envelope's `gate_left_open` object, kept raw and parsed only when
+        # read (gate_left_open.config_from_settings). It rides the same poll as
+        # the schedule and must never be able to change it: nothing about it
+        # is validated here, and nothing here raises over it.
+        self._left_open_section: object = None
+        self._left_open_path = (
+            self._path.with_name("gate-left-open.json") if self._path is not None else None
+        )
         self._load_cached()
 
     def get(self) -> MatchPolicy:
@@ -106,6 +119,11 @@ class MatchPolicyCache:
         to once the cloud serves something readable again, and the marker, not
         its absence, is what keeps the gate closed in the meantime.
         """
+        if not self._keep_left_open_section(document) and isinstance(document, dict):
+            # The section was refused; the schedule beside it is judged, and
+            # cached, without it, so an oversized alert setting can neither
+            # stick nor stop a good schedule surviving a restart.
+            document = {key: value for key, value in document.items() if key != "gate_left_open"}
         try:
             policy = policy_from_settings(document)
         except MatchPolicyError as error:
@@ -126,6 +144,41 @@ class MatchPolicyCache:
             self._configured = True
             self._refreshed_at = self._clock()
             self._last_error = None
+
+    def _keep_left_open_section(self, document: object) -> bool:
+        """Adopt the envelope's left-open section, and keep it for a restart.
+
+        Persisted on its own, beside the schedule's cache, because the two are
+        accepted independently: an envelope whose schedule is refused is not
+        cached, and restoring the left-open switch from that older cache would
+        undo a change the owner made in the same envelope.
+        """
+        section = document.get("gate_left_open") if isinstance(document, dict) else None
+        section = section if isinstance(section, dict) else None
+        encoded = json.dumps({"gate_left_open": section}, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_SETTINGS_BYTES:
+            # Not adopted at all: one that cannot be kept would be undone by
+            # the next restart. The two real fields are a few dozen bytes.
+            LOGGER.warning("left-open alert settings too large; keeping the previous ones")
+            return False
+        with self._lock:
+            changed = section != self._left_open_section
+            self._left_open_section = section
+        if changed and self._left_open_path is not None:
+            _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
+        return True
+
+    def gate_left_open(self, fallback):
+        """The left-open alert's switch and threshold, or ``fallback``.
+
+        Notify only, and independent of the schedule: a malformed section
+        leaves ``fallback`` in force and the plate-matching policy untouched.
+        """
+        from .gate_left_open import config_from_settings
+
+        with self._lock:
+            section = self._left_open_section
+        return config_from_settings(section, fallback)
 
     def mark_refresh_error(self, error: Exception) -> None:
         with self._lock:
@@ -153,6 +206,7 @@ class MatchPolicyCache:
             }
 
     def _load_cached(self) -> None:
+        self._load_cached_left_open()
         rejection = self._read_rejection()
         if rejection is not None:
             # The cloud was serving a document this controller refused when it
@@ -183,6 +237,25 @@ class MatchPolicyCache:
         self._refreshed_at = datetime.fromtimestamp(
             self._path.stat().st_mtime, timezone.utc
         )
+
+    def _load_cached_left_open(self) -> None:
+        """The last left-open section received, so a restart keeps it.
+
+        Its own file first; the schedule's cached envelope only for a board
+        that has never written one.
+        """
+        for path in (self._left_open_path, self._path):
+            if path is None or not path.exists():
+                continue
+            try:
+                if path.stat().st_size > MAX_SETTINGS_BYTES:
+                    continue
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            section = document.get("gate_left_open") if isinstance(document, dict) else None
+            self._left_open_section = section if isinstance(section, dict) else None
+            return
 
     def _persist(self, document: object) -> None:
         if self._path is None:

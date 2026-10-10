@@ -333,7 +333,8 @@ def already_scanned(connection) -> set[str]:
         return set()
 
 
-def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
+def gate_state(connection, *, now=None, recent_hours: int = 24,
+               left_open_config=None) -> dict | None:
     """What the microphone says the gate is doing, for the heartbeat.
 
     ``state`` is what the last movement left behind, and ``open_for_seconds``
@@ -413,6 +414,16 @@ def gate_state(connection, *, now=None, recent_hours: int = 24) -> dict | None:
     }
     # Additive, and absent until the scanner has measured something.
     report.update(listening_state(connection, now=moment, recent_hours=recent_hours))
+    # Whether the gate may have been left standing open (docs/gate-left-open.md).
+    # Notify only: `gate_left_open` reads these rows and returns a dictionary,
+    # and nothing it can reach is able to move the gate.
+    if left_open_config is not None:
+        from .gate_left_open import evaluate
+
+        try:
+            report["left_open"] = evaluate(connection, left_open_config, now=moment)
+        except Exception:
+            report["left_open"] = {"state": "unknown", "reason": "error"}
     return report
 
 
