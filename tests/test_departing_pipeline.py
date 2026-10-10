@@ -317,6 +317,7 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertNotIn("reason=departing", text)
         self.assertNotIn("would=departing", text)
         self.assertEqual(gate.sweep_status()["departing_skip"], "off")
+        self.assertEqual(gate.sweep_status()["departing"], 0, "off must not judge")
 
 
 if __name__ == "__main__":

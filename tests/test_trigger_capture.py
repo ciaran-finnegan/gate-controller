@@ -400,7 +400,12 @@ class DepartingPlateTests(unittest.TestCase):
         passage = SweepPassage(ORIGIN_CAMERA, started_at=200.0)
         judge = passage.departing
         self.assertEqual(judge.alarm_at, 200.0)
-        self.assertFalse(judge.note(330, 199.6))     # buffered, captured before the alarm
+        # Two buffered frames from before the alarm: the last car leaving, big
+        # then smaller. Neither is measured, so no verdict is ever recorded.
+        self.assertFalse(judge.note(330, 199.4))
+        self.assertFalse(judge.note(200, 199.8))
+        self.assertEqual(judge.peak_px, 0)
+        self.assertIsNone(judge.last_at)
         self.assertFalse(judge.note(150, 200.4))     # the arriving car, far off
         self.assertFalse(judge.note(150, 200.9))
         self.assertEqual(judge.peak_px, 150, "the last car's plate counted against this one")

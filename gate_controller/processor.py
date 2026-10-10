@@ -528,17 +528,35 @@ class GateProcessor:
                 prepared.cloud_skip = CLOUD_SKIP_DEPARTING
             prepared.offline = CLOUD_SKIP_DEPARTING
         elif mode == "shadow" and (
-            (prepared.cloud_skip is None and not prepared.decided) or len(prepared.paths) > 1
+            (prepared.cloud_skip is None and not prepared.decided)
+            or (len(prepared.paths) > 1 and not self._first_frame_grants(prepared))
         ):
             # Journalled only where `on` would have changed what is sent: an
             # undecided first frame no other skip already covers, or a burst
-            # with further frames to keep off the cloud. A decided single
-            # frame is answered by its own read either way, and counting it
-            # would overstate what switching the rule on would save.
+            # with further frames to keep off the cloud -- unless its first
+            # frame is a device grant, after which nothing else is read. A
+            # decided single frame is answered by its own read either way,
+            # and counting it would overstate what switching the rule on
+            # would save.
             logging.getLogger(__name__).info(
                 "gate_ocr stage=cloud_skip_shadow would=%s frames=%d",
                 CLOUD_SKIP_DEPARTING, len(prepared.paths),
             )
+
+    def _first_frame_grants(self, prepared: PreparedBurst) -> bool:
+        """Whether the first frame's device read names a listed plate. Journal only.
+
+        The grant itself is `process`'s to make, under the band and the
+        cooldown; this is the shadow journal's guess at it, and a guess that
+        cannot be made counts as no grant, so the line is kept.
+        """
+        try:
+            if not prepared.decided:
+                return False
+            plate = getattr(prepared.local_attempt.observation, "plate", None)
+            return bool(plate) and plate in set(self._authorised())
+        except Exception:
+            return False
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,
                             stillness: float | None, sweep_read=None) -> None:

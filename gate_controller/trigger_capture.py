@@ -865,6 +865,13 @@ class DepartingPlate:
         if width <= 0:
             return self.receding
         try:
+            if self.alarm_at is not None and now is not None and now <= self.alarm_at \
+                    and self.last_at is None:
+                # A frame captured before the alarm, in a passage that has
+                # measured nothing yet: a keyframe buffered from before the
+                # passage began, showing whatever car was there last. Not
+                # this car's, so not measured at all.
+                return self.receding
             # The first read begun since a new car came into view: nothing
             # measured before it is about this car. A read begun before the
             # alarm is the last car's, however late it finished.
@@ -2031,7 +2038,13 @@ class TriggerFrameCapture:
 
     def _note_departing(self, passage, plate_px: int, read_at: float,
                         sweep_started_at: float) -> None:
-        """Feed one boxed read to the passage's departure rule; journal the first verdict."""
+        """Feed one boxed read to the passage's departure rule; journal the first verdict.
+
+        Under ``off`` nothing is judged, journalled or counted.
+        """
+        mode = self.config.sweep_departing_skip
+        if mode not in ("on", "shadow"):
+            return
         try:
             receding = passage.departing.note(plate_px, read_at)
         except Exception:
@@ -2040,13 +2053,11 @@ class TriggerFrameCapture:
             return
         passage.departing.noticed = True
         self._sweep_departing += 1
-        mode = self.config.sweep_departing_skip
-        if mode in ("on", "shadow"):
-            LOGGER.info(
-                "gate_local_sweep stage=departing mode=%s peak_px=%d plate_px=%d at_ms=%d",
-                mode, passage.departing.peak_px, plate_px,
-                round(max(0.0, self._clock() - sweep_started_at) * 1000),
-            )
+        LOGGER.info(
+            "gate_local_sweep stage=departing mode=%s peak_px=%d plate_px=%d at_ms=%d",
+            mode, passage.departing.peak_px, plate_px,
+            round(max(0.0, self._clock() - sweep_started_at) * 1000),
+        )
 
     def _cloud_reachable(self) -> bool:
         """False only when the probe answers a definite False; see `__init__`."""

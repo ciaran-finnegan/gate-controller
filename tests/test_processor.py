@@ -3405,7 +3405,7 @@ class InternetDownTests(unittest.TestCase):
             self.assertTrue(prepared.route_to_cloud_lane())
             prepared.discard("test")
 
-        # A decided first frame with more behind it: `on` would keep the rest off.
+        # A refused first frame with more behind it: `on` would keep the rest off.
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")
             second = self._jpeg(directory, "second.jpg", 140)
@@ -3417,6 +3417,19 @@ class InternetDownTests(unittest.TestCase):
                                 for line in shadow_lines(journal)), journal.output)
             self.assertIsNone(prepared.offline)
             processor.process((frame, second), prepared=prepared)
+
+        # A device grant on the first frame with more behind it: nothing else
+        # is read after a grant, so `on` would send nothing it does not send.
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            second = self._jpeg(directory, "second.jpg", 140)
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "shadow")
+            with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+                prepared = processor.prepare((frame, second))
+            self.assertEqual(shadow_lines(journal), [])
+            result = processor.process((frame, second), prepared=prepared)
+            self.assertTrue(result.opened)
 
     def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
         with tempfile.TemporaryDirectory() as directory:
