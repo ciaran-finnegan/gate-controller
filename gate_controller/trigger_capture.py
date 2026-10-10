@@ -859,14 +859,16 @@ class DepartingPlate:
         if width <= 0:
             return self.receding
         try:
-            stale = self.alarm_at is not None and (
-                self.last_at is None or self.last_at <= self.alarm_at
+            # The first read begun since a new car came into view: nothing
+            # measured before it is about this car. A read begun before the
+            # alarm is the last car's, however late it finished.
+            first_since_alarm = (
+                self.alarm_at is not None and now is not None and now > self.alarm_at
+                and (self.last_at is None or self.last_at <= self.alarm_at)
             )
         except TypeError:
-            stale = False
-        if stale:
-            # The first read since a new car came into view: nothing measured
-            # before it is about this car.
+            first_since_alarm = False
+        if first_since_alarm:
             alarm_at = self.alarm_at
             self.lapse()
             self.alarm_at = alarm_at
@@ -1897,7 +1899,10 @@ class TriggerFrameCapture:
                 if read.recognised:
                     # Only a box the recogniser put characters on: a box with
                     # no text in it is as likely a bumper or a sign as a plate.
-                    self._note_departing(passage, plate_px, sweep_started_at)
+                    # Timed by when the read began, so an alarm that lands
+                    # while the reader is busy with a frame of this car does
+                    # not make that frame the next car's first.
+                    self._note_departing(passage, plate_px, last_read_at, sweep_started_at)
             # While waiting: a dark frame that is the unlit idle drive to the
             # baseline and nothing to the reader -- no characters and no box,
             # from a read that completed. Anything else -- a plate, a box, a
@@ -2013,10 +2018,11 @@ class TriggerFrameCapture:
         )
         return injected + fallback + handovers
 
-    def _note_departing(self, passage, plate_px: int, sweep_started_at: float) -> None:
+    def _note_departing(self, passage, plate_px: int, read_at: float,
+                        sweep_started_at: float) -> None:
         """Feed one boxed read to the passage's departure rule; journal the first verdict."""
         try:
-            receding = passage.departing.note(plate_px, self._clock())
+            receding = passage.departing.note(plate_px, read_at)
         except Exception:
             return
         if not receding or passage.departing.noticed:

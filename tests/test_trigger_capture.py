@@ -373,6 +373,24 @@ class DepartingPlateTests(unittest.TestCase):
             self.assertEqual(judge.note(width, 106.0 + at), at == 3)
         self.assertTrue(judge.receding_since_alarm(109.5))
 
+    def test_a_read_begun_before_the_alarm_stays_the_last_cars_however_late_it_finishes(self):
+        # Reads are timed by when they began. An alarm that lands while the
+        # reader is busy with a frame of the departing car must not make that
+        # frame the next car's first read and wipe the verdict the sweep's
+        # fallback is about to be handed over with.
+        judge = DepartingPlate()
+        for at, width in enumerate([320, 320, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.2))
+        judge.alarm(103.3)                       # lands mid-read
+        self.assertTrue(judge.note(180, 103.2), "the in-flight read began before the alarm")
+        self.assertEqual(judge.peak_px, 320)
+        self.assertTrue(judge.receding_at(103.5), "the fallback's verdict was wiped")
+        self.assertFalse(judge.receding_since_alarm(103.5))
+        # The first read begun after the alarm is the new car's.
+        self.assertFalse(judge.note(150, 103.6))
+        self.assertEqual(judge.peak_px, 150)
+
     def test_a_carried_verdict_answers_the_same_whatever_happens_next(self):
         carried = CarriedDeparture("on")
         self.assertEqual(carried(), "on")
