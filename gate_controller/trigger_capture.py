@@ -1899,10 +1899,10 @@ class TriggerFrameCapture:
                 if read.recognised:
                     # Only a box the recogniser put characters on: a box with
                     # no text in it is as likely a bumper or a sign as a plate.
-                    # Timed by when the read began, so an alarm that lands
-                    # while the reader is busy with a frame of this car does
-                    # not make that frame the next car's first.
-                    self._note_departing(passage, plate_px, last_read_at, sweep_started_at)
+                    # Timed by when the frame was captured, so an alarm that
+                    # lands while this frame of the car waits to be read, or
+                    # is being read, does not make it the next car's first.
+                    self._note_departing(passage, plate_px, captured_at, sweep_started_at)
             # While waiting: a dark frame that is the unlit idle drive to the
             # baseline and nothing to the reader -- no characters and no box,
             # from a read that completed. Anything else -- a plate, a box, a

@@ -3348,6 +3348,36 @@ class InternetDownTests(unittest.TestCase):
             self.assertTrue(result.opened, "a frame handed over before the verdict lost its lookup")
             self.assertEqual(recognizer.cloud_calls, [frame])
 
+    def test_a_refused_read_on_the_first_frame_still_keeps_the_rest_of_a_departing_burst_off_the_cloud(self):
+        # A confident read of a plate the list refuses decides its frame, and
+        # the loop then goes on to the burst's other frames; those must still
+        # be answered on the device.
+        class RefusedThenUnread(TwoPhaseRecognizer):
+            def local_pass(self, path, *, trace_id=None, budget=None):
+                passed = super().local_pass(path, trace_id=trace_id, budget=budget)
+                return passed if len(self.local_calls) == 1 else LocalPass(state={"frame": None})
+
+        with tempfile.TemporaryDirectory() as directory:
+            frames = (
+                self._jpeg(directory, "first.jpg", 100),
+                self._jpeg(directory, "second.jpg", 140),
+            )
+            recognizer = RefusedThenUnread(
+                local_plate="99ZZ9999", local_confidence=0.99,
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare(frames)
+            self.assertTrue(prepared.decided, "the first frame was decided on the device")
+            self.assertIsNone(prepared.cloud_skip, "a decided frame carries no skip")
+            self.assertEqual(prepared.offline, "departing")
+            result = processor.process(frames, prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(len(recognizer.local_calls), 2)
+            self.assertEqual(recognizer.cloud_calls, [], "a later frame posted after a refused read")
+
     def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

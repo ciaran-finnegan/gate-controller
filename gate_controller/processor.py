@@ -507,23 +507,24 @@ class GateProcessor:
         rear plate is decided before this and is untouched (#171).
         """
         ask = carried if carried is not None else self._departing
-        if (
-            ask is None or prepared.decided
-            or not _device_read(prepared.local_attempt)
-        ):
+        if ask is None or not _device_read(prepared.local_attempt):
             return
         try:
             mode = ask()
         except Exception:
             return
         if mode == "on":
-            # A reason already recorded for the first frame (the camera still
-            # held while a sweep reads) stands; the burst is departing either
-            # way. `cloud_skip` answers the first frame only, a camera burst
-            # can carry more, and the burst is kept on the burst thread: every
-            # frame of it is answered on the device (`_recognise`, the
-            # `offline` path), so none can take the slot or post from there.
-            if prepared.cloud_skip is None:
+            # `cloud_skip` answers the first frame, and only when the device
+            # did not decide it: a decided frame -- a grant, or a confident
+            # read the list refuses -- is answered by that read before any
+            # skip is looked at. A reason already recorded for it (the camera
+            # still held while a sweep reads) stands. A camera burst can carry
+            # more frames, and after a refused read the loop goes on to them,
+            # so the burst as a whole is marked: it is kept on the burst
+            # thread and every frame of it is answered on the device
+            # (`_recognise`, the `offline` path), none taking the slot or
+            # posting from there.
+            if prepared.cloud_skip is None and not prepared.decided:
                 prepared.cloud_skip = CLOUD_SKIP_DEPARTING
             prepared.offline = CLOUD_SKIP_DEPARTING
         elif mode == "shadow":
