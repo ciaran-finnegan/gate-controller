@@ -119,7 +119,11 @@ class MatchPolicyCache:
         to once the cloud serves something readable again, and the marker, not
         its absence, is what keeps the gate closed in the meantime.
         """
-        self._keep_left_open_section(document)
+        if not self._keep_left_open_section(document) and isinstance(document, dict):
+            # The section was refused; the schedule beside it is judged, and
+            # cached, without it, so an oversized alert setting can neither
+            # stick nor stop a good schedule surviving a restart.
+            document = {key: value for key, value in document.items() if key != "gate_left_open"}
         try:
             policy = policy_from_settings(document)
         except MatchPolicyError as error:
@@ -141,7 +145,7 @@ class MatchPolicyCache:
             self._refreshed_at = self._clock()
             self._last_error = None
 
-    def _keep_left_open_section(self, document: object) -> None:
+    def _keep_left_open_section(self, document: object) -> bool:
         """Adopt the envelope's left-open section, and keep it for a restart.
 
         Persisted on its own, beside the schedule's cache, because the two are
@@ -156,12 +160,13 @@ class MatchPolicyCache:
             # Not adopted at all: one that cannot be kept would be undone by
             # the next restart. The two real fields are a few dozen bytes.
             LOGGER.warning("left-open alert settings too large; keeping the previous ones")
-            return
+            return False
         with self._lock:
             changed = section != self._left_open_section
             self._left_open_section = section
         if changed and self._left_open_path is not None:
             _write_atomically(self._left_open_path, encoded, "cache the left-open alert settings")
+        return True
 
     def gate_left_open(self, fallback):
         """The left-open alert's switch and threshold, or ``fallback``.

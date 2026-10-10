@@ -293,6 +293,20 @@ class LeftOpenThroughTheHeartbeat(unittest.TestCase):
         self.assertFalse(cache.gate_left_open(LeftOpenConfig()).enabled)
         self.assertFalse(MatchPolicyCache(path).gate_left_open(LeftOpenConfig()).enabled)
 
+    def test_an_oversized_section_does_not_stop_its_schedule_being_kept(self):
+        path = Path(self.directory.name) / "match-policy.json"
+        schedule = {"schema_version": 1, "timezone": "Europe/Dublin",
+                    "bands": [{"start": "00:00", "end": "24:00", "level": "strict"}]}
+        MatchPolicyCache(path).replace({
+            "controller_id": "primary", "settings_version": 1, "plate_matching": schedule,
+            "gate_left_open": {"enabled": True, "threshold_minutes": 10, "padding": "x" * 20000},
+        })
+
+        restarted = MatchPolicyCache(path)
+
+        self.assertEqual(restarted.status()["bands"][0]["level"], "strict")
+        self.assertIsNone(restarted.status()["last_error"])
+
     def test_a_malformed_setting_changes_nothing_about_plate_matching(self):
         """The section shares the schedule's envelope and must never fail it closed."""
         cache = MatchPolicyCache(Path(self.directory.name) / "match-policy.json")
