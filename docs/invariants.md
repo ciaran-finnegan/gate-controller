@@ -113,7 +113,7 @@ read on two frames.
 - **2026-10-09 21:42** -- the other direction: an Audi departed under the
   camera's spotlight, the light went off, and the sweep read 152 black frames
   to the cap because the idle baseline had been refreshed under the spotlight
-  and black never matched it (8 Oct 19:27: 157). The dark-drive rule (#202)
+  and black never matched it (8 Oct 19:27: 157). The dark-drive rule (#204)
   ends the waiting when a dark frame matches the newest *dark* idle frame
   **and** the reader found neither characters nor a plate box in it, ten
   looks running. It is a second way to say "gone", so it is also a new way
