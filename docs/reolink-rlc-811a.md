@@ -766,13 +766,12 @@ Backup of both settings before the change:
 cd /opt/gate-controller-deploy/current && sudo python3 scripts/reolink/camtool.py raw "$(sudo python3 -c 'import json; a=json.load(open("/var/lib/gate-controller/camera-audio-alarm-before-2026-10-10.json"))[0]["value"]["Audio"]; print(json.dumps([{"cmd":"SetAudioAlarmV20","action":0,"param":{"Audio":a}}]))')"
 ```
 
-**To check:**
-
-- The next vehicle alarm's audio segment should show no clipping run 1-2 s
-  after the alarm.
-- If one still appears, the firmware links a siren from another alarm action
-  as well; look at the alarm-action settings (`GetAlarm`/`GetMdAlarm` on this
-  firmware) before assuming the gate moved.
+**Verified** on the first three vehicle alarms afterwards (15:49:10, 15:49:45
+and 15:52:19 IST). In the 20 s after each the audio peaked at -32 to -37 dBFS,
+with no clipping and no loud high-band run; before the change every alarm
+clipped. If a clipping run ever reappears 1-2 s after an alarm, the firmware is
+linking a siren from another alarm action as well. Look at the alarm-action
+settings before assuming the gate moved.
 
 ## Cutover And Rollback
 
