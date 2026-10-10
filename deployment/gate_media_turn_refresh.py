@@ -38,6 +38,9 @@ SYSTEMCTL_TIMEOUT_SECONDS = 10
 GATEWAY_HEALTH_CHECK_ATTEMPTS = 3
 GATEWAY_HEALTH_CHECK_INTERVAL_SECONDS = 2
 MAX_RESPONSE_BYTES = 64 * 1024
+# EX_TEMPFAIL. The unit retries this status, and only this one, in minutes
+# rather than waiting for the next 4-hourly timer run (see the unit file).
+EXIT_TRY_AGAIN = 75
 _TURN_URL = re.compile(
     r"^(turn|turns):(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})"
     r"\?transport=(udp|tcp)$"
@@ -51,6 +54,14 @@ _REPLACED_GATEWAY_KEYS = frozenset({
 
 class TurnRefreshError(RuntimeError):
     """Raised without including long-lived or short-lived secret values."""
+
+
+class TurnRequestUnavailable(TurnRefreshError):
+    """Cloudflare could not be reached, or answered that it is busy or down.
+
+    Nothing was written and the gateway was not touched, so trying again soon
+    is safe; it is what a boot-time run sees while the network is still late.
+    """
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -111,8 +122,14 @@ def fetch_ice_servers(key_id: str, api_token: str):
             if response.status != 201:
                 raise TurnRefreshError("TURN credential request was not created")
             body = response.read(MAX_RESPONSE_BYTES + 1)
-    except (HTTPError, URLError, OSError, TimeoutError) as error:
+    except HTTPError as error:
+        # A refusal (bad token, unknown key) will not change in two minutes;
+        # an overloaded or failing service may.
+        if error.code == 429 or error.code >= 500:
+            raise TurnRequestUnavailable("TURN credential request failed") from error
         raise TurnRefreshError("TURN credential request failed") from error
+    except (URLError, OSError, TimeoutError) as error:
+        raise TurnRequestUnavailable("TURN credential request failed") from error
     if len(body) > MAX_RESPONSE_BYTES:
         raise TurnRefreshError("TURN credential response is too large")
     try:
@@ -428,6 +445,9 @@ def main(argv=None) -> int:
             _load_turn_environment(TURN_ENVIRONMENT)
         else:
             refresh_turn_credentials()
+    except TurnRequestUnavailable as error:
+        print(f"gate media TURN refresh: {error}; will try again", file=sys.stderr)
+        return EXIT_TRY_AGAIN
     except TurnRefreshError as error:
         print(f"gate media TURN refresh: {error}", file=sys.stderr)
         return 1

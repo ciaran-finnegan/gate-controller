@@ -1,16 +1,23 @@
 import os
 import configparser
+import errno
+import io
 import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stderr
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
+import deployment.gate_media_turn_refresh as turn_refresh
 from deployment.gate_media_turn_refresh import (
+    EXIT_TRY_AGAIN,
     SystemdGatewayService,
     TurnRefreshError,
+    TurnRequestUnavailable,
     fetch_ice_servers,
     refresh_turn_credentials,
     select_turn_credentials,
@@ -122,6 +129,24 @@ class MediaTurnRefreshTests(unittest.TestCase):
         self.assertEqual("5min", timer["Timer"].get("RandomizedDelaySec"))
         self.assertEqual("true", timer["Timer"].get("Persistent"))
         self.assertEqual("gate-media-turn-refresh.service", timer["Timer"].get("Unit"))
+
+    def test_a_failed_run_is_retried_soon_only_when_cloudflare_was_unreachable(self):
+        service = self._read_unit("deployment/systemd/gate-media-turn-refresh.service")
+        timer = self._read_unit("deployment/systemd/gate-media-turn-refresh.timer")
+
+        # A boot-time run after a power cut fails while the network is late
+        # (2026-10-10). Exit 75 is retried in minutes; exit 1 waits for the
+        # timer, whose OnUnitInactiveSec counts from a failed run too.
+        self.assertEqual(75, EXIT_TRY_AGAIN)
+        self.assertEqual("on-failure", service["Service"].get("Restart"))
+        self.assertEqual("2min", service["Service"].get("RestartSec"))
+        prevented = service["Service"].get("RestartPreventExitStatus").split()
+        self.assertIn("1", prevented)
+        self.assertNotIn(str(EXIT_TRY_AGAIN), prevented)
+        self.assertNotIn("SuccessExitStatus", service["Service"])
+        self.assertEqual("0", service["Unit"].get("StartLimitIntervalSec"))
+        self.assertEqual("4h", timer["Timer"].get("OnUnitInactiveSec"))
+        self.assertNotIn("OnCalendar", timer["Timer"])
 
     def test_service_timeout_covers_generation_activation_health_and_rollback(self):
         service = self._read_unit("deployment/systemd/gate-media-turn-refresh.service")
@@ -436,6 +461,55 @@ configure_turn_refresh_timer
 
             self.assertEqual(before, runtime_turn.read_bytes())
             self.assertEqual([], service.calls)
+
+    def test_an_unreachable_cloudflare_is_a_retryable_failure_that_touches_nothing(self):
+        class Unreachable:
+            def open(self, _request, *, timeout):
+                raise URLError(OSError(errno.ENETUNREACH, "Network is unreachable"))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            auth, gateway, runtime_turn, turn = self._write_environments(root)
+            before = runtime_turn.read_bytes()
+            service = FakeGatewayService()
+
+            with patch("deployment.gate_media_turn_refresh.build_opener", return_value=Unreachable()), \
+                    self.assertRaises(TurnRequestUnavailable):
+                refresh_turn_credentials(
+                    turn_environment=turn,
+                    auth_environment=auth,
+                    gateway_environment=gateway,
+                    runtime_turn_environment=runtime_turn,
+                    service=service,
+                )
+
+            self.assertEqual(before, runtime_turn.read_bytes())
+            self.assertEqual([], service.calls)
+
+    def test_only_a_busy_or_failing_cloudflare_answer_is_worth_retrying(self):
+        for code, retryable in ((500, True), (503, True), (429, True),
+                                (400, False), (401, False), (403, False), (404, False)):
+            class Refusing:
+                def open(self, request, *, timeout, code=code):
+                    raise HTTPError(request.full_url, code, "refused", {}, io.BytesIO(b""))
+
+            with self.subTest(code=code), \
+                    patch("deployment.gate_media_turn_refresh.build_opener", return_value=Refusing()):
+                with self.assertRaises(TurnRefreshError) as raised:
+                    fetch_ice_servers("key-id", "api-token")
+                self.assertEqual(retryable, isinstance(raised.exception, TurnRequestUnavailable))
+                self.assertNotIn("api-token", str(raised.exception))
+
+    def test_main_exits_try_again_for_an_unreachable_service_and_1_otherwise(self):
+        for error, expected in (
+            (TurnRequestUnavailable("TURN credential request failed"), EXIT_TRY_AGAIN),
+            (TurnRefreshError("TURN secret environment is invalid"), 1),
+        ):
+            with self.subTest(error=str(error)), \
+                    patch.object(turn_refresh, "refresh_turn_credentials", side_effect=error), \
+                    redirect_stderr(io.StringIO()) as journal:
+                self.assertEqual(expected, turn_refresh.main([]))
+                self.assertIn(str(error), journal.getvalue())
 
     def test_failed_new_restart_restores_old_gateway_environment_and_restarts_it(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

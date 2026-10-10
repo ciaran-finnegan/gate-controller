@@ -1657,6 +1657,34 @@ camera's talk channel (see [Push-to-talk](talkback.md)) and `verified` only
 after the supervised acceptance test in that document sets
 `GATE_MEDIA_TALKBACK_VERIFIED=true`.
 
+**After a power cut the media services recover by themselves.** The Pi can
+finish booting before the powerline adapter has given eth0 its address;
+`NetworkManager-wait-online.service` then fails and `network-online.target` is
+reached anyway. On 2026-10-10 MediaMTX could not bind its ICE address, hit its
+start limit of five tries in 60 s, and systemd stopped trying; the transcoder,
+which `Requires=` it, stayed dead too, and there was no stream or audio for 25
+minutes until someone ran `systemctl reset-failed` by hand. Now:
+
+- `gate-media-auth`, `gate-media-gateway`, `gate-media-transcoder` and
+  `gate-camera-control` have `StartLimitIntervalSec=0`: they never give up,
+  and `RestartSec` (5-10 s) paces the retries.
+- The gateway launcher is started with `--wait-for-address=60`: it waits up to
+  60 s for the `MTX_WEBRTCADDITIONALHOSTS` address to be assigned to the Pi,
+  logs `waiting up to 60 s for <ip> to be assigned` once, and starts MediaMTX
+  the moment it is. If it is still missing it exits and systemd tries again.
+- The transcoder `Wants=` the gateway rather than `Requires=` it, so a failed
+  gateway start cannot end the transcoder's own retries; it reconnects within
+  10 s of the gateway coming back.
+- The TURN refresh retries every 2 minutes when Cloudflare could not be reached
+  (exit 75), and otherwise waits for its timer (below).
+
+`tests/test_service_restart_policy.py` fails if a long-running unit can give up
+again. `file-monitor.service` is not yet covered: it still has a 5-in-60 s start
+limit, and because it drives the relay it is changed only in its own reviewed
+PR. If the stream is still down well after the network is back, check
+`systemctl status gate-media-gateway.service` for the waiting line or another
+error before reaching for `reset-failed`.
+
 Create the two operator-managed root-owned environments before enabling the
 services. Both must remain regular non-symlink `root:root` mode `0600` files
 under the root-controlled `/etc` directory; never put either file in this
@@ -1746,8 +1774,15 @@ The media installer installs the root-only stdlib helper and the
 enables the timer only when this separate secret file passes validation, so a
 media installation using manually managed TURN credentials remains
 supported. The timer runs once shortly after boot and about every 4 hours with
-up to 5 minutes of randomized delay. This leaves several retry opportunities
-after a failed run before a 24-hour credential expires. Each successful run
+up to 5 minutes of randomized delay; the 4 hours count from the end of the
+previous run whether it succeeded or failed. This leaves several retry
+opportunities after a failed run before a 24-hour credential expires. A run
+that could not reach Cloudflare at all -- no route, DNS, a timeout, HTTP 5xx or
+429, which is what the run 2 minutes after a power cut sees while the network is
+late -- exits 75 and systemd retries it every 2 minutes until it gets through.
+Any other failure (a refused token, a rejected response, a rollback) exits 1
+and waits for the timer, because retrying it would only restart the gateway
+again. Each successful run
 requests a 24-hour credential from Cloudflare with the `gate-mate-pi` custom
 identifier.
 

@@ -1,5 +1,7 @@
 import configparser
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -10,7 +12,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import gate_media_gateway.__main__ as gateway_launcher
 from gate_controller.media_capabilities import (
     read_media_capabilities, validated_media_capabilities,
 )
@@ -257,6 +261,105 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
             self.assertNotEqual(0, rejected_whitespace.returncode)
             self.assertFalse(marker.exists())
 
+    def _valid_gateway_environment(self, root, address="10.0.0.5"):
+        _auth, gateway, runtime_turn = self._write_valid_media_environments(root)
+        values = dict(
+            line.split("=", 1)
+            for path in (gateway, runtime_turn)
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+        values["MTX_WEBRTCLOCALUDPADDRESS"] = f"{address}:8189"
+        values["MTX_WEBRTCLOCALTCPADDRESS"] = f"{address}:8189"
+        values["MTX_WEBRTCADDITIONALHOSTS"] = address
+        return values
+
+    def test_gateway_waits_for_a_late_ice_address_and_then_starts_mediamtx(self):
+        # 2026-10-10: the Pi booted before the powerline link gave eth0 its
+        # address, MediaMTX could not bind it, and the unit gave up.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            values = self._valid_gateway_environment(Path(temporary_directory))
+            probes = []
+
+            def assignable(host):
+                probes.append(host)
+                return len(probes) >= 4
+
+            with patch.dict(os.environ, values), \
+                    patch.object(gateway_launcher, "address_is_assignable", side_effect=assignable), \
+                    patch.object(gateway_launcher.time, "sleep") as sleep, \
+                    patch.object(gateway_launcher.os, "execve") as execve, \
+                    contextlib.redirect_stderr(io.StringIO()) as journal:
+                result = gateway_launcher.main(
+                    ["--wait-for-address=60", "/usr/local/bin/mediamtx", "/etc/gate-media/mediamtx.yml"]
+                )
+
+        self.assertEqual(0, result)
+        self.assertEqual(["10.0.0.5"] * 4, probes)
+        self.assertEqual(3, sleep.call_count)
+        self.assertIn("waiting up to 60 s for 10.0.0.5", journal.getvalue())
+        self.assertIn("10.0.0.5 is assigned after", journal.getvalue())
+        execve.assert_called_once()
+        self.assertEqual(
+            ["/usr/local/bin/mediamtx", "/etc/gate-media/mediamtx.yml"],
+            execve.call_args.args[1],
+        )
+
+    def test_gateway_gives_up_a_bounded_wait_without_starting_mediamtx_so_systemd_retries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            # TEST-NET-1: assigned to no real host, so the real probe says no.
+            values = self._valid_gateway_environment(root, address="192.0.2.10")
+            fake_binary = root / "mediamtx"
+            marker = root / "executed"
+            config = root / "mediamtx.yml"
+            config.write_text("paths: {}\n", encoding="utf-8")
+            fake_binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$GATEWAY_MARKER\"\n",
+                encoding="utf-8",
+            )
+            fake_binary.chmod(0o755)
+            environment = dict(os.environ)
+            environment.update(values)
+            environment["GATEWAY_MARKER"] = str(marker)
+
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, "-m", "gate_media_gateway", "--wait-for-address=1",
+                 str(fake_binary), str(config)],
+                cwd=REPOSITORY_ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                check=False, timeout=30,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertFalse(marker.exists())
+            self.assertIn("waiting up to 1 s for 192.0.2.10", completed.stderr)
+            self.assertIn("192.0.2.10 is still not assigned", completed.stderr)
+            self.assertNotIn("turn-password", completed.stderr)
+            self.assertLess(elapsed, 20)
+
+    def test_gateway_address_probe_tells_an_assigned_address_from_a_missing_one(self):
+        self.assertTrue(gateway_launcher.address_is_assignable("127.0.0.1"))
+        self.assertFalse(gateway_launcher.address_is_assignable("192.0.2.10"))
+
+    def test_gateway_wait_option_is_bounded_and_refuses_to_start_when_malformed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            values = self._valid_gateway_environment(Path(temporary_directory))
+            for option in (
+                "--wait-for-address=0", "--wait-for-address=601",
+                "--wait-for-address=", "--wait-for-address=1.5",
+                "--wait-for-address=-1",
+            ):
+                with self.subTest(option=option), patch.dict(os.environ, values), \
+                        patch.object(gateway_launcher.os, "execve") as execve, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    result = gateway_launcher.main(
+                        [option, "/usr/local/bin/mediamtx", "/etc/gate-media/mediamtx.yml"]
+                    )
+                    self.assertEqual(1, result)
+                    execve.assert_not_called()
+
     def test_installer_rejects_every_unpinned_mediamtx_version(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             trusted = Path(temporary_directory) / "trusted"
@@ -339,8 +442,8 @@ class MediaGatewayDeploymentTests(unittest.TestCase):
         )
         self.assertNotIn("EnvironmentFile=/etc/gate-media-auth.env", gateway_unit)
         self.assertEqual(
-            "/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx "
-            "/etc/gate-media/mediamtx.yml",
+            "/usr/bin/python3 -m gate_media_gateway --wait-for-address=60 "
+            "/usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml",
             gateway.get("ExecStart"),
         )
         self.assertEqual("PYTHONPATH=/usr/local/lib/gate-media", gateway.get("Environment"))
