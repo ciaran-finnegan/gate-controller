@@ -360,7 +360,7 @@ unchanged, whenever the local reader is off, in shadow mode, or not loaded.
 Journal: `gate_local_sweep stage=read plate=… score=… authorised=… read_ms=…`
 for every frame that read characters, and one
 `gate_local_sweep outcome=ended reason=opened|window|departed|wait_cap|new_event|stopping|plate_denied|final_…
-frames=N reads=N busy=N authorised=N injected=N fallback=N best_plate=… best_score=… waiting_reads=N`
+frames=N reads=N skipped_empty=N skipped_corrupt=N skipped_sample=… busy=N authorised=N injected=N fallback=N best_plate=… best_score=… waiting_reads=N`
 per event (a warning when nothing was injected). Injected frames log the
 usual `gate_trigger_capture outcome=captured` with `source=sweep` or
 `source=sweep_fallback`. `busy` counts frames the reader declined because the

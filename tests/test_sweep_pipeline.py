@@ -26,18 +26,23 @@ answered ``duplicate_event``, the session took that for a final answer, and
 for 15.5 s nothing read a frame of a car sitting at the gate.
 """
 import logging
+import re
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from hashlib import sha256
+from random import Random
 from io import BytesIO
 from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Lock, Thread
 from time import monotonic, sleep
+from unittest.mock import patch
 
 from PIL import Image
 
+from gate_controller.images import measure_flat_fraction
 from gate_controller.local_recognizer import (
     EngineRead, EngineResult, LocalRecognition, LocalRecognizer, LocalRecognizerConfig,
 )
@@ -192,12 +197,14 @@ class Gate:
 
     def __init__(self, test, *, answers, cloud=None, sweep_seconds=1.0, waiting=0.0,
                  waiting_fps=2.0, cloud_frames=0, fallback=0, policy=None,
-                 processor_policy=None, empty_scene=0.0, authorised=AUTHORISED):
+                 processor_policy=None, empty_scene=0.0, authorised=AUTHORISED,
+                 max_flat=0.0, sample_directory="default", sample_max_files=50):
         self.test = test
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
         self.uploads = root / "uploads"
         self.uploads.mkdir()
+        self.samples = root / "sweep-skipped-frames"
         self.engine = ScriptedEngine(answers)
         self.frames = LiveFrames()
         self.relay_calls = []
@@ -237,7 +244,11 @@ class Gate:
                 sweep_cloud_frames=cloud_frames, sweep_cloud_spacing_seconds=0.5,
                 sweep_waiting_seconds=waiting, sweep_waiting_fps=waiting_fps,
                 presence_max_frames=0, empty_scene_threshold=empty_scene,
-                max_flat_fraction=0.0, min_interval_seconds=0.5,
+                max_flat_fraction=max_flat, min_interval_seconds=0.5,
+                skipped_sample_directory=(
+                    self.samples if sample_directory == "default" else sample_directory
+                ),
+                skipped_sample_max_files=sample_max_files,
             ),
             popen=lambda *a, **k: None, frame_source=self.frames,
             sweep=LocalSweepReader(
@@ -659,6 +670,252 @@ class SweepPipelineTests(unittest.TestCase):
             )
             self.assertLess(monotonic() - second, 1.0, "a new alarm waited on a slow cadence")
             self.assertTrue(wait_for(lambda: gate.frames.sessions == 2, 3.0))
+
+
+class SkippedFrameSampleTests(unittest.TestCase):
+    """Why a sweep's frames went unread, and a frame of each reason to look at.
+
+    On 2026-10-08 10:24 an arriving Audi's sweep logged ``frames=10 reads=0``
+    and only the camera's 4K FTP still let it in. Nothing said which test had
+    skipped the ten frames, and nobody could look at one. The sweep now counts
+    each reason for the sweep and keeps the first frame of each, through the
+    real alarm -> sweep path.
+    """
+
+    def setUp(self):
+        self.gate = None
+
+    def tearDown(self):
+        if self.gate is not None:
+            self.gate.close()
+
+    def _gate(self, **options):
+        self.gate = Gate(self, **options)
+        return self.gate
+
+    @staticmethod
+    def solid(seed: int) -> bytes:
+        """A frame the decoder never finished: one flat colour end to end."""
+        output = BytesIO()
+        Image.new("RGB", FRAME_SIZE, color=(seed % 256, 128, 128)).save(output, format="JPEG")
+        return output.getvalue()
+
+    @staticmethod
+    def textured(seed: int) -> bytes:
+        """A frame with detail in the plate band: nowhere near one flat colour."""
+        generator = Random(seed)
+        image = Image.frombytes("RGB", (120, 68), bytes(
+            generator.randrange(256) for _ in range(120 * 68 * 3)
+        )).resize(FRAME_SIZE)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=90)
+        return output.getvalue()
+
+    @staticmethod
+    def ended(logs, count=1):
+        lines = [line for line in logs.lines if "gate_local_sweep outcome=ended" in line]
+        return lines if len(lines) >= count else None
+
+    @staticmethod
+    def field(line, name):
+        return re.search(rf"\b{name}=(\S+)", line).group(1)
+
+    def _run_sweep(self, gate, logs, count=1):
+        gate.alarm()
+        self.assertTrue(wait_for(lambda: self.ended(logs, count), 8.0), logs.text())
+        return self.ended(logs, count)[count - 1]
+
+    def _samples(self, gate):
+        return sorted(path.name for path in gate.samples.glob("*.jpg")) if gate.samples.exists() else []
+
+    def test_a_sweep_of_empty_scene_frames_says_so_and_keeps_one_to_look_at(self):
+        empty = [frame(seed) for seed in range(500, 512)]
+        gate = self._gate(answers={}, sweep_seconds=1.0, empty_scene=0.03)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(empty)])
+        before = datetime.now(timezone.utc)
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        after = datetime.now(timezone.utc)
+
+        frames = int(self.field(line, "frames"))
+        self.assertGreaterEqual(frames, 3)
+        self.assertEqual(self.field(line, "reads"), "0")
+        self.assertEqual(int(self.field(line, "skipped_empty")), frames)
+        self.assertEqual(self.field(line, "skipped_corrupt"), "0")
+        names = self._samples(gate)
+        self.assertEqual(len(names), 1, names)
+        self.assertEqual(self.field(line, "skipped_sample"), names[0])
+        match = re.fullmatch(r"(\d{8}T\d{6})(\d{3})Z-empty\.jpg", names[0])
+        self.assertTrue(match, names[0])
+        # Named by when the sweep started (UTC): inside this test's own span.
+        started = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        self.assertLessEqual(before.replace(microsecond=0), started)
+        self.assertLessEqual(started, after)
+        kept = gate.samples / names[0]
+        self.assertIn(kept.read_bytes(), empty)
+        self.assertEqual(stat.S_IMODE(kept.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(gate.samples.stat().st_mode), 0o700)
+        self.assertEqual(gate.relay_calls, [])
+
+    def test_a_sweep_of_corrupt_frames_says_so_and_keeps_one_to_look_at(self):
+        flat = [self.solid(seed) for seed in range(40, 52)]
+        self.assertGreater(measure_flat_fraction(flat[0], REGION), 0.5)
+        gate = self._gate(answers={}, sweep_seconds=1.0, max_flat=0.5)
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(flat)])
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+
+        frames = int(self.field(line, "frames"))
+        self.assertGreaterEqual(frames, 3)
+        self.assertEqual(self.field(line, "reads"), "0")
+        self.assertEqual(int(self.field(line, "skipped_corrupt")), frames)
+        self.assertEqual(self.field(line, "skipped_empty"), "0")
+        names = self._samples(gate)
+        self.assertEqual(len(names), 1, names)
+        self.assertTrue(names[0].endswith("-corrupt.jpg"), names)
+        self.assertEqual(self.field(line, "skipped_sample"), names[0])
+        self.assertEqual((gate.samples / names[0]).read_bytes(), flat[0])
+
+    def test_one_sample_of_each_kind_however_many_frames_of_it_there_are(self):
+        flat = [self.solid(seed) for seed in range(60, 66)]
+        empty = [self.textured(seed) for seed in range(520, 526)]
+        self.assertLess(measure_flat_fraction(empty[0], REGION), 0.5)
+        gate = self._gate(answers={}, sweep_seconds=1.2, empty_scene=0.03, max_flat=0.5)
+        gate.frames.empty = {digest(data) for data in empty}
+        script = flat + empty
+        gate.frames.script([(0.05 + index * 0.08, data) for index, data in enumerate(script)])
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        self.assertGreaterEqual(int(self.field(line, "skipped_corrupt")), 2)
+        self.assertGreaterEqual(int(self.field(line, "skipped_empty")), 2)
+        names = self._samples(gate)
+        self.assertEqual(len(names), 2, names)
+        self.assertEqual(sorted(name.split("-", 1)[1] for name in names),
+                         ["corrupt.jpg", "empty.jpg"])
+        self.assertEqual(sorted(self.field(line, "skipped_sample").split(",")), names)
+
+    def test_the_journal_names_only_the_samples_that_survived_the_cap(self):
+        flat = [self.solid(seed) for seed in range(70, 76)]
+        empty = [self.textured(seed) for seed in range(560, 566)]
+        gate = self._gate(answers={}, sweep_seconds=1.2, empty_scene=0.03, max_flat=0.5,
+                          sample_max_files=1)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.08, data) for index, data in enumerate(flat + empty)])
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        self.assertGreaterEqual(int(self.field(line, "skipped_corrupt")), 2)
+        self.assertGreaterEqual(int(self.field(line, "skipped_empty")), 2)
+        names = self._samples(gate)
+        self.assertEqual(len(names), 1, names)
+        self.assertEqual(self.field(line, "skipped_sample"), names[0])
+
+    def test_a_sweep_that_reads_everything_keeps_nothing_and_says_so(self):
+        frames = [self.textured(seed) for seed in range(530, 536)]
+        gate = self._gate(answers={}, sweep_seconds=0.8, empty_scene=0.03, max_flat=0.5)
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(frames)])
+        with CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        self.assertEqual(self.field(line, "skipped_empty"), "0")
+        self.assertEqual(self.field(line, "skipped_corrupt"), "0")
+        self.assertEqual(self.field(line, "skipped_sample"), "-")
+        self.assertEqual(self._samples(gate), [])
+
+    def test_the_samples_are_pruned_to_the_cap_oldest_first(self):
+        empty = [frame(seed) for seed in range(540, 546)]
+        gate = self._gate(answers={}, sweep_seconds=0.5, empty_scene=0.03, sample_max_files=2)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.08, data) for index, data in enumerate(empty)])
+        kept = []
+        with CapturedLogs() as logs:
+            for sweep in range(1, 5):
+                line = self._run_sweep(gate, logs, count=sweep)
+                kept.append(self.field(line, "skipped_sample"))
+                sleep(0.6)  # past the capture's own minimum between alarms
+        self.assertEqual(len(set(kept)), 4, kept)
+        self.assertEqual(self._samples(gate), sorted(kept)[-2:])
+
+    def test_the_samples_are_pruned_to_the_byte_cap(self):
+        empty = [frame(seed) for seed in range(550, 556)]
+        size = len(empty[0])
+        self.assertTrue(all(abs(len(data) - size) < size // 4 for data in empty))
+        gate = self._gate(answers={}, sweep_seconds=0.5, empty_scene=0.03)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.08, data) for index, data in enumerate(empty)])
+        # Room for two of them and not three.
+        gate.capture._skipped_samples.max_bytes = size * 2 + size // 2
+        kept = []
+        with CapturedLogs() as logs:
+            for sweep in range(1, 5):
+                line = self._run_sweep(gate, logs, count=sweep)
+                kept.append(self.field(line, "skipped_sample"))
+                sleep(0.6)
+        remaining = self._samples(gate)
+        self.assertEqual(remaining, sorted(kept)[-2:])
+        self.assertLessEqual(
+            sum((gate.samples / name).stat().st_size for name in remaining),
+            gate.capture._skipped_samples.max_bytes,
+        )
+
+    def test_samples_left_by_an_earlier_run_are_trimmed_to_the_cap_at_start(self):
+        """Disabling (0) or lowering the cap removes what a larger one had kept."""
+        for cap, left in ((0, 0), (2, 2)):
+            with tempfile.TemporaryDirectory() as root:
+                samples = Path(root) / "sweep-skipped-frames"
+                samples.mkdir(mode=0o700)
+                for index in range(5):
+                    (samples / f"2026100{index}T000000000Z-empty.jpg").write_bytes(b"x" * 10)
+                capture = TriggerFrameCapture(
+                    TriggerCaptureConfig(
+                        enabled=True, output_directory=Path(root) / "trigger-capture",
+                        skipped_sample_directory=samples, skipped_sample_max_files=cap,
+                    ),
+                    popen=lambda *a, **k: None,
+                )
+                self.assertEqual(len(list(samples.glob("*.jpg"))), left, cap)
+                if left:
+                    self.assertEqual(
+                        sorted(path.name for path in samples.glob("*.jpg")),
+                        ["20261003T000000000Z-empty.jpg", "20261004T000000000Z-empty.jpg"],
+                    )
+                capture.close()
+
+    def test_a_directory_that_cannot_be_written_does_not_break_the_sweep(self):
+        # The state root is a file, so the directory can never be made.
+        blocker = Path(tempfile.mkdtemp()) / "state-is-a-file"
+        blocker.write_text("not a directory")
+        self.addCleanup(lambda: blocker.unlink(missing_ok=True))
+        empty = [frame(seed) for seed in range(560, 568)]
+        authorised = frame(570)
+        answers = {digest(crop_to_region(authorised, REGION)): ("10CE1990", 0.95)}
+        gate = self._gate(answers=answers, sweep_seconds=2.0, empty_scene=0.03,
+                          sample_directory=blocker / "sweep-skipped-frames")
+        gate.frames.empty = {digest(data) for data in empty}
+        script = [(0.05 + index * 0.1, data) for index, data in enumerate(empty)]
+        script.append((1.0, authorised))
+        gate.frames.script(script)
+        with CapturedLogs() as logs:
+            gate.alarm()
+            # The frame after the unwritable samples still opens the gate.
+            self.assertTrue(wait_for(gate.opened), f"{gate.outcomes()}\n{logs.text()}")
+            self.assertTrue(wait_for(lambda: self.ended(logs), 8.0), logs.text())
+            line = self.ended(logs)[0]
+        self.assertEqual(gate.relay_calls, ["relay"])
+        self.assertGreaterEqual(int(self.field(line, "skipped_empty")), 2)
+        self.assertEqual(self.field(line, "skipped_sample"), "-")
+
+    def test_a_write_that_raises_midway_is_swallowed_and_not_retried_every_frame(self):
+        empty = [frame(seed) for seed in range(580, 590)]
+        gate = self._gate(answers={}, sweep_seconds=1.0, empty_scene=0.03)
+        gate.frames.empty = {digest(data) for data in empty}
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(empty)])
+        with patch("gate_controller.skipped_samples.write_private_frame",
+                   side_effect=OSError("disk full")) as writer, CapturedLogs() as logs:
+            line = self._run_sweep(gate, logs)
+        self.assertEqual(writer.call_count, 1, "one attempt per reason per sweep")
+        self.assertGreaterEqual(int(self.field(line, "skipped_empty")), 3)
+        self.assertEqual(self.field(line, "skipped_sample"), "-")
+        self.assertEqual(self._samples(gate), [])
 
 
 class CarriedReadSafetyTests(unittest.TestCase):

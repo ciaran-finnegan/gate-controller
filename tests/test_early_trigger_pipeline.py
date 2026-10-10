@@ -169,6 +169,9 @@ class EarlyOriginSweepTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: reports))
         self.assertEqual(reports[0]["reason"], "early_abort")
         self.assertEqual(reports[0]["reads"], 0, "an empty frame costs a thumbnail, not a read")
+        # The report says why nothing was read, not only that nothing was.
+        self.assertEqual(reports[0]["skipped_empty"], reports[0]["frames"])
+        self.assertEqual(reports[0]["skipped_corrupt"], 0)
         self.assertLess(monotonic() - started, 2.0, "well inside the seconds it may run")
         self.assertEqual(session.posted_at, [])
         self.assertEqual(count_rows(self._database(), "events"), 0)

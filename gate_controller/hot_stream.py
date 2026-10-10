@@ -307,9 +307,10 @@ class HotStreamBuffer:
             process.wait(timeout=1)
 
 
-def write_private_frame(directory: Path, frame: bytes) -> Path:
-    """Write one JPEG into an owner-only directory with a fresh random name."""
-    target = Path(directory) / f"frame-{secrets.token_hex(12)}.jpg"
+def write_private_frame(directory: Path, frame: bytes, *, name: str | None = None) -> Path:
+    """Write one JPEG into an owner-only directory, under a fresh random name
+    unless ``name`` is given (then it must not already exist)."""
+    target = Path(directory) / (name or f"frame-{secrets.token_hex(12)}.jpg")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags, 0o600)
