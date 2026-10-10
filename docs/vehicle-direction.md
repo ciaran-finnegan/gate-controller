@@ -7,7 +7,10 @@ match. Roughly half of everything at this gate is a departure. And an access
 log that cannot tell them apart is not an access log.
 
 Direction is a **label**. Nothing described here reaches the relay, the admit
-decision or the presence session, and nothing here can delay a gate.
+decision or the presence session, and nothing here can delay a gate. One
+thing about direction *is* used while the car is there, and only to decide
+what is spent: the sweep keeps a departing car's frames off the cloud plate
+reader. See [Spending, in real time](#spending-in-real-time) below.
 
 ## Where it stands, measured
 
@@ -232,8 +235,60 @@ signals:
 every ten minutes.** Not beside the relay, because that is not where the
 evidence is: a photo is read after the passage, by fetching it back from the
 dashboard, and the gate-sound scan writes a movement five to twenty minutes
-after it happened. While a car is at the gate the only signal that exists is
-the width fit, so there is nothing to combine.
+after it happened. While a car is at the gate the only signals that exist are
+the width fit and the sweep's own plate widths (below), so there is nothing to
+combine.
+
+### Spending, in real time
+
+The cloud plate reader is billed, slow, and runs over a lossy link. Since
+2026-10-05 it decided **no** opening at all (every one of the 29 grants was
+the device's own read), and 42 of its 107 lookups that took 250 ms or more or
+failed were on passages this scan marked `exiting`. A departing car is let
+out by the gate's exit mechanism, not by the Pi, so a lookup on it can decide
+nothing. Measured before choosing a signal, on everything since 5 October:
+
+* **The live width fit** (`direction.py`, `box_width`) said `exiting` on **0**
+  of 244 events. It is fed only the frames the processor sees -- a hand-over
+  or two and the still -- so it almost never has the three frames over two
+  seconds it needs (`frames=1 span_ms=0` on 30 events, `none` on 74).
+* **The gate heard running un-commanded** before the alarm
+  (`scripts/early_trigger_report.py`: 10 of 53 alarms) is read from
+  `gate_movements`, which the sound scan writes five to twenty minutes after
+  the fact. There is no live motor detector: `audio_segments` writes
+  five-minute files and `audio_capture` records clips on request; neither
+  decodes anything while a car is at the gate. And the 10-22 s band where a
+  car's own engine reads as the motor, and a diesel at walking pace that reads
+  as the motor for a minute, are exactly the arrivals such a signal would get
+  wrong.
+* **The sweep's own plate widths** are the signal that exists. The on-device
+  reader boxes a plate in every frame it reads, up to five a second, and
+  `SweepRead.plate_px` is already measured for the cloud hold. A departing
+  car's plate shrinks as it recedes; an arriving car's only grows until it
+  stops. On 2026-10-09, in the journal's own reads: two departures went
+  321->203->222->203->188->171->...->100 px and 229->333->321->279->247->229->
+  209->...->103 px; the one arrival went 138->319 px with its largest dip 3.8 %
+  (159->153), and a stopped car sat at 350-353 px. On the one frame per event
+  the dashboard keeps for the 48 passages from 5 to 9 October, "two reads
+  running at most 70 % of the passage's widest plate, once that plate reached
+  150 px" fired on **0 of 24 arrivals** (16 of them let in) and 6 of 15
+  departures; the departures it missed showed no boxed plate at all.
+
+So `trigger_capture.DepartingPlate` applies that rule to the sweep's reads,
+`TriggerFrameCapture.departing_skip` says `on` while the latest read still
+says the plate is receding, and `GateProcessor.prepare` asks it once per
+burst, before routing, and keeps the passage's frames and the camera's still
+off the cloud (`gate_ocr stage=cloud_skipped reason=departing`;
+`GATE_LOCAL_SWEEP_DEPARTING_SKIP=off|shadow|on`, on by default). The frame is
+decided on the device's read and answers "no plate", with the refused read
+carried as `review_plate` for the near miss like every other skip. It is not
+sticky -- a plate that grows back ends it -- and it never touches a frame the
+device decided: an authorised rear plate still opens the gate (#171).
+
+**It is a rule about spending, not a verdict.** Nothing here writes
+`direction`, feeds `judge`, or reaches `passage_directions`; the label is
+still made after the fact, from the photo and the gate's sound, as above.
+Details and the numbers in [local-recognition.md](local-recognition.md).
 
 Each pass:
 

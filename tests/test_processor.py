@@ -3216,6 +3216,45 @@ class InternetDownTests(unittest.TestCase):
             self.assertFalse(result.opened)
             self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
 
+    def test_a_burst_skipped_as_departing_is_finished_without_the_cloud_when_the_car_turns_back(self):
+        # The departure rule is not sticky: a plate that grows back ends it.
+        # The route was decided on the verdict at `prepare`, so a verdict that
+        # changes before `process` must not let the burst thread post (#197).
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(
+                cloud_observation=PlateObservation("12D3456", 0.99),
+            )
+            verdict = {"mode": "on"}
+            processor = self._processor(
+                directory, recognizer, departing=lambda: verdict["mode"],
+            )
+
+            prepared = processor.prepare((frame,))
+            self.assertEqual(prepared.cloud_skip, "departing")
+            self.assertFalse(prepared.route_to_cloud_lane())
+            verdict["mode"] = None
+            self.assertFalse(prepared.needs_cloud, "the route is the answer")
+            result = processor.process((frame,), prepared=prepared)
+
+            self.assertFalse(result.opened)
+            self.assertEqual(result.reason, "no_match")
+            self.assertEqual(recognizer.cloud_calls, [], "the burst thread went on the network")
+
+    def test_a_departing_verdict_never_touches_a_frame_the_device_decided(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frame = self._jpeg(directory, "frame.jpg")
+            recognizer = TwoPhaseRecognizer(local_plate="12D3456", local_confidence=0.99)
+            processor = self._processor(directory, recognizer, departing=lambda: "on")
+
+            prepared = processor.prepare((frame,))
+            self.assertIsNone(prepared.cloud_skip)
+            self.assertTrue(prepared.decided)
+            result = processor.process((frame,), prepared=prepared)
+
+            self.assertTrue(result.opened, result.reason)
+            self.assertEqual(recognizer.cloud_calls, [])
+
     def test_a_burst_the_lane_takes_is_not_marked_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             frame = self._jpeg(directory, "frame.jpg")

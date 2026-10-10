@@ -12,6 +12,7 @@ from PIL import Image
 
 from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.models import MatchDecision, ProcessingResult
+from gate_controller.trigger_capture import DepartingPlate
 from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
     TriggerFrameCapture,
@@ -152,6 +153,19 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), self.assertRaises(ValueError):
                 load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
 
+    def test_the_departure_skip_is_on_by_default_and_takes_only_its_three_modes(self):
+        config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
+        self.assertEqual(config.sweep_departing_skip, "on")
+        for raw, mode in (("off", "off"), (" Shadow ", "shadow"), ("ON", "on")):
+            tuned = load_trigger_capture_config(
+                {"GATE_LOCAL_SWEEP_DEPARTING_SKIP": raw}, Path("/uploads"), webhook_enabled=True,
+            )
+            self.assertEqual(tuned.sweep_departing_skip, mode)
+        for raw in ("yes", "1", "exiting", ""):
+            environment = {"GATE_LOCAL_SWEEP_DEPARTING_SKIP": raw}
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                load_trigger_capture_config(environment, Path("/uploads"), webhook_enabled=True)
+
     def test_presence_session_is_on_by_default_and_bounded(self):
         config = load_trigger_capture_config({}, Path("/uploads"), webhook_enabled=True)
         self.assertEqual(config.presence_window_seconds, 20.0)
@@ -270,6 +284,74 @@ class TriggerCaptureConfigTests(unittest.TestCase):
             with self.subTest(environment=environment):
                 with self.assertRaises(ValueError):
                     load_trigger_capture_config(environment, Path("/u"), webhook_enabled=True)
+
+
+class DepartingPlateTests(unittest.TestCase):
+    """The receding-plate rule, on the series the sweep's own reads produce."""
+
+    def _feed(self, widths):
+        judge = DepartingPlate()
+        return judge, [judge.note(width, at) for at, width in enumerate(widths)]
+
+    def test_the_2026_10_09_departures_are_caught_within_two_reads_of_the_peak(self):
+        # 11:58: 321, 203, 222, 203, 188 ... ; 14:33: 229, 333, 321, 279, 247, 229, 209 ...
+        judge, verdicts = self._feed([321, 203, 222, 203, 188, 171, 157, 145])
+        self.assertEqual(verdicts, [False, False, True, True, True, True, True, True])
+        self.assertEqual(judge.since, 2)
+        judge, verdicts = self._feed([229, 333, 321, 279, 247, 229, 209, 190, 172])
+        # 247 is 74 % of 333: not yet. 229 and 209 are the two reads under 70 %.
+        self.assertEqual(verdicts, [False] * 6 + [True] * 3)
+        self.assertEqual(judge.peak_px, 333)
+
+    def test_the_2026_10_09_arrival_never_reads_as_receding(self):
+        # 15:05: the plate grew 138 -> 319 px with a 3.8 % dip at 159 -> 153.
+        widths = [138, 136, 141, 159, 153, 153, 157, 171, 181, 190, 209, 210, 233, 236,
+                  243, 259, 269, 286, 290, 300, 319, 331, 333]
+        judge, verdicts = self._feed(widths)
+        self.assertEqual(verdicts, [False] * len(widths))
+        self.assertIsNone(judge.since)
+
+    def test_a_stopped_car_with_the_detectors_jitter_never_reads_as_receding(self):
+        # The stopped-car rule tolerates an 8 % spread; this tolerates 30 %.
+        judge, verdicts = self._feed([370, 372, 345, 369, 341, 372, 350, 360])
+        self.assertEqual(verdicts, [False] * 8)
+
+    def test_one_shrunk_read_is_not_a_departure(self):
+        judge, verdicts = self._feed([320, 200, 318, 200, 315])
+        self.assertEqual(verdicts, [False] * 5)
+
+    def test_a_car_that_backs_off_and_comes_forward_again_is_no_longer_departing(self):
+        judge, verdicts = self._feed([300, 300, 200, 190, 310, 320])
+        self.assertEqual(verdicts, [False, False, False, True, False, False])
+        self.assertEqual(judge.peak_px, 320)
+
+    def test_a_far_plate_is_not_measured(self):
+        # Below the 150 px peak the shrink of a few pixels is jitter, not a car.
+        judge, verdicts = self._feed([120, 80, 75, 70])
+        self.assertEqual(verdicts, [False] * 4)
+        judge, verdicts = self._feed([150, 105, 100])
+        self.assertEqual(verdicts, [False, False, True])
+
+    def test_a_verdict_is_honoured_for_ten_seconds_after_the_read_that_made_it(self):
+        # The fallback frame and the camera's still reach the processor after
+        # the sweep's window has closed; a passage nobody has read for a while
+        # must not speak for the next car.
+        judge = DepartingPlate()
+        for at, width in enumerate([300, 300, 200, 190]):
+            judge.note(width, 100.0 + at)
+        self.assertTrue(judge.receding_at(103.0))
+        self.assertTrue(judge.receding_at(113.0))
+        self.assertFalse(judge.receding_at(113.1))
+        self.assertFalse(judge.receding_at(99.0), "a clock that went backwards")
+        self.assertFalse(DepartingPlate().receding_at(0.0))
+
+    def test_nonsense_widths_change_nothing(self):
+        judge = DepartingPlate()
+        judge.note(300); judge.note(300)
+        for width in (None, "wide", 0, -4, float("nan")):
+            self.assertFalse(judge.note(width))
+        self.assertEqual(judge.peak_px, 300)
+        self.assertEqual(judge.shrunk, 0)
 
 
 class TriggerFrameCaptureTests(unittest.TestCase):

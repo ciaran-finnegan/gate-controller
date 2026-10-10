@@ -199,6 +199,42 @@ class CameraStillWhileTheSweepReadsTests(unittest.TestCase):
         self.assertEqual(policy["observed_plate"], DMAX_MISREAD)
 
 
+class DepartingCarTests(unittest.TestCase):
+    """A departing car's frames are kept off the cloud; the denial still names the near miss."""
+
+    setUp = fast_lane.FastLaneTests.setUp
+    tearDown = fast_lane.FastLaneTests.tearDown
+    _jpeg = fast_lane.FastLaneTests._jpeg
+    _stored = fast_lane.FastLaneTests._stored
+    _client = CameraStillWhileTheSweepReadsTests._client
+    _processor = CameraStillWhileTheSweepReadsTests._processor
+
+    def test_the_departing_frame_is_denied_and_names_the_dmax(self):
+        rear = self._jpeg("rear-plate.jpg", 100)
+        session = FakeSession([])
+        self.relay_calls = []
+        client = self._client([(DMAX_MISREAD, 0.61)], session)
+        processor = self._processor(client, departing=lambda: "on")
+        self.lanes = fast_lane.Lanes(processor)
+
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            self.lanes.inject(rear, stillness=0.001)
+            self.assertTrue(wait_for(lambda: self.lanes.result_for(rear) is not None, 3.0))
+        _, result = self.lanes.result_for(rear)
+
+        self.assertFalse(result.opened)
+        self.assertEqual(result.reason, "no_match")
+        self.assertEqual(session.calls, [], "the departing frame was sent to the cloud")
+        self.assertEqual(self.relay_calls, [])
+        self.assertTrue(any("cloud_skipped reason=departing" in line
+                            for line in journal.output), journal.output)
+        self.assertIsNone(self._stored(processor, result)["observed_plate"])
+        policy = _policy(result)
+        self.assertEqual(policy["near_miss_plate"], DMAX)
+        self.assertEqual(policy["near_miss_distance"], 1)
+        self.assertEqual(policy["observed_plate"], DMAX_MISREAD)
+
+
 class ReviewOnlyReadMatchingTests(unittest.TestCase):
     """`decide_access` never grants on a reviewed read, whatever it says."""
 

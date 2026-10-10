@@ -524,6 +524,45 @@ could not succeed. With no sweep reading -- sweep disabled, its reader
 unavailable, or no alarm to start it -- the still goes to the cloud as before.
 A still the device never read (`GATE_LOCAL_OCR_CLOUD=always`) is untouched.
 
+**A departing car** is not sent at all (`GATE_LOCAL_SWEEP_DEPARTING_SKIP`,
+on by default). It is let out by the gate's exit mechanism, not by the Pi, so
+a lookup on it decides nothing, and since 2026-10-05 the cloud had decided no
+opening while 42 of its 107 slow (250 ms or more) or failed lookups were on
+passages the direction scan marked `exiting`. The sweep's own reads say which
+way the car is going: a departing car comes from behind the camera and recedes
+up the approach, so the plate the device boxes *shrinks* read by read, where
+an arriving car's plate only grows until it stops at the gate. `DepartingPlate`
+in `trigger_capture.py` holds the rule -- the widest plate of the passage is at
+least 150 px (4K-equivalent), and two boxed reads running are each at most 70 %
+of it -- and `TriggerFrameCapture.departing_skip` answers `on` while the latest
+read, no older than ten seconds, still says so (the sweep's last hand-overs
+and the camera's still can reach the processor after the session has closed;
+a passage nobody has read for longer cannot speak for the next car). `GateProcessor.prepare` asks it once per burst, before the
+burst is routed, and records `cloud_skip="departing"`: the frame, or the
+camera's still, is decided on the device's own read and answers "no plate"
+(`gate_ocr stage=cloud_skipped reason=departing`), with the refused read
+carried as `review_plate` for the near miss exactly as every other skip. The
+verdict is journalled once a passage, `gate_local_sweep stage=departing
+mode=on peak_px=... plate_px=... at_ms=...`, and counted in the heartbeat's
+`sweep.departing`.
+
+What it does not touch: a frame the device *decided* -- an authorised rear
+plate still opens the gate on the device, as it always has (#171); a car
+whose plate grows back after shrinking (one that backed off and came forward)
+is an arrival again and gets its fallback; and a departure that shows no boxed
+plate at all is not caught -- on 2026-10-08 at 18:22 one such passage cost
+twelve lookups, and this rule has nothing to measure on it. The first lookup
+on a departure is usually still spent: its plate is biggest when it first
+appears, which releases a hand-over on plate width before any shrink can be
+seen. Measured on 2026-10-09 over the sweep's own reads, two departures
+(321->100 px and 333->103 px in about five seconds each) were caught 2.1-2.5 s
+after their widest plate and the one arrival (138->319 px, largest dip 3.8 %)
+never read as receding; over the one frame per event the dashboard keeps for
+the 48 passages from 5 to 9 October, the rule fired on 0 of 24 arrivals (16 of
+them let in) and 6 of 15 departures. See
+[vehicle-direction.md](vehicle-direction.md) for why no other real-time signal
+exists yet.
+
 **Rollout.** On by default since 2026-10-09, after the 2026-10-05/06 passages
 above showed the far frames costing lookups and, once, the gate's time.
 `shadow` hands over exactly as `off` does and journals what `on` would have

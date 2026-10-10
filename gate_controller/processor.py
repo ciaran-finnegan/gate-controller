@@ -84,6 +84,12 @@ CLOUD_SKIP_CLOUD_UNREACHABLE = "cloud_unreachable"
 # The camera's own alarm still, while a sweep is reading the same passage's
 # live stream: the device's read of it stands (`TriggerFrameCapture.camera_still_hold`).
 CLOUD_SKIP_SWEEP_READING = "sweep_reading"
+# The sweep's own reads say the car is leaving -- its plate is shrinking as it
+# recedes up the approach (`TriggerFrameCapture.departing_skip`). A departure
+# is let out by the gate's exit mechanism, not by the Pi, so a lookup on it
+# can decide nothing; the device's read of the frame stands, exactly as for
+# `sweep_reading`. Decided once per burst in `prepare`, before routing.
+CLOUD_SKIP_DEPARTING = "departing"
 FINAL_INHIBITION_REASONS = frozenset({
     "stale_burst", "authorisation_error", "authorisation_revoked",
     "decision_timeout", "processor_closed",
@@ -248,7 +254,8 @@ class GateProcessor:
                  telemetry_clock=None, telemetry_wall_clock=None, trace_factory=None,
                  match_policy=None, min_cloud_request_seconds: float | None = None,
                  cloud_skip_stillness: float | None = None,
-                 farm_machinery=None, internet_reachable=None, camera_still_hold=None):
+                 farm_machinery=None, internet_reachable=None, camera_still_hold=None,
+                 departing=None):
         if not math.isfinite(decision_timeout) or decision_timeout <= 0:
             raise ValueError("decision timeout must be finite and greater than zero")
         if activation_guard_seconds is None:
@@ -318,6 +325,9 @@ class GateProcessor:
         # `TriggerFrameCapture.camera_still_hold`, or None: whether a camera
         # upload is to be kept off the cloud because a sweep is reading.
         self._camera_still_hold = camera_still_hold
+        # `TriggerFrameCapture.departing_skip`, or None: whether the passage
+        # being read is a departing car, whose frames are kept off the cloud.
+        self._departing = departing
         self._recognizer_accepts_internet_reachable = _accepts_keyword(
             self._recognise_call, "internet_reachable", variadic=False,
         )
@@ -439,6 +449,7 @@ class GateProcessor:
             self._prepare_local_pass(prepared, deadline, stillness, sweep_read)
         if camera_upload:
             self._hold_camera_still(prepared)
+        self._skip_departing(prepared)
         if not prepared.decided:
             # A frame the device could not decide -- read here, or carried in
             # already read by the sweep -- may be a machine with no plate to
@@ -471,6 +482,34 @@ class GateProcessor:
             logging.getLogger(__name__).info(
                 "gate_ocr stage=cloud_hold_shadow source=camera_still would=%s",
                 CLOUD_SKIP_SWEEP_READING,
+            )
+
+    def _skip_departing(self, prepared: PreparedBurst) -> None:
+        """Keep a departing car's frame off the cloud. Never raises.
+
+        Asked once, here, before the burst is routed: `needs_cloud` and
+        `route_to_cloud_lane` both read ``cloud_skip``, so a verdict that
+        changes after this -- the rule is not sticky -- cannot move a burst
+        between the two lanes or let one finish on the burst thread with a
+        request (#197). Only a frame the device actually read and could not
+        decide, as for the camera still: a device grant on a departing car's
+        rear plate is decided before this and is untouched (#171).
+        """
+        if (
+            self._departing is None or prepared.decided
+            or prepared.cloud_skip is not None
+            or not _device_read(prepared.local_attempt)
+        ):
+            return
+        try:
+            mode = self._departing()
+        except Exception:
+            return
+        if mode == "on":
+            prepared.cloud_skip = CLOUD_SKIP_DEPARTING
+        elif mode == "shadow":
+            logging.getLogger(__name__).info(
+                "gate_ocr stage=cloud_skip_shadow would=%s", CLOUD_SKIP_DEPARTING,
             )
 
     def _prepare_local_pass(self, prepared: PreparedBurst, deadline: float,

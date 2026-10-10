@@ -297,6 +297,43 @@ class FastLaneTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: self.lanes.result_for(frame) is not None, 3.0))
         self.assertEqual(len(session.calls), 1, "a sweep hand-over is the sweep's own lookup")
 
+    def test_a_departing_burst_is_finished_on_the_burst_thread_without_the_cloud(self):
+        # The sweep says the car is leaving: its frame is kept here, decided
+        # on the device's read, and never takes the slot or posts -- however
+        # slow the cloud is at the time.
+        rear = self._jpeg("rear-plate.jpg", 100)
+        session = StallingSession(stall_seconds=3.0)
+        client = self._client([("13D2696", 0.40)], session)
+        processor = self._processor(client, departing=lambda: "on")
+        self.lanes = Lanes(processor)
+
+        with self.assertLogs("gate_controller.processor", level="INFO") as journal:
+            injected = self.lanes.inject(rear, stillness=0.001)
+            self.assertTrue(wait_for(lambda: self.lanes.result_for(rear) is not None, 2.0),
+                            "the departing frame waited on the cloud")
+        decided_at, result = self.lanes.result_for(rear)
+        self.assertFalse(result.opened)
+        self.assertEqual(result.reason, "no_match")
+        self.assertLess(decided_at - injected, 1.5)
+        self.assertEqual(session.calls, [], "a departing frame was posted")
+        self.assertTrue(any("cloud_skipped reason=departing" in line
+                            for line in journal.output), journal.output)
+        self.assertIsNone(self._stored(processor, result)["observed_plate"])
+
+    def test_a_departure_predicate_that_raises_costs_nothing_but_the_lookup(self):
+        def broken():
+            raise RuntimeError("no sweep")
+
+        frame = self._jpeg("sweep.jpg", 100)
+        session = FakeSession([])
+        client = self._client([("L514", 0.078)], session)
+        processor = self._processor(client, departing=broken)
+        self.lanes = Lanes(processor)
+
+        self.lanes.inject(frame, stillness=0.001)
+        self.assertTrue(wait_for(lambda: self.lanes.result_for(frame) is not None, 3.0))
+        self.assertEqual(len(session.calls), 1, "a broken predicate must not skip the cloud")
+
     def test_a_moving_frame_the_device_finds_no_plate_in_is_not_sent_to_the_cloud(self):
         # 21:52:22.47, frame 2766: the car still turning in, plate 88 px wide
         # and oblique, nothing on the device, then 2.3 s of cloud for "no

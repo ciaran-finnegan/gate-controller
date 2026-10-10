@@ -360,6 +360,11 @@ def main() -> None:
         camera_still_hold=(
             trigger_capture.camera_still_hold if trigger_capture is not None else None
         ),
+        # While the sweep's own reads say the car is leaving -- its plate is
+        # shrinking -- the passage's frames are decided on the device too.
+        departing=(
+            trigger_capture.departing_skip if trigger_capture is not None else None
+        ),
     )
     if early_trigger is not None:
         # The image tower the processor's policy loaded is the one the early

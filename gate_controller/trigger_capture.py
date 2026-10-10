@@ -141,6 +141,39 @@ SWEEP_CLOUD_STOPPED_READS = 3
 SWEEP_CLOUD_STOPPED_WINDOW_SECONDS = 2.0
 SWEEP_CLOUD_STOPPED_MIN_SPAN_SECONDS = 1.0
 SWEEP_CLOUD_STOPPED_SPREAD = 0.08
+# A departing car is not sent to the cloud plate reader. It comes from behind
+# the camera and recedes up the approach, so the plate the on-device detector
+# boxes *shrinks* read by read; an arriving car's plate only grows until it
+# stops at the gate, and the gate is opened for departures by the exit
+# mechanism, not by the Pi (the relay still fires for an authorised rear plate
+# the device reads, #171 -- that is a device grant and is untouched here).
+# `DepartingPlate` holds the rule: once the widest plate of the passage is at
+# least SWEEP_DEPARTING_MIN_PEAK_PX wide, SWEEP_DEPARTING_READS consecutive
+# boxed reads each at most (1 - SWEEP_DEPARTING_SHRINK) of it say the car is
+# receding, and `TriggerFrameCapture.departing_skip` tells the processor to
+# keep the passage's frames off the cloud (`cloud_skipped reason=departing`)
+# for as long as the latest read still says so. Measured on 2026-10-09 over
+# the sweep's own reads: two departures shrank 321->100 px and 333->103 px in
+# about five seconds each and were caught 2.1-2.5 s after their widest plate;
+# an arrival grew 138->319 px with its largest dip 3.8 % (159->153), and the
+# stopped-car rule above already tolerates 8 %. Over the 48 passages from 5
+# to 9 October, on the one frame per event the dashboard keeps, the rule
+# fired in 0 of 24 arrivals (16 of them let in) and 6 of 15 departures, the
+# rest showing no boxed plate for it to measure. 30 % is three times the
+# stopped-car spread; 150 px keeps jitter on a far plate from counting; two
+# reads are a quarter of a second at the sweep's rate. The rule is not sticky:
+# a car that backs off and comes forward again is an arrival once its plate
+# grows back, and gets its cloud fallback then. A verdict is only as fresh as
+# the read it came from: it is honoured for SWEEP_DEPARTING_GRACE_SECONDS
+# after that read, which covers the frames the sweep hands over as its window
+# closes (the fallback) and the camera's own still, and then lapses, so a
+# passage nobody read for a while cannot speak for the next car.
+SWEEP_DEPARTING_SKIP_MODES = ("off", "shadow", "on")
+DEFAULT_SWEEP_DEPARTING_SKIP = "on"
+SWEEP_DEPARTING_SHRINK = 0.30
+SWEEP_DEPARTING_MIN_PEAK_PX = 150
+SWEEP_DEPARTING_READS = 2
+SWEEP_DEPARTING_GRACE_SECONDS = 10.0
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
 # The waiting phase: once the full-rate window has closed with the gate still
@@ -447,6 +480,10 @@ class TriggerCaptureConfig:
     sweep_cloud_hold: str = DEFAULT_SWEEP_CLOUD_HOLD
     sweep_cloud_min_plate_px: int = DEFAULT_SWEEP_CLOUD_MIN_PLATE_PX
     sweep_cloud_last_chance_seconds: float = DEFAULT_SWEEP_CLOUD_LAST_CHANCE_SECONDS
+    # Whether a passage whose plate is shrinking -- a departing car -- is kept
+    # off the cloud: `off`, `shadow` (journal what `on` would skip) or `on`.
+    # See SWEEP_DEPARTING_SHRINK for the rule and its numbers.
+    sweep_departing_skip: str = DEFAULT_SWEEP_DEPARTING_SKIP
     # After the window: keep reading on the device, slowly, while a vehicle is
     # still in the picture and the gate has not opened. 0 seconds disables it.
     # See DEFAULT_SWEEP_WAITING_SECONDS for where the numbers come from.
@@ -603,6 +640,11 @@ def load_trigger_capture_config(
         ),
         0.0, MAX_SWEEP_CLOUD_LAST_CHANCE_SECONDS,
     )
+    sweep_departing_skip = str(
+        environment.get("GATE_LOCAL_SWEEP_DEPARTING_SKIP", DEFAULT_SWEEP_DEPARTING_SKIP)
+    ).strip().lower()
+    if sweep_departing_skip not in SWEEP_DEPARTING_SKIP_MODES:
+        raise ValueError("GATE_LOCAL_SWEEP_DEPARTING_SKIP must be 'off', 'shadow' or 'on'")
     sweep_waiting_seconds = _number(
         environment.get(
             "GATE_LOCAL_SWEEP_WAITING_SECONDS", str(DEFAULT_SWEEP_WAITING_SECONDS),
@@ -665,6 +707,7 @@ def load_trigger_capture_config(
         sweep_cloud_hold=sweep_cloud_hold,
         sweep_cloud_min_plate_px=sweep_cloud_min_plate_px,
         sweep_cloud_last_chance_seconds=sweep_cloud_last_chance_seconds,
+        sweep_departing_skip=sweep_departing_skip,
         sweep_waiting_seconds=sweep_waiting_seconds,
         sweep_waiting_fps=sweep_waiting_fps,
         early_max_seconds=early_max_seconds,
@@ -735,6 +778,65 @@ def _is_early(event) -> bool:
     return isinstance(event, EarlyEvent)
 
 
+class DepartingPlate:
+    """Whether the plate the on-device detector boxes is receding: a departing car.
+
+    Fed every boxed read of one passage, in order, in 4K-equivalent pixels
+    (``SweepRead.plate_px``). ``receding`` is true while the latest
+    ``SWEEP_DEPARTING_READS`` reads were each at most
+    ``1 - SWEEP_DEPARTING_SHRINK`` of the widest plate the passage has shown,
+    once that widest plate reached ``SWEEP_DEPARTING_MIN_PEAK_PX``. The widest
+    plate is remembered for the whole passage; the verdict is only as old as
+    the latest read, so a plate that grows back ends it. See the constants for
+    the measurements behind each number.
+    """
+
+    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "noticed")
+
+    def __init__(self) -> None:
+        self.peak_px = 0
+        self.shrunk = 0
+        self.receding = False
+        #: The sweep clock when the plate was first found receding, or None.
+        self.since: float | None = None
+        #: The sweep clock of the latest boxed read, or None before the first.
+        self.last_at: float | None = None
+        #: Whether this passage's recession has been journalled.
+        self.noticed = False
+
+    def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
+        """Whether the plate was receding on a read no older than ``grace`` seconds."""
+        if not self.receding or self.last_at is None:
+            return False
+        try:
+            return 0.0 <= (now - self.last_at) <= grace
+        except TypeError:
+            return False
+
+    def note(self, plate_px, now: float | None = None) -> bool:
+        """Take one boxed read; return whether the plate is receding now."""
+        try:
+            width = int(plate_px)
+        except (TypeError, ValueError):
+            return self.receding
+        if width <= 0:
+            return self.receding
+        self.last_at = now
+        if (
+            self.peak_px >= SWEEP_DEPARTING_MIN_PEAK_PX
+            and width <= self.peak_px * (1.0 - SWEEP_DEPARTING_SHRINK)
+        ):
+            self.shrunk += 1
+        else:
+            self.shrunk = 0
+        self.peak_px = max(self.peak_px, width)
+        receding = self.shrunk >= SWEEP_DEPARTING_READS
+        if receding and not self.receding:
+            self.since = now
+        self.receding = receding
+        return receding
+
+
 class SweepPassage:
     """Whose idea a sweep was, and whether the camera has agreed yet.
 
@@ -753,6 +855,9 @@ class SweepPassage:
         self.origin = origin if origin in (ORIGIN_CAMERA, ORIGIN_EARLY) else ORIGIN_EARLY
         self._confirmed = self.origin == ORIGIN_CAMERA
         self.confirmed_at: float | None = None
+        #: The passage's plate widths so far, and whether they say the car is
+        #: leaving. Written by the sweep, read by `departing_skip`.
+        self.departing = DepartingPlate()
 
     @property
     def early(self) -> bool:
@@ -891,6 +996,7 @@ class TriggerFrameCapture:
         # Frames a cloud hand-over was held back from (`on`), or handed over
         # although `on` would have held them (`shadow`).
         self._sweep_cloud_held = 0
+        self._sweep_departing = 0
         self._sweep_waiting_reads = 0
         # Waiting phases ended by the dark-drive rule (SWEEP_DARK_DEPARTED_FRAMES).
         self._sweep_dark_departed = 0
@@ -1059,6 +1165,30 @@ class TriggerFrameCapture:
             return None
         try:
             if not (self._sweep_ready() and self.session_active()):
+                return None
+        except Exception:
+            return None
+        return mode
+
+    def departing_skip(self) -> str | None:
+        """Whether the passage being read is a departing car, right now.
+
+        ``"on"`` or ``"shadow"`` while the sweep's latest read of the passage,
+        no older than ``SWEEP_DEPARTING_GRACE_SECONDS``, says the plate is
+        receding (`DepartingPlate`); None otherwise: no passage read lately, a
+        car that is not receding, or the rule switched off. Not tied to the
+        session flag, because the sweep's last hand-overs -- the fallback at
+        the window's end -- and the camera's still can reach `prepare` after
+        the session has closed. Asked by `GateProcessor.prepare` once per
+        burst, before the burst is routed, so the answer a burst was routed
+        on is the answer it is finished on. Never raises.
+        """
+        mode = self.config.sweep_departing_skip
+        if mode not in ("on", "shadow"):
+            return None
+        try:
+            passage = self._passage
+            if passage is None or not passage.departing.receding_at(self._clock()):
                 return None
         except Exception:
             return None
@@ -1635,6 +1765,10 @@ class TriggerFrameCapture:
             if plate_px is not None:
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
+                if read.recognised:
+                    # Only a box the recogniser put characters on: a box with
+                    # no text in it is as likely a bumper or a sign as a plate.
+                    self._note_departing(passage, plate_px, sweep_started_at)
             # While waiting: a dark frame that is the unlit idle drive to the
             # baseline and nothing to the reader -- no characters and no box,
             # from a read that completed. Anything else -- a plate, a box, a
@@ -1749,6 +1883,24 @@ class TriggerFrameCapture:
             hold_mode, len(held),
         )
         return injected + fallback + handovers
+
+    def _note_departing(self, passage, plate_px: int, sweep_started_at: float) -> None:
+        """Feed one boxed read to the passage's departure rule; journal the first verdict."""
+        try:
+            receding = passage.departing.note(plate_px, self._clock())
+        except Exception:
+            return
+        if not receding or passage.departing.noticed:
+            return
+        passage.departing.noticed = True
+        self._sweep_departing += 1
+        mode = self.config.sweep_departing_skip
+        if mode in ("on", "shadow"):
+            LOGGER.info(
+                "gate_local_sweep stage=departing mode=%s peak_px=%d plate_px=%d at_ms=%d",
+                mode, passage.departing.peak_px, plate_px,
+                round(max(0.0, self._clock() - sweep_started_at) * 1000),
+            )
 
     def _cloud_reachable(self) -> bool:
         """False only when the probe answers a definite False; see `__init__`."""
@@ -2443,6 +2595,8 @@ class TriggerFrameCapture:
                 "cloud_min_plate_px": self.config.sweep_cloud_min_plate_px,
                 "cloud_last_chance_seconds": self.config.sweep_cloud_last_chance_seconds,
                 "cloud_held": self._sweep_cloud_held,
+                "departing_skip": self.config.sweep_departing_skip,
+                "departing": self._sweep_departing,
                 "waiting_seconds": self.config.sweep_waiting_seconds,
                 "waiting_fps": self.config.sweep_waiting_fps,
                 "waiting_reads": self._sweep_waiting_reads,
