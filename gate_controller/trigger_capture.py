@@ -932,13 +932,18 @@ class SweepPassage:
     The origin is stated, never inferred from timing.
     """
 
-    def __init__(self, origin: str = ORIGIN_CAMERA):
+    def __init__(self, origin: str = ORIGIN_CAMERA, started_at: float | None = None):
         self.origin = origin if origin in (ORIGIN_CAMERA, ORIGIN_EARLY) else ORIGIN_EARLY
         self._confirmed = self.origin == ORIGIN_CAMERA
         self.confirmed_at: float | None = None
         #: The passage's plate widths so far, and whether they say the car is
-        #: leaving. Written by the sweep, read by `departing_skip`.
+        #: leaving. Written by the sweep, read by `departing_skip`. Bounded
+        #: from the start by the alarm (or early trigger) that began the
+        #: passage: the session's first frames can be keyframes buffered from
+        #: before it, and a departing car's last big plate in one of those
+        #: must not make the arriving car's first small plates a shrink.
         self.departing = DepartingPlate()
+        self.departing.alarm(started_at)
 
     @property
     def early(self) -> bool:
@@ -1369,7 +1374,7 @@ class TriggerFrameCapture:
             early = _is_early(event)
             # Every event starts with its own passage, so nothing a previous
             # early sweep left behind can describe this one.
-            self._passage = SweepPassage(ORIGIN_EARLY if early else ORIGIN_CAMERA)
+            self._passage = SweepPassage(ORIGIN_EARLY if early else ORIGIN_CAMERA, scheduled_at)
             self._sweep_upgrade = None
             if early and not (self._early_enabled and self._sweep_ready()):
                 # Only the sweep can keep a frame off the cloud, so an early
@@ -1485,7 +1490,7 @@ class TriggerFrameCapture:
         # Stated, not inferred: a sweep is early-origin because the early
         # trigger asked for it, and stays unconfirmed until the camera's own
         # alarm is taken off the queue below. See `SweepPassage`.
-        passage = SweepPassage(ORIGIN_EARLY if _is_early(event) else ORIGIN_CAMERA)
+        passage = SweepPassage(ORIGIN_EARLY if _is_early(event) else ORIGIN_CAMERA, scheduled_at)
         self._passage = passage
         self._sweep_upgrade = None
         self._early_sweeps += 1 if passage.early else 0

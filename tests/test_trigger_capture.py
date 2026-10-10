@@ -13,7 +13,7 @@ from PIL import Image
 from gate_controller.reolink_events import SanitizedCameraEvent
 from gate_controller.models import MatchDecision, ProcessingResult
 from gate_controller.trigger_capture import (
-    ORIGIN_EARLY, CarriedDeparture, DepartingPlate, SweepPassage,
+    ORIGIN_CAMERA, ORIGIN_EARLY, CarriedDeparture, DepartingPlate, SweepPassage,
 )
 from gate_controller.trigger_capture import (
     TriggerCaptureConfig,
@@ -392,6 +392,22 @@ class DepartingPlateTests(unittest.TestCase):
         # The first read begun after the alarm is the new car's.
         self.assertFalse(judge.note(150, 103.6))
         self.assertEqual(judge.peak_px, 150)
+
+    def test_a_passage_is_bounded_by_the_alarm_that_began_it(self):
+        # The session's first frame can be a keyframe buffered from before
+        # the alarm, showing the last car's big plate as it left. The new
+        # car's first small plates are not a shrink from it.
+        passage = SweepPassage(ORIGIN_CAMERA, started_at=200.0)
+        judge = passage.departing
+        self.assertEqual(judge.alarm_at, 200.0)
+        self.assertFalse(judge.note(330, 199.6))     # buffered, captured before the alarm
+        self.assertFalse(judge.note(150, 200.4))     # the arriving car, far off
+        self.assertFalse(judge.note(150, 200.9))
+        self.assertEqual(judge.peak_px, 150, "the last car's plate counted against this one")
+        self.assertFalse(judge.receding)
+        # The early trigger's passage is bounded the same way.
+        self.assertEqual(SweepPassage(ORIGIN_EARLY, started_at=7.5).departing.alarm_at, 7.5)
+        self.assertIsNone(SweepPassage().departing.alarm_at)
 
     def test_a_carried_verdict_answers_the_same_whatever_happens_next(self):
         carried = CarriedDeparture("on")
