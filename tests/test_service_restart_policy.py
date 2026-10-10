@@ -95,3 +95,19 @@ class RestartPolicyTests(unittest.TestCase):
                     with self.subTest(unit=path.name, key=key, requires=required):
                         self.assertFalse(required.startswith("gate-"),
                                          f"{path.name} {key}={required}")
+
+
+class OneshotRestartTests(unittest.TestCase):
+    def test_no_oneshot_unit_uses_a_restart_setting_systemd_refuses(self):
+        # systemd 252 (the Pi) through 255 refuses RestartForceExitStatus= on
+        # a Type=oneshot unit, and Restart= other than no/on-failure, with
+        # "bad unit file setting": the unit does not load and its timer never
+        # runs it. Measured with systemd-analyze verify on the Pi, 2026-10-10.
+        for path in _units():
+            parser = _read(path)
+            if parser.get("Service", "Type", fallback="simple") != "oneshot":
+                continue
+            with self.subTest(unit=path.name):
+                self.assertNotIn("RestartForceExitStatus", parser["Service"])
+                self.assertIn(parser.get("Service", "Restart", fallback="no"),
+                              ("no", "on-failure"))
