@@ -593,7 +593,12 @@ def _clear_stream_source(config, local_recognizer=None, plate_region=None):
     """
     if not (config.enabled and config.hot_keyframes):
         return None
-    vehicle_check = _baseline_vehicle_check(local_recognizer, plate_region)
+    # Under GATE_TRIGGER_CAPTURE_CROP the decoders have already cut the frame
+    # to the plate band (`decoder_filters`), so the probe must not cut it
+    # again -- the same rule `_flat_fraction` and the OCR path follow.
+    vehicle_check = _baseline_vehicle_check(
+        local_recognizer, None if config.crop_capture else plate_region,
+    )
     if config.clear_stream_mode == "decoded":
         return ClearKeyframeBuffer(config, vehicle_check=vehicle_check)
     from .clear_stream_source import ClearStreamSource
@@ -615,7 +620,8 @@ def _baseline_vehicle_check(local_recognizer, plate_region):
 
     The detector sees the plate band exactly as the sweep hands it over
     (``crop_to_region``), so what it clears for the baseline is what the sweep
-    would have been able to read.
+    would have been able to read. ``plate_region`` is None when the frames are
+    already cropped to it.
     """
     if local_recognizer is None or not getattr(local_recognizer, "enabled", False):
         return None

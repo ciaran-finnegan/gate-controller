@@ -39,6 +39,7 @@ frames differ, which is to say read.
 from collections.abc import Callable
 from io import BytesIO
 import logging
+from threading import Lock
 from time import monotonic
 import warnings
 
@@ -122,6 +123,10 @@ class SceneBaseline:
         self._dark_baseline_at: float | None = None
         self._last_activity: float | None = None
         self._refreshes = 0
+        # `note_activity` arrives from the webhook thread while `observe` runs
+        # on the decoder's; the lock is what makes "no alarm since the probe
+        # began" a statement about the moment the baseline is installed.
+        self._lock = Lock()
         # When the detector was last asked, refused or not: it costs a read,
         # so it is asked no more often than a refresh could happen, whatever
         # rate frames are offered at (the decoded ring offers one a second).
@@ -133,13 +138,19 @@ class SceneBaseline:
 
     def note_activity(self, now: float | None = None) -> None:
         """A camera event: the scene is busy, so stop refreshing the baseline."""
-        self._last_activity = self._clock() if now is None else now
+        with self._lock:
+            self._last_activity = self._clock() if now is None else now
+
+    def _busy(self, now: float) -> bool:
+        return self._last_activity is not None and now - self._last_activity < self._idle_seconds
 
     def observe(self, frame: bytes, now: float | None = None) -> bool:
         """Offer a decoded keyframe; it becomes the baseline when the scene is idle."""
         now = self._clock() if now is None else now
-        if self._last_activity is not None and now - self._last_activity < self._idle_seconds:
-            return False
+        with self._lock:
+            if self._busy(now):
+                return False
+            activity_before = self._last_activity
         if self._baseline_at is not None and now - self._baseline_at < self._refresh_seconds:
             return False
         if self._checked_at is not None and now - self._checked_at < self._refresh_seconds:
@@ -156,17 +167,26 @@ class SceneBaseline:
             if boxed is not False:
                 self._refuse(now, "plate_box" if boxed else "detector_unanswered")
                 return False
-        self._baseline = thumbnail
-        self._baseline_at = now
-        self._refreshes += 1
-        if is_dark(thumbnail):
-            self._dark_baseline = thumbnail
-            self._dark_baseline_at = now
+        with self._lock:
+            # The probe blocks for up to a second, and an alarm in that time
+            # is a car in view -- one the detector may not have boxed (too
+            # close, too far, still moving). Whatever the frame showed, the
+            # scene is not idle now, so it is not the idle drive.
+            if self._last_activity != activity_before or self._busy(self._clock()):
+                self._refuse(now, "alarm_during_probe")
+                return False
+            self._baseline = thumbnail
+            self._baseline_at = now
+            self._refreshes += 1
+            if is_dark(thumbnail):
+                self._dark_baseline = thumbnail
+                self._dark_baseline_at = now
         return True
 
     def _refuse(self, now: float, reason: str) -> None:
         """A frame the detector would not clear: keep the baseline as it was."""
-        if reason == "plate_box":
+        if reason in ("plate_box", "alarm_during_probe"):
+            # Both are a vehicle in view: one the detector saw, one the camera did.
             self._refused_vehicle += 1
         else:
             self._refused_unanswered += 1

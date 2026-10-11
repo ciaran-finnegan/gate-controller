@@ -156,7 +156,9 @@ read on two frames.
   baseline; one with a plate box in it is refused and the old baseline kept,
   and so is one the detector cannot answer for (not ready, busy with a sweep
   frame, failed), because a stale picture of the *empty* drive makes a car's
-  frames differ, which is to say read. A sweep read that boxes a plate also
+  frames differ, which is to say read. An alarm that lands while the
+  detector is looking refuses it too: the idle check is made again before
+  the baseline is installed. A sweep read that boxes a plate also
   counts as activity, so the idle clock runs from the last sight of the car,
   not the last alarm. Without a local recogniser there is no detector and
   the baseline refreshes as before.
@@ -176,7 +178,9 @@ Guards:
 - `tests/test_scene.py::WaitingCarTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_refused_and_the_old_baseline_kept`
 - `tests/test_scene.py::WaitingCarTests::test_a_detector_that_cannot_answer_keeps_the_old_baseline`
 - `tests/test_scene.py::WaitingCarTests::test_an_empty_frame_is_still_adopted_when_the_detector_finds_nothing`
+- `tests/test_scene.py::WaitingCarTests::test_an_alarm_on_another_thread_during_a_slow_probe_refuses_the_frame`
 - `tests/test_clear_stream_source.py::ClearStreamSourceTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_never_adopted_as_the_idle_drive`
+- `tests/test_main.py::BaselineVehicleCheckWiringTests::test_a_capture_the_decoder_already_cropped_is_not_cropped_again`
 
 ## 7. The camera lens is never left changed, and neither is a picture setting a lease changed
 

@@ -383,13 +383,18 @@ frames unread as "empty" (the kept samples show the car; 9 Oct 12:35 and
 recording loop shows its plate band to the on-device detector
 (`LocalRecognizer.plate_boxed`, about 200 ms on one core, at most once per
 30 s, never while a session is reading, declined rather than queued if a
-frame is in flight). A box refuses the frame and keeps the old baseline; so
-does no answer at all -- a reader still loading, busy, timed out or failing
--- because a stale picture of the *empty* drive is the safe side: a car's
-frames differ from it and are read. The sweep's own boxed reads count as
-activity too, so the idle clock runs from the last sight of the car. One
-journal line per five minutes says so (`gate_scene_baseline
-outcome=refresh_refused reason=plate_box|detector_unanswered refused=N`), and
+frame is in flight; the band is cut once -- not again when
+`GATE_TRIGGER_CAPTURE_CROP` has the decoder cut it already). A box refuses
+the frame and keeps the old baseline; so does no answer at all -- a reader
+still loading, busy, timed out or failing -- because a stale picture of the
+*empty* drive is the safe side: a car's frames differ from it and are read.
+So does a camera alarm that lands while the detector is looking: the probe
+blocks for up to a second, an alarm in that time is a car in view whether or
+not the detector boxed it, and the idle check is made again before the
+baseline is installed. The sweep's own boxed reads count as activity too, so
+the idle clock runs from the last sight of the car. One journal line per five
+minutes says so (`gate_scene_baseline outcome=refresh_refused
+reason=plate_box|alarm_during_probe|detector_unanswered refused=N`), and
 the status block counts them under `scene.refused_vehicle` and
 `scene.refused_unanswered`. Without a local recogniser there is no detector
 to ask and the baseline refreshes as it always did.

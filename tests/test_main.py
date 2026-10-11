@@ -1612,6 +1612,82 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertIn("GATE_MAX_CANDIDATE_IMAGE_BYTES=8388608", example)
 
 
+class BaselineVehicleCheckWiringTests(unittest.TestCase):
+    """What `_clear_stream_source` hands the detector before a baseline refresh.
+
+    The detector must see the plate band once: cut from a full frame, or the
+    frame as it comes when GATE_TRIGGER_CAPTURE_CROP has the decoder cut it
+    already. Cutting a cut frame again shows the detector a sliver of the band
+    and lets a waiting car through into the baseline.
+    """
+
+    REGION_TEXT = "0.25,0.0,0.75,0.6"
+
+    class Recognizer:
+        enabled = True
+
+        def __init__(self):
+            self.seen = []
+
+        def plate_boxed(self, image):
+            self.seen.append(image)
+            return True
+
+    def setUp(self):
+        from io import BytesIO
+        from PIL import Image
+        from gate_controller.plate_region import parse_plate_region
+        self.directory = tempfile.TemporaryDirectory()
+        self.region = parse_plate_region(self.REGION_TEXT)
+        output = BytesIO()
+        Image.new("RGB", (192, 108), color=(120, 120, 120)).save(output, format="JPEG")
+        self.frame = output.getvalue()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _source(self, *, crop, mode):
+        from gate_controller.trigger_capture import TriggerCaptureConfig
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=Path(self.directory.name) / "capture",
+            plate_region=self.region, crop_capture=crop, clear_stream_mode=mode,
+        )
+        recognizer = self.Recognizer()
+        source = gate_main._clear_stream_source(
+            config, local_recognizer=recognizer, plate_region=self.region,
+        )
+        return source, recognizer
+
+    def test_an_uncropped_capture_shows_the_detector_the_plate_band(self):
+        from gate_controller.local_sweep import crop_to_region
+        for mode in ("compressed", "decoded"):
+            with self.subTest(mode=mode):
+                source, recognizer = self._source(crop=False, mode=mode)
+                self.assertIs(source.scene._vehicle_check(self.frame), True)
+                self.assertEqual(recognizer.seen, [crop_to_region(self.frame, self.region)])
+                self.assertNotEqual(recognizer.seen[0], self.frame, "the band, not the whole frame")
+
+    def test_a_capture_the_decoder_already_cropped_is_not_cropped_again(self):
+        for mode in ("compressed", "decoded"):
+            with self.subTest(mode=mode):
+                source, recognizer = self._source(crop=True, mode=mode)
+                self.assertIs(source.scene._vehicle_check(self.frame), True)
+                self.assertEqual(recognizer.seen, [self.frame], "the decoder cut the band already")
+
+    def test_without_a_recogniser_the_baseline_has_no_detector_to_ask(self):
+        from gate_controller.trigger_capture import TriggerCaptureConfig
+        config = TriggerCaptureConfig(
+            enabled=True, output_directory=Path(self.directory.name) / "capture",
+            plate_region=self.region,
+        )
+        source = gate_main._clear_stream_source(config)
+        self.assertIsNone(source.scene._vehicle_check)
+        disabled = self.Recognizer()
+        disabled.enabled = False
+        source = gate_main._clear_stream_source(config, local_recognizer=disabled, plate_region=self.region)
+        self.assertIsNone(source.scene._vehicle_check)
+
+
 class AuthorisationStalenessTests(unittest.TestCase):
     def test_default_keeps_the_last_snapshot_for_fourteen_days(self):
         from gate_controller.__main__ import authorisation_max_staleness

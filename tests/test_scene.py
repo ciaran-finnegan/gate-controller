@@ -252,6 +252,51 @@ class WaitingCarTests(unittest.TestCase):
         self.assertEqual(scene.status()["dark_age_seconds"], 60.0)
         self.assertTrue(scene.status()["dark_available"])
 
+    def test_an_alarm_that_lands_while_the_detector_is_looking_refuses_the_frame(self):
+        # The probe blocks for up to a second. A camera alarm in that time is a
+        # car in view -- perhaps one the detector did not box (too close, too
+        # far, still moving) -- so the frame is not the idle drive even when
+        # the probe comes back "no plate". The alarm arrives on the webhook
+        # thread; here it lands inside the probe, which is the same moment.
+        scene = self.scene(lambda frame: (scene.note_activity(), False)[1])
+        self.assertTrue(scene.observe(self.empty) is False, "the first offer is refused: an alarm landed")
+        self.assertFalse(scene.status()["available"])
+        self.assertEqual(scene.status()["refused_vehicle"], 1)
+        # And the alarm counts as activity from then on: idle again 60 s later.
+        self.clock[0] += 30.0
+        self.assertFalse(scene.observe(self.empty), "still inside the idle window; the detector is not even asked")
+        self.assertEqual(len(self.asked), 1)
+
+    def test_an_alarm_on_another_thread_during_a_slow_probe_refuses_the_frame(self):
+        from threading import Event, Thread
+        looking = Event()
+        alarm_landed = Event()
+
+        def slow_probe(_frame):
+            looking.set()
+            self.assertTrue(alarm_landed.wait(5))
+            return False
+
+        scene = self.scene(slow_probe)
+        outcome = []
+        offer = Thread(target=lambda: outcome.append(scene.observe(self.empty)), daemon=True)
+        offer.start()
+        self.assertTrue(looking.wait(5))
+        scene.note_activity()  # the webhook thread, mid-probe
+        alarm_landed.set()
+        offer.join(5)
+        self.assertEqual(outcome, [False])
+        self.assertFalse(scene.status()["available"])
+        self.assertEqual(scene.status()["refused_vehicle"], 1)
+
+    def test_a_quiet_probe_still_adopts_the_frame(self):
+        # The recheck refuses only an alarm that landed *during* the probe; an
+        # old one, outside the idle window, is no bar.
+        scene = self.scene(lambda frame: False)
+        scene.note_activity()
+        self.clock[0] += 60.0
+        self.assertTrue(scene.observe(self.empty))
+
     def test_an_undecodable_frame_never_reaches_the_detector(self):
         scene = self.scene(lambda frame: False)
         self.assertFalse(scene.observe(b"not a jpeg"))
