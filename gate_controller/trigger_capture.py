@@ -1017,8 +1017,12 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         )
         # The detector gate on the baseline (scene.py). This ring offers every
         # decoded keyframe, one a second; the baseline asks the detector no
-        # more often than it could refresh.
+        # more often than it could refresh, and never while a capture session
+        # is reading (below), so the recogniser's one worker is not taken from
+        # a sweep frame by a baseline probe.
         self.scene = SceneBaseline(clock=self._clock, vehicle_check=vehicle_check)
+        self._session_lock = Lock()
+        self._session_active = False
         self._decode = {
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
@@ -1034,7 +1038,33 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         )
 
     def _on_frame(self, frame: bytes, now: float) -> None:
+        # Exactly the compressed source's rule (`_maybe_refresh_baseline`):
+        # no baseline offer, and so no detector probe, while a session reads.
+        if self.session_active():
+            return
         self.scene.observe(frame, now)
+
+    # -- capture session marker ---------------------------------------------
+    # This ring has no live decoder to start: it already decodes one keyframe
+    # a second. What `start_session` records is that a sweep is reading, for
+    # as long as the capture says so, and `_on_frame` offers nothing to the
+    # baseline in that time. Without it a sweep that outlives the 60 s idle
+    # window -- a car at the gate whose plate the detector has not boxed --
+    # could lose its one recogniser worker to a baseline probe for up to a
+    # second, and the first frame where the plate comes clear would be read
+    # as `unavailable`.
+    def session_active(self) -> bool:
+        with self._session_lock:
+            return self._session_active
+
+    def start_session(self) -> bool:
+        with self._session_lock:
+            self._session_active = True
+        return True
+
+    def stop_session(self, reason: str = "ended") -> None:
+        with self._session_lock:
+            self._session_active = False
 
     def note_activity(self) -> None:
         self.scene.note_activity(self._clock())
@@ -1050,6 +1080,7 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         status.update({
             "stream": "clear",
             "keyframes_only": True,
+            "session_active": self.session_active(),
             "source_profile": {
                 "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
             },

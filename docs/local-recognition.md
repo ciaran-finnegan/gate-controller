@@ -382,7 +382,8 @@ frames unread as "empty" (the kept samples show the car; 9 Oct 12:35 and
 8 Oct 10:24 went the same way). So before a keyframe becomes the baseline the
 recording loop shows its plate band to the on-device detector
 (`LocalRecognizer.plate_boxed`, about 200 ms on one core, at most once per
-30 s, never while a session is reading, declined rather than queued if a
+30 s, never while a session is reading -- in `decoded` mode too, where the
+ring marks the capture's session itself -- declined rather than queued if a
 frame is in flight; the band is cut once -- not again when
 `GATE_TRIGGER_CAPTURE_CROP` has the decoder cut it already). A box refuses
 the frame and keeps the old baseline; so does no answer at all -- a reader
