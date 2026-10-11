@@ -37,7 +37,7 @@ further is marked as resting on fewer than five passages.
 - **The house link is the weakest part of the installation, and it is worst by day.**
   - Pi→router loss averages 5-8 % from 20:00 to 07:00 and 34-40 % from 09:00 to 15:00. On 9 Oct it was 67-100 % for most of the afternoon.
   - Openings do not depend on it (invariant 3). The cloud fallback, the outbox, deploys and remote diagnosis all do.
-- **9 Oct 21:42-22:22 the gate stood open for 39 minutes**, after a departure, with no pulse from the Pi (see section 8).
+- **9 Oct 21:42-22:22: whether the gate stood open is unknown.** The scanner rows that suggested it are the camera's alarm sound and car engines (corrected 10 Oct; see section 8). The Pi sent no pulse.
 
 ## 1. Latency breakdown per arrival
 
@@ -234,13 +234,11 @@ The decode-width costs are in Task 1 below.
 
 ## 8. Anything else
 
-- **9 Oct 21:42-22:22, the gate stood open for 39 minutes.**
-  - The audio scanner (`gate_movements`) heard a 17 s motor run at 21:41:38 as the Audi left, then two more runs (21:42:08, 21:42:23) as it was still in the gateway.
-  - Then nothing, and no latch clang, until 22:21:47, when the owner drove through the open gate. The Pi sent no pulse all evening (`relay_outcome=not_attempted`) and there was no app command.
-  - Why, from the opener's own manual: it is a TOPENS A5132 with auto-close set to about 14 s after fully open. The TOPENS manual says the board "reverse[s] the gate upon first obstruction and stop[s] upon a second sequential obstruction"; its troubleshooting table lists "the gate stop[s] when on the way of opening or closing" as "two sequential photo beam blocked".
-  - That fits the audio exactly. The exit wand opened the gate (21:41:38), auto-close started about 14 s after full open (21:42:08), the departing car broke the beam (reverse, 21:42:23), and broke it again (stop). A board that has stopped waits for a command; auto-close does not re-arm.
-  - So the board is behaving as designed; the gate can be left open, possibly part-way, whenever a car lingers in the beam.
-  - A notify-only "gate left open" alert now ships (gate-controller#202, access-gate-ui#94). Its one-tap Close requires the user to confirm they can see the gate fully open and not moving (access-gate-ui#95): a pulse into a gate stopped part-way reverses it, and the leaves can cross (2026-09-21).
+- **9 Oct 21:42-22:22: what the gate did is unknown.**
+  - **Corrected 10 Oct.** This section first said the gate stood open for 39 minutes after the photocell reversed an interrupted auto-close. Re-read at 0.5 s resolution ([2026-10-10-gate-jam.md](2026-10-10-gate-jam.md)), the scanner's three rows are not motor runs. The 21:41:38 row is the departing Audi's engine (band +10 to +30 dB, almost no 1.2-8 kHz share). The 21:42:23 row is the camera's own vehicle alarm sound, which clipped the microphone from 0.2 s after the alarm. No motor-band run is visible in the burst.
+  - So the audio cannot say whether the exit wand opened the gate, whether the auto-close ran or was reversed, or whether the gate stood open until 22:22. The Pi sent no pulse all evening (`relay_outcome=not_attempted`) and there was no app command; those facts stand.
+  - The TOPENS manual's photocell behaviour still holds: the first block reverses the gate, a second sequential block stops it, and auto-close does not re-arm. A gate *can* be left open that way; this evening is not shown to be an instance.
+  - The notify-only "gate left open" alert (gate-controller#202, access-gate-ui#94, #95) was built on this reading. Its rule is unvalidated until it is replayed on audio recorded with the alarm sound off (it was switched off on 10 Oct at 15:27); see [../gate-left-open.md](../gate-left-open.md).
 - **Link loss is diurnal.**
   - Mean Pi→router loss by hour (IST), 5-9 Oct: 00-06 h 5-8 %, 08 h 18 %, 09-14 h 34-40 %, 15-17 h 27-29 %, 19-22 h 7-11 %.
   - A constant load such as the NVR recording the camera around the clock does not by itself explain a daily shape.
@@ -255,7 +253,7 @@ The decode-width costs are in Task 1 below.
 | # | Change | Expected gain | Cost / risk | Who | Invariants |
 | --- | --- | --- | --- | --- | --- |
 | 1 | **More pixels on the D-Max's plate where it waits: a stop mark on the drive about 3-5 m out**, so it stops inside the readable zone (plate within about 45 degrees of the lens). Not a re-aim to the stop: from this mount a car at the gate is 40-90 degrees off and unreadable, so the camera stays aimed at the approach ([reolink-rlc-811a.md](../reolink-rlc-811a.md#capture-at-the-stop)) | The one household failure mode: a 53 s wait and a 67 s wait in 4 passages | A painted mark or marker post; no camera change | User | none |
-| 2 | **The TOPENS board stops the gate on a second photocell block and does not re-close** (manual: "reverse the gate upon first obstruction and stop upon a second sequential obstruction"), so ship a notify-only "gate left open" alert | 39 min open on 9 Oct; an alert within ~10 min (1.5 a week on history, about 0.7 false) | The alert never pulses; its Close button needs the user to confirm they can see the gate fully open, because a pulse into a gate stopped part-way can cross the leaves | Done: #202, access-gate-ui#94, #95 | 1, 3, 11 |
+| 2 | **The TOPENS board stops the gate on a second photocell block and does not re-close** (manual: "reverse the gate upon first obstruction and stop upon a second sequential obstruction"), so ship a notify-only "gate left open" alert | A gate left open by a lingering car (9 Oct was thought to be one; unconfirmed). An alert within ~10 min, 1.5 a week on history; up to about 1.1 a week may be false (only 1 of 4 firings known real) | The alert never pulses; its Close button needs the user to confirm they can see the gate fully open, because a pulse into a gate stopped part-way can cross the leaves | Done: #202, access-gate-ui#94, #95 | 1, 3, 11 |
 | 3 | **Journal skip counts per sweep** (`skipped_empty`, `skipped_corrupt` on `outcome=ended`), and keep one skipped frame per sweep for review | Explains the daytime sweeps that read nothing, one of which a 4K still rescued | Journal and disk only | Done: #203 | none |
 | 4 | **End the waiting phase on a dark, plate-less scene.** The idle baseline was captured while the floodlight was on, so no black frame could match it | 70-80 s of pointless reads per night departure, now ~5 s | Invariant 6 kept: a dark frame is never skipped unread, and a plate box restarts the count; new guards listed under invariant 6 | Done: #204 | 6 |
 | 5 | **No cloud hand-overs for departures**, judged from the sweep's own reads (a receding plate). On history it judged 0 of 24 arrivals departing and caught 6 of 15 departures | About 40 % of cloud attempts, and their denial rows over the lossy link | Must not touch arrivals; the relay still fires for rear plates (#171). Ships as `shadow` (records only); switch `on` after a week of records shows no arrival judged departing | Done: #205 (shadow) | 1, 2, 5 |

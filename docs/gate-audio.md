@@ -958,7 +958,10 @@ cycles, and over a third of real cycles produce one motor run or none. That
 rules out "no latch, then silence" as an alert: it would fire 8 times a week.
 What is reliable is the interrupted closing: three or more runs, an odd
 number, and no latch on the last. Over 2.72 weeks of history that rule fired
-four times, two of which are known to be real.
+four times. Only one of them (2026-09-21) is known to be real: the 2026-10-09
+burst turned out to be the camera's alarm sound and car engines, so the rule
+is unvalidated until it is replayed on audio recorded with that sound off
+(see [gate-left-open.md](gate-left-open.md)).
 
 It is notify only. It reads `gate_movements` and `gate_listening` on the
 heartbeat's read-only connection and returns a dictionary. It can never

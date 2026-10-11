@@ -725,6 +725,54 @@ at 0.96 -- still cut by the picture's own edge, as before.
 autofocus), then revert the two defaults above. What to watch: `plate_px=` on
 `gate_local_sweep stage=read` lines for the pickup at the stop, and its reads.
 
+## Vehicle audio alarm switched off, 2026-10-10
+
+The camera had its own **audio alarm** enabled for `AI_VEHICLE`, all 168
+hours of the week (`GetAudioAlarmV20`: `enable 1`), with the speaker at volume
+92 (`GetAudioCfg`). The repo never set it; it was configured on the camera
+itself.
+
+On every vehicle detection the camera played a sound through its speaker, which
+sits beside its own microphone:
+
+- it started 0.2-1.9 s after the alarm and lasted 9-15 s (one 29.5 s when two
+  alarms overlapped);
+- it drove the microphone to clipping, at -5.7 dBFS with a 1.2-8 kHz share of
+  0.60;
+- it played on 12 of 12 vehicle alarms between 9 Oct 21:30 and 10 Oct 11:20.
+
+The gate motor peaks at -25 to -46 dBFS, about 35 dB below that, so for the
+first 10-15 s of every passage the controller could not hear the gate.
+
+The production sound scanner recorded the sound as motor runs, and the
+left-open alert (#202) read those rows. See
+[reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md).
+
+**Switched off** at 15:27 IST with the owner's OK, in daylight with the gate
+quiet:
+
+- `SetAudioAlarmV20` with `enable 0`, `rspCode 200`; read back as `enable 0`.
+- The schedule table was left exactly as found (`AI_VEHICLE` all hours), so
+  re-enabling restores the old behaviour.
+- The speaker volume (92) is unchanged; push-to-talk still uses it.
+
+Backup of both settings before the change:
+`/var/lib/gate-controller/camera-audio-alarm-before-2026-10-10.json` on the Pi.
+
+**Rollback** is the backup's `GetAudioAlarmV20` value posted back with
+`enable 1`, run on the Pi:
+
+```bash
+cd /opt/gate-controller-deploy/current && sudo python3 scripts/reolink/camtool.py raw "$(sudo python3 -c 'import json; a=json.load(open("/var/lib/gate-controller/camera-audio-alarm-before-2026-10-10.json"))[0]["value"]["Audio"]; print(json.dumps([{"cmd":"SetAudioAlarmV20","action":0,"param":{"Audio":a}}]))')"
+```
+
+**Verified** on the first three vehicle alarms afterwards (15:49:10, 15:49:45
+and 15:52:19 IST). In the 20 s after each the audio peaked at -32 to -37 dBFS,
+with no clipping and no loud high-band run; before the change every alarm
+clipped. If a clipping run ever reappears 1-2 s after an alarm, the firmware is
+linking a siren from another alarm action as well. Look at the alarm-action
+settings before assuming the gate moved.
+
 ## Cutover And Rollback
 
 Only one camera is on the port at any time, so the swap is a short outage:
