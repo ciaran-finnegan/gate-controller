@@ -71,6 +71,29 @@ names disappears.
   touch the same function, merge one, rebase the other, re-test.
 - A change to an invariant is a change to `docs/invariants.md` in the same PR.
 
+## The Pi has no fan
+
+The Pi 5 at the gate has no fan and no active cooler (confirmed by the owner
+on 2026-10-11; the board exposes no `cooling_fan` device). Its firmware
+throttles at 85 °C. In normal running, 28 Sep - 11 Oct, its 5-minute
+`soc_temp_c` averaged 51-59 °C a day and peaked at 57-74 °C. The one reading
+above that, 84.2 °C at 07:55 IST on 10 Oct, was an offline video-decode test
+run on the Pi, which also ran it out of memory.
+[The thermal constraint](docs/local-recognition.md#the-thermal-constraint-which-is-the-real-constraint)
+has the benchmark: four inference threads heated it about 3.5 °C a second.
+
+- The plate reader runs on one core (`GATE_LOCAL_OCR_THREADS=1`), one frame
+  at a time, and only while a camera event is live. Do not add a continuous
+  loop. Fit the official Pi 5 Active Cooler before raising the thread count.
+- Anything that adds CPU per frame (a wider decode, a larger model, more
+  reads a second, a second detector pass) is measured on a workstation first.
+  Then measure it on the board, with `soc_temp_c` and the sweep's `read_fps`
+  in view.
+- Do not decode video, benchmark, or run the full test suite on the Pi. The
+  on-device suite held it at 84 °C for six hours on 2026-09-07
+  ([deployment.md](docs/deployment.md)). The decode test of 2026-10-10 is the
+  84.2 °C above.
+
 ## Other things that have bitten
 
 - Merging to `master` deploys to the Pi within ~5 minutes of CI passing.
