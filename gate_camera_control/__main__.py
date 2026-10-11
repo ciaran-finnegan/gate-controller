@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from .clock import ClockReconciler, ClockWorker
 from .focus import REASONS as REFOCUS_REASONS
 from .focus import RefocusController, RefocusRefused, ZoomReturnFailed, ZoomReturnWorker
 from .ir import DIRECT_READ_MAX_AGE_SECONDS, IrController, RevertWorker, SpotlightController
+from .night import NightModeController
 from .reolink import (
     IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient,
 )
@@ -59,6 +61,11 @@ SPOTLIGHT_LEASE_PATH = f"{STATE_ROOT}/spotlight-lease.json"
 # and removed once the zoom is proven back. Durable for the same reason as the
 # lease: a power cut between the step and the return must not strand the zoom.
 REFOCUS_RECORD_PATH = f"{STATE_ROOT}/refocus-return.json"
+# The camera's whole ISP block as read before a night-vision lease switched its
+# dayNight mode, written before the switch and removed once the restore is
+# confirmed. Durable for the same reason as the lease: the camera is separately
+# powered, so a power cut mid-lease must not strand it in night mode.
+NIGHT_ISP_RECORD_PATH = f"{STATE_ROOT}/night-isp.json"
 SNAPSHOT_MIN_INTERVAL_SECONDS = 2.0
 IDEMPOTENCY_TTL_SECONDS = 300.0
 IDEMPOTENCY_WAIT_SECONDS = 15.0
@@ -105,8 +112,15 @@ def _journal_value(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     text = str(value)
+    # `/` is kept so a rejected request's path reads as a path. Fields are
+    # split on spaces and `=`, neither of which survives this.
     return "".join(character for character in text if character.isalnum()
-                   or character in "-_.:+")[:64] or "unknown"
+                   or character in "-_.:+/")[:64] or "unknown"
+
+
+# A ValueError that names its reason as one journal token, e.g. the talk
+# controller's `talk_too_short`; anything else is journaled as `invalid_request`.
+_REASON_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,40}")
 
 
 class CameraControlService:
@@ -115,10 +129,12 @@ class CameraControlService:
     def __init__(self, controller, client, *, clock=time.time, logger=None,
                  snapshot_min_interval=SNAPSHOT_MIN_INTERVAL_SECONDS,
                  state_rate=None, ir_rate=None, spotlight=None, spotlight_rate=None,
-                 talk=None, talk_rate=None, refocus=None):
+                 talk=None, talk_rate=None, refocus=None, night=None):
         self._controller = controller
         # The zoom nudge, or None on a service built without one.
         self._refocus = refocus
+        # The ISP half of the IR lease, or None when night vision is IR-only.
+        self._night = night
         # The spotlight's own lease controller, or None on a camera without one.
         self._spotlight = spotlight
         self._client = client
@@ -163,6 +179,17 @@ class CameraControlService:
     @property
     def refocus_controller(self):
         return self._refocus
+
+    @property
+    def night_mode(self):
+        return self._night
+
+    def night_vision_snapshot(self) -> dict:
+        """The night-vision block: whether the ISP is switched, and whether it came back."""
+        if self._night is None:
+            return {"enabled": False, "active": False, "restore_failed": False,
+                    "last_error": None}
+        return self._night.snapshot()
 
     def refocus(self, payload) -> dict:
         """Nudge the zoom one step and back so the camera's autofocus runs again.
@@ -273,7 +300,9 @@ class CameraControlService:
             call.fail(error)
             raise
         try:
-            snapshot = controller.set_state(request["state"], request["lease_minutes"])
+            snapshot = controller.set_state(
+                request["state"], request["lease_minutes"], idempotency_key=client_key,
+            )
         except BaseException as error:
             # The camera was called and did not confirm. The key keeps that
             # outcome for its whole life, so a replay is answered with the same
@@ -325,6 +354,10 @@ class CameraControlService:
                 microsecond=0
             ).isoformat(),
             "ir": ir_snapshot,
+            # From the lease records, never a camera read: whether the picture
+            # is switched to night mode for the IR lease, and whether a restore
+            # has failed and is being retried.
+            "night_vision": self.night_vision_snapshot(),
         }
         if self._spotlight is not None:
             # From the last observation, never a fresh read: a state request
@@ -718,7 +751,15 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             # indeterminate rather than as a landed change or a refusal.
             journal(self.server.logger, "ir_idempotent_in_flight")
             self._respond_json(502, {"error": "camera_indeterminate"})
-        except ValueError:
+        except ValueError as error:
+            # Journaled like every other refusal: a request the service turned
+            # away used to leave no trace at all, so the app's "Talk failed"
+            # had nothing on the Pi to match it against.
+            reason = str(error)
+            if _REASON_TOKEN.fullmatch(reason) is None:
+                reason = "invalid_request"
+            journal(self.server.logger, "request_rejected", method=self.command,
+                    path=urlsplit(self.path).path, reason=reason)
             self._respond_json(400, {"error": "invalid_request"})
         except Exception:
             journal(self.server.logger, "internal_error")
@@ -797,6 +838,7 @@ def _talk_rtsp_url(credential, logger):
 def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
                   spotlight_lease_path=SPOTLIGHT_LEASE_PATH,
                   refocus_record_path=REFOCUS_RECORD_PATH,
+                  night_record_path=NIGHT_ISP_RECORD_PATH,
                   logger=None, connection_factory=None, clock=time.time,
                   talk_client_factory=None, talk_options=None,
                   talk_credential=None, refocus_options=None) -> CameraControlService:
@@ -828,6 +870,16 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         connection_factory=connection_factory,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
     )
+    night = None
+    if settings.get("GATE_CAMERA_NIGHT_VISION_ISP", "true") != "false":
+        # The ISP half of the IR lease. `false` is the pre-night-mode service:
+        # an IR-only lease that changes nothing about the picture.
+        night = NightModeController(
+            client,
+            record_path=night_record_path,
+            clock=clock,
+            journal=lambda stage, **fields: journal(logger, stage, **fields),
+        )
     controller = IrController(
         client,
         default_state=settings["GATE_CAMERA_IR_DEFAULT"],
@@ -836,6 +888,7 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
         max_lease_minutes=int(settings["GATE_CAMERA_IR_LEASE_MAX_MINUTES"]),
         clock=clock,
         journal=lambda stage, **fields: journal(logger, stage, **fields),
+        night=night,
     )
     talk = None
     if settings.get("GATE_CAMERA_TALK_ENABLED") == "true":
@@ -875,7 +928,7 @@ def build_service(settings, *, token_path=TOKEN_PATH, lease_path=LEASE_PATH,
     )
     return CameraControlService(
         controller, client, clock=clock, logger=logger, spotlight=spotlight, talk=talk,
-        refocus=refocus,
+        refocus=refocus, night=night,
     )
 
 
@@ -919,8 +972,12 @@ def main(argv=None) -> int:
     os.makedirs(STATE_ROOT, mode=0o700, exist_ok=True)
     os.chmod(STATE_ROOT, 0o700)
     service = build_service(settings, logger=logger, talk_credential=os.environ)
-    # A lease that outlived the previous process must never leave IR -- or the
-    # spotlight -- on.
+    # A night-vision lease that outlived the previous process must never leave
+    # the picture in night mode: the ISP goes back first, then IR, in the order
+    # a normal revert takes. A lease that outlived the previous process must
+    # never leave IR -- or the spotlight -- on.
+    if service.night_mode is not None:
+        service.night_mode.restore_on_start()
     service.controller.restore_default_on_start()
     service.spotlight.restore_default_on_start()
     # Likewise a zoom nudge the previous process never finished: the zoom goes
@@ -946,6 +1003,7 @@ def main(argv=None) -> int:
         refresher=refresh_lights,
         clock_provider=clock_reconciler.snapshot,
         spotlight_provider=service.spotlight.snapshot,
+        night_provider=service.night_vision_snapshot,
         talk_provider=None if talk is None else talk.state_block,
         talk_refresher=None if talk is None else talk.refresh_if_due,
     )
@@ -954,6 +1012,7 @@ def main(argv=None) -> int:
             ir_default=service.controller.default_state,
             lease_default_minutes=service.controller.default_lease_minutes,
             lease_max_minutes=service.controller.max_lease_minutes,
+            night_vision_isp=service.night_mode is not None,
             talk_enabled=talk is not None,
             talk_max_seconds=None if talk is None else talk.max_seconds)
     reverts.start()

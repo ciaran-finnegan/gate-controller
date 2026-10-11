@@ -96,6 +96,7 @@ class RefocusHttpTests(unittest.TestCase):
             token_path=Path(self.directory.name) / "token.json",
             lease_path=Path(self.directory.name) / "lease.json",
             spotlight_lease_path=Path(self.directory.name) / "spotlight-lease.json",
+            night_record_path=Path(self.directory.name) / "night-isp.json",
             refocus_record_path=self.record_path,
             logger=self.journal,
             connection_factory=self.camera.connection_factory,

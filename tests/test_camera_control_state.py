@@ -246,6 +246,50 @@ class CameraControlStateFileTests(unittest.TestCase):
                     validated_camera_control({**ready, "spotlight": bad})["reason"],
                 )
 
+    def test_the_night_vision_block_round_trips_and_a_bad_one_fails_closed(self):
+        """Whether the IR lease switched the picture, and whether it came back.
+
+        Three booleans, exactly. `active` without `enabled` is a document the
+        service cannot have written, and a block of any other shape takes the
+        whole snapshot down to `service_unhealthy` rather than being guessed at.
+        """
+        ready = ready_document(state="Auto", effective_until="2026-10-11T22:10:00+00:00")["camera_control"]
+        night = {"enabled": True, "active": True, "restore_failed": False}
+        parsed = validated_camera_control({**ready, "night_vision": night})
+        self.assertEqual(night, parsed["night_vision"])
+        # A service from before night vision publishes no block at all.
+        self.assertNotIn("night_vision", validated_camera_control(ready))
+        failed = {"enabled": True, "active": True, "restore_failed": True}
+        self.assertEqual(failed, validated_camera_control({**ready, "night_vision": failed})["night_vision"])
+        for bad in (
+            {"enabled": False, "active": True, "restore_failed": False},
+            {"enabled": True, "active": "yes", "restore_failed": False},
+            {"enabled": True, "active": True},
+            {"enabled": True, "active": True, "restore_failed": False, "mode": "Black&White"},
+            [], "on",
+        ):
+            with self.subTest(night_vision=bad):
+                self.assertEqual(
+                    "service_unhealthy",
+                    validated_camera_control({**ready, "night_vision": bad})["reason"],
+                )
+
+    def test_the_published_document_with_night_vision_passes_the_reader(self):
+        write_state(self.path, state_document(
+            {"state": "Auto", "default": "Off", "effective_until": "2026-10-11T22:10:00+00:00",
+             "lease_seconds_remaining": 600, "revert_failed": False, "last_error": None},
+            now=time.time(),
+            night_snapshot={"enabled": True, "active": True, "restore_failed": False,
+                            "last_error": None},
+        ))
+        parsed = read_camera_control_state(self.path)
+        self.assertEqual("ready", parsed["reason"])
+        self.assertEqual({"enabled": True, "active": True, "restore_failed": False},
+                         parsed["night_vision"])
+        # `last_error` is the HTTP answer's; the heartbeat carries the three
+        # booleans and the IR block's expiry, which is the lease's.
+        self.assertEqual("2026-10-11T22:10:00+00:00", parsed["ir"]["effective_until"])
+
     def test_the_published_document_with_a_spotlight_passes_the_reader(self):
         document = state_document(
             {"state": "Off", "default": "Off", "effective_until": None, "revert_failed": False},
@@ -573,9 +617,22 @@ class CameraControlDeploymentTests(unittest.TestCase):
         block = document["camera_control"]
 
         self.assertEqual({"observed_at", "camera_control"}, set(document))
-        # `talkback` is the one addition since #36: the Worker keeps unknown
-        # keys rather than dropping the block, and reads this one for talk.
+        # `talkback` is the one addition since #36 that is always published:
+        # the Worker keeps unknown keys rather than dropping the block, and
+        # reads this one for talk. `clock`, `spotlight` and `night_vision` are
+        # published only by a service that has the thing, and the reader
+        # accepts exactly those three optional keys and no other.
         self.assertEqual({"available", "reason", "ir", "talkback"}, set(block))
+        self.assertEqual(
+            {"available", "reason", "ir", "clock", "spotlight", "talkback", "night_vision"},
+            set(validated_camera_control({
+                **block, "clock": {"synced": False, "outcome": "not_checked", "skew_seconds": None,
+                                   "checked_at": None, "corrections": 0},
+                "spotlight": {"state": "Off", "default": "Off", "effective_until": None,
+                              "revert_failed": False},
+                "night_vision": {"enabled": True, "active": False, "restore_failed": False},
+            })),
+        )
         self.assertEqual({"available", "reason", "active"}, set(block["talkback"]))
         self.assertEqual(
             {"state", "default", "effective_until", "revert_failed"}, set(block["ir"])

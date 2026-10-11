@@ -85,6 +85,10 @@ _CAMERA_CONTROL_DEFAULTS = {
     # Keep the camera's clock on the Pi's, hourly, so its alarm timestamps are
     # trusted by the controller. "false" leaves the camera clock alone.
     "GATE_CAMERA_CLOCK_SYNC": "true",
+    # An IR lease also switches the ISP's dayNight mode to Black&White and
+    # restores it exactly when the lease ends; without it the camera, pinned to
+    # Color, never lights its IR LEDs. "false" is the IR-only lease of before.
+    "GATE_CAMERA_NIGHT_VISION_ISP": "true",
 }
 _CAMERA_CONTROL_KEYS = _CAMERA_CONTROL_REQUIRED_KEYS | frozenset(_CAMERA_CONTROL_DEFAULTS)
 _CAMERA_IR_STATES = frozenset({"Auto", "Off"})
@@ -378,6 +382,8 @@ def validate_camera_control_environment(values: Mapping[str, str]) -> dict[str, 
     _bounded_talk_seconds(selected["GATE_CAMERA_TALK_MAX_SECONDS"])
     if selected["GATE_CAMERA_CLOCK_SYNC"] not in ("true", "false"):
         raise MediaConfigError("GATE_CAMERA_CLOCK_SYNC must be exactly true or false")
+    if selected["GATE_CAMERA_NIGHT_VISION_ISP"] not in ("true", "false"):
+        raise MediaConfigError("GATE_CAMERA_NIGHT_VISION_ISP must be exactly true or false")
     return selected
 
 

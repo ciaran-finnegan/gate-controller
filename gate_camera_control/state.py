@@ -97,6 +97,23 @@ def clock_block(clock_snapshot) -> dict | None:
     }
 
 
+def night_vision_block(snapshot) -> dict | None:
+    """The night-vision block, or None when the service does not publish one.
+
+    Three booleans: whether the service switches the ISP for an IR lease at
+    all, whether a switch is outstanding now (the camera may be in night
+    mode), and whether putting it back has failed and is being retried. The
+    lease's own expiry rides in the IR block beside it.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    return {
+        "enabled": bool(snapshot.get("enabled")),
+        "active": bool(snapshot.get("active")),
+        "restore_failed": bool(snapshot.get("restore_failed")),
+    }
+
+
 def light_block(snapshot, states, default_fallback) -> dict:
     """One light's lease state, in the exact shape the controller validates."""
     state = snapshot.get("state")
@@ -117,7 +134,7 @@ def light_block(snapshot, states, default_fallback) -> dict:
 
 
 def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snapshot=None,
-                   talk_block=None) -> dict:
+                   talk_block=None, night_snapshot=None) -> dict:
     """Convert an IR snapshot into the exact nonsecret heartbeat document.
 
     The spotlight rides alongside, when the service has one. It does not decide
@@ -165,6 +182,9 @@ def state_document(ir_snapshot, *, now=None, clock_snapshot=None, spotlight_snap
         document["camera_control"]["spotlight"] = light_block(
             spotlight_snapshot, SPOTLIGHT_STATES, "Off",
         )
+    night = night_vision_block(night_snapshot)
+    if night is not None:
+        document["camera_control"]["night_vision"] = night
     return document
 
 
@@ -187,9 +207,11 @@ class StatePublisher:
                  interval_seconds=PUBLISH_INTERVAL_SECONDS,
                  refresher=None, refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
                  clock=time.time, clock_provider=None, spotlight_provider=None,
-                 talk_provider=None, talk_refresher=None):
+                 talk_provider=None, talk_refresher=None, night_provider=None):
         self._path = path
         self._snapshot_provider = snapshot_provider
+        # The night-vision block; None on a service that does not publish one.
+        self._night_provider = night_provider
         # The spotlight controller's snapshot; None on a service without one.
         self._spotlight_provider = spotlight_provider
         # The clock reconciler's own snapshot; None when it is not wired.
@@ -228,9 +250,18 @@ class StatePublisher:
                 # A spotlight fault must never stop IR and the clock being published.
                 spotlight_snapshot = {"state": "unknown"}
         talk_block = self._talk_provider() if self._talk_provider is not None else None
+        night_snapshot = None
+        if self._night_provider is not None:
+            try:
+                night_snapshot = self._night_provider()
+            except Exception:
+                # Said as "may be in night mode, not restored" rather than
+                # dropped: a fault here must never read as all clear.
+                night_snapshot = {"enabled": True, "active": True, "restore_failed": True}
         write_state(self._path, state_document(
             self._snapshot_provider(), clock_snapshot=clock_snapshot,
             spotlight_snapshot=spotlight_snapshot, talk_block=talk_block,
+            night_snapshot=night_snapshot,
         ))
 
     def refresh_if_due(self) -> bool:

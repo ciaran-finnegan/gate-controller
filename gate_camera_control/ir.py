@@ -12,6 +12,13 @@ for ever.  Because a record can still be lost -- an operator clearing the state
 directory, a filesystem restored from elsewhere -- startup also *reconciles*: it
 reads the camera once and puts it back to the configured default when what it
 finds is not the default and no lease explains it.
+
+Since the night-vision work the IR lease has a second half: the ISP's
+``dayNight`` mode (``night.py``). Leasing IR on in ``Color`` mode did nothing,
+because the camera never lights its IR LEDs in ``Color``; so a lease to ``Auto``
+now also switches the picture to ``Black&White``, and every way the lease ends
+restores the ISP exactly as it was read *before* IR is switched off. The IR
+controller owns the order and the lock; the night controller owns the snapshot.
 """
 
 import contextlib
@@ -53,6 +60,10 @@ class IrController:
     STATES = IR_STATES
     NAME = "IR"
     JOURNAL_NAME = "ir"
+    # The leased state that means "night vision": only a lease *to* this state
+    # switches the ISP. A deployment whose default is Auto and whose leases
+    # turn IR off changes nothing about the picture.
+    NIGHT_STATE = "Auto"
 
     def _read_camera_state(self) -> str:
         return self._client.ir_state()
@@ -62,7 +73,8 @@ class IrController:
 
     def __init__(self, client, *, default_state="Off", lease_path=None,
                  default_lease_minutes=DEFAULT_LEASE_MINUTES,
-                 max_lease_minutes=MAX_LEASE_MINUTES, clock=time.time, journal=None):
+                 max_lease_minutes=MAX_LEASE_MINUTES, clock=time.time, journal=None,
+                 night=None):
         if default_state not in self.STATES:
             raise ValueError(f"the {self.NAME} default must be {' or '.join(self.STATES)}")
         if not 1 <= default_lease_minutes <= max_lease_minutes <= MAX_LEASE_MINUTES:
@@ -74,6 +86,9 @@ class IrController:
         self._max_lease_minutes = int(max_lease_minutes)
         self._clock = clock
         self._journal = journal or (lambda *_arguments, **_keywords: None)
+        # The ISP half of the lease (night.py), or None for an IR-only lease.
+        # Its camera calls are only ever made from inside `_camera_writer`.
+        self._night = night
         # Two locks, and never one held across a camera call for a read.
         # `_lock` guards the published state only; `_camera_lock` serialises the
         # camera itself, with writers queueing ahead of readers.
@@ -126,7 +141,7 @@ class IrController:
             outstanding = self._lease is not None
         if outstanding:
             self._journal("startup_revert", state=self._default_state)
-            self._revert(stage="startup_revert")
+            self._revert(stage="startup_revert", reason="startup")
             return
         self._reconcile_on_start()
 
@@ -155,7 +170,7 @@ class IrController:
         self._journal(
             "startup_reconcile", state=self._default_state, observed=observed
         )
-        self._revert(stage="startup_reconcile")
+        self._revert(stage="startup_reconcile", reason="startup")
 
     def state(self, *, refresh_max_age=OBSERVATION_MAX_AGE_SECONDS) -> dict:
         """Return the published state, refreshing a stale observation first.
@@ -203,16 +218,39 @@ class IrController:
         with self._lock:
             return self._snapshot_locked()
 
-    def set_state(self, state: str, lease_minutes=None) -> dict:
-        """Apply a bounded IR lease and return the resulting state."""
+    def set_state(self, state: str, lease_minutes=None, *, idempotency_key=None) -> dict:
+        """Apply a bounded IR lease and return the resulting state.
+
+        ``idempotency_key`` is the app's audit id for this change; its prefix
+        goes into every journal line the change produces, so a line here can
+        be matched to the Worker's `camera_control_audits` row.
+        """
         if state not in self.STATES:
             raise ValueError(f"{self.NAME} state must be {' or '.join(self.STATES)}")
         minutes = self._bounded_lease_minutes(lease_minutes)
+        key = _key_prefix(idempotency_key)
         with self._camera_writer():
+            reverting = state == self._default_state
+            night = self._night if state == self.NIGHT_STATE and not reverting else None
+            if night is not None:
+                # The picture is read and its snapshot persisted before any
+                # record or any write: a camera whose ISP cannot be read gets
+                # no mode change, no IR change and no lease -- nothing has been
+                # touched, so there is nothing a later revert would need to
+                # undo, and the caller gets the camera's own error.
+                try:
+                    night.prepare(key=key)
+                except CameraError as error:
+                    with self._lock:
+                        self._record_error_locked(error)
+                        self._journal(
+                            f"{self.JOURNAL_NAME}_set", state=state, lease_seconds=minutes * 60,
+                            outcome=error.code, key=key,
+                        )
+                    raise
             with self._lock:
                 now = self._clock()
                 expires_at = now + minutes * 60
-                reverting = state == self._default_state
                 # Persist a new lease before the camera changes so a crash
                 # between the two still reverts on the next start. A cancel
                 # removes nothing yet: until the camera confirms, the record is
@@ -223,6 +261,13 @@ class IrController:
                         "state": state, "expires_at": expires_at, "set_at": now,
                     })
             try:
+                if reverting and self._night is not None:
+                    # The picture first, then the illuminator: the same order
+                    # as `_revert`. A restore that fails leaves IR on and the
+                    # lease standing, to be retried at its expiry.
+                    self._night.restore(reason="requested", key=key)
+                if night is not None:
+                    night.apply(key=key)
                 self._write_camera_state(state)
             except CameraError as error:
                 with self._lock:
@@ -238,7 +283,7 @@ class IrController:
                         }
                     self._journal(
                         f"{self.JOURNAL_NAME}_set", state=state, lease_seconds=minutes * 60,
-                        outcome=error.code,
+                        outcome=error.code, key=key,
                     )
                 raise
             with self._lock:
@@ -250,7 +295,8 @@ class IrController:
                     self._write_lease(None)
                     self._revert_failed = False
                     self._revert_attempts = 0
-                    self._journal(f"{self.JOURNAL_NAME}_revert", state=state, outcome="completed")
+                    self._journal(f"{self.JOURNAL_NAME}_revert", state=state, outcome="completed",
+                                  reason="requested", key=key)
                 else:
                     self._lease = {
                         "state": state, "expires_at": expires_at, "set_at": now,
@@ -259,7 +305,8 @@ class IrController:
                     self._revert_attempts = 0
                     self._journal(
                         f"{self.JOURNAL_NAME}_set", state=state, lease_seconds=minutes * 60,
-                        outcome="completed",
+                        outcome="completed", key=key,
+                        night_mode=None if night is None else True,
                     )
                 return self._snapshot_locked()
 
@@ -268,17 +315,44 @@ class IrController:
         return self.set_state(self._default_state, self._default_lease_minutes)
 
     def run_due_revert(self) -> bool:
-        """Revert an expired lease, or retry a failed revert. Returns True on action."""
+        """Revert an expired lease, or retry a failed revert. Returns True on action.
+
+        With no lease standing, a night-mode restore that failed on its own --
+        at startup, with no IR record left to carry it -- is retried here on
+        the same worker, so the camera is never left in night mode with nothing
+        on the Pi trying to put it back.
+        """
         with self._lock:
-            if self._lease is None:
-                return False
+            lease = self._lease
             now = self._clock()
-            if self._revert_failed:
-                if now < self._next_revert_attempt_at:
+            if lease is not None:
+                if self._revert_failed:
+                    if now < self._next_revert_attempt_at:
+                        return False
+                    reason = "retry"
+                elif now >= lease["expires_at"]:
+                    reason = "expired"
+                elif self._night is not None and self._night.restore_due():
+                    # An Off the app asked for whose picture restore failed:
+                    # the operator wants the lease ended, so it is retried on
+                    # the restore's backoff rather than left until expiry.
+                    reason = "retry"
+                else:
                     return False
-            elif now < self._lease["expires_at"]:
-                return False
-        return self._revert(stage=f"{self.JOURNAL_NAME}_revert")
+        if lease is None:
+            return self._retry_night_restore()
+        return self._revert(stage=f"{self.JOURNAL_NAME}_revert", reason=reason)
+
+    def _retry_night_restore(self) -> bool:
+        if self._night is None or not self._night.restore_due():
+            return False
+        with self._camera_writer():
+            try:
+                self._night.restore(reason="retry")
+            except CameraError as error:
+                with self._lock:
+                    self._record_error_locked(error, invalidates_observation=True)
+        return True
 
     def seconds_until_next_revert(self):
         with self._lock:
@@ -289,13 +363,21 @@ class IrController:
                    else self._lease["expires_at"])
             return max(0.0, due - now)
 
-    def _revert(self, *, stage: str) -> bool:
-        """Put the camera back to the default. The priority path: readers wait."""
+    def _revert(self, *, stage: str, reason: str) -> bool:
+        """Put the camera back to the default. The priority path: readers wait.
+
+        ``reason`` says why in the journal -- `expired`, `requested`, `retry`,
+        `startup` -- so an expiry and an operator's Off are not the same line.
+        The picture is restored before the illuminator goes off; if the
+        restore fails, nothing else is written and the whole revert is retried.
+        """
         with self._camera_writer():
             with self._lock:
                 if self._lease is None:
                     return False
             try:
+                if self._night is not None:
+                    self._night.restore(reason=reason)
                 self._write_camera_state(self._default_state)
             except CameraError as error:
                 with self._lock:
@@ -309,6 +391,7 @@ class IrController:
                     self._journal(
                         stage, state=self._default_state, outcome=error.code,
                         attempt=self._revert_attempts, retry_after=int(backoff),
+                        reason=reason,
                     )
                 return False
             with self._lock:
@@ -319,7 +402,8 @@ class IrController:
                 self._revert_attempts = 0
                 self._lease = None
                 self._write_lease(None)
-                self._journal(stage, state=self._default_state, outcome="completed")
+                self._journal(stage, state=self._default_state, outcome="completed",
+                              reason=reason)
             return True
 
     @contextlib.contextmanager
@@ -523,6 +607,17 @@ class RevertWorker:
                 # must never take the service down.
                 pass
             self._stopped.wait(self._interval_seconds)
+
+
+def _key_prefix(idempotency_key):
+    """The first twelve characters of the app's audit id, for the journal.
+
+    Enough to find the `camera_control_audits` row it came from; short enough
+    that the line stays one line. None stays None, and the journal omits it.
+    """
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        return None
+    return idempotency_key[:12]
 
 
 def _isoformat(epoch_seconds: float) -> str:

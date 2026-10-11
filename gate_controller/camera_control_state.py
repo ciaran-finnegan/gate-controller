@@ -70,7 +70,7 @@ def validated_camera_control(value) -> dict:
     try:
         if not isinstance(value, dict) or not (
             {"available", "reason", "ir"} <= set(value)
-            <= {"available", "reason", "ir", "clock", "spotlight", "talkback"}
+            <= {"available", "reason", "ir", "clock", "spotlight", "talkback", "night_vision"}
         ):
             raise ValueError("invalid camera control snapshot")
         available, reason = value["available"], value["reason"]
@@ -97,6 +97,11 @@ def validated_camera_control(value) -> dict:
             if spotlight["default"] != "Off":
                 raise ValueError("the spotlight default is always Off")
             block["spotlight"] = spotlight
+        if "night_vision" in value:
+            # Whether the IR lease also switched the picture to night mode,
+            # and whether putting it back has failed. It decides nothing about
+            # `available`; the lease's expiry is in the IR block.
+            block["night_vision"] = _parse_night_vision(value["night_vision"])
         return block
     except (TypeError, ValueError, KeyError):
         return unavailable("service_unhealthy")
@@ -158,6 +163,17 @@ def _parse_light(value, states, name) -> dict:
         "effective_until": effective_until,
         "revert_failed": revert_failed,
     }
+
+
+def _parse_night_vision(value) -> dict:
+    if (not isinstance(value, dict)
+            or set(value) != {"enabled", "active", "restore_failed"}
+            or not all(isinstance(value[key], bool) for key in value)):
+        raise ValueError("invalid night vision block")
+    if value["active"] and not value["enabled"]:
+        raise ValueError("incoherent night vision block")
+    return {"enabled": value["enabled"], "active": value["active"],
+            "restore_failed": value["restore_failed"]}
 
 
 _CLOCK_OUTCOMES = frozenset({
