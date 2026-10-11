@@ -289,6 +289,30 @@ class WaitingCarTests(unittest.TestCase):
         self.assertFalse(scene.status()["available"])
         self.assertEqual(scene.status()["refused_vehicle"], 1)
 
+    def test_a_session_that_started_since_the_offer_keeps_the_detector_unasked(self):
+        # The frame sources offer nothing while a session reads, but a session
+        # can start between that check and the probe (the compressed source
+        # decodes a keyframe in between, for up to 3 s). A probe that has
+        # started cannot be taken back; one that has not is simply not made.
+        reading = []
+        scene = SceneBaseline(
+            idle_seconds=60, refresh_seconds=30, clock=lambda: self.clock[0],
+            vehicle_check=lambda frame: self.asked.append(frame) or False,
+            may_probe=lambda: not reading,
+        )
+        self.assertTrue(scene.observe(self.empty))
+        self.clock[0] += 30.0
+        reading.append("sweep")
+        with self.assertLogs("gate_controller.scene", level="INFO") as logs:
+            self.assertFalse(scene.observe(self.empty))
+        self.assertEqual(self.asked, [self.empty], "the detector was not asked")
+        self.assertIn("reason=session_started refused=1", logs.output[0])
+        self.assertEqual(scene.status()["refused_vehicle"], 1)
+        # It cost no look: the first idle frame after the session is asked about at once.
+        reading.clear()
+        self.assertTrue(scene.observe(self.empty))
+        self.assertEqual(len(self.asked), 2)
+
     def test_a_quiet_probe_still_adopts_the_frame(self):
         # The recheck refuses only an alarm that landed *during* the probe; an
         # old one, outside the idle window, is no bar.

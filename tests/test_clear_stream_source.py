@@ -462,3 +462,46 @@ class ClearStreamSourceTests(unittest.TestCase):
         source._maybe_refresh_baseline()
         self.assertEqual(asked, [])
         source.stop_session("test")
+
+    def test_a_session_that_starts_during_the_keyframe_decode_does_not_take_the_detector(self):
+        # `_maybe_refresh_baseline` checks for a session, then decodes the
+        # keyframe -- up to 3 s -- then offers the frame. A session that starts
+        # during the decode (the alarm's sweep, on its own thread) finds the
+        # probe unmade: the baseline asks once more just before the detector.
+        # Nothing holds the session lock across the decode; the sweep never waits.
+        asked = []
+        decoding = []
+        started = []
+        session_over = Event()
+
+        class OpenStdout:
+            """The session decoder's pipe: nothing yet, and not closed either."""
+
+            def read(self, _size):
+                session_over.wait(5)
+                return b""
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            if not decoding:
+                # The keyframe decode: the sweep starts while it runs. (Marked
+                # before the session starts, since its own decoder's popen
+                # lands here from the session thread.)
+                decoding.append(command)
+                started.append(source.start_session())
+                return FakeProcess(output=jpeg())
+            process = FakeProcess()  # the session's own decoder, still reading
+            process.stdout = OpenStdout()
+            return process
+
+        source, popen = self.source(factory, vehicle_check=lambda frame: asked.append(frame) or False)
+        source.ring.feed(STREAM)
+        source._maybe_refresh_baseline()
+        self.assertEqual(started, [True])
+        self.assertTrue(source.session_active())
+        self.assertEqual(asked, [], "the detector was not asked")
+        self.assertEqual(source.scene.status()["refused_vehicle"], 1)
+        self.assertFalse(source.scene.status()["available"])
+        session_over.set()
+        source.stop_session("test")

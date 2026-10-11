@@ -398,23 +398,34 @@ class BaselineProbeTests(unittest.TestCase):
         self.assertIsNone(local.plate_boxed(b"frame", timeout=0.05))
         gate.set()
         # Once the slow probe finishes, the next frame is admitted as usual.
-        self.assertTrue(wait_until(lambda: local._inflight == 0))
+        self.assertTrue(wait_until(lambda: not local._probing))
         frame = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
         self.assertEqual(frame.result(5).plate, "12D3456")
         local.close()
 
-    def test_a_frame_in_flight_is_declined_rather_than_queued_behind_a_probe(self):
+    def test_a_frame_arriving_during_a_probe_is_read_the_moment_the_probe_ends(self):
+        # The gate opens on this read with no link to the house (invariant 3),
+        # so nothing done for the baseline may refuse it. A probe's inference
+        # cannot be taken back once started; the frame is admitted behind it
+        # on the one worker, never answered `busy`, and read the moment the
+        # probe ends. (Before #211's review the probe reserved the worker
+        # exactly as a frame did, and the alarm's still was declined.)
         gate = Event()
         tracker = ConcurrencyTracker()
         local = recognizer([read("12D3456", 0.99), read("12D3456", 0.99)], gate=gate, tracker=tracker)
         probing = Thread(target=lambda: local.plate_boxed(b"car", timeout=5), daemon=True)
         probing.start()
         self.assertTrue(wait_until(lambda: tracker.current == 1))
+        self.assertIsNone(local.plate_boxed(b"car"), "one probe at a time")
         frame = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
-        self.assertEqual(frame.result(1).status, "unavailable", "answered at once, to fall back to the cloud")
+        self.assertIsNone(frame.settled(), "admitted, and waiting its turn behind the probe")
+        self.assertEqual(local.status()["busy"], 0, "not refused")
+        self.assertIsNone(local.plate_boxed(b"car"), "a frame waiting is a frame in flight: no probe")
         gate.set()
+        self.assertEqual(frame.result(5).plate, "12D3456")
         probing.join(5)
         self.assertEqual(tracker.peak, 1, "two inferences never share the board")
+        self.assertEqual(local.status()["busy"], 0)
         local.close()
 
 

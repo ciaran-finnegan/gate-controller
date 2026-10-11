@@ -384,8 +384,16 @@ recording loop shows its plate band to the on-device detector
 (`LocalRecognizer.plate_boxed`, about 200 ms on one core, at most once per
 30 s, never while a session is reading -- in `decoded` mode too, where the
 ring marks the capture's session itself -- declined rather than queued if a
-frame is in flight; the band is cut once -- not again when
-`GATE_TRIGGER_CAPTURE_CROP` has the decoder cut it already). A box refuses
+frame is in flight, and the other way round never: a frame that lands while
+the probe is on the worker is admitted behind it and read the moment it
+ends, because the gate opens on that read with no link to the house; the
+band is cut once -- not again when `GATE_TRIGGER_CAPTURE_CROP` has the
+decoder cut it already). A session can start between a source's "no session
+is reading" check and the probe (the compressed source decodes a keyframe in
+between, for up to 3 s), so the baseline asks once more, just before the
+detector, and makes no probe if one has (`session_started`); nothing holds
+the session lock across the probe, since `start_session` is called on the
+sweep's thread and the sweep never waits. A box refuses
 the frame and keeps the old baseline; so does no answer at all -- a reader
 still loading, busy, timed out or failing -- because a stale picture of the
 *empty* drive is the safe side: a car's frames differ from it and are read.
@@ -395,7 +403,7 @@ not the detector boxed it, and the idle check is made again before the
 baseline is installed. The sweep's own boxed reads count as activity too, so
 the idle clock runs from the last sight of the car. One journal line per five
 minutes says so (`gate_scene_baseline outcome=refresh_refused
-reason=plate_box|alarm_during_probe|detector_unanswered refused=N`), and
+reason=plate_box|alarm_during_probe|session_started|detector_unanswered refused=N`), and
 the status block counts them under `scene.refused_vehicle` and
 `scene.refused_unanswered`. Without a local recogniser there is no detector
 to ask and the baseline refreshes as it always did.

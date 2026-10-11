@@ -1018,11 +1018,19 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         # The detector gate on the baseline (scene.py). This ring offers every
         # decoded keyframe, one a second; the baseline asks the detector no
         # more often than it could refresh, and never while a capture session
-        # is reading (below), so the recogniser's one worker is not taken from
-        # a sweep frame by a baseline probe.
-        self.scene = SceneBaseline(clock=self._clock, vehicle_check=vehicle_check)
+        # is reading: `_on_frame` offers nothing during one, and `may_probe`
+        # asks again at the last moment before the detector is, because a
+        # session can start between the two. Neither holds `_session_lock`
+        # across the probe -- `start_session` runs on the sweep's own thread,
+        # and the sweep never waits. A probe already on the worker when a
+        # session starts cannot be taken back; the sweep's read is admitted
+        # behind it and runs the moment it ends (`LocalRecognizer.begin`).
         self._session_lock = Lock()
         self._session_active = False
+        self.scene = SceneBaseline(
+            clock=self._clock, vehicle_check=vehicle_check,
+            may_probe=lambda: not self.session_active(),
+        )
         self._decode = {
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
@@ -1040,6 +1048,8 @@ class ClearKeyframeBuffer(HotStreamBuffer):
     def _on_frame(self, frame: bytes, now: float) -> None:
         # Exactly the compressed source's rule (`_maybe_refresh_baseline`):
         # no baseline offer, and so no detector probe, while a session reads.
+        # Checked without the lock held across `observe`, on purpose (above);
+        # the scene asks `may_probe` again just before the detector.
         if self.session_active():
             return
         self.scene.observe(frame, now)

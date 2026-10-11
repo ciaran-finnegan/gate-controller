@@ -77,7 +77,13 @@ class ClearStreamSource:
         the recording thread, inside ``_maybe_refresh_baseline``, where the
         keyframe decode already blocks for up to 3 s at most once per
         ``baseline_seconds`` and never while a session is active; the
-        recogniser declines it rather than queueing it behind a frame.
+        recogniser declines it rather than queueing it behind a frame, and a
+        frame that lands during it is read the moment it ends, never refused.
+        A session can start during that 3 s decode, so the baseline asks
+        ``may_probe`` again just before the detector; nothing holds
+        ``_session_lock`` across the decode or the probe, because
+        ``start_session`` is called on the sweep's thread and the sweep never
+        waits.
         """
         if not (0 < session_fps <= 10):
             raise ValueError("session_fps must be between 0 and 10")
@@ -96,7 +102,10 @@ class ClearStreamSource:
         self._popen = popen
         self._clock = clock
         self.ring = ring or HevcPacketRing(clock=clock)
-        self.scene = scene or SceneBaseline(clock=clock, vehicle_check=vehicle_check)
+        self.scene = scene or SceneBaseline(
+            clock=clock, vehicle_check=vehicle_check,
+            may_probe=lambda: not self.session_active(),
+        )
         self.command = record_command(source_url, FFMPEG_BINARY)
         self.child_environment = {"LANG": "C", "LC_ALL": "C"}
         self._process = None

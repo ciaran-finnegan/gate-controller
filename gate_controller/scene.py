@@ -101,12 +101,21 @@ class SceneBaseline:
     def __init__(self, *, idle_seconds: float = DEFAULT_IDLE_SECONDS,
                  refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
                  clock: Callable[[], float] = monotonic,
-                 vehicle_check: Callable[[bytes], bool | None] | None = None):
+                 vehicle_check: Callable[[bytes], bool | None] | None = None,
+                 may_probe: Callable[[], bool] | None = None):
         """``vehicle_check`` is the on-device plate detector, asked of every
         frame that is about to become the baseline: True for a plate box in
         the picture, False for none, None when it cannot say (not loaded,
         busy with a sweep frame, timed out). Only False lets the frame in.
         Without one, every idle frame is adopted as before.
+
+        ``may_probe`` is asked at the last moment before the detector is: the
+        frame sources answer "no capture session is reading". They ask the
+        same question before offering a frame at all, but a session can start
+        between that check and this one -- the compressed source decodes a
+        keyframe in between, for up to 3 s -- and a probe that has started
+        cannot be taken back. One that has not started is simply not made:
+        the frame is refused as ``session_started`` and the baseline kept.
         """
         if not idle_seconds >= 0 or not refresh_seconds > 0:
             raise ValueError("scene baseline timings must be non-negative and refresh positive")
@@ -114,6 +123,7 @@ class SceneBaseline:
         self._refresh_seconds = refresh_seconds
         self._clock = clock
         self._vehicle_check = vehicle_check
+        self._may_probe = may_probe
         self._baseline: list[int] | None = None
         self._baseline_at: float | None = None
         # The newest idle frame that was itself dark. Kept alongside the
@@ -159,6 +169,13 @@ class SceneBaseline:
         if thumbnail is None:
             return False
         if self._vehicle_check is not None:
+            if self._may_probe is not None and not self._may_probe():
+                # A session started since this frame was offered: a sweep is
+                # reading, and a probe it would have to queue behind is not
+                # made. The detector is not charged a look, so the next idle
+                # frame after the session is asked about at once.
+                self._refuse(now, "session_started")
+                return False
             self._checked_at = now
             try:
                 boxed = self._vehicle_check(frame)
@@ -185,8 +202,9 @@ class SceneBaseline:
 
     def _refuse(self, now: float, reason: str) -> None:
         """A frame the detector would not clear: keep the baseline as it was."""
-        if reason in ("plate_box", "alarm_during_probe"):
-            # Both are a vehicle in view: one the detector saw, one the camera did.
+        if reason in ("plate_box", "alarm_during_probe", "session_started"):
+            # All three are a vehicle in view: one the detector saw, one the
+            # camera did, one a sweep is reading.
             self._refused_vehicle += 1
         else:
             self._refused_unanswered += 1

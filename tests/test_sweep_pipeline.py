@@ -136,6 +136,9 @@ class ScriptedEngine:
         self.read_seconds = read_seconds
         self._lock = Lock()
         self.calls = []  # (monotonic, digest)
+        # digest -> Event: a read that stays on the worker until the test lets
+        # it go, for what lands while an inference is running.
+        self.holds = {}
 
     def load(self):
         return None
@@ -147,6 +150,9 @@ class ScriptedEngine:
         key = digest(image)
         with self._lock:
             self.calls.append((monotonic(), key))
+            hold = self.holds.get(key)
+        if hold is not None:
+            hold.wait(5)
         sleep(self.read_seconds)
         plate, score = self.answers.get(key, (None, 0.0))
         if plate is None:
@@ -958,6 +964,60 @@ class SweepPipelineTests(unittest.TestCase):
         self.assertFalse(adopted, "a frame the detector boxes a plate in is not the idle drive")
         self.assertEqual((scene_status["refreshes"], scene_status["refused_vehicle"]), (1, 1))
         self.assertGreater(gate.frames.scene_difference(second_visit[0]), 0.03)
+
+    def test_an_alarm_whose_sweep_lands_during_a_baseline_probe_is_still_read_and_let_in(self):
+        # The baseline's detector probe is on the recogniser's one worker when
+        # the camera's alarm lands. The probe's inference cannot be taken back,
+        # and the sweep's first frames must not be refused for it -- they were,
+        # as `busy`, until #211's review -- so they are admitted behind it and
+        # read the moment it ends. Alarm -> sweep -> processor -> relay, with
+        # the probe through the real recogniser as `__main__` wires it.
+        empty = frame(9300)
+        offered = car_frame(9301)
+        passage = [car_frame(seed) for seed in range(9310, 9322)]
+        answers = {digest(crop_to_region(data, REGION)): ("10CE1990", 0.91) for data in passage}
+        gate = self._gate(answers=answers, sweep_seconds=1.0, empty_scene=0.03)
+        looking = ThreadEvent()
+        gate.engine.holds[digest(crop_to_region(offered, REGION))] = looking
+        clock = [1000.0]
+        gate.frames.scene = SceneBaseline(
+            idle_seconds=60.0, refresh_seconds=30.0, clock=lambda: clock[0],
+            vehicle_check=lambda data: gate.local.plate_boxed(
+                crop_to_region(data, REGION), timeout=5.0,
+            ),
+        )
+        self.assertTrue(gate.frames.scene.observe(empty), "the empty drive is the baseline")
+        clock[0] += 90.0
+        probe = []
+        offering = Thread(target=lambda: probe.append(gate.frames.scene.observe(offered)), daemon=True)
+        offering.start()
+        self.assertTrue(
+            wait_for(lambda: gate.engine.was_read(crop_to_region(offered, REGION))),
+            "the probe is on the worker",
+        )
+
+        gate.frames.script([(0.05 + index * 0.1, data) for index, data in enumerate(passage)])
+        with CapturedLogs() as logs:
+            gate.alarm()
+            sleep(0.5)  # the probe is still looking; the sweep has frames in hand
+            self.assertEqual(probe, [], "the probe is still looking")
+            self.assertEqual(gate.local.status()["busy"], 0, "no sweep frame was refused for the probe")
+            self.assertEqual(gate.opened(), [])
+            looking.set()
+            self.assertTrue(wait_for(gate.opened, 8.0), f"never opened: {gate.outcomes()}\n{logs.text()}")
+            self.assertTrue(wait_for(lambda: "gate_local_sweep outcome=ended" in logs.text(), 8.0))
+        offering.join(5)
+
+        self.assertEqual(gate.relay_calls, ["relay"], "exactly one pulse")
+        self.assertEqual(gate.opened_result().reason, "exact_match")
+        self.assertEqual(gate.stored(gate.opened_result())["source"], "local")
+        self.assertEqual(len(gate.session.calls), 0, "no cloud lookup was needed")
+        self.assertTrue(gate.engine.was_read(crop_to_region(passage[0], REGION)),
+                        "the first frame handed to the reader was read, not declined")
+        self.assertEqual(gate.local.status()["busy"], 0)
+        # And the alarm landed during the probe: the offered frame is not the idle drive.
+        self.assertEqual(probe, [False])
+        self.assertEqual(gate.frames.scene.status()["refused_vehicle"], 1)
 
     def test_a_new_alarm_is_not_kept_waiting_by_the_waiting_phase(self):
         frames = [frame(seed) for seed in range(360, 460)]

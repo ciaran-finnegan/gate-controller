@@ -884,6 +884,13 @@ class LocalRecognizer:
         self._event_waits: dict[str, float] = {}
         self._wait_order: list[str] = []
         self._inflight = 0
+        #: A scene-baseline probe (`plate_boxed`) on the worker. Kept apart
+        #: from `_inflight` on purpose: a probe is not a frame, so it must
+        #: never be the reason a gate-decision read is refused as busy. The
+        #: read goes to the one worker behind it and runs the moment the
+        #: probe's inference ends; the probe itself is declined behind any
+        #: read, and behind another probe.
+        self._probing = False
         self._counts = {
             "frames": 0, "recognised": 0, "errors": 0, "unavailable": 0,
             "busy": 0,
@@ -1008,6 +1015,10 @@ class LocalRecognizer:
             # One outstanding read, never a queue. A stalled inference must
             # not make every later frame wait its turn before falling back to
             # the cloud, and queued frames would each pin a JPEG in memory.
+            # A baseline probe is not a read: a frame that lands during one
+            # is admitted and runs the moment the probe's inference ends,
+            # because the gate must open on this read with no link to the
+            # house, and nothing done for the baseline may stand in its way.
             if self._inflight:
                 busy = True
             else:
@@ -1034,24 +1045,27 @@ class LocalRecognizer:
         The scene baseline asks this before it adopts a keyframe as the empty
         drive (:mod:`gate_controller.scene`). It is a probe, not a read: no
         event, no journal line, no agreement bookkeeping, nothing added to
-        ``frames`` or the latency sample. It takes the one worker exactly as
-        a frame does and is declined the same way -- a sweep or pipeline frame
-        already in flight is never queued behind, and never waits behind, this.
-        A reader that is not ready, is busy, raises, or runs past ``timeout``
-        answers None, which the caller treats as "do not adopt".
+        ``frames`` or the latency sample. It runs on the one worker, but it is
+        not the one outstanding read: a sweep or pipeline frame already in
+        flight declines the probe, never waits behind it, and a frame that
+        arrives while the probe is on the worker is admitted by :meth:`begin`
+        and read the moment the probe's inference ends -- a gate-decision read
+        is never refused for the baseline's sake. One probe at a time. A reader
+        that is not ready, is busy, raises, or runs past ``timeout`` answers
+        None, which the caller treats as "do not adopt".
         """
         if not self._config.enabled or self._closed:
             return None
         with self._lock:
             pool, state = self._pool, self._state
-            if pool is None or state != "ready" or self._inflight:
+            if pool is None or state != "ready" or self._inflight or self._probing:
                 return None
-            self._inflight += 1
+            self._probing = True
         try:
             future = pool.submit(self._probe, image)
         except RuntimeError:
             with self._lock:
-                self._inflight -= 1
+                self._probing = False
             return None
         try:
             return bool(future.result(timeout=timeout))
@@ -1068,7 +1082,7 @@ class LocalRecognizer:
             return bool(engine.read(image).reads)
         finally:
             with self._lock:
-                self._inflight = max(0, self._inflight - 1)
+                self._probing = False
 
     def _declined(self, trace_id, plates, policy=None, now=None, *,
                   count: str | None = "unavailable") -> LocalFrame:
