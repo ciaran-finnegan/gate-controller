@@ -84,7 +84,7 @@ hold unchanged. Talkback adds these:
 | Camera credentials stay in one process | The Baichuan client lives in `gate-camera-control` and reads the same `/etc/gate-camera-control.env`. The media gateway, the auth sidecar, the Worker and the browser never see them |
 | No new network exposure | The camera-control service still binds loopback and still reaches nothing but loopback and the camera's `/32`; port 9000 is on that same address. The only new public surface is `/talk/whip` on the media hostname, behind the same nginx, Access and token check as `/gate/whep` |
 | Off by default, and nothing until enabled | `GATE_CAMERA_TALK_ENABLED=false` means the service never opens port 9000. With it `true`, the only unsolicited traffic is one `TalkAbility` probe at start, hourly once ready, every 15 min while not. A press while the camera was last unreachable, busy or erroring probes first, at most once every 15 s; refused credentials are never retried by a press |
-| Bounded sessions with a hard time limit | One session at a time. `GATE_CAMERA_TALK_MAX_SECONDS` (5–60, default 30) is a **kill** of ffmpeg at the deadline from a timer thread, not a cooperative check a stalled read could miss. A publisher that never arrives ends the session at 10 s. The token is 60 s. Nothing here can be extended |
+| Bounded sessions with a hard time limit | One session at a time. `GATE_CAMERA_TALK_MAX_SECONDS` (5–60, default 30) is a **kill** of ffmpeg at the deadline from a timer thread, not a cooperative check a stalled read could miss. A request for longer is clamped to it, never granted. A publisher that never arrives ends the session at 10 s. The token is 60 s. Nothing here can be extended |
 | The browser cannot pick the camera or the format | The WHIP path is fixed to `talk`; ffmpeg's command is fixed and credential-free; the ADPCM format comes from the camera's own `TalkAbility` and its tokens are ASCII-checked before they are echoed back in `TalkConfig` |
 | Only operators and admins | Enforced twice: the Worker refuses the talk session and the WHIP proxy for viewers, and the media-session contract only ever reports `talkback: true` to those roles |
 | No payload leaks | Errors are typed with no camera body attached; journal lines carry stage, outcome, block count and a truncated session id; the state file names no camera, address or credential |
@@ -163,8 +163,20 @@ shares the state budget.
 
 ### `POST /camera/talk`
 
-Body optional; `{"max_seconds": 20}` bounds this session (5–`GATE_CAMERA_TALK_MAX_SECONDS`).
-Unknown fields are a `400`.
+Body optional; `{"max_seconds": 20}` bounds this session. A value above
+`GATE_CAMERA_TALK_MAX_SECONDS` is **clamped** to it, not refused: the Worker
+asks for its own 60 s ceiling on every press and sizes its token to the
+`talk.max_seconds` it reads back, so until 2026-10-11, with the Pi's limit at
+30, every press was a `400` and nothing in the journal said why. A value below
+5, a non-integer, a boolean or an unknown field is still a `400
+invalid_request`, journaled as `stage=request_rejected method=POST
+path=/camera/talk reason=talk_too_short` (or `reason=invalid_request`).
+
+In the answer, `talk.max_seconds` is **this session's** bound while it is
+active -- the clamped value, which is also `seconds_remaining` at the moment of
+arming -- and the configured maximum when nothing is armed. The journal names
+the clamp: `talk_armed max_seconds=30 requested=60 session=…`; `requested` is
+absent when the caller got what it asked for.
 
 ```json
 {
@@ -203,7 +215,7 @@ Two optional keys in `/etc/gate-camera-control.env` (root:root 0600):
 | Key | Default | Rules |
 | --- | --- | --- |
 | `GATE_CAMERA_TALK_ENABLED` | `false` | exactly `true` or `false` |
-| `GATE_CAMERA_TALK_MAX_SECONDS` | `30` | whole seconds, 5–60, no leading zero |
+| `GATE_CAMERA_TALK_MAX_SECONDS` | `30` | whole seconds, 5–60, no leading zero. A session request above it is clamped to it |
 
 One optional key in `/etc/gate-media-auth.env`:
 
@@ -234,6 +246,8 @@ until they restart, which is why nothing rewrites it automatically.
 ```text
 gate_camera_control stage=talk_probe outcome=ready
 gate_camera_control stage=talk_armed max_seconds=30 session=3f2a9c1d0b7e
+gate_camera_control stage=talk_armed max_seconds=30 requested=60 session=3f2a9c1d0b7e
+gate_camera_control stage=request_rejected method=POST path=/camera/talk reason=talk_too_short
 gate_camera_control stage=talk_publisher outcome=ready session=3f2a9c1d0b7e
 gate_camera_control stage=talk_stream format=adpcm16000x1024 outcome=started session=3f2a9c1d0b7e
 gate_camera_control stage=talk_ended blocks=214 reason=publisher_gone seconds=14.1 session=3f2a9c1d0b7e

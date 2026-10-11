@@ -1,3 +1,4 @@
+import copy
 import json
 import shutil
 import socket
@@ -46,6 +47,24 @@ from gate_media_config import (
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+# The fitted RLC-811A's `GetIsp` value as read live on 2026-10-11: the 2026-09-06
+# night configuration (Manual 1/250 s, gain 16) with `dayNight` pinned to Color
+# on 2026-09-07. Every field is here so a round-trip can be checked whole.
+LIVE_ISP = {
+    "antiFlicker": "Off", "backLight": "Off",
+    "bd_day": {"bright": 128, "dark": 128, "mode": "Auto"},
+    "bd_led_color": {"bright": 128, "dark": 128, "mode": "Auto"},
+    "bd_night": {"bright": 128, "dark": 128, "mode": "Auto"},
+    "blc": 128, "blueGain": 128, "channel": 0, "constantFrameRate": 1,
+    "dayNight": "Color", "dayNightThreshold": 50, "drc": 128, "encType": "CBR",
+    "exposure": "Manual", "gain": {"max": 16, "min": 16}, "hdr": 0, "mirroring": 0,
+    "nr3d": 1, "redGain": 128, "rotation": 0, "shutter": {"max": 4, "min": 4},
+    "whiteBalance": "Auto",
+}
+# The `dayNight` range the RLC-810A's firmware reported on 2026-09-06
+# (docs/reviews/2026-09-06-camera-config-backup/camera-isp-before-2026-09-06.json).
+LIVE_ISP_RANGE = {"dayNight": ["Auto", "Color", "Black&White"],
+                  "exposure": ["Auto", "LowNoise", "Anti-Smearing", "Manual"]}
 
 
 def self_signed_certificate(directory):
@@ -97,6 +116,17 @@ class FakeCamera:
         self.zoom_stuck = False
         self.zoom_refuse = False
         self.zoom_focus_value = None
+        # The ISP block, written back whole by `SetIsp`. `isp_range` is the
+        # `range` block `GetIsp action 1` carries, or None on a firmware that
+        # reports none. Every SetIsp body is kept so a test can prove exactly
+        # what was written.
+        self.isp = copy.deepcopy(LIVE_ISP)
+        self.isp_range = copy.deepcopy(LIVE_ISP_RANGE)
+        self.isp_writes = []
+        self.isp_read_refuse = False
+        self.isp_write_refuse = False
+        # `hooks[command]` runs before the command is handled, with the body.
+        self.hooks = {}
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCameraHandler)
         self._server.camera = self
@@ -148,6 +178,25 @@ class FakeCamera:
                 self.tokens.discard(token)
                 return 200, _authentication_failure(command)
             self.commands.append(command)
+            hook = self.hooks.get(command)
+            if hook is not None:
+                hook(payload)
+            if command == "GetIsp":
+                if self.isp_read_refuse:
+                    return 200, json.dumps([{"cmd": command, "code": 1,
+                                             "error": {"rspCode": -1}}]).encode("utf-8")
+                entry = {"cmd": "GetIsp", "code": 0, "value": {"Isp": copy.deepcopy(self.isp)}}
+                if self.isp_range is not None:
+                    entry["range"] = {"Isp": copy.deepcopy(self.isp_range)}
+                return 200, json.dumps([entry]).encode("utf-8")
+            if command == "SetIsp":
+                block = payload[0]["param"]["Isp"]
+                self.isp_writes.append(copy.deepcopy(block))
+                if self.isp_write_refuse:
+                    return 200, json.dumps([{"cmd": command, "code": 1,
+                                             "error": {"rspCode": -1}}]).encode("utf-8")
+                self.isp = copy.deepcopy(block)
+                return 200, _command_response("SetIsp", None)
             if command == "GetIrLights":
                 return 200, _command_response("GetIrLights", {
                     "IrLights": {"state": self.ir_state},
@@ -314,6 +363,8 @@ class CameraControlEnvironmentTests(unittest.TestCase):
         # service never opens the camera's Baichuan port.
         self.assertEqual("false", settings["GATE_CAMERA_TALK_ENABLED"])
         self.assertEqual("30", settings["GATE_CAMERA_TALK_MAX_SECONDS"])
+        # Night vision switches the ISP by default; the IR-only lease is opt-in.
+        self.assertEqual("true", settings["GATE_CAMERA_NIGHT_VISION_ISP"])
 
     def test_invalid_camera_control_environments_fail_closed(self):
         base = {
@@ -339,6 +390,8 @@ class CameraControlEnvironmentTests(unittest.TestCase):
             {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "61"},
             {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "030"},
             {**base, "GATE_CAMERA_TALK_MAX_SECONDS": "30.0"},
+            {**base, "GATE_CAMERA_NIGHT_VISION_ISP": "yes"},
+            {**base, "GATE_CAMERA_NIGHT_VISION_ISP": "True"},
         ]
 
         for values in rejected:
@@ -625,9 +678,15 @@ class ReolinkClientTests(unittest.TestCase):
         client = self.client()
 
         with self.assertRaises(ValueError):
-            client._command("SetIsp", 0, {"Isp": {"drc": 1}})
+            client._command("SetImage", 0, {"Image": {"bright": 1}})
         with self.assertRaises(ValueError):
             client.set_ir_state("On")
+        # SetIsp is on the list, but only for a whole block the camera gave us:
+        # a fragment, however it is spelt, never reaches the camera.
+        for fragment in ({"drc": 1}, {"dayNight": "Black&White"}, {"channel": 0}, [], "Color"):
+            with self.subTest(fragment=fragment), self.assertRaises(ValueError):
+                client.set_isp(fragment)
+        self.assertEqual([], self.camera.isp_writes)
 
 
 class IrLeaseTests(unittest.TestCase):
@@ -1003,6 +1062,7 @@ class CameraControlHttpTests(unittest.TestCase):
             token_path=Path(self.directory.name) / "token.json",
             lease_path=Path(self.directory.name) / "lease.json",
             spotlight_lease_path=Path(self.directory.name) / "spotlight-lease.json",
+            night_record_path=Path(self.directory.name) / "night-isp.json",
             logger=self.journal,
             connection_factory=self.camera.connection_factory,
             clock=self.clock,
@@ -1039,7 +1099,10 @@ class CameraControlHttpTests(unittest.TestCase):
                 status, payload, _ = self.json_request("GET", path)
 
                 self.assertEqual(200, status)
-                self.assertEqual({"observed_at", "ir", "spotlight"}, set(payload))
+                self.assertEqual({"observed_at", "ir", "spotlight", "night_vision"}, set(payload))
+                # No lease, so the picture is untouched and nothing is pending.
+                self.assertEqual({"enabled": True, "active": False, "restore_failed": False,
+                                  "last_error": None}, payload["night_vision"])
                 # From the last observation, never a second camera read: a
                 # spotlight nobody has looked at yet is unknown, not "Off".
                 self.assertEqual("unknown", payload["spotlight"]["state"])
@@ -1261,7 +1324,9 @@ class CameraControlHttpTests(unittest.TestCase):
         self.clock.advance(payload["retry_after"])
         self.assertEqual(200, self.json_request("GET", "/camera/state")[0])
 
-        commands = len(self.camera.commands)
+        # Counted on the IR write itself: a night-vision lease also costs the
+        # camera an ISP read and write, and those are not what is bounded here.
+        ir_writes = self.camera.commands.count("SetIrLights")
         for _ in range(IR_BURST):
             self.assertEqual(
                 200, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
@@ -1271,13 +1336,13 @@ class CameraControlHttpTests(unittest.TestCase):
         self.assertEqual(429, status)
         self.assertEqual("rate_limited", payload["error"])
         # The refused lease change never reached the camera.
-        self.assertEqual(IR_BURST, len(self.camera.commands) - commands)
+        self.assertEqual(IR_BURST, self.camera.commands.count("SetIrLights") - ir_writes)
 
         self.clock.advance(payload["retry_after"])
         self.assertEqual(
             200, self.json_request("POST", "/camera/ir", {"state": "Auto"})[0]
         )
-        self.assertEqual(IR_BURST + 1, len(self.camera.commands) - commands)
+        self.assertEqual(IR_BURST + 1, self.camera.commands.count("SetIrLights") - ir_writes)
 
     def test_bad_input_is_rejected_without_reaching_the_camera(self):
         commands = len(self.camera.commands)
@@ -1500,21 +1565,26 @@ class ServiceFacadeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "gate_camera_control"
         text = "\n".join(
             (source / name).read_text(encoding="utf-8")
-            for name in ("__main__.py", "ir.py", "reolink.py", "state.py", "clock.py")
+            for name in ("__main__.py", "ir.py", "reolink.py", "state.py", "clock.py",
+                         "night.py", "focus.py", "talk.py")
         )
 
-        self.assertNotIn("SetIsp", text)
         # The clock reconcile adds exactly GetTime and SetTime: the camera's
         # displayed time and DST block, nothing that touches the picture. The
         # spotlight adds exactly GetWhiteLed and SetWhiteLed, and only ever
         # sends `state` -- never the automation `mode` or the brightness. The
         # refocus nudge adds exactly GetZoomFocus and StartZoomFocus, and only
         # ever with the zoom operation: no focus position, no autofocus mode.
+        # Night vision adds exactly GetIsp and SetIsp, and SetIsp is sent from
+        # one place with nothing but a whole block the camera gave us.
         self.assertEqual(frozenset({
             "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed",
             "Snap", "GetTime", "SetTime", "GetZoomFocus", "StartZoomFocus",
+            "GetIsp", "SetIsp",
         }), ALLOWED_COMMANDS)
         self.assertIn('"WhiteLed": {"channel": 0, "state": 1 if state == "On" else 0}', text)
+        self.assertEqual(1, text.count('self._command("SetIsp"'))
+        self.assertEqual(1, text.count('self._command("GetIsp"'))
 
     def test_the_installer_publishes_every_module_in_the_package(self):
         """A module missing from the installer's list is an import error on the Pi.

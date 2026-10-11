@@ -247,9 +247,7 @@ class TalkController:
             self.probe(unless_within=PROBE_SPACING_SECONDS)
         if self._reason != "ready" or self._format is None:
             raise TalkUnavailable(self._reason)
-        seconds = self._max_seconds if max_seconds is None else int(max_seconds)
-        if not MIN_SECONDS <= seconds <= self._max_seconds:
-            raise ValueError("invalid_request")
+        seconds = self._bounded_seconds(max_seconds)
         with self._lock:
             if self._session is not None:
                 raise TalkBusySession()
@@ -262,7 +260,12 @@ class TalkController:
                 target=self._run, args=(session,), name="camera-talk", daemon=True
             )
             self._thread = thread
-        self._journal("talk_armed", max_seconds=seconds, session=session.id[:12])
+        armed_fields = {"max_seconds": seconds, "session": session.id[:12]}
+        if max_seconds is not None and max_seconds != seconds:
+            # Named only when the caller asked for more than it got, so the
+            # app's 60 s press and the Pi's 30 s limit can be told apart.
+            armed_fields["requested"] = max_seconds
+        self._journal("talk_armed", **armed_fields)
         try:
             thread.start()
         except RuntimeError:
@@ -271,6 +274,24 @@ class TalkController:
                 self._session = None
             raise
         return armed
+
+    def _bounded_seconds(self, max_seconds) -> int:
+        """This session's length: the configured maximum, or less if asked for less.
+
+        A request for *more* than the configured maximum is clamped to it, not
+        refused. The Worker asks for its own 60 s ceiling on every press and
+        reads the length it was actually given back out of the answer; refusing
+        it made every press a 400 with nothing in the journal. A request below
+        `MIN_SECONDS`, or one that is not a whole number, is still refused: it
+        is not a length anyone meant.
+        """
+        if max_seconds is None:
+            return self._max_seconds
+        if isinstance(max_seconds, bool) or not isinstance(max_seconds, int):
+            raise ValueError("invalid_request")
+        if max_seconds < MIN_SECONDS:
+            raise ValueError("talk_too_short")
+        return min(max_seconds, self._max_seconds)
 
     def release(self) -> dict:
         with self._lock:
@@ -299,7 +320,9 @@ class TalkController:
             "available": self.available(),
             "reason": self._reason,
             "active": active,
-            "max_seconds": self._max_seconds,
+            # While a session runs this is *its* bound -- the clamped length the
+            # Worker sizes its token to -- and the configured maximum otherwise.
+            "max_seconds": session.max_seconds if active and session is not None else self._max_seconds,
             "state": session.state if session is not None else "idle",
             "session_id": None,
             "armed_at": None,

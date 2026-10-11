@@ -2,7 +2,9 @@
 
 `gate-camera-control` is the only process in the deployment that holds Reolink
 camera API credentials. It exposes a small loopback HTTP surface so the Gate Mate
-Worker can read the IR illuminator state, take a bounded IR lease, fetch one
+Worker can read the IR illuminator state, take a bounded IR lease — which since
+2026-10-11 also switches the picture to night mode and back
+([Night vision](#night-vision-the-isp-half-of-the-ir-lease)) — fetch one
 on-demand 4K still, arm one bounded push-to-talk session, and nudge the zoom
 one step and back so the camera's autofocus runs again ([Refocus](#refocus)) —
 without the browser, the Worker, or the gate controller ever holding a camera
@@ -30,14 +32,19 @@ Therefore every change this service accepts is a **bounded lease** that reverts
 to `GATE_CAMERA_IR_DEFAULT`, and the revert survives a service restart and a
 reboot: the lease record lives on durable storage, and a start that finds no
 usable record reads the camera once and puts it back if it disagrees. The
-service exposes IR and the spotlight only. It never calls `SetIsp`: the deployed
-Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
-operation. The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
+service exposes IR, the spotlight, and — for the IR lease only — the ISP's
+`dayNight` mode. The deployed Manual `s4 g16` exposure is a measured setting
+and stays a reviewed, on-Pi operation: the one `SetIsp` this service sends is
+the camera's own `Isp` block written back whole, with `dayNight` switched for a
+lease and the block restored exactly afterwards; no exposure, shutter or gain
+value originates here ([Night vision](#night-vision-the-isp-half-of-the-ir-lease)).
+The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
 `SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime`, `SetTime`,
-`GetZoomFocus` and `StartZoomFocus`, and no request body can widen it.
-`StartZoomFocus` is only ever sent with the operation `ZoomPos`: nothing in the
-service can write a focus position or change the autofocus mode (see
-[Refocus](#refocus)). The Baichuan (port 9000) message set used for
+`GetZoomFocus`, `StartZoomFocus`, `GetIsp` and `SetIsp`, and no request body
+can widen it. `StartZoomFocus` is only ever sent with the operation `ZoomPos`:
+nothing in the service can write a focus position or change the autofocus mode
+(see [Refocus](#refocus)). `SetIsp` only ever takes a whole block `GetIsp`
+returned. The Baichuan (port 9000) message set used for
 push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
 `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
 `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
@@ -109,7 +116,9 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
     "lease_seconds_remaining": 600,
     "revert_failed": false,
     "last_error": null
-  }
+  },
+  "night_vision": {"enabled": true, "active": true, "restore_failed": false, "last_error": null},
+  "spotlight": {"state": "Off", "default": "Off", "effective_until": null, "lease_seconds_remaining": null, "revert_failed": false, "last_error": null}
 }
 ```
 
@@ -122,6 +131,10 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `ir.lease_seconds_remaining` | integer \| `null` | seconds left on the lease, for a countdown |
 | `ir.revert_failed` | boolean | a revert has failed and is being retried with backoff |
 | `ir.last_error` | `"camera_busy"` \| `"camera_unreachable"` \| `"camera_error"` \| `null` | the last camera failure seen |
+| `night_vision.enabled` | boolean | `GATE_CAMERA_NIGHT_VISION_ISP`: whether an IR lease also switches the picture to night mode |
+| `night_vision.active` | boolean | an ISP snapshot is outstanding: the camera is, or may be, in night mode for the lease. Never from a camera read; from the record on disk |
+| `night_vision.restore_failed` | boolean | the ISP could not be put back and is being retried; also `true` over an unreadable record (`last_error` `record_corrupt`), which a person must look at |
+| `night_vision.last_error` | `"camera_busy"` \| `"camera_unreachable"` \| `"camera_error"` \| `"record_corrupt"` \| `null` | the last ISP failure |
 
 A read refreshes the observation from the camera when it is older than 5 s;
 otherwise it answers from the cached observation. The refresh is subject to the
@@ -186,6 +199,118 @@ A key records how its call ended, not merely that it happened:
 
 Setting `state` to the configured default cancels the lease immediately — that
 is the "revert now" action.
+
+A lease **to `Auto`** is the app's Night vision: with `GATE_CAMERA_NIGHT_VISION_ISP`
+on (the default) it also switches the camera's `Isp.dayNight` to `Black&White`
+and restores it when the lease ends, in the order and with the guarantees in
+[Night vision](#night-vision-the-isp-half-of-the-ir-lease). A camera whose ISP
+cannot be read, or whose firmware does not offer the mode, gets **no** change
+at all — not to the ISP, not to IR, and no lease — and the caller gets the
+camera's own `502`/`503`.
+
+Every journal line a lease change produces carries `key=`, the first twelve
+characters of the request's `idempotency_key`. The Worker sends its audit id
+(`camera_control_audits.idempotency_key`) as that key, so a line on the Pi and
+a row in D1 can be matched by prefix.
+
+### Night vision: the ISP half of the IR lease
+
+**2026-10-11.** The app's Night vision tile leased IR `Auto` and the picture
+stayed black. `GetIsp`, read live that night, said why: `dayNight` has been
+pinned to `Color` since 2026-09-07 (the PIR floodlight lights plates in colour;
+[the review](reviews/2026-09-06-camera-night-configuration.md) § 5, Status), and
+in `Color` the RLC-811A never swings its IR cut filter out and never lights its
+IR LEDs, whatever `IrLights` says. The lease did exactly what it was told and
+it changed nothing anyone could see.
+
+So an IR lease to `Auto` now has two halves, and the service owns their order:
+
+| | On a lease to `Auto` | When the lease ends |
+| --- | --- | --- |
+| 1 | `GetIsp` (action 1, so the firmware's `range` comes too) — a camera that will not answer, or whose `range.dayNight` does not list `Black&White`, stops here with the camera's error and **nothing changed** | `SetIsp` with the snapshot, **exactly** as read: every field, every value |
+| 2 | the whole `Isp` block is written to `/var/lib/gate-camera/night-isp.json` (0600, durable) | the record is removed only once the camera has confirmed |
+| 3 | the IR lease record is written | `SetIrLights` to the default |
+| 4 | `SetIsp` with the snapshot and **one** field changed: `dayNight` `Black&White` | |
+| 5 | `SetIrLights` `Auto` | |
+
+The ISP values written are therefore only ever the camera's own. The service
+holds no exposure, shutter, gain or `dayNight` value of its own apart from the
+word `Black&White`; a camera found with different settings gets those settings
+back, not the ones in any script or document
+(`tests/test_camera_night_vision.py::NightVisionLeaseTests::test_nothing_is_ever_written_to_the_isp_that_was_not_in_the_snapshot`).
+
+**Why only `dayNight`, and not the exposure.** The review measured the
+deployed `Manual` 1/250 s, gain 16 *with IR on* (its row 13): brightness 0.1159,
+"the veiling haze across the driveway is gone and the fence and trees are
+clean". That is a dim but usable IR picture, and it is the exposure the plate
+reader is tuned to. Letting `Auto` exposure own the IR scene would brighten it
+(row 02: 0.41) at the cost of the blown near post and a shutter the plate
+reader cannot use. So the lease changes the mode and nothing else.
+
+**Arrivals during a lease read from the IR picture.** The sweep and the FTP
+stills see a black-and-white, IR-lit scene at the fixed exposure for as long as
+the lease runs. Nothing about plate reading changes, and this has **not** been
+tested against a car: the near-post blaze the review measured at left-third
+clipping 0.0871 under this exposure is back for the duration. The tile is for
+an operator looking at the live view, not for recognition, and the default lease
+is 10 minutes.
+
+**Every way a lease ends restores the picture first, then IR**, and a restore
+that fails stops the revert there — IR stays on, the lease stands, and the
+whole revert is retried with 5/10/20/40/60 s backoff for the life of the
+process. Each failure is one `isp_restore` line at **error** priority and
+`night_vision.restore_failed: true` in `GET /camera/state` and in the heartbeat;
+the camera is never left in night mode silently. The ends, and their journal:
+
+| How it ended | ISP line | IR line |
+| --- | --- | --- |
+| expiry | `isp_restore outcome=completed reason=expired` | `ir_revert outcome=completed reason=expired state=Off` |
+| `POST /camera/ir {"state":"Off"}` from the app | `… reason=requested key=<prefix>` | `ir_revert … reason=requested key=<prefix>` |
+| a failed revert's retry | `… reason=retry` | `ir_revert … reason=retry` |
+| service start with records on disk | `startup_isp_restore` (warning), then `isp_restore … reason=startup` | `startup_revert`, then `startup_revert … reason=startup` |
+
+A **lease extended** from the app while one is running does not read the
+camera again: the snapshot is the picture *before* the lease, and reading it
+mid-lease would make the night values what the lease "restores" to. The night
+`SetIsp` is sent again (it is idempotent), the IR lease takes the new expiry.
+
+**Service restart or power cut mid-lease.** Both records are on durable
+storage. On start, the ISP is restored before the IR startup revert and before
+anything is served; with only the ISP record left (the IR record lost), it is
+still restored, and if the camera will not answer the IR worker's one-second
+tick keeps retrying it. There is no shutdown revert: a `systemctl stop` without
+a start leaves the camera as it was until the next start, exactly as it does
+IR. **A record that cannot be read** is kept on disk as evidence, journaled
+`isp_record_corrupt` at error priority, published as `active: true,
+restore_failed: true, last_error: record_corrupt`, and never written back; a
+new lease is refused (`502 camera_error`) until a person has restored the ISP
+by hand and removed the file. **No record** means no lease touched the ISP, and
+a start never reads or writes it — a `Black&White` someone set by hand stays.
+
+**Recovering by hand** if the camera is ever found in night mode with the
+service unable to put it back:
+
+```bash
+# On the Pi. What the service thinks, and what it last did:
+curl -s http://127.0.0.1:8767/camera/state | python3 -m json.tool
+sudo journalctl -u gate-camera-control --since -1d | grep -E 'stage=(isp_|startup_isp|ir_revert)'
+# 1. End the lease (its default is the cancel). The service restores the ISP
+#    from its record and then IR; if it cannot, the journal says why.
+curl -s -X POST http://127.0.0.1:8767/camera/ir -H 'Content-Type: application/json' -d '{"state":"Off"}'
+# 2. If the record is unreadable or gone, put the deployed configuration back
+#    with the setup script, which round-trips the live block and pins dayNight
+#    Color (and reads it back to prove it), then remove the record:
+sudo python3 /root/configure-rlc811a.py --apply          # see docs/reolink-rlc-811a.md
+sudo rm -f /var/lib/gate-camera/night-isp.json
+sudo systemctl restart gate-camera-control
+# Or, with camtool, re-send the GetIsp block with "dayNight":"Color" -- never a
+# partial block (reviews/2026-09-06-camera-night-configuration.md § rollback).
+```
+
+`GATE_CAMERA_NIGHT_VISION_ISP=false` turns the ISP half off: the lease is the
+IR-only lease of before, `night_vision.enabled` reads `false`, and nothing here
+touches the picture. Use it if the switch misbehaves on a firmware it was not
+measured on, or if the camera has to be left in a mode by hand for a while.
 
 ### `POST /camera/spotlight`
 
@@ -263,7 +388,7 @@ With talk not enabled, `GET` reports `reason: not_enabled` and `POST` is
 
 | Status | Body | When |
 | --- | --- | --- |
-| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds, a refocus body that names anything but a reason |
+| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds, a talk length under 5 s, a refocus body that names anything but a reason. Journaled `stage=request_rejected method=… path=… reason=…` |
 | `409` | `{"error":"refocus_busy","reason":...}` | a refocus is running, or a zoom return is still outstanding |
 | `404` | `{"error":"not_found"}` | unknown path, or any query string |
 | `405` | `{"error":"method_not_allowed"}` | wrong method for a known path |
@@ -326,6 +451,14 @@ from its cached observation — it never calls the camera to publish:
 Since push-to-talk the block also carries
 `"talkback": {"available": false, "reason": "not_enabled", "active": false}`;
 its reasons and its coherence rule are in [talkback.md](talkback.md#capability-flow).
+Since night vision it also carries
+`"night_vision": {"enabled": true, "active": false, "restore_failed": false}`
+— whether an IR lease switches the picture, whether one has, and whether it
+came back — beside the IR block whose `effective_until` is the lease's expiry,
+so "Night vision on, N min left" is the IR block and "the picture did not come
+back" is this one. No ISP value reaches the file. The Worker's heartbeat
+narrowing keeps the IR block and drops keys it does not know, so the app shows
+the lease today and learns `night_vision` when access-gate-ui does.
 
 `not_observed` means the service is running and nothing has failed — it simply
 has not called the camera yet. It is deliberately distinct from
@@ -519,8 +652,9 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_LEASE_DEFAULT_MINUTES` | no | `10` | 1–60, and not greater than the maximum |
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
 | `GATE_CAMERA_TALK_ENABLED` | no | `false` | exactly `true` or `false`; with `false` the service never opens the camera's port 9000 |
-| `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session |
+| `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session; a request for longer is clamped to it |
 | `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; hourly `GetTime`/`SetTime` reconcile of the camera clock to UTC |
+| `GATE_CAMERA_NIGHT_VISION_ISP` | no | `true` | `true` or `false`; an IR lease to `Auto` also switches `Isp.dayNight` to `Black&White` and restores the block exactly when it ends. `false` is the IR-only lease |
 
 Validate a file without starting the service:
 
@@ -538,10 +672,21 @@ values are stripped to `[A-Za-z0-9-_.:+]`, so no field can inject another:
 gate_camera_control stage=started ir_default=Off lease_default_minutes=10 lease_max_minutes=60 port=8767
 gate_camera_control stage=login lease_seconds=3600
 gate_camera_control stage=login_throttled retry_after=41
-gate_camera_control stage=ir_set lease_seconds=600 outcome=completed state=Auto
-gate_camera_control stage=ir_revert outcome=completed state=Off
-gate_camera_control stage=ir_revert attempt=2 outcome=camera_busy retry_after=10 state=Off
+gate_camera_control stage=isp_snapshot day_night=Color key=0d8f5a1c-4b2
+gate_camera_control stage=isp_night day_night=Black&White key=0d8f5a1c-4b2 outcome=completed
+gate_camera_control stage=ir_set key=0d8f5a1c-4b2 lease_seconds=600 night_mode=true outcome=completed state=Auto
+gate_camera_control stage=isp_restore day_night=Color outcome=completed reason=expired
+gate_camera_control stage=ir_revert outcome=completed reason=expired state=Off
+gate_camera_control stage=isp_restore attempt=1 outcome=camera_busy reason=expired retry_after=5
+gate_camera_control stage=ir_revert attempt=2 outcome=camera_busy reason=retry retry_after=10 state=Off
+gate_camera_control stage=ir_revert key=5c1d0e9f-77a outcome=completed reason=requested state=Off
+gate_camera_control stage=startup_isp_restore
 gate_camera_control stage=startup_revert state=Off
+gate_camera_control stage=startup_revert outcome=isp_restore_pending reason=startup retry_after=5 state=Off
+gate_camera_control stage=isp_restore attempt=1 outcome=record_unremovable reason=expired retry_after=5
+gate_camera_control stage=startup_isp_restore outcome=cleanup
+gate_camera_control stage=isp_record_corrupt
+gate_camera_control stage=request_rejected method=POST path=/camera/talk reason=talk_too_short
 gate_camera_control stage=startup_reconcile observed=Auto state=Off
 gate_camera_control stage=startup_reconcile outcome=not_observed
 gate_camera_control stage=lease_corrupt state=Off
@@ -565,7 +710,8 @@ gate_camera_control stage=refocus_return background=true expected=2 observed=2 o
 gate_camera_control stage=startup_zoom_return zoom=2
 ```
 
-The `refocus_return*` and `startup_zoom_return` lines are written at warning or
+The `refocus_return*`, `startup_zoom_return`, `startup_isp_restore`,
+`isp_record_corrupt` and failed `isp_restore` lines are written at warning or
 error priority, so `journalctl -u gate-camera-control -p warning` finds them.
 
 No credential, token, camera address, or camera payload ever appears — the same
@@ -584,7 +730,12 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | Camera unreachable | `503 camera_unreachable` and the breaker opens for 60 s, so the retries after it are `503 camera_busy`; `state.json` keeps `last_error` and its own `observed_at`, so the app says "unknown", never "Off" |
 | Nothing has called the camera yet | `state.json` reads `not_observed`, not `camera_unreachable`; the 30 s background refresh clears it without an operator doing anything |
 | A read flood during an expiring lease | reads are single-flighted, skipped while a revert is queued, and rate limited; the revert waits for at most one in-flight call |
-| Service restart mid-lease | the lease is persisted to `/var/lib/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. A lost revert timer can never leave IR in the temporary state |
+| Service restart mid-lease | the lease is persisted to `/var/lib/gate-camera/lease.json` **before** the camera is changed; on start the service reverts to `GATE_CAMERA_IR_DEFAULT` before it serves a single request, then clears the record. A lost revert timer can never leave IR in the temporary state. The ISP snapshot in `night-isp.json` is restored first, in the same way ([Night vision](#night-vision-the-isp-half-of-the-ir-lease)) |
+| The ISP cannot be read when a night-vision lease is asked for | nothing changes — no ISP write, no IR write, no lease — and the caller gets the camera's own `502`/`503`. A mode the service could not snapshot is a mode it could not restore |
+| The ISP restore fails when a lease ends | IR is left on and the lease stands; the whole revert (picture, then IR) is retried with 5/10/20/40/60 s backoff, each failure one `isp_restore` line at error priority, `night_vision.restore_failed` true in the state and the heartbeat until it takes |
+| The ISP record is unreadable | kept as evidence, journaled `isp_record_corrupt` at error priority, published `restore_failed` with `last_error: record_corrupt`, never written back; new night leases are refused until a person restores the ISP by hand and removes the file |
+| The camera takes the restore but the record will not unlink | the lease stays outstanding (`active`, `restore_failed`, `last_error: record_unremovable`, one `isp_restore outcome=record_unremovable` line at error priority) and the removal is retried on the restore's backoff **without writing the camera again**; the file is marked `restored_at` (best effort) so a start that finds it only cleans up and never replays the snapshot over a picture set since |
+| A restore fails and a revert follows at once (the startup revert after `startup_isp_restore`, or an IR retry whose own backoff ran out first) | the revert sends nothing and waits for the restore's backoff: `ir_revert`/`startup_revert … outcome=isp_restore_pending retry_after=N`. A camera that has just refused a `SetIsp` is not sent a second one |
 | Reboot or power cut mid-lease | the record is on durable storage (`StateDirectory=gate-camera`), not in `/run`, which the boot recreates empty — the camera is separately powered, so a lease whose record died with the tmpfs would have been held indefinitely. It is reverted on the next start exactly as a service restart is |
 | The lease record is lost or unreadable anyway | on start, with no usable record, the service **reads** the camera once: a state that is not `GATE_CAMERA_IR_DEFAULT` is put back and journaled `startup_reconcile`; a state that matches it, or a camera that will not answer, is left alone. That read is one `GetIrLights` on the cached token, so a restart loop still cannot become a login storm, and nothing is ever written on the strength of a camera that could not be read. A record that exists but is unusable — bad JSON, or a timestamp outside a year either side of now — is journaled `lease_corrupt` and treated as an expired lease, so the default is restored through the ordinary revert path |
 | A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |

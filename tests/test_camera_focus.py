@@ -548,6 +548,7 @@ class EndToEndTests(unittest.TestCase):
             token_path=Path(self.directory.name) / "token.json",
             lease_path=Path(self.directory.name) / "lease.json",
             spotlight_lease_path=Path(self.directory.name) / "spotlight-lease.json",
+            night_record_path=Path(self.directory.name) / "night-isp.json",
             refocus_record_path=Path(self.directory.name) / "refocus-return.json",
             logger=logging.getLogger("test.camera_control"),
             connection_factory=camera.connection_factory, clock=service_clock,

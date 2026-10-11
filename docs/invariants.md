@@ -156,7 +156,7 @@ Guards:
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_boxed_plate_in_the_dark_starts_the_run_again`
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_failed_read_in_the_dark_is_not_an_empty_drive`
 
-## 7. The camera lens is never left changed
+## 7. The camera lens is never left changed, and neither is a picture setting a lease changed
 
 Only one thing on the Pi moves the lens: the refocus nudge (#195), which steps
 zoom one position and back to exactly where it was, and puts it back first if
@@ -164,13 +164,37 @@ the service restarted part-way. Nothing writes a focus position. The setup
 script (`scripts/reolink/configure-rlc811a.py`) sends no zoom or focus command
 at all.
 
+The same discipline holds for any camera setting a lease changes. The
+night-vision lease switches `Isp.dayNight` to `Black&White` so the IR LEDs
+light; it reads the whole `Isp` block first and writes it to durable storage
+before anything changes, writes back **exactly** that block when the lease ends
+-- expiry, an Off from the app, or the next start after a crash -- and only
+then switches IR off. The only ISP value it ever writes that was not in the
+snapshot is `dayNight` itself; the exposure the plate reader is tuned to
+(Manual 1/250 s, gain 16, [the review](reviews/2026-09-06-camera-night-configuration.md))
+is never a value the service holds. A camera whose ISP cannot be read gets no
+change at all, a restore that fails is retried and journaled at error priority
+and reported in the heartbeat, and an unreadable snapshot is never written back
+([camera-control.md, Night vision](camera-control.md#night-vision-the-isp-half-of-the-ir-lease)).
+
 - **2026-10-04** -- the camera's autofocus settled out of focus overnight;
   every daytime frame was soft for a day and a half until the zoom was nudged.
+- **2026-10-11** -- the app's Night vision tile leased IR on and the picture
+  stayed black: the ISP had been pinned to `Color` since 2026-09-07, in which
+  the camera never lights its IR LEDs. Making the lease switch the mode made it
+  a lease over a measured plate-reading setting, which is why it is held to
+  the lens's rule.
 
 Guards:
 
 - `tests/test_camera_refocus.py::test_a_restart_part_way_through_a_nudge_puts_the_zoom_back_first`
 - `tests/test_camera_refocus.py::test_a_restart_with_no_record_never_moves_the_lens`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_expiry_restores_the_isp_exactly_as_it_was_read_then_turns_ir_off`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_nothing_is_ever_written_to_the_isp_that_was_not_in_the_snapshot`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_a_restart_mid_lease_restores_the_isp_before_anything_else`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_an_isp_that_cannot_be_read_is_never_changed`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_a_restore_that_fails_is_retried_reported_and_leaves_ir_on_until_it_takes`
+- `tests/test_camera_night_vision.py::NightVisionLeaseTests::test_a_record_that_cannot_be_read_is_never_written_back_and_is_said_loudly`
 
 ## 8. The camera's clock is UTC, and the Pi owns it
 

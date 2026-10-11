@@ -27,8 +27,23 @@ ALLOWED_COMMANDS = frozenset({
     # and back. `StartZoomFocus` is only ever sent with op `ZoomPos` -- see
     # `zoom_to` -- so no focus position is ever written from here.
     "GetZoomFocus", "StartZoomFocus",
+    # The night-vision lease (night.py): read the whole `Isp` block, and write
+    # it back whole. `set_isp` takes nothing but a block `isp()` returned, so
+    # the only ISP values this service can ever write are the camera's own,
+    # with `dayNight` switched for the lease and switched back after it.
+    "GetIsp", "SetIsp",
 })
 IR_STATES = ("Auto", "Off")
+# `Isp.dayNight` as the firmware's `GetIsp` range reports it. `Black&White` is
+# the night mode in which the IR cut filter swings out and `IrLights` `Auto`
+# actually lights the LEDs; in `Color` they never come on, whatever IR says.
+DAY_NIGHT_MODES = ("Auto", "Color", "Black&White")
+NIGHT_DAY_NIGHT = "Black&White"
+# A GetIsp block is a few dozen scalar fields and a few two-level ranges. Anything
+# wider is not an ISP block this service knows how to put back.
+_MAX_ISP_FIELDS = 64
+_MAX_ISP_SUBFIELDS = 16
+_MAX_ISP_TEXT = 64
 # The RLC-811A's white spotlight, as the firmware's `WhiteLed.state` reports it:
 # 1 lit, 0 dark. `mode` (off / night-smart / schedule) is the camera's own
 # automation and is never touched here -- only whether it is lit right now.
@@ -274,6 +289,42 @@ class ReolinkClient:
             "ZoomFocus": {"channel": 0, "op": "ZoomPos", "pos": position},
         })
 
+    def isp(self):
+        """The camera's whole `Isp` block, and the `dayNight` modes it accepts.
+
+        Returns ``(block, day_night_modes)``. ``block`` is exactly what the
+        camera reported, deep-copied, so that a caller can hand it straight
+        back to `set_isp` and restore the picture to the state it was read in;
+        ``day_night_modes`` is the firmware's own range for `dayNight`, or None
+        on a firmware that does not report one.
+        """
+        entry = self._command("GetIsp", 1, {"channel": 0}, full=True)
+        value = entry.get("value") if isinstance(entry, dict) else None
+        block = value.get("Isp") if isinstance(value, dict) else None
+        if not usable_isp_block(block):
+            raise CameraError("camera reported an unusable ISP block")
+        ranges = entry.get("range")
+        ranges = ranges.get("Isp") if isinstance(ranges, dict) else None
+        modes = ranges.get("dayNight") if isinstance(ranges, dict) else None
+        if not (isinstance(modes, list) and modes
+                and all(isinstance(mode, str) and 0 < len(mode) <= _MAX_ISP_TEXT
+                        for mode in modes)):
+            modes = None
+        return json.loads(json.dumps(block)), (None if modes is None else tuple(modes))
+
+    def set_isp(self, block: dict) -> None:
+        """Write a whole `Isp` block back, exactly as `isp()` shaped it.
+
+        Deliberately not a field setter: a caller cannot send `{"drc": 1}` or
+        any other fragment, only a complete block that was read from the
+        camera (with at most `dayNight` changed by night.py). The firmware is
+        told the whole picture every time, so no field is ever dropped to its
+        default by a partial write (docs/reviews/2026-09-06-camera-night-configuration.md).
+        """
+        if not usable_isp_block(block):
+            raise ValueError("an ISP write must be a whole ISP block read from the camera")
+        self._command("SetIsp", 0, {"Isp": json.loads(json.dumps(block))})
+
     def snapshot(self) -> bytes:
         """Return one bounded 4K JPEG from the camera's Snap endpoint."""
         token = self._ensure_token()
@@ -296,21 +347,26 @@ class ReolinkClient:
             raise CameraError("camera returned a non-JPEG snapshot")
         return body
 
-    def _command(self, command: str, action: int, param: dict):
+    def _command(self, command: str, action: int, param: dict, *, full: bool = False):
+        """Run one allowlisted command; ``full`` returns the whole answer entry.
+
+        The default is the command's `value`. `full` is for `GetIsp`, whose
+        `range` block says which `dayNight` modes this firmware accepts.
+        """
         if command not in ALLOWED_COMMANDS:
             raise ValueError("camera command is not on the allowlist")
         token = self._ensure_token()
-        value, authentication_failed = self._invoke(command, action, param, token)
+        value, authentication_failed = self._invoke(command, action, param, token, full=full)
         if not authentication_failed:
             return value
         self._invalidate_token()
         token = self._ensure_token()
-        value, authentication_failed = self._invoke(command, action, param, token)
+        value, authentication_failed = self._invoke(command, action, param, token, full=full)
         if authentication_failed:
             raise CameraError("camera rejected the cached credentials")
         return value
 
-    def _invoke(self, command: str, action: int, param: dict, token: str):
+    def _invoke(self, command: str, action: int, param: dict, token: str, *, full: bool = False):
         body = json.dumps(
             [{"cmd": command, "action": action, "param": param}], separators=(",", ":")
         ).encode("utf-8")
@@ -320,7 +376,10 @@ class ReolinkClient:
             return None, True
         if status != 200:
             raise CameraError("camera returned an unexpected status")
-        return _decode_command_response(command, payload)
+        entry, authentication_failed = _decode_command_response(command, payload)
+        if authentication_failed:
+            return None, True
+        return (entry if full else entry.get("value")), False
 
     def _ensure_token(self) -> str:
         with self._lock:
@@ -355,7 +414,8 @@ class ReolinkClient:
         status, payload = self._request("POST", "cmd=Login", body, MAX_RESPONSE_BYTES)
         if status != 200:
             raise CameraError("camera refused the login request")
-        value, authentication_failed = _decode_command_response("Login", payload)
+        entry, authentication_failed = _decode_command_response("Login", payload)
+        value = entry.get("value") if isinstance(entry, dict) else None
         if authentication_failed or not isinstance(value, dict):
             raise CameraError("camera rejected the configured credentials")
         token = value.get("Token")
@@ -448,12 +508,48 @@ def _decode_command_response(command: str, payload: bytes):
         raise CameraError("camera answered a different command")
     code = entry.get("code")
     if code == 0:
-        return entry.get("value"), False
+        return entry, False
     detail = entry.get("error")
     error_code = detail.get("rspCode") if isinstance(detail, dict) else None
     if error_code in _AUTH_ERROR_CODES:
         return None, True
     raise CameraError("camera reported a command failure")
+
+
+def usable_isp_block(block) -> bool:
+    """True for a block shaped like the camera's own `Isp` value and nothing else.
+
+    A few dozen fields, each a short scalar or a small object of short scalars,
+    always naming `channel` and `dayNight`. Bounded here so that a snapshot
+    this service persists and later writes back is one it read, not something
+    a corrupt record or a caller shaped.
+    """
+    if not isinstance(block, dict) or not 0 < len(block) <= _MAX_ISP_FIELDS:
+        return False
+    if not isinstance(block.get("dayNight"), str):
+        return False
+    if isinstance(block.get("channel"), bool) or not isinstance(block.get("channel"), int):
+        return False
+    for key, value in block.items():
+        if not isinstance(key, str) or not 0 < len(key) <= _MAX_ISP_TEXT:
+            return False
+        if isinstance(value, dict):
+            if not 0 < len(value) <= _MAX_ISP_SUBFIELDS:
+                return False
+            if not all(isinstance(sub_key, str) and 0 < len(sub_key) <= _MAX_ISP_TEXT
+                       and _isp_scalar(sub_value) for sub_key, sub_value in value.items()):
+                return False
+        elif not _isp_scalar(value):
+            return False
+    return True
+
+
+def _isp_scalar(value) -> bool:
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    return isinstance(value, str) and len(value) <= _MAX_ISP_TEXT
 
 
 def _quote_token(token: str) -> str:

@@ -589,16 +589,47 @@ class TalkControllerTests(unittest.TestCase):
     def test_bounds_on_the_requested_length(self):
         controller = self.controller(max_seconds=20)
         controller.probe()
-        for seconds in (MIN_SECONDS - 1, 21, HARD_MAX_SECONDS + 1, 0):
+        for seconds in (MIN_SECONDS - 1, 0, -1):
             with self.subTest(seconds=seconds), self.assertRaises(ValueError):
                 controller.arm(seconds)
         self.assertEqual(20, controller.max_seconds)
+        self.assertIsNone(controller.snapshot()["session_id"])
         self.assertEqual(
             60,
             TalkController(
                 self.client_factory(), max_seconds=999, rtsp_url=TALK_URL
             ).max_seconds,
         )
+
+    def test_a_request_for_longer_than_the_limit_gets_the_limit_not_a_refusal(self):
+        """The app asks for 60 s on every press; the Pi's limit is 30 s.
+
+        Until 2026-10-11 that was a 400 with no journal line, so Hold to talk
+        failed every time and nothing on the Pi said why. The request is now
+        clamped to the configured maximum and the answer says what it got,
+        which is the figure the Worker sizes its token to.
+        """
+        controller = self.controller(max_seconds=20)
+        controller.probe()
+        for requested in (21, 60, HARD_MAX_SECONDS + 1, 999):
+            with self.subTest(requested=requested):
+                armed = controller.arm(requested)
+                self.assertEqual(20, armed["max_seconds"])
+                self.assertEqual(20, armed["seconds_remaining"])
+                stage, fields = [entry for entry in self.journal if entry[0] == "talk_armed"][-1]
+                self.assertEqual(20, fields["max_seconds"])
+                self.assertEqual(requested, fields["requested"])
+                controller.release()
+                self.wait_until_ended(controller)
+        # A shorter request is its own bound, and the answer says so too.
+        armed = controller.arm(10)
+        self.assertEqual(10, armed["max_seconds"])
+        self.assertEqual(10, controller.snapshot()["max_seconds"])
+        self.assertNotIn("requested", [e for e in self.journal if e[0] == "talk_armed"][-1][1])
+        controller.release()
+        self.wait_until_ended(controller)
+        # Idle again, the configured maximum is what is reported.
+        self.assertEqual(20, controller.snapshot()["max_seconds"])
 
     def test_the_probe_runs_on_a_slow_clock(self):
         clock = ManualClock()
@@ -833,6 +864,8 @@ class TalkHttpTests(unittest.TestCase):
             },
             token_path=Path(self.directory.name) / "token.json",
             lease_path=Path(self.directory.name) / "lease.json",
+            spotlight_lease_path=Path(self.directory.name) / "spotlight-lease.json",
+            night_record_path=Path(self.directory.name) / "night-isp.json",
             logger=self.journal,
             connection_factory=self.api_camera.connection_factory,
             talk_client_factory=lambda: baichuan.BaichuanClient(
@@ -916,13 +949,34 @@ class TalkHttpTests(unittest.TestCase):
 
     def test_bad_talk_requests_are_refused_before_the_camera(self):
         self.service.talk.probe()
-        for payload in ({"max_seconds": 999}, {"max_seconds": "10"}, {"max_seconds": True},
-                        {"seconds": 10}, [10]):
+        for payload in ({"max_seconds": 4}, {"max_seconds": 0}, {"max_seconds": "10"},
+                        {"max_seconds": True}, {"seconds": 10}, [10]):
             with self.subTest(payload=payload):
                 status, body = self.request("POST", "/camera/talk", payload)
                 self.assertEqual(400, status)
                 self.assertEqual({"error": "invalid_request"}, body)
         self.assertEqual([1, 1, 10, 2], self.talk_camera.messages)  # the probe only
+        # Every refusal is in the journal, with the path and why.
+        rejected = [line for line in self.journal.lines if "stage=request_rejected" in line]
+        self.assertEqual(6, len(rejected))
+        self.assertIn("method=POST path=/camera/talk reason=talk_too_short", rejected[0])
+        self.assertIn("reason=invalid_request", rejected[2])
+
+    def test_the_apps_sixty_second_press_is_clamped_to_the_pis_limit_and_answered(self):
+        """`POST /camera/talk {"max_seconds": 60}` is what the Worker sends."""
+        self.service.talk.probe()
+        status, body = self.request("POST", "/camera/talk", {"max_seconds": 60})
+        self.assertEqual(200, status, body)
+        self.assertEqual("armed", body["status"])
+        self.assertEqual(20, body["talk"]["max_seconds"])
+        self.assertLessEqual(body["talk"]["seconds_remaining"], 20)
+        armed = [line for line in self.journal.lines if "stage=talk_armed" in line]
+        self.assertEqual(1, len(armed))
+        self.assertIn("max_seconds=20", armed[0])
+        self.assertIn("requested=60", armed[0])
+        status, body = self.request("DELETE", "/camera/talk")
+        self.assertEqual(200, status)
+        self.wait_until_idle()
         status, body = self.request("PUT", "/camera/talk")
         self.assertEqual(405, status)
         status, body = self.request("DELETE", "/camera/ir")

@@ -31,11 +31,15 @@ subsection, and for the exposure settings deployed around it.
 The camera's HTTPS `api.cgi` interface is reached by exactly one process on the
 Pi: the isolated `gate-camera-control` service, documented in
 [Gate camera control](camera-control.md). It holds the only camera API
-credentials, allows only `Login`, `GetIrLights`, `SetIrLights` and `Snap`, caches
-one login token (this firmware answers 502 for about a minute after repeated
-logins), and turns every IR change into a bounded lease that reverts to the
-configured default. `SetIsp` is deliberately not exposed to the app: the deployed
-Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi change.
+credentials, allows only the commands on its allowlist (`Login`, `GetIrLights`,
+`SetIrLights`, `Snap` and the later additions listed in camera-control.md),
+caches one login token (this firmware answers 502 for about a minute after
+repeated logins), and turns every IR change into a bounded lease that reverts
+to the configured default. The ISP is not exposed to the app: the deployed
+Manual `s4 g16` exposure is a measured setting and stays a reviewed, on-Pi
+change. The one `SetIsp` the service sends is the camera's own block written
+back whole, with `dayNight` switched for a night-vision lease and restored
+exactly after it ([camera-control.md, Night vision](camera-control.md#night-vision-the-isp-half-of-the-ir-lease)).
 
 ## Network Boundary
 
