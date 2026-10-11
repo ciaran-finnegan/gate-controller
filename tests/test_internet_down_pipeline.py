@@ -272,7 +272,7 @@ class InternetDownPassageTests(unittest.TestCase):
         link = Link(up=False)
         link.measure()
         cloud = DeadLinkCloud()
-        gate = self._gate(link, answers={})
+        gate = self._gate(link, answers={}, cloud=cloud)
         still = frame(340)
         gate.engine.answers[digest(gate.pipeline_bytes(still))] = ("10CE1990", 0.95)
         offered = harness.car_frame(341)

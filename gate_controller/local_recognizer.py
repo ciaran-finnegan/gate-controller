@@ -1061,12 +1061,15 @@ class LocalRecognizer:
             if pool is None or state != "ready" or self._inflight or self._probing:
                 return None
             self._probing = True
-        try:
-            future = pool.submit(self._probe, image)
-        except RuntimeError:
-            with self._lock:
+            # Submitted under the same lock as the check, so a frame admitted
+            # a moment later is behind the probe, never ahead of it: a probe
+            # queued behind a read would run during the session the read
+            # belongs to. `submit` only enqueues; it never blocks here.
+            try:
+                future = pool.submit(self._probe, image)
+            except RuntimeError:
                 self._probing = False
-            return None
+                return None
         try:
             return bool(future.result(timeout=timeout))
         except Exception:
