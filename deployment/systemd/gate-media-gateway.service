@@ -2,9 +2,17 @@
 Description=Isolated Gate MediaMTX gateway
 After=network-online.target gate-media-auth.service
 Wants=network-online.target
-Requires=gate-media-auth.service
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Wants=, not Requires=: a failed start of the auth sidecar would otherwise
+# fail this start job as a dependency failure, which Restart= never retries
+# (the transcoder was stranded exactly so on 2026-10-10). Without the sidecar
+# MediaMTX's external authentication fails closed, and this keeps retrying.
+Wants=gate-media-auth.service
+# Never give up starting. After a power cut the Pi can boot before the
+# powerline link is up (NetworkManager-wait-online then fails and
+# network-online.target is reached anyway); on 2026-10-10 a start limit of
+# 5 in 60 s stopped the media stack for 25 minutes until someone ran
+# `systemctl reset-failed` by hand. Restart= paces the retries instead.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,9 +21,11 @@ Group=gate-media
 EnvironmentFile=/etc/gate-media-gateway.env
 EnvironmentFile=/var/lib/gate-media/turn.env
 Environment=PYTHONPATH=/usr/local/lib/gate-media
-ExecStart=/usr/bin/python3 -m gate_media_gateway /usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml
+# --wait-for-address: hold MediaMTX back (at most 60 s per attempt) until the
+# ICE listener address is on this host, rather than letting it fail to bind.
+ExecStart=/usr/bin/python3 -m gate_media_gateway --wait-for-address=60 /usr/local/bin/mediamtx /etc/gate-media/mediamtx.yml
 Restart=always
-RestartSec=5s
+RestartSec=10s
 TimeoutStopSec=10s
 MemoryMax=256M
 CPUQuota=40%

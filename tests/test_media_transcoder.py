@@ -85,7 +85,12 @@ class MediaTranscoderUnitTests(unittest.TestCase):
         unit = self.unit["Unit"]
         service = self.unit["Service"]
 
-        self.assertEqual("gate-media-gateway.service", unit["Requires"])
+        # Wants=, not Requires=: a Requires= turns a failed gateway start into a
+        # dependency failure of this unit's own restart, which systemd does not
+        # retry -- the transcoder stayed dead after the 2026-10-10 power cut.
+        self.assertNotIn("Requires", unit)
+        self.assertNotIn("BindsTo", unit)
+        self.assertEqual("gate-media-gateway.service", unit["Wants"])
         self.assertIn("gate-media-gateway.service", unit["After"])
         self.assertEqual("gate-media-gateway.service", unit["PartOf"])
         self.assertEqual("true", service["DynamicUser"])
@@ -115,7 +120,7 @@ class MediaTranscoderUnitTests(unittest.TestCase):
         self.assertEqual("0", unit["StartLimitIntervalSec"])
         self.assertNotIn("StartLimitBurst", unit)
         self.assertEqual("always", service["Restart"])
-        self.assertEqual("5s", service["RestartSec"])
+        self.assertEqual("10s", service["RestartSec"])
 
     def test_unit_has_exact_resource_bounds(self):
         service = self.unit["Service"]

@@ -2,8 +2,12 @@
 Description=Gate MediaMTX loopback authorization sidecar
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Never give up starting. After a power cut the Pi can boot before the
+# powerline link is up (NetworkManager-wait-online then fails and
+# network-online.target is reached anyway); on 2026-10-10 a start limit of
+# 5 in 60 s stopped the media stack for 25 minutes until someone ran
+# `systemctl reset-failed` by hand. Restart= paces the retries instead.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

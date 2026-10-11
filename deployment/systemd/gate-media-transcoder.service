@@ -1,8 +1,17 @@
 [Unit]
 Description=Isolated gate camera audio transcoder
 After=network-online.target gate-media-gateway.service
-Requires=gate-media-gateway.service
+# Wants=, not Requires=: ffmpeg reads the gateway over loopback RTSP, so it
+# needs the gateway running, but a Requires= makes this unit's own restart
+# fail as a dependency whenever a gateway start fails, and a dependency
+# failure is not retried -- on 2026-10-10 that left the transcoder dead
+# after the gateway recovered. Without it, ffmpeg simply fails to connect
+# while the gateway is down and Restart= tries again until it is back.
+Wants=gate-media-gateway.service
+# A stop or restart of the gateway still stops or restarts this with it.
 PartOf=gate-media-gateway.service
+# Never give up starting: the gateway can be down for as long as the
+# network is late after a power cut.
 StartLimitIntervalSec=0
 
 [Service]
@@ -10,7 +19,7 @@ Type=simple
 DynamicUser=true
 ExecStart=/usr/bin/python3 -I /usr/local/lib/gate-media/gate_media_transcoder/__main__.py
 Restart=always
-RestartSec=5s
+RestartSec=10s
 TimeoutStopSec=10s
 MemoryMax=96M
 CPUQuota=20%
