@@ -1,6 +1,7 @@
 """Push-to-talk: the Baichuan talk client, the ADPCM encoder, and the bounded session."""
 
 import configparser
+import http.client
 import json
 import math
 import os
@@ -30,7 +31,7 @@ from gate_camera_control.state import StatePublisher, state_document
 from gate_camera_control.talk import (
     HARD_MAX_SECONDS, MIN_SECONDS, PROBE_RETRY_SECONDS, PROBE_SPACING_SECONDS,
     TALK_RTSP_BASE_URL,
-    TalkBusySession, TalkController, TalkUnavailable, ffmpeg_command,
+    TalkBusySession, TalkController, TalkSessionChanged, TalkUnavailable, ffmpeg_command,
 )
 from gate_media_config import generate_talk_credential, talk_rtsp_url
 from gate_controller.camera_control_state import read_camera_control_state
@@ -569,6 +570,23 @@ class TalkControllerTests(unittest.TestCase):
         self.assertEqual("released", self.wait_until_ended(streaming)["last_outcome"])
         self.assertGreater(len(self.camera.blocks), 0)
 
+    def test_a_release_naming_another_arm_ends_nothing(self):
+        controller = self.controller(gateway=FakeGateway(publisher=None), publisher_wait=30)
+        controller.probe()
+        current = controller.arm(10)["session_id"]
+        with self.assertRaises(TalkSessionChanged) as raised:
+            controller.release("0" * 32)
+        self.assertEqual("000000000000", raised.exception.expected)
+        self.assertEqual(current[:12], raised.exception.current)
+        time.sleep(0.2)
+        snapshot = controller.snapshot()
+        self.assertTrue(snapshot["active"])
+        self.assertEqual(current, snapshot["session_id"])
+        self.assertEqual(current, controller.release(current)["session_id"])
+        self.assertEqual("released", self.wait_until_ended(controller)["last_outcome"])
+        # With nothing current, a named release has nothing to refuse.
+        self.assertFalse(controller.release("0" * 32)["active"])
+
     def test_no_publisher_ends_the_session_without_opening_the_talk_channel(self):
         controller = self.controller(gateway=FakeGateway(publisher=None), publisher_wait=0.3)
         controller.probe()
@@ -850,7 +868,7 @@ class TalkHttpTests(unittest.TestCase):
         self.addCleanup(lambda: self.service.talk and self.service.talk.stop())
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
 
-    def build(self, *, enabled):
+    def build(self, *, enabled, **talk_overrides):
         return build_service(
             {
                 "GATE_CAMERA_HOST": self.api_camera.host,
@@ -874,15 +892,17 @@ class TalkHttpTests(unittest.TestCase):
             talk_options={
                 "ffmpeg_binary": sys.executable, "publisher_wait": 0.5, "poll_interval": 0.05,
                 "drain_seconds": 0.0, "spawn": fake_spawn(0.5), "opener": self.gateway,
+                **talk_overrides,
             },
             talk_credential=TALK_CREDENTIAL,
         )
 
-    def request(self, method, path, body=None, raw=None):
+    def request(self, method, path, body=None, raw=None, headers=None):
         data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
+        sent = {} if data is None else {"Content-Type": "application/json"}
+        sent.update(headers or {})
         request = urllib.request.Request(
-            f"{self.base}{path}", data=data, method=method,
-            headers={} if data is None else {"Content-Type": "application/json"},
+            f"{self.base}{path}", data=data, method=method, headers=sent,
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -992,6 +1012,180 @@ class TalkHttpTests(unittest.TestCase):
             service.arm_talk(None)
         self.assertEqual("released", service.release_talk()["status"])
         self.assertEqual([], self.talk_camera.messages)
+
+    # -- a release names the arm it is for (access-gate-ui #97) -------------
+
+    def hold_talk_open(self):
+        """Serve a talk that waits for its publisher until released or 20 s pass.
+
+        The default service's session ends itself within a second, which is
+        too soon to show that a refused release left it running.
+        """
+        self.gateway.publisher = None
+        self.server.shutdown()
+        self.server.server_close()
+        self.service.talk.stop()
+        self.service = self.build(enabled=True, publisher_wait=60)
+        self.server = CameraControlServer(("127.0.0.1", 0), self.service, logger=self.journal)
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.service.talk.stop)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.service.talk.probe()
+
+    def arm(self):
+        status, body = self.request("POST", "/camera/talk", {"max_seconds": 20})
+        self.assertEqual(200, status, body)
+        self.assertTrue(body["talk"]["active"])
+        return body["talk"]["session_id"]
+
+    def release(self, session_id):
+        return self.request("DELETE", "/camera/talk", headers={"Gate-Talk-Session": session_id})
+
+    def raw_release(self, header_lines):
+        """A DELETE with header lines exactly as given, which urllib cannot send."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        self.addCleanup(connection.close)
+        connection.putrequest("DELETE", "/camera/talk")
+        for name, value in header_lines:
+            connection.putheader(name, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+    def test_the_session_ids_talk_issues_are_the_shape_the_header_carries(self):
+        self.hold_talk_open()
+        session_id = self.arm()
+        self.assertRegex(session_id, r"\A[a-f0-9]{32}\Z")
+        status, body = self.release(session_id)
+        self.assertEqual(200, status, body)
+
+    def test_a_release_that_names_the_current_arm_ends_it(self):
+        self.hold_talk_open()
+        session_id = self.arm()
+        status, body = self.release(session_id)
+        self.assertEqual(200, status, body)
+        self.assertEqual("released", body["status"])
+        self.assertEqual(session_id, body["talk"]["session_id"])
+        ended = self.wait_until_idle()["talk"]
+        self.assertEqual("released", ended["last_outcome"])
+        self.assertEqual(session_id, ended["session_id"])
+        self.assertEqual([], [line for line in self.journal.lines
+                              if "stage=talk_session_changed" in line])
+
+    def test_a_release_for_an_older_press_leaves_the_newer_one_armed(self):
+        self.hold_talk_open()
+        older = self.arm()
+        status, _ = self.release(older)
+        self.assertEqual(200, status)
+        self.wait_until_idle()
+        newer = self.arm()
+        self.assertNotEqual(older, newer)
+
+        status, body = self.release(older)
+
+        self.assertEqual(409, status, body)
+        self.assertEqual({"error": "talk_session_changed"}, body)
+        # Nothing was released: a released session that is waiting for its
+        # publisher ends within one 50 ms poll, so after this it would be gone.
+        time.sleep(0.5)
+        snapshot = self.service.talk.snapshot()
+        self.assertTrue(snapshot["active"])
+        self.assertEqual(newer, snapshot["session_id"])
+        self.assertEqual("waiting_for_publisher", snapshot["state"])
+        self.assertIsNone(snapshot["last_outcome"])
+        refused = [line for line in self.journal.lines if "stage=talk_session_changed" in line]
+        self.assertEqual(1, len(refused))
+        self.assertIn(f"current={newer[:12]}", refused[0])
+        self.assertIn(f"expected={older[:12]}", refused[0])
+        self.assertNotIn(newer, refused[0])
+        # And the newer press's own release still ends it.
+        status, body = self.release(newer)
+        self.assertEqual(200, status, body)
+        self.assertEqual("released", self.wait_until_idle()["talk"]["last_outcome"])
+
+    def test_a_malformed_session_header_is_refused_and_ends_nothing(self):
+        self.hold_talk_open()
+        session_id = self.arm()
+        for value in ("", "x", session_id.upper(), session_id[:-1], session_id + "0",
+                      f"{session_id},{session_id}", f"{session_id[:8]}-{session_id[8:]}"):
+            with self.subTest(value=value):
+                status, body = self.raw_release([("Gate-Talk-Session", value)])
+                self.assertEqual(400, status, body)
+                self.assertEqual({"error": "invalid_request"}, body)
+        # Two names for one release, even two that agree, are refused too.
+        status, body = self.raw_release([("Gate-Talk-Session", session_id),
+                                         ("Gate-Talk-Session", session_id)])
+        self.assertEqual(400, status, body)
+        snapshot = self.service.talk.snapshot()
+        self.assertTrue(snapshot["active"])
+        self.assertEqual(session_id, snapshot["session_id"])
+        rejected = [line for line in self.journal.lines if "stage=request_rejected" in line]
+        self.assertEqual(8, len(rejected))
+        for line in rejected:
+            self.assertIn("method=DELETE path=/camera/talk reason=invalid_request", line)
+        status, _ = self.release(session_id)
+        self.assertEqual(200, status)
+        self.wait_until_idle()
+
+    def test_a_release_without_the_header_ends_whatever_is_current(self):
+        """What a Worker from before #97 sends, and what it still gets."""
+        self.hold_talk_open()
+        session_id = self.arm()
+        status, body = self.request("DELETE", "/camera/talk")
+        self.assertEqual(200, status, body)
+        self.assertEqual("released", body["status"])
+        ended = self.wait_until_idle()["talk"]
+        self.assertEqual("released", ended["last_outcome"])
+        self.assertEqual(session_id, ended["session_id"])
+
+    def test_a_named_release_with_nothing_armed_answers_the_inactive_snapshot(self):
+        self.hold_talk_open()
+        status, body = self.release("0" * 32)
+        self.assertEqual(200, status, body)
+        self.assertEqual("released", body["status"])
+        self.assertFalse(body["talk"]["active"])
+        self.assertIsNone(body["talk"]["session_id"])
+        # After a press has ended, a release naming any arm is still a 200: there
+        # is nothing current for it to end.
+        older = self.arm()
+        self.release(older)
+        self.wait_until_idle()
+        status, body = self.release("f" * 32)
+        self.assertEqual(200, status, body)
+        self.assertFalse(body["talk"]["active"])
+        self.assertEqual(older, body["talk"]["session_id"])
+
+    def test_a_named_release_with_talk_disabled_is_released_and_never_dials_the_camera(self):
+        service = self.build(enabled=False)
+        self.assertEqual("released", service.release_talk("0" * 32)["status"])
+        with self.assertRaises(ValueError):
+            service.release_talk("not-a-session")
+        self.assertEqual([], self.talk_camera.messages)
+
+    def test_the_state_document_names_the_current_talk_session(self):
+        """The Worker reads `talk.active` and `talk.session_id` here before it releases."""
+        self.hold_talk_open()
+        status, body = self.request("GET", "/camera/state")
+        self.assertEqual(200, status, body)
+        self.assertFalse(body["talk"]["active"])
+        self.assertIsNone(body["talk"]["session_id"])
+        session_id = self.arm()
+        status, body = self.request("GET", "/camera/state")
+        self.assertEqual(200, status, body)
+        self.assertTrue(body["talk"]["active"])
+        self.assertEqual(session_id, body["talk"]["session_id"])
+        status, _ = self.release(session_id)
+        self.assertEqual(200, status)
+        self.wait_until_idle()
+        status, body = self.request("GET", "/camera/state")
+        self.assertEqual(200, status, body)
+        self.assertFalse(body["talk"]["active"])
+        self.assertEqual(session_id, body["talk"]["session_id"])
+        self.assertEqual("released", body["talk"]["last_outcome"])
 
     def test_the_state_file_carries_the_talkback_block_the_controller_reads(self):
         path = Path(self.directory.name) / "state.json"

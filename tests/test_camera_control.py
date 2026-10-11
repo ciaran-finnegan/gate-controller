@@ -1099,7 +1099,8 @@ class CameraControlHttpTests(unittest.TestCase):
                 status, payload, _ = self.json_request("GET", path)
 
                 self.assertEqual(200, status)
-                self.assertEqual({"observed_at", "ir", "spotlight", "night_vision"}, set(payload))
+                self.assertEqual({"observed_at", "ir", "spotlight", "night_vision", "talk"},
+                                 set(payload))
                 # No lease, so the picture is untouched and nothing is pending.
                 self.assertEqual({"enabled": True, "active": False, "restore_failed": False,
                                   "last_error": None}, payload["night_vision"])

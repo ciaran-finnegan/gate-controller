@@ -118,6 +118,7 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
     "last_error": null
   },
   "night_vision": {"enabled": true, "active": true, "restore_failed": false, "last_error": null},
+  "talk": {"available": true, "reason": "ready", "active": false, "max_seconds": 30, "state": "idle", "session_id": null, "armed_at": null, "expires_at": null, "seconds_remaining": null, "last_outcome": null, "last_ended_at": null},
   "spotlight": {"state": "Off", "default": "Off", "effective_until": null, "lease_seconds_remaining": null, "revert_failed": false, "last_error": null}
 }
 ```
@@ -135,6 +136,7 @@ Each endpoint has its own budget, and exceeding one is `429` with `Retry-After`:
 | `night_vision.active` | boolean | an ISP snapshot is outstanding: the camera is, or may be, in night mode for the lease. Never from a camera read; from the record on disk |
 | `night_vision.restore_failed` | boolean | the ISP could not be put back and is being retried; also `true` over an unreadable record (`last_error` `record_corrupt`), which a person must look at |
 | `night_vision.last_error` | `"camera_busy"` \| `"camera_unreachable"` \| `"camera_error"` \| `"record_corrupt"` \| `null` | the last ISP failure |
+| `talk` | object | the same document `GET /camera/talk` answers, from the talk controller's own record and never a camera read; `reason: not_enabled` when talk is off. The Worker reads `talk.active` and `talk.session_id` here before it releases a press. Fields in [talkback.md](talkback.md#http-contract-camera-control-service) |
 
 A read refreshes the observation from the camera when it is older than 5 s;
 otherwise it answers from the cached observation. The refresh is subject to the
@@ -379,8 +381,9 @@ the zoom was still proven at its original position. `zoom.after` always equals
 ### `GET`, `POST`, `DELETE /camera/talk`
 
 Push-to-talk: arm one bounded session, read it, end it. The contract, the
-session states and the two extra errors (`409 talk_busy`, `503
-talk_unavailable`) are in [talkback.md § HTTP contract](talkback.md#http-contract-camera-control-service).
+session states, the three extra errors (`409 talk_busy`, `409
+talk_session_changed`, `503 talk_unavailable`) and the `Gate-Talk-Session`
+header a `DELETE` may carry are in [talkback.md § HTTP contract](talkback.md#http-contract-camera-control-service).
 With talk not enabled, `GET` reports `reason: not_enabled` and `POST` is
 `503 talk_unavailable`.
 
@@ -388,7 +391,7 @@ With talk not enabled, `GET` reports `reason: not_enabled` and `POST` is
 
 | Status | Body | When |
 | --- | --- | --- |
-| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds, a talk length under 5 s, a refocus body that names anything but a reason. Journaled `stage=request_rejected method=… path=… reason=…` |
+| `400` | `{"error":"invalid_request"}` | malformed JSON, unknown field, bad state, lease out of bounds, a talk length under 5 s, a `Gate-Talk-Session` header that is not a session id, a refocus body that names anything but a reason. Journaled `stage=request_rejected method=… path=… reason=…` |
 | `409` | `{"error":"refocus_busy","reason":...}` | a refocus is running, or a zoom return is still outstanding |
 | `404` | `{"error":"not_found"}` | unknown path, or any query string |
 | `405` | `{"error":"method_not_allowed"}` | wrong method for a known path |
@@ -702,6 +705,7 @@ gate_camera_control stage=ir_rate_limited retry_after=2
 gate_camera_control stage=talk_probe outcome=ready
 gate_camera_control stage=talk_armed max_seconds=30 session=3f2a9c1d0b7e
 gate_camera_control stage=talk_ended blocks=214 reason=publisher_gone seconds=14.1 session=3f2a9c1d0b7e
+gate_camera_control stage=talk_session_changed current=8d04be71c2a9 expected=3f2a9c1d0b7e
 gate_camera_control stage=refocus focus_after=78 focus_before=86 outcome=completed reason=daily return_attempts=1 zoom_after=2 zoom_before=2 zoom_step=3
 gate_camera_control stage=refocus_rate_limited reason=manual retry_after=412
 gate_camera_control stage=refocus_return attempt=2 expected=2 observed=3 outcome=mismatch reason=daily
