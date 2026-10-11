@@ -65,6 +65,19 @@ thermal budget absorbs. **Fit the official Pi 5 active cooler before raising
 `GATE_LOCAL_OCR_THREADS` above 1**, and re-run `bench2.py`
 (left on the Pi at `/home/pi/recog-bench`) rather than assuming a number.
 
+**Update, 2026-10-11: the starting point above no longer holds.** The
+benchmark was taken while the board idled at 71-74 °C. The hourly
+`soc_temp_c` record in D1 (`controller_health_hour`, from 2026-09-07) shows
+it ran warmer only until 11 Sep (daily averages 65-69 °C). From 12 Sep to
+11 Oct it averaged 54-65 °C a day and peaked at 57-74 °C, sweeps included.
+Every reading above 75 °C was minutes of all-core work: release installs on
+17 and 21 Sep, and the 10 Oct decode test. The rule is now the one in
+[CLAUDE.md](../CLAUDE.md#the-pi-has-no-fan): raising the thread count is a
+measured change rather than one that waits for a cooler. Measure a short
+burst's peak on the board first (no car about, stop at 80 °C), then watch
+`soc_temp_c` and `read_fps` in live use, and fit the cooler if they call for
+it. The one-frame-at-a-time, event-only design is unchanged.
+
 ## Modes
 
 `GATE_LOCAL_OCR_MODE` takes one of three values.

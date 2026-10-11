@@ -75,24 +75,39 @@ names disappears.
 
 The Pi 5 at the gate has no fan and no active cooler (confirmed by the owner
 on 2026-10-11; the board exposes no `cooling_fan` device). Its firmware
-throttles at 85 °C. In normal running, 28 Sep - 11 Oct, its 5-minute
-`soc_temp_c` averaged 51-59 °C a day and peaked at 57-74 °C. The one reading
-above that, 84.2 °C at 07:55 IST on 10 Oct, was an offline video-decode test
-run on the Pi, which also ran it out of memory.
-[The thermal constraint](docs/local-recognition.md#the-thermal-constraint-which-is-the-real-constraint)
-has the benchmark: four inference threads heated it about 3.5 °C a second.
+throttles at 85 °C. The hourly `soc_temp_c` in D1 (`controller_health_hour`,
+kept from 2026-09-07) is the record:
 
-- The plate reader runs on one core (`GATE_LOCAL_OCR_THREADS=1`), one frame
-  at a time, and only while a camera event is live. Do not add a continuous
-  loop. Fit the official Pi 5 Active Cooler before raising the thread count.
-- Anything that adds CPU per frame (a wider decode, a larger model, more
-  reads a second, a second detector pass) is measured on a workstation first.
-  Then measure it on the board, with `soc_temp_c` and the sweep's `read_fps`
-  in view.
-- Do not decode video, benchmark, or run the full test suite on the Pi. The
-  on-device suite held it at 84 °C for six hours on 2026-09-07
-  ([deployment.md](docs/deployment.md)). The decode test of 2026-10-10 is the
-  84.2 °C above.
+- **Normal running, every car's sweep included:** from 12 Sep to 11 Oct the
+  board averaged 54-65 °C a day, with daily peaks of 57-74 °C. 7-11 Sep ran
+  warmer, averaging 65-69 °C.
+- **Every reading above 75 °C was minutes of all-core work, never the plate
+  reader.** On 17 Sep (83-87 °C) and 21 Sep (78.8 °C), each came in the hour
+  a release was installed. On 10 Oct (84.2 °C, 07:55 IST), a video-decode
+  test ran the Pi out of memory.
+- **What the record cannot show:** each reading is a spot sample taken at a
+  heartbeat, so a few-second peak during a sweep would not appear. There are
+  no summer readings yet.
+
+What follows:
+
+- Do not decode video, run the full test suite, or run benchmarks lasting
+  minutes on the Pi. The on-device suite held it at 84 °C for six hours on
+  2026-09-07 ([deployment.md](docs/deployment.md)).
+- The reader works one frame at a time, and only while a camera event is
+  live. Do not add a continuous loop.
+- `GATE_LOCAL_OCR_THREADS=1` rests on the September benchmark in
+  [the thermal constraint](docs/local-recognition.md#the-thermal-constraint-which-is-the-real-constraint),
+  taken while the board idled at 71-74 °C. It has run 10-15 °C cooler
+  since. So raising the count is a measured change, not one that waits for a
+  cooler:
+  - First measure the peak of a short burst on the board, sampling the
+    thermal zone at least once a second, with no car about and a stop at
+    80 °C.
+  - Then watch `soc_temp_c` and the sweep's `read_fps` in live use.
+  - Fit the official Active Cooler if those numbers call for it.
+- Anything else that adds CPU per frame (a wider decode, a larger model) is
+  measured on a workstation first, then on the board in the same way.
 
 ## Other things that have bitten
 
