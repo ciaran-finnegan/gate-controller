@@ -375,6 +375,18 @@ class IrController:
             with self._lock:
                 if self._lease is None:
                     return False
+            wait = None if self._night is None else self._night.restore_wait()
+            if wait:
+                # The picture's restore has just failed and is on its backoff.
+                # Nothing is sent: a second `SetIsp` straight after a refused
+                # one is the login storm's cousin. The IR revert waits the
+                # same time, and is recorded as not done.
+                with self._lock:
+                    self._revert_failed = True
+                    self._next_revert_attempt_at = self._clock() + wait
+                    self._journal(stage, state=self._default_state, outcome="isp_restore_pending",
+                                  retry_after=math.ceil(wait), reason=reason)
+                return False
             try:
                 if self._night is not None:
                     self._night.restore(reason=reason)

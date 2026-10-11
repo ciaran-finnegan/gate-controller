@@ -264,6 +264,100 @@ class NightVisionLeaseTests(unittest.TestCase):
         self.assertFalse(self.record_path.exists())
         self.assertFalse(restarted.night_vision_snapshot()["active"])
 
+    def test_a_startup_restore_the_camera_refuses_is_not_sent_twice_in_a_row(self):
+        """Both records survive the restart and the camera refuses the restore.
+
+        `restore_on_start` schedules the retry; the IR startup revert that
+        follows must wait for that backoff rather than put a second `SetIsp`
+        on a camera that has just refused one, and the IR retries after it
+        must not run ahead of the picture's schedule either.
+        """
+        self.lease(minutes=30)
+        self.camera.commands.clear()
+        self.camera.isp_write_refuse = True
+
+        restarted = self.build()
+        restarted.night_mode.restore_on_start()
+        restarted.controller.restore_default_on_start()
+
+        self.assertEqual(["SetIsp"], self.camera_writes())  # one attempt, not two
+        self.assertEqual("Auto", self.camera.ir_state)
+        self.assertEqual(1, len(self.journal.find("isp_restore")))
+        self.assertIn("outcome=isp_restore_pending", self.journal.find("startup_revert")[-1][1])
+        self.assertTrue(restarted.controller.snapshot()["revert_failed"])
+        # Not due yet: nothing goes to the camera.
+        self.clock.advance(RESTORE_RETRY_SECONDS[0] - 1)
+        self.assertFalse(restarted.controller.run_due_revert())
+        self.assertEqual(["SetIsp"], self.camera_writes())
+        # Due: one more attempt, still refused, and the backoff grows.
+        self.clock.advance(2)
+        self.assertFalse(restarted.controller.run_due_revert())
+        self.assertEqual(["SetIsp", "SetIsp"], self.camera_writes())
+        self.assertIn("attempt=2", self.journal.find("isp_restore")[-1][1])
+        # The camera answers: picture, then IR, all clear.
+        self.camera.isp_write_refuse = False
+        self.clock.advance(RESTORE_RETRY_SECONDS[1] + 1)
+        self.assertTrue(restarted.controller.run_due_revert())
+        self.assertEqual(LIVE_ISP, self.camera.isp)
+        self.assertEqual("Off", self.camera.ir_state)
+        self.assertFalse(self.record_path.exists())
+        self.assertFalse(restarted.controller.snapshot()["revert_failed"])
+
+    def test_a_record_that_will_not_go_stays_outstanding_and_is_never_replayed(self):
+        """The camera took the restore; the file would not unlink.
+
+        An all-clear here would leave a replayable snapshot on disk for the
+        next start to write over whatever the camera held by then. Instead the
+        lease stays outstanding, the removal is retried without writing the
+        camera again, and the file is marked as already applied.
+        """
+        self.lease(minutes=10)
+        self.camera.commands.clear()
+        os.chmod(self.directory.name, 0o500)  # unlink needs write on the directory
+        self.addCleanup(os.chmod, self.directory.name, 0o700)
+        self.clock.advance(601)
+
+        self.assertTrue(self.service.controller.run_due_revert())
+
+        # The picture and the illuminator are right; the record is not gone.
+        self.assertEqual(LIVE_ISP, self.camera.isp)
+        self.assertEqual("Off", self.camera.ir_state)
+        self.assertTrue(self.record_path.exists())
+        self.assertEqual({"enabled": True, "active": True, "restore_failed": True,
+                          "last_error": "record_unremovable"},
+                         self.service.night_vision_snapshot())
+        [(level, line)] = self.journal.find("isp_restore")
+        self.assertEqual("error", level)
+        self.assertIn("outcome=record_unremovable", line)
+        # The retry removes the file without a second SetIsp.
+        os.chmod(self.directory.name, 0o700)
+        self.clock.advance(RESTORE_RETRY_SECONDS[0] + 1)
+        self.assertTrue(self.service.controller.run_due_revert())
+        self.assertEqual(["SetIsp", "SetIrLights"], self.camera_writes())
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual({"enabled": True, "active": False, "restore_failed": False,
+                          "last_error": None}, self.service.night_vision_snapshot())
+
+    def test_a_record_marked_as_applied_is_cleaned_up_at_start_and_never_written_back(self):
+        # The previous process restored the picture, could not remove the
+        # file, managed to mark it, and died. Someone has since set the ISP by
+        # hand; the start must not write the old snapshot over it.
+        self.record_path.write_text(json.dumps({"isp": LIVE_ISP, "set_at": 1.0, "restored_at": 2.0}))
+        os.chmod(self.record_path, 0o600)
+        self.camera.isp = {**copy.deepcopy(LIVE_ISP), "gain": {"max": 8, "min": 8}}
+        by_hand = copy.deepcopy(self.camera.isp)
+
+        restarted = self.build()
+        self.assertTrue(restarted.night_vision_snapshot()["active"])
+        restarted.night_mode.restore_on_start()
+        restarted.controller.restore_default_on_start()
+
+        self.assertEqual([], self.camera.isp_writes)
+        self.assertEqual(by_hand, self.camera.isp)
+        self.assertFalse(self.record_path.exists())
+        self.assertIn("outcome=cleanup", self.journal.find("startup_isp_restore")[0][1])
+        self.assertFalse(restarted.night_vision_snapshot()["active"])
+
     def test_a_restart_with_no_record_never_touches_the_isp(self):
         self.camera.isp["dayNight"] = NIGHT_DAY_NIGHT  # set by hand, not by a lease
 

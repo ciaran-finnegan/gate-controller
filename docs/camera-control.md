@@ -682,6 +682,9 @@ gate_camera_control stage=ir_revert attempt=2 outcome=camera_busy reason=retry r
 gate_camera_control stage=ir_revert key=5c1d0e9f-77a outcome=completed reason=requested state=Off
 gate_camera_control stage=startup_isp_restore
 gate_camera_control stage=startup_revert state=Off
+gate_camera_control stage=startup_revert outcome=isp_restore_pending reason=startup retry_after=5 state=Off
+gate_camera_control stage=isp_restore attempt=1 outcome=record_unremovable reason=expired retry_after=5
+gate_camera_control stage=startup_isp_restore outcome=cleanup
 gate_camera_control stage=isp_record_corrupt
 gate_camera_control stage=request_rejected method=POST path=/camera/talk reason=talk_too_short
 gate_camera_control stage=startup_reconcile observed=Auto state=Off
@@ -731,6 +734,8 @@ journalctl -u gate-camera-control --since -1h | grep 'stage=ir_'
 | The ISP cannot be read when a night-vision lease is asked for | nothing changes — no ISP write, no IR write, no lease — and the caller gets the camera's own `502`/`503`. A mode the service could not snapshot is a mode it could not restore |
 | The ISP restore fails when a lease ends | IR is left on and the lease stands; the whole revert (picture, then IR) is retried with 5/10/20/40/60 s backoff, each failure one `isp_restore` line at error priority, `night_vision.restore_failed` true in the state and the heartbeat until it takes |
 | The ISP record is unreadable | kept as evidence, journaled `isp_record_corrupt` at error priority, published `restore_failed` with `last_error: record_corrupt`, never written back; new night leases are refused until a person restores the ISP by hand and removes the file |
+| The camera takes the restore but the record will not unlink | the lease stays outstanding (`active`, `restore_failed`, `last_error: record_unremovable`, one `isp_restore outcome=record_unremovable` line at error priority) and the removal is retried on the restore's backoff **without writing the camera again**; the file is marked `restored_at` (best effort) so a start that finds it only cleans up and never replays the snapshot over a picture set since |
+| A restore fails and a revert follows at once (the startup revert after `startup_isp_restore`, or an IR retry whose own backoff ran out first) | the revert sends nothing and waits for the restore's backoff: `ir_revert`/`startup_revert … outcome=isp_restore_pending retry_after=N`. A camera that has just refused a `SetIsp` is not sent a second one |
 | Reboot or power cut mid-lease | the record is on durable storage (`StateDirectory=gate-camera`), not in `/run`, which the boot recreates empty — the camera is separately powered, so a lease whose record died with the tmpfs would have been held indefinitely. It is reverted on the next start exactly as a service restart is |
 | The lease record is lost or unreadable anyway | on start, with no usable record, the service **reads** the camera once: a state that is not `GATE_CAMERA_IR_DEFAULT` is put back and journaled `startup_reconcile`; a state that matches it, or a camera that will not answer, is left alone. That read is one `GetIrLights` on the cached token, so a restart loop still cannot become a login storm, and nothing is ever written on the strength of a camera that could not be read. A record that exists but is unusable — bad JSON, or a timestamp outside a year either side of now — is journaled `lease_corrupt` and treated as an expired lease, so the default is restored through the ordinary revert path |
 | A set call fails without answering | treated as indeterminate, because the camera may have applied it: the lease record is **kept**, so a later expiry or restart still reverts. A failed revert likewise keeps the outstanding lease rather than assuming success |

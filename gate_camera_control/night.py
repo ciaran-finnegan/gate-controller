@@ -46,6 +46,11 @@ from .reolink import NIGHT_DAY_NIGHT, CameraError, usable_isp_block
 RESTORE_RETRY_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 MAX_RECORD_FILE_BYTES = 16 * 1024
 _RECORD_KEYS = frozenset({"isp", "set_at"})
+# Written into the record when the camera has taken the restore but the file
+# could not be removed, so a later start knows the snapshot has already been
+# applied and only the file is left to clean up -- it must not be replayed over
+# whatever the camera has been set to since.
+_RESTORED_KEY = "restored_at"
 
 
 class NightModeController:
@@ -71,6 +76,13 @@ class NightModeController:
         self._next_restore_at = None
         self._last_error = None
         self._record, self._record_corrupt = self._load_record()
+        # True once the camera has taken the restore; from then on only the
+        # file is outstanding and the snapshot is never written again.
+        self._restored = self._record is not None and _RESTORED_KEY in self._record
+        if self._restored:
+            self._restore_failed = True
+            self._last_error = "record_unremovable"
+            self._next_restore_at = self._clock()
         if self._record_corrupt:
             # The camera may be in night mode and the only copy of what it
             # was before cannot be read. Nothing is written on its strength;
@@ -148,43 +160,85 @@ class NightModeController:
 
     # -- leaving -------------------------------------------------------------
     def restore(self, *, reason: str, key=None) -> bool:
-        """Write the snapshot back exactly. True when a restore was written.
+        """Write the snapshot back exactly. True when the camera holds it again.
 
         No snapshot means nothing to put back -- an IR-only lease, or one
         already restored -- and the camera is not touched. A failed restore
         keeps the record, schedules a retry and raises, so the caller's own
         revert is recorded as failed too and IR is not switched off ahead of
         the picture.
+
+        The lease is not over until the record is gone. A camera that took the
+        restore but a file that would not go is reported as still outstanding
+        (`active`, `restore_failed`, `record_unremovable`), the file is marked
+        as already applied, and the removal is retried on the same backoff --
+        without writing the camera again. Clearing the record in memory while
+        a replayable copy stayed on disk would have had the next start write a
+        stale picture over whatever the camera had been set to since.
         """
         with self._lock:
             record = self._record
+            restored = self._restored
         if record is None:
             return False
-        try:
-            self._client.set_isp(record["isp"])
-        except CameraError as error:
+        if not restored:
+            try:
+                self._client.set_isp(record["isp"])
+            except CameraError as error:
+                self._schedule_retry(error.code)
+                with self._lock:
+                    attempt, backoff = self._restore_attempts, self._next_restore_at - self._clock()
+                self._journal("isp_restore", outcome=error.code, reason=reason, key=key,
+                              attempt=attempt, retry_after=int(backoff), level="error")
+                raise
             with self._lock:
-                self._last_error = error.code
-                self._restore_failed = True
-                self._restore_attempts += 1
-                backoff = self._retry_seconds[
-                    min(self._restore_attempts, len(self._retry_seconds)) - 1
-                ]
-                self._next_restore_at = self._clock() + backoff
-                attempt = self._restore_attempts
-            self._journal("isp_restore", outcome=error.code, reason=reason, key=key,
-                          attempt=attempt, retry_after=int(backoff), level="error")
-            raise
+                self._restored = True
+        if self._remove_record():
+            with self._lock:
+                self._record = None
+                self._restored = False
+                self._restore_failed = False
+                self._restore_attempts = 0
+                self._next_restore_at = None
+                self._last_error = None
+            self._journal("isp_restore", outcome="completed", reason=reason, key=key,
+                          day_night=record["isp"].get("dayNight"))
+            return True
+        # The camera is right; the file is not. Mark it applied so a start
+        # that finds it never replays it, keep it outstanding, retry the
+        # removal.
+        self._mark_restored(record)
+        self._schedule_retry("record_unremovable")
         with self._lock:
-            self._record = None
-            self._restore_failed = False
-            self._restore_attempts = 0
-            self._next_restore_at = None
-            self._last_error = None
-        self._remove_record()
-        self._journal("isp_restore", outcome="completed", reason=reason, key=key,
-                      day_night=record["isp"].get("dayNight"))
+            attempt, backoff = self._restore_attempts, self._next_restore_at - self._clock()
+        self._journal("isp_restore", outcome="record_unremovable", reason=reason, key=key,
+                      attempt=attempt, retry_after=int(backoff), level="error")
         return True
+
+    def _schedule_retry(self, code: str) -> None:
+        with self._lock:
+            self._last_error = code
+            self._restore_failed = True
+            self._restore_attempts += 1
+            backoff = self._retry_seconds[
+                min(self._restore_attempts, len(self._retry_seconds)) - 1
+            ]
+            self._next_restore_at = self._clock() + backoff
+
+    def restore_wait(self):
+        """Seconds a failed restore must still wait before its retry; None when none is pending.
+
+        The IR controller asks before it reverts, so a revert that follows a
+        failed restore -- the startup revert straight after `restore_on_start`,
+        or an IR retry whose own backoff ran out first -- waits for this
+        backoff rather than putting a second `SetIsp` on a camera that has just
+        refused one.
+        """
+        with self._lock:
+            if (self._record is None or not self._restore_failed
+                    or self._next_restore_at is None):
+                return None
+            return max(0.0, self._next_restore_at - self._clock())
 
     def restore_on_start(self) -> None:
         """Put the ISP back if the previous process died with a lease outstanding.
@@ -195,9 +249,11 @@ class NightModeController:
         """
         with self._lock:
             outstanding = self._record is not None
+            restored = self._restored
         if not outstanding:
             return
-        self._journal("startup_isp_restore", level="warning")
+        self._journal("startup_isp_restore", level="warning",
+                      outcome="cleanup" if restored else None)
         try:
             self.restore(reason="startup")
         except CameraError:
@@ -217,15 +273,34 @@ class NightModeController:
         body = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
         atomic_write(self._record_path, body, 0o600)
 
-    def _remove_record(self) -> None:
+    def _remove_record(self) -> bool:
+        """True once no record is on disk; False when the file would not go."""
         if self._record_path is None:
-            return
+            return True
         try:
             os.unlink(self._record_path)
         except FileNotFoundError:
             pass
         except OSError:
             self._journal("isp_record_unremovable", level="warning")
+            return False
+        return True
+
+    def _mark_restored(self, record: dict) -> None:
+        """Best effort: say in the file that the camera already holds this block."""
+        if _RESTORED_KEY in record:
+            return
+        marked = {**record, _RESTORED_KEY: float(self._clock())}
+        try:
+            self._write_record(marked)
+        except OSError:
+            # A directory that will not take an unlink will seldom take a
+            # rename either; the record stays as it was and the journal line
+            # above is what says so.
+            return
+        with self._lock:
+            if self._record is record:
+                self._record = marked
 
     def _load_record(self):
         """``(record, corrupt)``: no record, a usable one, or an unusable one.
@@ -257,12 +332,17 @@ class NightModeController:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return None, True
-        if not isinstance(decoded, dict) or set(decoded) != _RECORD_KEYS:
+        if (not isinstance(decoded, dict)
+                or not _RECORD_KEYS <= set(decoded) <= _RECORD_KEYS | {_RESTORED_KEY}):
             return None, True
-        set_at = decoded["set_at"]
-        if isinstance(set_at, bool) or not isinstance(set_at, (int, float)):
-            return None, True
+        for key in _RECORD_KEYS | {_RESTORED_KEY}:
+            value = decoded.get(key, 0.0)
+            if key != "isp" and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                return None, True
         # The same shape check the client applies before it will write a block.
         if not usable_isp_block(decoded["isp"]):
             return None, True
-        return {"isp": decoded["isp"], "set_at": float(set_at)}, False
+        record = {"isp": decoded["isp"], "set_at": float(decoded["set_at"])}
+        if _RESTORED_KEY in decoded:
+            record[_RESTORED_KEY] = float(decoded[_RESTORED_KEY])
+        return record, False
