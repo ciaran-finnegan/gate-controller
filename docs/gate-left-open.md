@@ -1,6 +1,7 @@
 # Gate may have been left open
 
-On 2026-10-09 the gate stood open for 39 minutes and nobody knew. This page
+On 2026-10-09 the gate was thought to have stood open for 39 minutes with
+nobody knowing; the audio re-read on 2026-10-10 cannot confirm it. This page
 covers the check that now says so, the measurements behind its rule, and what
 it cannot do.
 
@@ -14,7 +15,8 @@ is fully open and **stops one that is moving**, and the button says so.
 
 ## What happened on 2026-10-09
 
-From `gate_movements` on the Pi, times in IST:
+As the scanner's `gate_movements` rows first read it, times in IST. This
+reading is **superseded**; see the correction below the table.
 
 | Time | Run | Reading |
 | --- | --- | --- |
@@ -168,9 +170,10 @@ by about 22:11, ten minutes before the owner arrived at 22:21.
   now off, but an engine idling beside the camera still reads as a run and
   hides the real motor. Until the scanner is fixed, a `likely` or `possible`
   during a passage says little about the leaves.
-* **The two unverified alerts above may be real.** If someone knows what the
-  gate was doing on 2026-10-04 at 16:51 or on 2026-10-08 at 17:30 IST, that
-  would settle the false-alert rate.
+* **Three of the four alerts above are unverified** (2026-10-04 16:51,
+  2026-10-08 17:30 and 2026-10-09 21:42). Knowing what the gate did at the
+  first two would narrow the false-alert rate. It would not settle it: the 9 Oct
+  burst is a siren and an engine on the audio, and stays unknown.
 
 ## The operator's settings
 
@@ -190,10 +193,10 @@ checked the fitted board's model. That manual says:
   open keeps it open**.
 * There is no "close immediately after the photocell clears" function.
 
-On 2026-10-09 the car broke the beam during the auto-close, and the gate
-reversed open and never closed again. That fits a board whose auto-close is
-not re-armed after a photocell reversal, or one that stopped on a second
-consecutive block. It does not fit a board that simply closes again after its
-pause time. Someone at the gate needs to read the board's model and DIP
+Whether this happened on 2026-10-09 is unknown: the scanner rows that seemed
+to show a reversal are the camera's alarm sound and car engines. The manual's
+behaviour still means a gate *can* be left open by a car lingering in the
+beam, if the fitted board's auto-close is not re-armed after a photocell
+reversal or it stops on a second consecutive block. Someone at the gate needs to read the board's model and DIP
 switches to confirm which. That is a hardware question, and no software here
 can answer it.

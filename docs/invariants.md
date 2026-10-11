@@ -229,9 +229,10 @@ does.
 - **2026-09-21** -- an audio-following harness decided the gate was "not
   provably shut" and sent three recovery pulses, crossing the leaves; the gate
   could not open until someone freed them by hand ([gate-operator.md](gate-operator.md)).
-- **2026-10-09** -- the gate stood open for 39 minutes after an interrupted
-  auto-close. The alert built for this (docs/gate-left-open.md) is notify-only
-  for the reason above.
+- **2026-10-09** -- the gate was thought to have stood open for 39 minutes
+  after an interrupted auto-close. The audio re-read on 2026-10-10 cannot
+  confirm it ([the review](reviews/2026-10-10-gate-jam.md)). The alert built for
+  this case (docs/gate-left-open.md) is notify-only for the reason above.
 
 Guards:
 

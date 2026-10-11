@@ -122,4 +122,5 @@ Two things mask the motor, and both were found on 2026-10-10
 - **A diesel idling beside the camera** sits at the motor's own 1.2-3 kHz
   level (about -47 dBFS), so a waiting car hides the gate. The motor's
   fingerprint is a line at 1.1-1.5 kHz. On a quiet night it is plain: four
-  runs and a latch were heard on 10 Oct 23:24-01:32 that the scanner missed.
+  runs and a latch were heard from 9 Oct 23:24 to 10 Oct 01:32 that the scanner
+  missed.
