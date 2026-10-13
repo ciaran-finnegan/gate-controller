@@ -107,6 +107,19 @@ class TalkBusySession(Exception):
     """A session is already armed or streaming."""
 
 
+class TalkSessionChanged(Exception):
+    """A release named an arm that is not the current one; nothing was released.
+
+    Carries 12-character prefixes only, the same length the journal uses for
+    every other session line.
+    """
+
+    def __init__(self, expected: str, current: str):
+        super().__init__("talk_session_changed")
+        self.expected = expected[:12]
+        self.current = current[:12]
+
+
 class _Session:
     def __init__(self, session_id: str, armed_at: float, max_seconds: int):
         self.id = session_id
@@ -293,11 +306,24 @@ class TalkController:
             raise ValueError("talk_too_short")
         return min(max_seconds, self._max_seconds)
 
-    def release(self) -> dict:
+    def release(self, expected=None) -> dict:
+        """End the current session; with ``expected``, only if it is that session.
+
+        ``expected`` is the ``session_id`` the caller armed. The check and the
+        signal to end are taken together under the lock, so a release sent for
+        an old press can never end a newer press that armed in between: it is
+        refused with ``TalkSessionChanged`` and the newer session runs on. With
+        no session current there is nothing to end, and the answer is the
+        inactive snapshot whatever ``expected`` says. ``expected=None`` ends
+        whatever is current, as every release did before callers named one.
+        """
         with self._lock:
             session = self._session
+            if session is not None and expected is not None and session.id != expected:
+                raise TalkSessionChanged(expected, session.id)
+            if session is not None:
+                session.release.set()
         if session is not None:
-            session.release.set()
             self._stop_process(session)
         return self.snapshot()
 

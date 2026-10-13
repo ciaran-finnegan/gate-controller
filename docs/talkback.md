@@ -203,10 +203,31 @@ absent when the caller got what it asked for.
 
 ### `GET /camera/talk`, `DELETE /camera/talk`
 
-`GET` returns the `talk` document above without `status`. `DELETE` ends the
-current session if there is one and answers `200 {"status":"released", …}`
-either way. It has no budget: hanging up is the fail-safe, so a run of refused
-arms can never spend what it needs.
+`GET` returns the `talk` document above without `status`; the same `talk`
+block is also in `GET /camera/state`, which is where the Worker reads
+`talk.active` and `talk.session_id` before it releases a press. `DELETE` ends
+the current session if there is one and answers `200 {"status":"released", …}`
+with the `talk` document taken just after it acted. It has no budget: hanging
+up is the fail-safe, so a run of refused arms can never spend what it needs.
+
+A `DELETE` may name the arm it is for in a `Gate-Talk-Session` request header,
+carrying that arm's `session_id` exactly as the arm answered it (32 lowercase
+hex characters). It is a header because the service answers any query string
+with `404` and reads no `DELETE` body. Without it, a release from an old press
+that reaches the Pi after a newer press has armed would end the newer press
+(access-gate-ui #97). The check and the release are taken together under the
+controller's lock, so nothing can arm in between.
+
+| `Gate-Talk-Session` | Current session | Answer |
+| --- | --- | --- |
+| absent | any | the current session ends, `200 released` -- what every release did before the header existed, and what a Worker that does not send it still gets |
+| the current `session_id` | that one | it ends, `200 released` |
+| another well-formed id | a different one | `409 {"error":"talk_session_changed"}`; **nothing is released** and the current press runs on. Journaled `stage=talk_session_changed current=… expected=…` with 12-character prefixes of both |
+| any well-formed id | none | `200 released` with the inactive document, as with no header: there is nothing current to end |
+| empty, not 32 lowercase hex, or sent twice | any | `400 invalid_request`, nothing released. Journaled `stage=request_rejected method=DELETE path=/camera/talk reason=invalid_request` |
+
+The Worker passes the `409` on to the app as `talk_session_changed`; the person
+whose press it was has already let go, and the newer press is unaffected.
 
 ## Environment
 

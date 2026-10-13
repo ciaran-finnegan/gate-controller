@@ -37,7 +37,9 @@ from .reolink import (
     IR_STATES, SPOTLIGHT_STATES, CameraBusy, CameraError, CameraUnreachable, ReolinkClient,
 )
 from .state import STATE_PATH, StatePublisher
-from .talk import TALK_RTSP_BASE_URL, TalkBusySession, TalkController, TalkUnavailable
+from .talk import (
+    TALK_RTSP_BASE_URL, TalkBusySession, TalkController, TalkSessionChanged, TalkUnavailable,
+)
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -90,6 +92,12 @@ _STATE_PATHS = frozenset({"/camera/state", "/camera/ir", "/camera/spotlight"})
 _LEASE_PATHS = frozenset({"/camera/ir", "/camera/spotlight"})
 _SNAPSHOT_PATHS = frozenset({"/camera/snap", "/camera/snapshot"})
 _TALK_PATH = "/camera/talk"
+# Sent by the Worker on `DELETE /camera/talk`: the `session_id` of the arm it is
+# releasing, exactly as `TalkController` issues it (`uuid4().hex`). A header,
+# because this handler answers any query string with 404 and reads no DELETE
+# body. Absent means "whatever is current", for Workers that predate it.
+TALK_SESSION_HEADER = "Gate-Talk-Session"
+_TALK_SESSION_ID = re.compile(r"[a-f0-9]{32}")
 
 
 def journal(logger, stage, *, level="info", **fields) -> None:
@@ -223,10 +231,19 @@ class CameraControlService:
         response["status"] = "armed"
         return response
 
-    def release_talk(self) -> dict:
+    def release_talk(self, expected=None) -> dict:
+        """End the current talk session, or only the one ``expected`` names.
+
+        ``expected`` is the raw ``Gate-Talk-Session`` header, or None when the
+        caller sent none. A value that is not a session id is a 400 rather
+        than a release of whatever is current: the caller meant one arm, and
+        ending another is the thing the header exists to prevent.
+        """
+        if expected is not None and _TALK_SESSION_ID.fullmatch(expected) is None:
+            raise ValueError("invalid_request")
         # Never rate limited: hanging up is the fail-safe, and a run of refused
         # arms must not be able to spend the budget it would need.
-        snapshot = self._talk_snapshot() if self._talk is None else self._talk.release()
+        snapshot = self._talk_snapshot() if self._talk is None else self._talk.release(expected)
         response = self._talk_envelope(snapshot)
         response["status"] = "released"
         return response
@@ -358,6 +375,10 @@ class CameraControlService:
             # is switched to night mode for the IR lease, and whether a restore
             # has failed and is being retried.
             "night_vision": self.night_vision_snapshot(),
+            # From the controller's own record, never a camera read: the
+            # Worker reads `talk.active` and `talk.session_id` here before it
+            # releases a press.
+            "talk": self._talk_snapshot(),
         }
         if self._spotlight is not None:
             # From the last observation, never a fresh read: a state request
@@ -636,8 +657,14 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         if path is None:
             return
         if path == _TALK_PATH:
+            named = self.headers.get_all(TALK_SESSION_HEADER) or []
+            if len(named) > 1:
+                # Two names for one release cannot both be meant.
+                self._guarded(self._refuse_request)
+                return
+            expected = named[0] if named else None
             self._guarded(lambda: self._respond_json(
-                200, self.server.service.release_talk()
+                200, self.server.service.release_talk(expected)
             ))
             return
         self._respond_json(405, {"error": "method_not_allowed"})
@@ -697,6 +724,10 @@ class CameraControlHandler(BaseHTTPRequestHandler):
             self._respond_json(400, {"error": "invalid_request"})
             return _INVALID
 
+    @staticmethod
+    def _refuse_request() -> None:
+        raise ValueError("invalid_request")
+
     def _respond_snapshot(self) -> None:
         image = self.server.service.snapshot()
         self._respond(200, "image/jpeg", image)
@@ -739,6 +770,11 @@ class CameraControlHandler(BaseHTTPRequestHandler):
         except TalkBusySession:
             journal(self.server.logger, "talk_busy")
             self._respond_json(409, {"error": "talk_busy"})
+        except TalkSessionChanged as error:
+            # A release for an older press; the newer one was left running.
+            journal(self.server.logger, "talk_session_changed",
+                    expected=error.expected, current=error.current)
+            self._respond_json(409, {"error": "talk_session_changed"})
         except TalkUnavailable as error:
             journal(self.server.logger, "talk_unavailable", reason=error.reason)
             self._respond_json(503, {"error": "talk_unavailable", "reason": error.reason})
