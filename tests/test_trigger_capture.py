@@ -1555,6 +1555,84 @@ class HotKeyframeCaptureTests(unittest.TestCase):
         self.assertIn("keyframe=unavailable fallback=grab", combined)
         self.assertIn("source=grab", combined)
 
+    def test_the_decoded_ring_offers_nothing_to_the_baseline_while_a_session_reads(self):
+        # GATE_CLEAR_STREAM_MODE=decoded: this ring offers every keyframe to
+        # the baseline, and the baseline's detector probe takes the
+        # recogniser's one worker. A sweep that outlives the 60 s idle window
+        # must never lose that worker to a probe, exactly as the compressed
+        # source already arranges by skipping its refresh during a session.
+        from gate_controller.trigger_capture import ClearKeyframeBuffer
+        asked = []
+        empty, car = jpeg(), jpeg(size=(64, 33))
+        config = TriggerCaptureConfig(enabled=True, output_directory=self.root / ".trigger-capture")
+        buffer = ClearKeyframeBuffer(
+            config, popen=never_spawn, clock=lambda: 10.0,
+            vehicle_check=lambda frame: asked.append(frame) or frame == car,
+        )
+        buffer._on_frame(empty, 100.0)
+        self.assertEqual(asked, [empty], "idle: the keyframe is offered and the detector asked")
+        self.assertTrue(buffer.scene.status()["available"])
+
+        self.assertTrue(buffer.start_session(), "the capture is told the session took")
+        self.assertTrue(buffer.status()["session_active"])
+        for second in range(61, 121):
+            buffer._on_frame(car, 100.0 + second)
+        self.assertEqual(asked, [empty], "nothing offered, nothing probed, for the whole session")
+        self.assertEqual(buffer.scene.status()["refreshes"], 1)
+
+        buffer.stop_session("ended")
+        self.assertFalse(buffer.status()["session_active"])
+        buffer._on_frame(car, 230.0)
+        self.assertEqual(asked, [empty, car], "offered again once the session has ended")
+        self.assertEqual(buffer.scene.status()["refused_vehicle"], 1, "and the car is still refused")
+
+    def test_a_session_that_starts_between_the_check_and_the_probe_does_not_take_the_detector(self):
+        # `_on_frame` asks whether a session is reading before it offers a
+        # keyframe, and does not hold the session lock across the probe:
+        # `start_session` runs on the sweep's own thread, and the sweep never
+        # waits. A session that starts in the gap -- here while the thumbnail
+        # is made -- finds the probe unmade and the detector unasked.
+        from unittest import mock
+        from gate_controller import scene as scene_module
+        from gate_controller.trigger_capture import ClearKeyframeBuffer
+        asked = []
+        empty = jpeg()
+        config = TriggerCaptureConfig(enabled=True, output_directory=self.root / ".trigger-capture")
+        buffer = ClearKeyframeBuffer(
+            config, popen=never_spawn, clock=lambda: 10.0,
+            vehicle_check=lambda frame: asked.append(frame) or False,
+        )
+        capture = self._capture(buffer)
+        real_thumbnail = scene_module.frame_thumbnail
+
+        def thumbnail_then_sweep(frame):
+            thumbnail = real_thumbnail(frame)
+            capture._start_live_session()  # the sweep's thread, in the gap
+            return thumbnail
+
+        with mock.patch.object(scene_module, "frame_thumbnail", thumbnail_then_sweep):
+            buffer._on_frame(empty, 100.0)
+        self.assertTrue(buffer.session_active())
+        self.assertEqual(asked, [], "the probe was not made")
+        self.assertEqual(buffer.scene.status()["refused_vehicle"], 1)
+        self.assertFalse(buffer.scene.status()["available"], "nothing adopted")
+        capture._stop_live_session("ended")
+        buffer._on_frame(empty, 101.0)
+        self.assertEqual(asked, [empty], "asked at once after the session: the refusal cost no look")
+        self.assertTrue(buffer.scene.status()["available"])
+
+    def test_the_capture_drives_the_decoded_rings_session_marker(self):
+        # Through the real hooks the sweep uses, not by calling the ring directly.
+        from gate_controller.trigger_capture import ClearKeyframeBuffer
+        config = TriggerCaptureConfig(enabled=True, output_directory=self.root / ".trigger-capture")
+        buffer = ClearKeyframeBuffer(config, popen=never_spawn)
+        capture = self._capture(buffer)
+        self.assertFalse(buffer.session_active())
+        capture._start_live_session()
+        self.assertTrue(buffer.session_active())
+        capture._stop_live_session("ended")
+        self.assertFalse(buffer.session_active())
+
     def test_keyframe_buffer_decodes_only_keyframes_without_probing(self):
         from gate_controller.trigger_capture import ClearKeyframeBuffer
         config = TriggerCaptureConfig(

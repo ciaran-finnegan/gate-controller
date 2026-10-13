@@ -75,8 +75,20 @@ dashboard and the NVR are not. A locally authorised plate opens the gate with
 the internet down, the breaker open, or the powerline link to the house lossy.
 Nothing the cloud or the house link does may delay or block that open.
 
+Nor may anything done on the Pi for the baseline. The on-device reader has one
+worker, and the scene baseline's detector probe (invariant 6) runs on it. A
+probe is not a read: a frame that lands while a probe is on the worker -- the
+camera's still, the sweep's first frame -- is admitted behind it and read the
+moment the probe's inference ends, never refused as busy. The probe itself is
+declined behind any read, and the one-outstanding-read rule stands for reads.
+(Found in review of #211 before it shipped: the probe reserved the worker
+exactly as a frame did, and a still landing in that second was declined; with
+the internet down and no later frame, an authorised plate could not open.)
+
 - `tests/test_internet_down_pipeline.py::test_a_locally_authorised_plate_still_opens_once_with_the_internet_down`
 - `tests/test_fast_lane.py::test_a_burst_kept_off_the_lane_never_waits_on_the_cloud_when_the_breaker_closes`
+- `tests/test_internet_down_pipeline.py::InternetDownPassageTests::test_the_cameras_still_landing_during_a_baseline_probe_is_read_on_the_device`
+- `tests/test_local_recognizer.py::BaselineProbeTests::test_a_frame_arriving_during_a_probe_is_read_the_moment_the_probe_ends`
 
 ## 4. No frame opens the gate once it is older than `GATE_MAX_IMAGE_AGE_SECONDS`
 
@@ -145,6 +157,31 @@ read on two frames.
   closed the older hole on a quiet night, where the baseline is itself black
   and three *unread* black looks used to end the wait, or the window: a dark
   frame always goes to the reader now, in the window and while waiting.
+- **2026-10-10 10:05:38 and 10:07:34** -- a car that waits raises no alarm,
+  and "idle" was measured from the last alarm. The D-Max `172-L-66` sat at
+  the stop, half the picture, through the 60 s of quiet after its alarm; the
+  keyframe decoder's 30 s refresh adopted it as the idle drive, and the next
+  alarm's sweep skipped its frames unread as "empty" (the samples #203 kept
+  show the car, judged empty; 9 Oct 12:35 -- 17 frames, 3 reads, the first
+  at +9.7 s -- and 8 Oct 10:24 -- 10 frames, 0 reads -- went the same way).
+  A frame is now shown to the on-device plate detector before it becomes the
+  baseline; one with a plate box in it is refused and the old baseline kept,
+  and so is one the detector cannot answer for (not ready, busy with a sweep
+  frame, failed), because a stale picture of the *empty* drive makes a car's
+  frames differ, which is to say read. An alarm that lands while the
+  detector is looking refuses it too: the idle check is made again before
+  the baseline is installed. A sweep read that boxes a plate also
+  counts as activity, so the idle clock runs from the last sight of the car,
+  not the last alarm. Without a local recogniser there is no detector and
+  the baseline refreshes as before. The probe runs on the reader's one
+  worker, so the sources offer nothing while a capture session is reading,
+  and the baseline asks once more, at the last moment before the detector,
+  that no session has started since the frame was offered (the compressed
+  source decodes a keyframe in between, for up to 3 s). Neither holds the
+  session lock across the probe: `start_session` is called on the sweep's
+  thread, and the sweep never waits. A probe already on the worker when a
+  session starts cannot be taken back; the sweep's read is admitted behind
+  it and runs the moment it ends (invariant 3), never refused.
 
 Guards:
 
@@ -155,6 +192,21 @@ Guards:
 - `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_black_drive_with_no_dark_idle_frame_on_record_is_read_to_the_cap`
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_boxed_plate_in_the_dark_starts_the_run_again`
 - `tests/test_local_sweep.py::LocalSweepTests::test_a_failed_read_in_the_dark_is_not_an_empty_drive`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_a_car_waiting_at_the_gate_through_the_idle_refresh_is_read_on_the_next_alarm`
+  (the 10 Oct morning: alarm → sweep of misreads → 90 s of quiet with the
+  car offered as the idle drive → second alarm, read and let in once)
+- `tests/test_scene.py::WaitingCarTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_refused_and_the_old_baseline_kept`
+- `tests/test_scene.py::WaitingCarTests::test_a_detector_that_cannot_answer_keeps_the_old_baseline`
+- `tests/test_scene.py::WaitingCarTests::test_an_empty_frame_is_still_adopted_when_the_detector_finds_nothing`
+- `tests/test_scene.py::WaitingCarTests::test_an_alarm_on_another_thread_during_a_slow_probe_refuses_the_frame`
+- `tests/test_clear_stream_source.py::ClearStreamSourceTests::test_a_keyframe_the_detector_boxes_a_plate_in_is_never_adopted_as_the_idle_drive`
+- `tests/test_main.py::BaselineVehicleCheckWiringTests::test_a_capture_the_decoder_already_cropped_is_not_cropped_again`
+- `tests/test_sweep_pipeline.py::SweepPipelineTests::test_an_alarm_whose_sweep_lands_during_a_baseline_probe_is_still_read_and_let_in`
+  (alarm → sweep → processor → relay while the probe holds the reader's
+  one worker: the sweep's first frames are read behind it, none refused)
+- `tests/test_trigger_capture.py::HotKeyframeCaptureTests::test_a_session_that_starts_between_the_check_and_the_probe_does_not_take_the_detector`
+- `tests/test_clear_stream_source.py::ClearStreamSourceTests::test_a_session_that_starts_during_the_keyframe_decode_does_not_take_the_detector`
+- `tests/test_scene.py::WaitingCarTests::test_a_session_that_started_since_the_offer_keeps_the_detector_unasked`
 
 ## 7. The camera lens is never left changed, and neither is a picture setting a lease changed
 

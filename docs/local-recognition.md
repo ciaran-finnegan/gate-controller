@@ -373,6 +373,41 @@ In every one of those the car is read to the cap as before. The 15 s status
 counts these under
 `recognition.trigger_capture.sweep.dark_departed`.
 
+The baseline is "idle" 60 s after the last camera alarm, refreshed no more
+than once per 30 s, and a car that stops and waits at a shut gate raises no
+alarm while it sits there. On 2026-10-10 at 10:05:38 and 10:07:34 the D-Max
+`172-L-66` was parked at the stop, half the picture, when the refresh came
+round; it became the idle drive, and the next alarm's sweep skipped its
+frames unread as "empty" (the kept samples show the car; 9 Oct 12:35 and
+8 Oct 10:24 went the same way). So before a keyframe becomes the baseline the
+recording loop shows its plate band to the on-device detector
+(`LocalRecognizer.plate_boxed`, about 200 ms on one core, at most once per
+30 s, never while a session is reading -- in `decoded` mode too, where the
+ring marks the capture's session itself -- declined rather than queued if a
+frame is in flight, and the other way round never: a frame that lands while
+the probe is on the worker is admitted behind it and read the moment it
+ends, because the gate opens on that read with no link to the house; the
+band is cut once -- not again when `GATE_TRIGGER_CAPTURE_CROP` has the
+decoder cut it already). A session can start between a source's "no session
+is reading" check and the probe (the compressed source decodes a keyframe in
+between, for up to 3 s), so the baseline asks once more, just before the
+detector, and makes no probe if one has (`session_started`); nothing holds
+the session lock across the probe, since `start_session` is called on the
+sweep's thread and the sweep never waits. A box refuses
+the frame and keeps the old baseline; so does no answer at all -- a reader
+still loading, busy, timed out or failing -- because a stale picture of the
+*empty* drive is the safe side: a car's frames differ from it and are read.
+So does a camera alarm that lands while the detector is looking: the probe
+blocks for up to a second, an alarm in that time is a car in view whether or
+not the detector boxed it, and the idle check is made again before the
+baseline is installed. The sweep's own boxed reads count as activity too, so
+the idle clock runs from the last sight of the car. One journal line per five
+minutes says so (`gate_scene_baseline outcome=refresh_refused
+reason=plate_box|alarm_during_probe|session_started|detector_unanswered refused=N`), and
+the status block counts them under `scene.refused_vehicle` and
+`scene.refused_unanswered`. Without a local recogniser there is no detector
+to ask and the baseline refreshes as it always did.
+
 The cap covers
 the passage above (first authorisable read at +30.8 s) with room to spare:
 until 2026-10-05 it was 30 s at one read a second, and in the 36 h to that

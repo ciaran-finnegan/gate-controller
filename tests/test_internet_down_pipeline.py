@@ -35,12 +35,14 @@ import ast
 import unittest
 from functools import partial
 from pathlib import Path
+from threading import Event, Thread
 from time import monotonic, sleep
 from unittest import mock
 
 import requests
 
 from gate_controller.local_sweep import crop_to_region
+from gate_controller.scene import SceneBaseline
 from gate_controller.net_probe import NetProbeConfig, NetProbeWorker
 from gate_controller.processor import GateProcessor
 from gate_controller.trigger_capture import TriggerFrameCapture
@@ -261,6 +263,49 @@ class InternetDownPassageTests(unittest.TestCase):
         self.assertEqual(gate.outcomes(), [(False, "no_match")])
         self.assertLess(self._finished_at(gate) - landed_at, 3.0)
         self.assertIn("gate_ocr stage=cloud_skipped reason=internet_down", logs.text())
+        self.assertNotIn("decision_timeout", logs.text())
+
+    def test_the_cameras_still_landing_during_a_baseline_probe_is_read_on_the_device(self):
+        """The hole Codex found on #211: the baseline's detector probe holds the
+        reader's one worker, the internet is down, and the camera's still is
+        the only frame. It must be read behind the probe, never refused `busy`."""
+        link = Link(up=False)
+        link.measure()
+        cloud = DeadLinkCloud()
+        gate = self._gate(link, answers={}, cloud=cloud)
+        still = frame(340)
+        gate.engine.answers[digest(gate.pipeline_bytes(still))] = ("10CE1990", 0.95)
+        offered = harness.car_frame(341)
+        looking = Event()
+        gate.engine.holds[digest(crop_to_region(offered, REGION))] = looking
+        # The baseline as `__main__` wires it: the probe through the real recogniser.
+        scene = SceneBaseline(
+            idle_seconds=0.0,
+            vehicle_check=lambda data: gate.local.plate_boxed(crop_to_region(data, REGION), timeout=5.0),
+        )
+        probe = []
+        offering = Thread(target=lambda: probe.append(scene.observe(offered)), daemon=True)
+
+        sleep(0.5)  # FSEvents settling, as above
+        offering.start()
+        self.assertTrue(
+            wait_for(lambda: gate.engine.was_read(crop_to_region(offered, REGION))),
+            "the probe is on the worker",
+        )
+        with CapturedLogs() as logs:
+            gate.ftp_still(still)
+            sleep(0.5)  # the probe is still looking
+            self.assertEqual(probe, [])
+            self.assertEqual(gate.outcomes(), [], "the still waits its turn; it is not decided without its read")
+            self.assertEqual(gate.local.status()["busy"], 0, "not refused for the probe")
+            looking.set()
+            self.assertTrue(wait_for(gate.opened, 8.0), f"never opened: {gate.outcomes()}\n{logs.text()}")
+        offering.join(5)
+
+        self.assertEqual(cloud.posted_at, [])
+        self.assertEqual(gate.relay_calls, ["relay"], "exactly one pulse")
+        self.assertEqual(gate.opened_result().reason, "exact_match")
+        self.assertEqual(gate.stored(gate.opened_result())["source"], "local")
         self.assertNotIn("decision_timeout", logs.text())
 
     # -- fail open towards the cloud -----------------------------------------

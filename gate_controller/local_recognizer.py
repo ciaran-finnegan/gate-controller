@@ -137,6 +137,12 @@ LOCAL_DECISION_CLOUD_RESERVE_SECONDS = 2.0
 #: is bounded per frame, but without this a three-frame burst could pay the
 #: stuck-engine guard three times over inside one decision budget.
 LOCAL_EVENT_WAIT_BUDGET_SECONDS = 2.0
+#: How long the scene baseline's refresh will wait for :meth:`plate_boxed`
+#: before giving up on the frame. The read costs ~200 ms on one Pi core and
+#: the caller is the clear stream's recording thread, which the keyframe
+#: decode already holds for up to 3 s; a probe that runs out keeps the old
+#: baseline, and the read it started still finishes and frees the worker.
+BASELINE_PROBE_TIMEOUT_SECONDS = 1.0
 #: How many events' summaries are retained for the telemetry block.
 MAX_ITEM_SUMMARIES = 64
 #: Local observations kept per event, mirroring the telemetry item bound.
@@ -878,6 +884,13 @@ class LocalRecognizer:
         self._event_waits: dict[str, float] = {}
         self._wait_order: list[str] = []
         self._inflight = 0
+        #: A scene-baseline probe (`plate_boxed`) on the worker. Kept apart
+        #: from `_inflight` on purpose: a probe is not a frame, so it must
+        #: never be the reason a gate-decision read is refused as busy. The
+        #: read goes to the one worker behind it and runs the moment the
+        #: probe's inference ends; the probe itself is declined behind any
+        #: read, and behind another probe.
+        self._probing = False
         self._counts = {
             "frames": 0, "recognised": 0, "errors": 0, "unavailable": 0,
             "busy": 0,
@@ -1002,6 +1015,10 @@ class LocalRecognizer:
             # One outstanding read, never a queue. A stalled inference must
             # not make every later frame wait its turn before falling back to
             # the cloud, and queued frames would each pin a JPEG in memory.
+            # A baseline probe is not a read: a frame that lands during one
+            # is admitted and runs the moment the probe's inference ends,
+            # because the gate must open on this read with no link to the
+            # house, and nothing done for the baseline may stand in its way.
             if self._inflight:
                 busy = True
             else:
@@ -1020,6 +1037,55 @@ class LocalRecognizer:
                 self._inflight -= 1
             return NULL_FRAME
         return LocalFrame(self, trace_id, future, plates, resolved, now)
+
+    def plate_boxed(self, image: bytes, *,
+                    timeout: float = BASELINE_PROBE_TIMEOUT_SECONDS) -> bool | None:
+        """Does the detector find a plate in ``image``? None when it cannot say.
+
+        The scene baseline asks this before it adopts a keyframe as the empty
+        drive (:mod:`gate_controller.scene`). It is a probe, not a read: no
+        event, no journal line, no agreement bookkeeping, nothing added to
+        ``frames`` or the latency sample. It runs on the one worker, but it is
+        not the one outstanding read: a sweep or pipeline frame already in
+        flight declines the probe, never waits behind it, and a frame that
+        arrives while the probe is on the worker is admitted by :meth:`begin`
+        and read the moment the probe's inference ends -- a gate-decision read
+        is never refused for the baseline's sake. One probe at a time. A reader
+        that is not ready, is busy, raises, or runs past ``timeout`` answers
+        None, which the caller treats as "do not adopt".
+        """
+        if not self._config.enabled or self._closed:
+            return None
+        with self._lock:
+            pool, state = self._pool, self._state
+            if pool is None or state != "ready" or self._inflight or self._probing:
+                return None
+            self._probing = True
+            # Submitted under the same lock as the check, so a frame admitted
+            # a moment later is behind the probe, never ahead of it: a probe
+            # queued behind a read would run during the session the read
+            # belongs to. `submit` only enqueues; it never blocks here.
+            try:
+                future = pool.submit(self._probe, image)
+            except RuntimeError:
+                self._probing = False
+                return None
+        try:
+            return bool(future.result(timeout=timeout))
+        except Exception:
+            # A timeout, a cancelled pool or a failed read alike: no answer.
+            return None
+
+    def _probe(self, image: bytes) -> bool:
+        try:
+            with self._lock:
+                engine = self._engine
+            if engine is None:
+                raise LocalRecognizerUnavailable("not_ready")
+            return bool(engine.read(image).reads)
+        finally:
+            with self._lock:
+                self._probing = False
 
     def _declined(self, trace_id, plates, policy=None, now=None, *,
                   count: str | None = "unavailable") -> LocalFrame:

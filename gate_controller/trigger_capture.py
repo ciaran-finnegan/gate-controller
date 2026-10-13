@@ -988,7 +988,8 @@ class ClearKeyframeBuffer(HotStreamBuffer):
     is stale.
     """
 
-    def __init__(self, capture_config: TriggerCaptureConfig, **kwargs) -> None:
+    def __init__(self, capture_config: TriggerCaptureConfig, *, vehicle_check=None,
+                 **kwargs) -> None:
         super().__init__(
             HotStreamConfig(
                 enabled=True,
@@ -1014,7 +1015,22 @@ class ClearKeyframeBuffer(HotStreamBuffer):
             "-vf", ",".join(decoder_filters(capture_config, sample=True)),
             "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
         )
-        self.scene = SceneBaseline(clock=self._clock)
+        # The detector gate on the baseline (scene.py). This ring offers every
+        # decoded keyframe, one a second; the baseline asks the detector no
+        # more often than it could refresh, and never while a capture session
+        # is reading: `_on_frame` offers nothing during one, and `may_probe`
+        # asks again at the last moment before the detector is, because a
+        # session can start between the two. Neither holds `_session_lock`
+        # across the probe -- `start_session` runs on the sweep's own thread,
+        # and the sweep never waits. A probe already on the worker when a
+        # session starts cannot be taken back; the sweep's read is admitted
+        # behind it and runs the moment it ends (`LocalRecognizer.begin`).
+        self._session_lock = Lock()
+        self._session_active = False
+        self.scene = SceneBaseline(
+            clock=self._clock, vehicle_check=vehicle_check,
+            may_probe=lambda: not self.session_active(),
+        )
         self._decode = {
             "hwaccel": capture_config.hwaccel or "software",
             "frame_width": capture_config.frame_width or 3840,
@@ -1030,7 +1046,35 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         )
 
     def _on_frame(self, frame: bytes, now: float) -> None:
+        # Exactly the compressed source's rule (`_maybe_refresh_baseline`):
+        # no baseline offer, and so no detector probe, while a session reads.
+        # Checked without the lock held across `observe`, on purpose (above);
+        # the scene asks `may_probe` again just before the detector.
+        if self.session_active():
+            return
         self.scene.observe(frame, now)
+
+    # -- capture session marker ---------------------------------------------
+    # This ring has no live decoder to start: it already decodes one keyframe
+    # a second. What `start_session` records is that a sweep is reading, for
+    # as long as the capture says so, and `_on_frame` offers nothing to the
+    # baseline in that time. Without it a sweep that outlives the 60 s idle
+    # window -- a car at the gate whose plate the detector has not boxed --
+    # could lose its one recogniser worker to a baseline probe for up to a
+    # second, and the first frame where the plate comes clear would be read
+    # as `unavailable`.
+    def session_active(self) -> bool:
+        with self._session_lock:
+            return self._session_active
+
+    def start_session(self) -> bool:
+        with self._session_lock:
+            self._session_active = True
+        return True
+
+    def stop_session(self, reason: str = "ended") -> None:
+        with self._session_lock:
+            self._session_active = False
 
     def note_activity(self) -> None:
         self.scene.note_activity(self._clock())
@@ -1046,6 +1090,7 @@ class ClearKeyframeBuffer(HotStreamBuffer):
         status.update({
             "stream": "clear",
             "keyframes_only": True,
+            "session_active": self.session_active(),
             "source_profile": {
                 "codec": "h265", "width": 3840, "height": 2160, "fps": 10,
             },
@@ -1204,12 +1249,7 @@ class TriggerFrameCapture:
             outcome = "skipped_type"
         else:
             now = self._clock()
-            note_activity = getattr(self._frame_source, "note_activity", None)
-            if callable(note_activity):
-                try:
-                    note_activity()
-                except Exception:
-                    pass
+            self._note_source_activity()
             # A vehicle alarm is a car in view, whether or not a sweep is
             # scheduled for it (one inside the minimum interval is not).
             # Whatever the last passage's reads said about its plate receding
@@ -1920,6 +1960,10 @@ class TriggerFrameCapture:
             newest = (frame, captured_at, digest, read)
             plate_px = _plate_px(read)
             if plate_px is not None:
+                # A boxed plate is a car in view as surely as an alarm is, and
+                # a car that waits raises none: the idle clock behind the
+                # scene baseline starts from this read, not the last alarm.
+                self._note_source_activity()
                 plate_boxes.append((self._clock(), plate_px))
                 del plate_boxes[:-32]
                 if read.recognised:
@@ -2642,6 +2686,15 @@ class TriggerFrameCapture:
             raise
         self._capture_count += 1
         return True
+
+    def _note_source_activity(self) -> None:
+        """Tell the frame source the drive is busy, so its baseline waits."""
+        note_activity = getattr(self._frame_source, "note_activity", None)
+        if callable(note_activity):
+            try:
+                note_activity()
+            except Exception:
+                pass
 
     def _scene_difference(self, frame: bytes) -> float | None:
         return self._source_difference("scene_difference", frame)

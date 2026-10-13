@@ -359,6 +359,85 @@ class AvailabilityTests(unittest.TestCase):
         local.close()
 
 
+class BaselineProbeTests(unittest.TestCase):
+    """``plate_boxed``: the scene baseline's question before it adopts a frame."""
+
+    def test_a_boxed_plate_answers_true_and_an_empty_band_false(self):
+        local = recognizer([read("172L66", 0.62), no_plate()], mode="active")
+        self.assertIs(local.plate_boxed(b"car"), True)
+        self.assertIs(local.plate_boxed(b"empty"), False)
+        status = local.status()
+        self.assertEqual(status["frames"], 0, "a probe is not a frame")
+        self.assertEqual(status["latency_ms"]["samples"], 0, "nor a latency sample")
+        self.assertEqual(status["busy"], 0)
+        local.close()
+
+    def test_a_reader_that_is_not_ready_busy_or_failing_answers_none(self):
+        self.assertIsNone(recognizer([], mode="off").plate_boxed(b"frame"))
+        failed = recognizer([], load_error=LocalRecognizerUnavailable("import_failed"))
+        self.assertIsNone(failed.plate_boxed(b"frame"))
+
+        gate = Event()
+        local = recognizer([read("12D3456", 0.99), RuntimeError("engine")], gate=gate)
+        first = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
+        self.assertIsNone(local.plate_boxed(b"frame"), "a frame in flight is never waited behind")
+        gate.set()
+        self.assertEqual(first.result(5).plate, "12D3456")
+        self.assertIsNone(local.plate_boxed(b"frame"), "a read that raised is no answer")
+        self.assertEqual(local.status()["busy"], 0, "a declined probe is not counted against frames")
+        self.assertEqual(local.status()["errors"], 0)
+
+        closed = recognizer([read("12D3456", 0.99)])
+        closed.close()
+        self.assertIsNone(closed.plate_boxed(b"frame"))
+        local.close()
+
+    def test_a_probe_that_runs_out_of_time_answers_none_and_frees_the_worker(self):
+        gate = Event()
+        local = recognizer([read("12D3456", 0.99), read("12D3456", 0.99)], gate=gate)
+        self.assertIsNone(local.plate_boxed(b"frame", timeout=0.05))
+        gate.set()
+        # Once the slow probe finishes, the next frame is admitted as usual.
+        self.assertTrue(wait_until(lambda: not local._probing))
+        frame = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
+        self.assertEqual(frame.result(5).plate, "12D3456")
+        local.close()
+
+    def test_a_frame_arriving_during_a_probe_is_read_the_moment_the_probe_ends(self):
+        # The gate opens on this read with no link to the house (invariant 3),
+        # so nothing done for the baseline may refuse it. A probe's inference
+        # cannot be taken back once started; the frame is admitted behind it
+        # on the one worker, never answered `busy`, and read the moment the
+        # probe ends. (Before #211's review the probe reserved the worker
+        # exactly as a frame did, and the alarm's still was declined.)
+        gate = Event()
+        tracker = ConcurrencyTracker()
+        local = recognizer([read("12D3456", 0.99), read("12D3456", 0.99)], gate=gate, tracker=tracker)
+        probing = Thread(target=lambda: local.plate_boxed(b"car", timeout=5), daemon=True)
+        probing.start()
+        self.assertTrue(wait_until(lambda: tracker.current == 1))
+        self.assertIsNone(local.plate_boxed(b"car"), "one probe at a time")
+        frame = local.begin(b"frame", trace_id="t0", authorised={"12D3456"})
+        self.assertIsNone(frame.settled(), "admitted, and waiting its turn behind the probe")
+        self.assertEqual(local.status()["busy"], 0, "not refused")
+        self.assertIsNone(local.plate_boxed(b"car"), "a frame waiting is a frame in flight: no probe")
+        gate.set()
+        self.assertEqual(frame.result(5).plate, "12D3456")
+        probing.join(5)
+        self.assertEqual(tracker.peak, 1, "two inferences never share the board")
+        self.assertEqual(local.status()["busy"], 0)
+        local.close()
+
+
+def wait_until(predicate, timeout=5.0):
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if predicate():
+            return True
+        sleep(0.005)
+    return bool(predicate())
+
+
 class SerialisationTests(unittest.TestCase):
     def test_one_worker_means_two_inferences_never_share_the_board(self):
         tracker = ConcurrencyTracker()

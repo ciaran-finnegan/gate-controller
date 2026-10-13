@@ -406,3 +406,102 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertEqual(source.latest(after=None), (decoded, 100.0))
         never.set()
         source.stop_session("test")
+
+    def test_a_keyframe_the_detector_boxes_a_plate_in_is_never_adopted_as_the_idle_drive(self):
+        # 2026-10-10 10:05: the D-Max waited at the stop through two 30 s
+        # refreshes with no alarm, and the recording loop's refresh adopted it.
+        # The refresh now shows the keyframe to the detector first, on this
+        # same thread, and keeps the old baseline when it boxes a plate.
+        empty = jpeg((120, 120, 120), size=(192, 108))
+        car = jpeg((235, 235, 235), size=(192, 108))
+        decoded = [empty, car, car]
+        asked = []
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            return FakeProcess(output=decoded.pop(0))
+
+        def vehicle_check(frame):
+            asked.append(frame)
+            return frame == car
+
+        source, popen = self.source(factory, vehicle_check=vehicle_check)
+        source.ring.feed(STREAM)
+        with self.assertLogs("gate_controller.scene", level="INFO") as logs:
+            source._maybe_refresh_baseline()            # idle: the empty drive
+            self.clock[0] += 90.0                        # the car has stood there since
+            source._maybe_refresh_baseline()            # the keyframe is the car: refused
+            self.clock[0] += 30.0
+            source._maybe_refresh_baseline()            # and again
+        self.assertEqual(asked, [empty, car, car])
+        self.assertEqual(source.scene.status()["refreshes"], 1)
+        self.assertEqual(source.scene.status()["refused_vehicle"], 2)
+        self.assertGreater(source.scene_difference(car), 0.03, "the car differs from the idle drive: read")
+        self.assertLess(source.scene_difference(empty), 0.03)
+        self.assertEqual(source.status()["scene"]["refused_vehicle"], 2)
+        self.assertEqual(len(logs.output), 1, "one journal line for the run of refusals")
+        self.assertIn("outcome=refresh_refused reason=plate_box", logs.output[0])
+
+    def test_the_detector_is_not_asked_while_a_session_is_reading(self):
+        # The refresh never runs during a session, so the sweep's frames never
+        # find the one worker taken by a baseline probe.
+        asked = []
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            process = FakeProcess()
+            process.stdout = Stdout([])
+            return process
+
+        source, popen = self.source(factory, vehicle_check=lambda frame: asked.append(frame) or False)
+        source.ring.feed(STREAM)
+        self.assertTrue(source.start_session())
+        self.clock[0] += 60.0
+        source._maybe_refresh_baseline()
+        self.assertEqual(asked, [])
+        source.stop_session("test")
+
+    def test_a_session_that_starts_during_the_keyframe_decode_does_not_take_the_detector(self):
+        # `_maybe_refresh_baseline` checks for a session, then decodes the
+        # keyframe -- up to 3 s -- then offers the frame. A session that starts
+        # during the decode (the alarm's sweep, on its own thread) finds the
+        # probe unmade: the baseline asks once more just before the detector.
+        # Nothing holds the session lock across the decode; the sweep never waits.
+        asked = []
+        decoding = []
+        started = []
+        session_over = Event()
+
+        class OpenStdout:
+            """The session decoder's pipe: nothing yet, and not closed either."""
+
+            def read(self, _size):
+                session_over.wait(5)
+                return b""
+
+        def factory(command):
+            if "copy" in command:
+                return FakeProcess(chunks=[STREAM])
+            if not decoding:
+                # The keyframe decode: the sweep starts while it runs. (Marked
+                # before the session starts, since its own decoder's popen
+                # lands here from the session thread.)
+                decoding.append(command)
+                started.append(source.start_session())
+                return FakeProcess(output=jpeg())
+            process = FakeProcess()  # the session's own decoder, still reading
+            process.stdout = OpenStdout()
+            return process
+
+        source, popen = self.source(factory, vehicle_check=lambda frame: asked.append(frame) or False)
+        source.ring.feed(STREAM)
+        source._maybe_refresh_baseline()
+        self.assertEqual(started, [True])
+        self.assertTrue(source.session_active())
+        self.assertEqual(asked, [], "the detector was not asked")
+        self.assertEqual(source.scene.status()["refused_vehicle"], 1)
+        self.assertFalse(source.scene.status()["available"])
+        session_over.set()
+        source.stop_session("test")

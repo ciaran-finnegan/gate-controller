@@ -23,17 +23,36 @@ the 5,184 in a thumbnail, which is below the noise between two black frames,
 so a dark frame that matches the dark baseline may still carry a readable
 plate and must be read, not skipped. The sweep's waiting phase asks the
 reader as well before it concludes anything from a dark match.
+
+"Idle" is measured from the camera's last alarm, and a car that stops and
+waits at a shut gate raises no alarm while it sits there. On 2026-10-10 at
+10:05:38 and 10:07:34 the D-Max ``172-L-66`` was parked at the stop, half
+the picture, 60-90 s after the last alarm; the keyframe decoder adopted it as
+the idle drive, and the next alarm's sweep skipped its frames unread as
+"empty" (9 Oct 12:35 and 8 Oct 10:24 went the same way). So before a frame
+becomes the baseline it is shown to the on-device plate detector through
+``vehicle_check``: a frame with a plate box in it is refused and the old
+baseline kept, and so is one the detector could not answer for -- a stale
+picture of the *empty* drive is the safe side, because it makes a car's
+frames differ, which is to say read.
 """
 from collections.abc import Callable
 from io import BytesIO
+import logging
+from threading import Lock
 from time import monotonic
 import warnings
 
 from PIL import Image
 
+LOGGER = logging.getLogger(__name__)
+
 THUMBNAIL_SIZE = (96, 54)
 DEFAULT_IDLE_SECONDS = 60.0
 DEFAULT_REFRESH_SECONDS = 30.0
+# A refused refresh is journalled at most this often: a car waiting ten
+# minutes at the gate is refused twenty times, and one line says so.
+REFUSAL_LOG_SECONDS = 300.0
 # Mean thumbnail luma (0..255) below which a frame is dark: the spotlight and
 # the IR illuminator are both off and nothing in the picture is lit. The black
 # stills of 2026-10-09 measure 7.4-7.5 with the camera's white overlay text
@@ -81,12 +100,30 @@ class SceneBaseline:
 
     def __init__(self, *, idle_seconds: float = DEFAULT_IDLE_SECONDS,
                  refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
-                 clock: Callable[[], float] = monotonic):
+                 clock: Callable[[], float] = monotonic,
+                 vehicle_check: Callable[[bytes], bool | None] | None = None,
+                 may_probe: Callable[[], bool] | None = None):
+        """``vehicle_check`` is the on-device plate detector, asked of every
+        frame that is about to become the baseline: True for a plate box in
+        the picture, False for none, None when it cannot say (not loaded,
+        busy with a sweep frame, timed out). Only False lets the frame in.
+        Without one, every idle frame is adopted as before.
+
+        ``may_probe`` is asked at the last moment before the detector is: the
+        frame sources answer "no capture session is reading". They ask the
+        same question before offering a frame at all, but a session can start
+        between that check and this one -- the compressed source decodes a
+        keyframe in between, for up to 3 s -- and a probe that has started
+        cannot be taken back. One that has not started is simply not made:
+        the frame is refused as ``session_started`` and the baseline kept.
+        """
         if not idle_seconds >= 0 or not refresh_seconds > 0:
             raise ValueError("scene baseline timings must be non-negative and refresh positive")
         self._idle_seconds = idle_seconds
         self._refresh_seconds = refresh_seconds
         self._clock = clock
+        self._vehicle_check = vehicle_check
+        self._may_probe = may_probe
         self._baseline: list[int] | None = None
         self._baseline_at: float | None = None
         # The newest idle frame that was itself dark. Kept alongside the
@@ -96,28 +133,95 @@ class SceneBaseline:
         self._dark_baseline_at: float | None = None
         self._last_activity: float | None = None
         self._refreshes = 0
+        # `note_activity` arrives from the webhook thread while `observe` runs
+        # on the decoder's; the lock is what makes "no alarm since the probe
+        # began" a statement about the moment the baseline is installed.
+        self._lock = Lock()
+        # When the detector was last asked, refused or not: it costs a read,
+        # so it is asked no more often than a refresh could happen, whatever
+        # rate frames are offered at (the decoded ring offers one a second).
+        self._checked_at: float | None = None
+        self._refused_vehicle = 0
+        self._refused_unanswered = 0
+        self._refusals_unlogged = 0
+        self._refusal_logged_at: float | None = None
 
     def note_activity(self, now: float | None = None) -> None:
         """A camera event: the scene is busy, so stop refreshing the baseline."""
-        self._last_activity = self._clock() if now is None else now
+        with self._lock:
+            self._last_activity = self._clock() if now is None else now
+
+    def _busy(self, now: float) -> bool:
+        return self._last_activity is not None and now - self._last_activity < self._idle_seconds
 
     def observe(self, frame: bytes, now: float | None = None) -> bool:
         """Offer a decoded keyframe; it becomes the baseline when the scene is idle."""
         now = self._clock() if now is None else now
-        if self._last_activity is not None and now - self._last_activity < self._idle_seconds:
-            return False
+        with self._lock:
+            if self._busy(now):
+                return False
+            activity_before = self._last_activity
         if self._baseline_at is not None and now - self._baseline_at < self._refresh_seconds:
+            return False
+        if self._checked_at is not None and now - self._checked_at < self._refresh_seconds:
             return False
         thumbnail = frame_thumbnail(frame)
         if thumbnail is None:
             return False
-        self._baseline = thumbnail
-        self._baseline_at = now
-        self._refreshes += 1
-        if is_dark(thumbnail):
-            self._dark_baseline = thumbnail
-            self._dark_baseline_at = now
+        if self._vehicle_check is not None:
+            if self._may_probe is not None and not self._may_probe():
+                # A session started since this frame was offered: a sweep is
+                # reading, and a probe it would have to queue behind is not
+                # made. The detector is not charged a look, so the next idle
+                # frame after the session is asked about at once.
+                self._refuse(now, "session_started")
+                return False
+            self._checked_at = now
+            try:
+                boxed = self._vehicle_check(frame)
+            except Exception:
+                boxed = None
+            if boxed is not False:
+                self._refuse(now, "plate_box" if boxed else "detector_unanswered")
+                return False
+        with self._lock:
+            # The probe blocks for up to a second, and an alarm in that time
+            # is a car in view -- one the detector may not have boxed (too
+            # close, too far, still moving). Whatever the frame showed, the
+            # scene is not idle now, so it is not the idle drive.
+            if self._last_activity != activity_before or self._busy(self._clock()):
+                self._refuse(now, "alarm_during_probe")
+                return False
+            self._baseline = thumbnail
+            self._baseline_at = now
+            self._refreshes += 1
+            if is_dark(thumbnail):
+                self._dark_baseline = thumbnail
+                self._dark_baseline_at = now
         return True
+
+    def _refuse(self, now: float, reason: str) -> None:
+        """A frame the detector would not clear: keep the baseline as it was."""
+        if reason in ("plate_box", "alarm_during_probe", "session_started"):
+            # All three are a vehicle in view: one the detector saw, one the
+            # camera did, one a sweep is reading.
+            self._refused_vehicle += 1
+        else:
+            self._refused_unanswered += 1
+        self._refusals_unlogged += 1
+        if (
+            self._refusal_logged_at is not None
+            and now - self._refusal_logged_at < REFUSAL_LOG_SECONDS
+        ):
+            return
+        LOGGER.info(
+            "gate_scene_baseline outcome=refresh_refused reason=%s refused=%d "
+            "baseline_age_seconds=%s",
+            reason, self._refusals_unlogged,
+            "none" if self._baseline_at is None else round(now - self._baseline_at, 1),
+        )
+        self._refusal_logged_at = now
+        self._refusals_unlogged = 0
 
     def difference(self, frame: bytes) -> float | None:
         """How far a frame is from the idle scene, 0..1, or None without a baseline."""
@@ -157,4 +261,8 @@ class SceneBaseline:
                 None if self._dark_baseline_at is None
                 else max(0.0, round(now - self._dark_baseline_at, 1))
             ),
+            # Refreshes refused because the detector boxed a plate in the
+            # frame, and because it could not answer for it.
+            "refused_vehicle": self._refused_vehicle,
+            "refused_unanswered": self._refused_unanswered,
         }
