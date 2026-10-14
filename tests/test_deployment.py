@@ -3912,7 +3912,7 @@ class DependencyLockTests(unittest.TestCase):
             "certifi": "2026.7.22",
             "charset-normalizer": "3.5.0",
             "idna": "3.18",
-            "urllib3": "2.7.0",
+            "urllib3": "2.8.0",
             "rpi-lgpio": "0.6",
             # On-device recognition, arm64 only: the versions measured on the
             # gate Pi and the Mac, where the reads were byte-identical.
