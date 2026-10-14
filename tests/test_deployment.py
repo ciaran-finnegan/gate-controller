@@ -3910,9 +3910,9 @@ class DependencyLockTests(unittest.TestCase):
             "requests": "2.34.2",
             "watchdog": "6.0.0",
             "certifi": "2026.7.22",
-            "charset-normalizer": "3.5.0",
-            "idna": "3.18",
-            "urllib3": "2.7.0",
+            "charset-normalizer": "3.5.2",
+            "idna": "3.20",
+            "urllib3": "2.8.0",
             "rpi-lgpio": "0.6",
             # On-device recognition, arm64 only: the versions measured on the
             # gate Pi and the Mac, where the reads were byte-identical.
@@ -3922,12 +3922,12 @@ class DependencyLockTests(unittest.TestCase):
             # Their transitive closure, pinned to the same resolution.
             "numpy": "2.4.6",
             "opencv-python-headless": "5.0.0.93",
-            "protobuf": "7.36.1",
+            "protobuf": "7.36.2",
             "flatbuffers": "25.12.19",
             "packaging": "26.3",
             "PyYAML": "6.0.3",
             "rich": "15.0.0",
-            "tqdm": "4.70.0",
+            "tqdm": "4.70.1",
             "markdown-it-py": "4.2.0",
             "mdurl": "0.1.2",
             "Pygments": "2.21.0",
