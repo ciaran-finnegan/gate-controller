@@ -3927,7 +3927,7 @@ class DependencyLockTests(unittest.TestCase):
             "packaging": "26.3",
             "PyYAML": "6.0.3",
             "rich": "15.0.0",
-            "tqdm": "4.70.0",
+            "tqdm": "4.70.1",
             "markdown-it-py": "4.2.0",
             "mdurl": "0.1.2",
             "Pygments": "2.21.0",
