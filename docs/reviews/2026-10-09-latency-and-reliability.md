@@ -265,8 +265,8 @@ Task 1 (decode width) is reported separately below.
 
 ## Task 1: decode width
 
-**Not shipped.** The evidence does not justify changing
-`GATE_TRIGGER_CAPTURE_FRAME_WIDTH` from 1920.
+**Not shipped, and settled on 14 Oct by real stream frames (below): keep
+`GATE_TRIGGER_CAPTURE_FRAME_WIDTH` at 1920.**
 
 **What the pipeline really does.**
 - The Pi's config has `GATE_TRIGGER_CAPTURE_CROP` off. So the session decoder scales the whole 4K frame to 1920 (the plate ×0.50, not the ×0.556 assumed when this was proposed), and the band is cut from that.
@@ -306,3 +306,71 @@ Decode experiments belong on a workstation, not the gate's only controller.
 - read time (expect about +8 %);
 - the Pi's temperature (currently 57-74 °C daily maximum);
 - the sweep's `read_fps` while waiting, which must stay at about 2.
+
+### 14 Oct: NVR stream frames
+
+Harness: [scripts/decode_width/](../../scripts/decode_width/) decodes NVR
+recordings of the 4K main stream the way the session decoder does
+(`scale=w='min(iw,W)':h=-2`, MJPEG `-q:v 2`, crop off), then reads each frame
+through `local_sweep.crop_with_geometry` (band, q90) or
+`PlateRecognizerClient._open_upload` (band, Lanczos to the cap, q85) and the
+deployed engine (yolo-v9-t-384, cct-xs-v2, one thread), band
+`0.05,0.10,0.90,0.85`. Workstation only.
+
+Five passages from before 11 Oct 14:43, when the NVR still recorded the main
+stream. Each was decoded at 1920, 2560 and 3200 and read on the sweep's path,
+and on the capped main path at each cap up to the decode width. A passage runs
+from the first frame of the car (the first frame any variant boxes a plate in,
+walking back from its first good read) to its last read; 815 frames in all.
+Correct means the exact plate at or above the 0.75 bar.
+
+| Passage | Plate px (4K) | 1920 | 2560 | 2560, cap 2560 | 3200 | First correct read |
+| --- | --- | --- | --- | --- | --- | --- |
+| D-Max `172L66`, 7 Oct dusk | 102-237 | 123/140 | 121/140 | 122/140 | 123/140 | 2.06-2.16 s, every variant |
+| Audi `131D2696`, 4 Oct day | 107-377 | 0/218 | 0/218 | 0/218 | 0/218 | none |
+| `11WH2397`, 7 Oct day | 99-779 | 86/110 | 95/110 | 92/110 | 91/110 | 2.82 s, every variant |
+| D-Max `172L66`, 5 Oct night | 149-260 | 107/145 | 108/145 | 109/145 | 111/145 | 3.86 s; 1920 sweep 4.29 s |
+| `10CE1990`, 7 Oct day | 98-529 | 150/202 | 118/202 | 127/202 | 93/202 | 1.02 s; 3200 sweep 1.99 s |
+| **All** | | **466/815 (57 %)** | 442 (54 %) | 450 (55 %) | 418 (51 %) | |
+
+(1920, 2560 and 3200 are the sweep's path. The capped main path at 1920 reads within a few frames of the 1920 sweep at every decode width: 461, 460 and 458 of 815.)
+
+By plate width, the same reads:
+
+| Plate px (4K) | frames | 1920 | 2560 | 3200 |
+| --- | --- | --- | --- | --- |
+| under 200 | 31 | 1 | 2 | 2 |
+| 200-250 | 275 | 229 | 228 | 232 |
+| 250-300 | 104 | 87 | 95 | 91 |
+| 300 and over | 405 | 149 | 117 | 93 |
+
+- **The first correct read, the moment that opens the gate, does not come
+  earlier at a wider decode.** It is the same frame at every width on
+  `11WH2397`. On `10CE1990` it is the same frame except at 3200, which is a
+  second later. On the dusk D-Max, the 1920 sweep is one read earlier than
+  2560 and 3200. On the night D-Max it is one read (0.43 s) later than 2560
+  and 3200 on the sweep's path, but 1920's capped path is as early as any.
+- **A wider decode gains a little at 250-300 px and loses more above 300 px.**
+  A larger crop is shrunk further to the recogniser's 128×64, which is the
+  aliasing the synthetic test above suggested. Overall 1920 reads the most of
+  the nine variants. At the 0.9 bar the order is the same: 1920 51 %, 2560
+  48-51 %, 3200 45-49 %.
+- **The Audi passage reads `13D2696` (and `19D`, `11D`) at every width.** That
+  is the dropped `1` that [vehicle-direction.md](../vehicle-direction.md)
+  records for this car's rear plate, so this passage is almost certainly a
+  departure, and no decode width changes it.
+- **Where local reads fail, the plate is too small or it is a rear plate.**
+  Under 200 px, at most 2 of 31 frames read at any width. Neither failure is a
+  decode-width problem.
+
+**Cost: not timed, and no longer needed.** A clean per-frame timing has to
+run the variants one at a time; the read times the harness prints come from
+nine runs in parallel and are not timings. With no accuracy to buy, a wider
+decode only adds cost on a Pi with no fan: a larger decode output and MJPEG
+encode in the session decoder, and more pixels to crop and shrink on every
+read.
+
+**Decision: keep `GATE_TRIGGER_CAPTURE_FRAME_WIDTH=1920` and
+`GATE_OCR_MAX_UPLOAD_WIDTH=1920`.** Task 1 is closed. The footage and the
+decoded frames were deleted after scoring; the per-frame reads were not
+committed, because they hold the plates of every passage.
