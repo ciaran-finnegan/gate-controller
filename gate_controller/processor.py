@@ -14,7 +14,8 @@ from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 
 from .actuation import (
-    AUTOMATIC_PAUSED, DEFAULT_AUTOMATIC_COOLDOWN, WITHHELD_OUTCOMES, ActuationCoordinator,
+    AUTOMATIC_PAUSED, DEFAULT_AUTOMATIC_COOLDOWN, DEPARTING, WITHHELD_OUTCOMES,
+    ActuationCoordinator,
 )
 from .agricultural import EVENT_REASON as FARM_MACHINERY_REASON
 from .agricultural import EVENT_SOURCE as APPEARANCE_SOURCE
@@ -173,6 +174,12 @@ class PreparedBurst:
     #: camera's own vehicle event for the passage has arrived. While it says
     #: no, this burst is never sent to the cloud plate reader.
     cloud_permit: Callable | None = field(default=None, repr=False)
+    #: Only on a frame the capture injected: the way back to its own
+    #: passage's live reads (`CarriedDeparture.direction`), which the
+    #: actuation coordinator asks whether the relay may pulse for a car that
+    #: may be leaving (#171). None for the camera's still, which the
+    #: coordinator judges by the capture's current passage instead.
+    direction: Callable | None = field(default=None, repr=False)
     #: The controller's network probe's answer to "is the internet reachable",
     #: or None when there is no probe. Asked, never remembered, so a burst
     #: routed after the link comes back goes to the cloud lane as before.
@@ -441,11 +448,13 @@ class GateProcessor:
         if decision_started_at is None:
             trace.mark_burst()
         received_at = received_at or self._clock()
+        carried_direction = getattr(departing, "direction", None)
         prepared = PreparedBurst(
             paths=paths, digests=digests, idempotency_key=idempotency_key,
             received_at=received_at, started=started, trace=trace, trigger=trigger,
             discard_hook=self._discard_prepared, cloud_permit=cloud_permit,
             internet_reachable=self._internet_reachable,
+            direction=carried_direction if callable(carried_direction) else None,
         )
         if not local_pass or not paths:
             return prepared
@@ -898,19 +907,43 @@ class GateProcessor:
                 return "failed", "decision_timeout"
             return None
 
+        def hold_budget():
+            """Seconds this grant may still wait before it must pulse or lapse.
+
+            The coordinator holds a grant whose car may be leaving (#171) for
+            no longer than this: the decision deadline and the frame's
+            freshness are the same bars `activation_inhibition` asks just
+            before the relay, so a held arrival still pulses inside them.
+            """
+            remaining = activation_deadline - self._decision_clock()
+            try:
+                fresh_for = (
+                    received_at + self._max_image_age - self._clock()
+                ).total_seconds()
+            except (TypeError, ValueError):
+                return 0.0
+            return min(remaining, fresh_for)
+
         actuation_kwargs = {
             "outbox_payload": outbox_payload,
             "pre_activation_inhibit": activation_inhibition,
         }
+        if _accepts_keyword(self._coordinator.actuate, "hold_budget"):
+            actuation_kwargs["hold_budget"] = hold_budget
+            if prepared.direction is not None:
+                actuation_kwargs["direction"] = prepared.direction
         if _accepts_keyword(self._coordinator.actuate, "on_activation"):
             actuation_kwargs["on_activation"] = trace.mark_relay_activation
         if _accepts_keyword(self._coordinator.actuate, "on_deactivation"):
             actuation_kwargs["on_deactivation"] = trace.mark_relay_finished
         with self._actuation_lock:
             execution = self._coordinator.actuate(event, **actuation_kwargs)
-        if execution.reason in FINAL_INHIBITION_REASONS or execution.reason == AUTOMATIC_PAUSED:
-            # A grant the owner's pause switch refused is recorded, and told
-            # to the app, as the denial it is: the gate did not open for it.
+        if execution.reason in FINAL_INHIBITION_REASONS or execution.reason in (
+            AUTOMATIC_PAUSED, DEPARTING,
+        ):
+            # A grant the owner's pause switch refused, or one withheld from a
+            # car that is leaving, is recorded, and told to the app, as the
+            # denial it is: the gate did not open for it.
             trace.revise_decision("denied", execution.reason)
         trace.set_actuation_outcome(*_actuation_telemetry(execution))
         return self._keep_appearance(appearance, self._finish_result(

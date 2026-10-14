@@ -16,6 +16,7 @@ from .actuation import (
     ActuationCoordinator,
 )
 from .automatic_open import load_config as load_automatic_open_config
+from .departure import load_config as load_departure_config
 from .agricultural import build_policy as build_farm_machinery_policy
 from .backpressure import ActivityGate, DEFAULT_QUIET_SECONDS, bounded_quiet_seconds
 from .authorisation import (
@@ -152,6 +153,14 @@ def main() -> None:
         Path(arguments.database).resolve().parent / "match-policy.json"
     )
     automatic_open_defaults = load_automatic_open_config(os.environ)
+    # GATE_DEPARTING_WITHHOLD=off|shadow|on (default shadow) and its hold
+    # (#171, gate_controller/departure.py). Read here with the rest, never
+    # raising: a typo journals and keeps the default.
+    departure_config = load_departure_config(os.environ)
+    logging.getLogger(__name__).info(
+        "departure_withhold mode=%s hold_seconds=%g",
+        departure_config.mode, departure_config.hold_seconds,
+    )
     # One coordinator, shared by the recognition pipeline and the command
     # server, so both windows are measured from the same last pulse -- and so
     # the one-pulse-per-car hold and the pause switch sit on the one path
@@ -162,6 +171,12 @@ def main() -> None:
         command_cooldown=command_cooldown,
         repulse_unseen=repulse_unseen(os.environ),
         automatic_open=lambda: _automatic_open_config(match_policy, automatic_open_defaults),
+        # Whether the car in view is leaving, for a grant that does not carry
+        # its own passage (the camera's still). The capture is built further
+        # down; until it exists -- and on a controller without one -- the
+        # answer is None, which withholds nothing.
+        departure=departure_config,
+        departure_reading=lambda: _departure_reading(trigger_capture),
     )
     max_image_age = float(os.environ.get("GATE_MAX_IMAGE_AGE_SECONDS", "8"))
     decision_timeout = float(os.environ.get("GATE_DECISION_TIMEOUT_SECONDS", "4"))
@@ -795,6 +810,17 @@ def actuation_cooldowns(environment) -> tuple[timedelta, timedelta]:
         automatic.total_seconds(), command.total_seconds(),
     )
     return automatic, command
+
+
+def _departure_reading(capture):
+    """The capture's `departure_reading`, or None while there is no capture. Never raises."""
+    reader = getattr(capture, "departure_reading", None)
+    if not callable(reader):
+        return None
+    try:
+        return reader()
+    except Exception:
+        return None
 
 
 def repulse_unseen(environment) -> timedelta | None:

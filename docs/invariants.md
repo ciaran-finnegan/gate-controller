@@ -23,7 +23,8 @@ case through the real path.
 See [gate-operator.md](gate-operator.md) and the hard rules in `CLAUDE.md`.
 Every open needs an exact match against the authorised list under the band
 in force, a fresh frame, the cooldown, the one-car-one-pulse hold
-(invariant 12), and the actuation claim. Nothing added for speed or spend --
+(invariant 12), a car that is not leaving (invariant 13, under
+`GATE_DEPARTING_WITHHOLD=on`), and the actuation claim. Nothing added for speed or spend --
 the sweep, the cloud hold, the conclusive-read rule, the early trigger -- may
 open the gate on anything else; those only decide what is read and what is
 spent.
@@ -125,7 +126,18 @@ the passage's frames and still are decided on the device and not sent
 (`cloud_skipped reason=departing`) once `GATE_LOCAL_SWEEP_DEPARTING_SKIP=on`;
 shipped as `shadow`, which journals what `on` would have kept off the cloud
 and sends exactly as before. An arriving car keeps its cloud fallback, and an
-authorised rear plate the device reads still opens the gate (#171).
+authorised rear plate the device reads is still decided as the grant it is:
+the skip is about spending. Whether that grant's pulse goes is invariant 13.
+
+The judge is shared with invariant 13, and was hardened for it on 2026-10-14:
+"receding" now takes **three** shrunk reads in a row, not two, and a plate
+standing still (five reads within 8 % across two seconds) is never receding.
+On 2026-10-13 at 13:37 UTC the two-read rule judged an authorised arrival
+departing from the detector's box jumping 205 <-> 322 px; under `on` its
+later frames would have been kept off the cloud (nothing was lost: the car
+had been let in 1.1 s earlier on the device). Every departure the journal
+holds from 2026-10-10 to 10-14 is still judged, 0.3-0.6 s later. Under `off`
+the judge is still fed (invariant 13 reads it), but nothing here consults it.
 
 - `tests/test_fast_lane.py::test_the_cameras_alarm_still_is_not_sent_to_the_cloud_while_a_sweep_is_reading`
 - `tests/test_fast_lane.py::test_a_sweep_frame_is_never_treated_as_the_cameras_still`
@@ -133,6 +145,8 @@ authorised rear plate the device reads still opens the gate (#171).
 - `tests/test_departing_pipeline.py::test_an_arriving_car_still_gets_its_cloud_fallback`
 - `tests/test_departing_pipeline.py::test_a_departing_cars_authorised_rear_plate_still_opens_on_the_device`
 - `tests/test_trigger_capture.py::DepartingPlateTests::test_the_2026_10_09_arrival_never_reads_as_receding`
+- `tests/test_trigger_capture.py::DepartingPlateTests::test_the_2026_10_13_arrival_whose_box_jumped_never_reads_as_receding`
+- `tests/test_trigger_capture.py::DepartingPlateTests::test_every_departure_the_journal_holds_from_10_to_14_october_is_still_caught`
 
 ## 6. A waiting car keeps being read
 
@@ -389,3 +403,103 @@ Guards:
 - `tests/test_gate_jam_2026_10_10.py::AutomaticOpenPausedReplayTests::test_a_presence_frame_is_refused_too`
 - `tests/test_one_pulse_per_car.py::AutomaticOpenPauseTests::test_every_automatic_source_is_refused_at_the_coordinator`
 - `tests/test_one_pulse_per_car.py::AutomaticOpenPauseTests::test_a_malformed_app_setting_changes_nothing`
+
+## 13. No automatic pulse for a car that is leaving
+
+A departing car comes from behind the camera and shows it a rear plate that is
+on the same list. It is let out by the exit wand or the auto-open, so a pulse
+for it lands on a gate that is open or opening -- on the step-by-step input
+that closes it behind the car or stops it dead, and stopped leaves pulsed
+again can cross (invariant 1, [gate-operator.md](gate-operator.md)). Under
+`GATE_DEPARTING_WITHHOLD=on` the `ActuationCoordinator` -- the one place every
+automatic path goes through, after the cooldown and the one-pulse hold --
+withholds the pulse from a grant whose passage reads as a car leaving, and
+records it as the denial it is (`reason`/`actuation_outcome` `departing`). A
+sweep frame, or a cloud answer on one, is judged by its own passage; the
+camera's still by the current passage's reads since the latest alarm, never
+by the car before it.
+
+The judgement is the sweep's plate widths (`DepartingPlate.direction_at`, the
+same one the cloud skip of invariant 5 reads): three boxed reads in a row at
+most 70 % of the passage's widest plate. A plate standing still is never
+leaving, so a car waiting at the gate is not, however big the car before it in
+the same alarm. A grant whose passage has boxed a plate it cannot yet place is
+**held** -- the one place a decided grant waits on anything -- for at most
+`GATE_DEPARTING_HOLD_SECONDS` (2.0), never past its own decision deadline or
+its frame's freshness, while the sweep reads on; a hold that ends undecided
+pulses. A passage with nothing to judge by is never held. Nothing here waits on
+the network, and nothing here can add, retry or hurry a pulse.
+
+Where the hold waits: inside `ActuationCoordinator.actuate`, under the
+coordinator's lock, on the thread that decided the frame -- the burst thread
+for a frame the device read (invariant 2 is about the network, and the hold
+polls a passage in memory and sleeps), the cloud lane for a cloud answer. The
+sweep is a thread of its own and is never made to wait: its hand-over is a
+queue put, and its reads during the hold are what settle it (invariant 6).
+What a hold keeps waiting is another grant of the same passage, which its
+outcome settles anyway. A pulse that follows a hold is recorded at the
+moment it went, so both cooldowns run their full length from the pulse. The
+judge is read without a lock; a read torn between the sweep's write of one
+width and its verdict can only answer `undecided` or the verdict the whole
+write gives, never a release the finished write would not.
+
+A car withheld that was arriving is not stuck: no pulse was sent, so invariant
+12 has nothing to hold it on; the sweep keeps reading (`departing` is a retry
+reason) and lets it in the moment its plate grows back or stands still. A
+person's command from the app is never asked, and never waits on the rule: a
+command on its way to the lock ends a hold at once, the held grant is judged
+on what the reads have said by then, and the command meets only what it
+always met (the pulse's own two seconds, and its 20 s cooldown if that grant
+pulsed). Shipped as `shadow`, which pulses exactly as before and journals
+what `on` would have done; the criterion for `on` is in
+[vehicle-direction.md](vehicle-direction.md#withholding-the-pulse).
+
+What it cannot see: a departing car that stops beside the camera (its plate
+grows), and the camera's still of one car decided after the next car's alarm
+is judged by the next car's reads -- both bounded by the still being decided
+on the device within a second or two of landing.
+
+- **2026-10-10 18:26 to 10-14 15:30 UTC** -- eight of eighteen vehicle pulses
+  went to departing cars. On 10-14 the gate began opening at 13:11:00 for a
+  car leaving; the Pi pulsed for its rear plate at 13:11:13.85 and a closing
+  run began three seconds later. Replayed, seven of the eight are withheld
+  (three after a hold of 1.16-1.45 s); the eighth was the camera's still,
+  granted before any plate was boxed, of a car that then stood beside the
+  camera. None of the ten arrivals is withheld or held.
+- **2026-10-13 13:37 UTC** -- the plate-shrink rule as #205 shipped it (two
+  reads) judged an authorised arrival departing, 1.1 s after its pulse: the
+  detector's box jumped 205 <-> 322 px on a car coming closer. Three reads now.
+
+Guards:
+
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_14_13_11_the_pulse_that_closed_an_opening_gate`
+  (each of the eight replayed alarm -> sweep -> processor -> coordinator ->
+  relay, the grant arriving as it did: sweep frame, cloud answer, or still)
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_11_16_19_a_cloud_grant_on_a_plate_already_receding`
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_12_12_59_a_cloud_grant_before_the_plate_had_receded_is_held_then_withheld`
+  (held `undecided` at the grant and withheld `departing` after: the reads
+  that settled it were the sweep's, taken on its own thread while the
+  coordinator held the grant)
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_12_15_48_a_sweep_frame_long_after_the_verdict`
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_13_10_49_a_cloud_grant_two_reads_in_is_held_then_withheld`
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_13_16_08_a_sweep_frame_after_the_verdict`
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_14_15_17_a_sweep_frame_before_the_verdict_is_held_then_withheld`
+- `tests/test_departing_withhold.py::DepartingPulseReplayTests::test_10_11_10_47_a_departure_with_no_plate_to_measure_still_pulses`
+  (the rule withholds only on evidence)
+- `tests/test_departing_withhold.py::ArrivalReplayTests::test_every_arrival_of_10_to_14_october_is_let_in_with_no_hold`
+- `tests/test_departing_withhold.py::ArrivalReplayTests::test_the_10_13_13_37_arrival_is_never_judged_departing`
+- `tests/test_departing_withhold.py::WithheldArrivalStillGetsInTests::test_a_car_wrongly_judged_departing_that_stands_at_the_gate_is_let_in`
+- `tests/test_departing_withhold.py::WithheldArrivalStillGetsInTests::test_a_person_can_open_the_gate_for_a_car_judged_departing`
+- `tests/test_departing_withhold.py::CameraStillTests::test_the_cameras_still_of_a_departing_car_is_withheld_by_the_passage_it_belongs_to`
+- `tests/test_departing_withhold.py::CameraStillTests::test_the_next_cars_still_is_not_judged_by_the_car_before_it`
+- `tests/test_departing_withhold.py::ModeTests::test_shadow_pulses_exactly_as_before_and_journals_what_on_would_have_done`
+- `tests/test_departure.py::CoordinatorTests::test_the_hold_never_outlasts_the_frames_freshness`
+- `tests/test_departure.py::CoordinatorTests::test_a_passage_still_undecided_when_the_hold_runs_out_is_pulsed`
+- `tests/test_departure.py::CoordinatorTests::test_a_passage_that_cannot_be_read_withholds_nothing`
+- `tests/test_departure.py::CoordinatorTests::test_the_cooldown_and_the_one_pulse_hold_are_asked_first`
+- `tests/test_departure.py::CoordinatorTests::test_a_departure_never_starts_a_one_pulse_hold`
+- `tests/test_departure.py::CoordinatorTests::test_a_person_at_the_app_is_never_asked`
+- `tests/test_departure.py::CoordinatorTests::test_a_person_pressing_the_app_during_a_hold_ends_it_and_is_not_kept_waiting`
+- `tests/test_departure.py::CoordinatorTests::test_a_held_pulse_is_recorded_at_the_moment_it_went_not_at_the_grant`
+- `tests/test_departure.py::CoordinatorTests::test_shadow_pulses_and_says_what_on_would_have_done`
+- `tests/test_trigger_capture.py::DepartingPlateTests::test_the_2026_10_13_arrival_whose_box_jumped_never_reads_as_receding`

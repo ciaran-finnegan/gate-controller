@@ -582,8 +582,9 @@ way the car is going: a departing car comes from behind the camera and recedes
 up the approach, so the plate the device boxes *shrinks* read by read, where
 an arriving car's plate only grows until it stops at the gate. `DepartingPlate`
 in `trigger_capture.py` holds the rule -- the widest plate of the passage is at
-least 150 px (4K-equivalent), and two boxed reads running are each at most 70 %
-of it -- and each frame the sweep hands over carries the verdict as it stood at the
+least 150 px (4K-equivalent), and three boxed reads running are each at most
+70 % of it (two until 2026-10-14; a plate standing still is never receding, see
+[vehicle-direction.md](vehicle-direction.md#withholding-the-pulse)) -- and each frame the sweep hands over carries the verdict as it stood at the
 hand-over (`CarriedDeparture`), so a frame of the departing car that reaches
 the processor after the next alarm -- the fallback at `new_event` -- keeps
 it. A frame the sweep did not hand over itself, the camera's FTP still above
@@ -605,7 +606,9 @@ mode=on peak_px=... plate_px=... at_ms=...`, and counted in the heartbeat's
 `sweep.departing`.
 
 What it does not touch: a frame the device *decided* -- an authorised rear
-plate still opens the gate on the device, as it always has (#171); a car
+plate is still decided as a grant on the device (whether its pulse goes is
+`GATE_DEPARTING_WITHHOLD`'s question, #171,
+[vehicle-direction.md](vehicle-direction.md#withholding-the-pulse)); a car
 whose plate grows back after shrinking (one that backed off and came forward)
 is an arrival again and gets its fallback; and a departure that shows no boxed
 plate at all is not caught -- on 2026-10-08 at 18:22 one such passage cost

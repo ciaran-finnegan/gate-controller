@@ -101,6 +101,9 @@ class GateEvent:
     #: already pulsed for this plate and the car has not left the picture
     #: since (``ActuationCoordinator``, docs/invariants.md 12) -- and
     #: ``"automatic_paused"``, the owner's switch against any automatic open.
+    #: Since 2026-10-14, ``"departing"``: the plate read as a car leaving and
+    #: the pulse was withheld (gate_controller/departure.py, #171). Like a
+    #: paused grant it is written as a denial with ``reason`` the same.
     actuation_outcome: str | None = None
     #: On a denial, the authorised plate the refused read was closest to
     #: (``MatchDecision.near_miss_plate``), or ``None``. Record-only, and local

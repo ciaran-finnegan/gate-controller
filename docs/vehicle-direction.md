@@ -6,11 +6,14 @@ its rear plate as `II011T`, `13D2696` and `13D2896` — none of which could ever
 match. Roughly half of everything at this gate is a departure. And an access
 log that cannot tell them apart is not an access log.
 
-Direction is a **label**. Nothing described here reaches the relay, the admit
-decision or the presence session, and nothing here can delay a gate. One
-thing about direction *is* used while the car is there, and only to decide
-what is spent: the sweep keeps a departing car's frames off the cloud plate
-reader. See [Spending, in real time](#spending-in-real-time) below.
+Direction after the fact is a **label**: the photo verdicts and the combined
+verdict below reach neither the relay, the admit decision nor the presence
+session. Two things about direction *are* used while the car is there, both
+read from the sweep's own plate widths, and both can only hold something back:
+the sweep keeps a departing car's frames off the cloud plate reader
+([Spending, in real time](#spending-in-real-time)), and the coordinator
+withholds the relay's pulse from a car that is leaving
+([Withholding the pulse](#withholding-the-pulse), #171).
 
 ## Where it stands, measured
 
@@ -233,7 +236,7 @@ signals:
 
 **After the fact, in `scripts/scan_direction.py`, on `gate-direction-scan.timer`
 every ten minutes.** Not beside the relay, because that is not where the
-evidence is: a photo is read after the passage, by fetching it back from the
+photo's evidence is: a photo is read after the passage, by fetching it back from the
 dashboard, and the gate-sound scan writes a movement five to twenty minutes
 after it happened. While a car is at the gate the only signals that exist are
 the width fit and the sweep's own plate widths (below), so there is nothing to
@@ -285,12 +288,123 @@ shows no arrival judged a departure). The frame is
 decided on the device's read and answers "no plate", with the refused read
 carried as `review_plate` for the near miss like every other skip. It is not
 sticky -- a plate that grows back ends it -- and it never touches a frame the
-device decided: an authorised rear plate still opens the gate (#171).
+device decided: an authorised rear plate is still a grant. Whether that
+grant's *pulse* goes is the next section's question.
 
 **It is a rule about spending, not a verdict.** Nothing here writes
 `direction`, feeds `judge`, or reaches `passage_directions`; the label is
 still made after the fact, from the photo and the gate's sound, as above.
 Details and the numbers in [local-recognition.md](local-recognition.md).
+
+Since 2026-10-14 it takes **three** shrunk reads in a row, not two, and a
+plate standing still (five reads within 8 % across two seconds) is never
+receding. Both changes came from the passages below.
+
+### Withholding the pulse
+
+The relay is on the operator's step-by-step input. A departing car is let out
+by the exit wand or the auto-open, so a pulse for its rear plate lands on a
+gate that is open or opening: it starts it closing behind the car, or stops it
+dead ([gate-operator.md](gate-operator.md)). From 2026-10-10 18:26 to 10-14
+15:30 UTC the relay pulsed eighteen times for vehicles and **eight were
+departures**; on 10-14 at 13:11 the gate began opening at 13:11:00, our pulse
+went at 13:11:13.85 and a closing run with a latch began three seconds later.
+
+`ActuationCoordinator` now asks, for every automatic grant the cooldown and
+the one-pulse hold would let through, what the grant's own passage says
+(`DepartingPlate.direction_at`; the camera's still, which carries no passage,
+asks the current one, from reads since the latest alarm):
+
+| state | means | under `on` |
+| --- | --- | --- |
+| `departing` | three boxed reads in a row at most 70 % of the widest | withheld, recorded `reason=departing` |
+| `undecided` | the first boxed plate is still the widest, or the latest is more than 15 % below it | held up to 2.0 s while the sweep reads on, then judged again |
+| `approaching` | grown since first boxed, latest near the widest | pulsed now |
+| `standing` | five reads within 8 % across two seconds | pulsed now |
+| `far` | nothing boxed wider than 150 px | pulsed now |
+| none | nothing boxed since the alarm | pulsed now |
+
+`GATE_DEPARTING_WITHHOLD=off|shadow|on`, shipped as `shadow`
+([deployment.md](deployment.md#no-pulse-for-a-car-that-is-leaving)).
+
+**Which signal, measured.** Two exist.
+
+* **The photo** (`direction_vision`, CLIP) read rear at 0.93-0.99 on the
+  departures above. Over the whole record (event 1926 on, 2026-09-17 to 10-14,
+  129 automatic pulses) the *granting* frame read rear with a score of 0.5 or
+  more on 12: eleven are departures by their passage verdict or their plate
+  widths, and the twelfth (10-10 14:49 UTC, rear 0.99) has neither on record.
+  The highest score on the granting frame of a passage judged an arrival was
+  0.32 (09-18 16:56, rear 0.65 front 0.33). It would be the better signal
+  -- it is the only one that sees a car that stops beside the camera -- **but
+  it does not exist while the car is there.** It runs every ten minutes on the
+  photo fetched back from the dashboard once the outbox has delivered it: over
+  the 721 events since 10-01 its verdict came 25 s after the event at the
+  earliest and 455 s at the median, against a pulse 3-9 s after the alarm.
+  The inference itself is cheap (about 0.2 s of CPU a frame on the Pi; seven
+  frames and the model's start cost 2.6 s of CPU at 16:21 today), but running
+  it on the decision path means loading an 84 MB model into the controller
+  and reading the granting frame before every pulse -- latency on every
+  arrival -- with no live record of how it reads the 1920 px sweep frames it
+  would be given rather than the dashboard's copy. Not built here.
+* **The plate widths** are live, cost nothing, and are the signal used. Over
+  every passage the journal holds them for (2026-10-10 18:26 to 10-14 15:30
+  UTC; older journals do not record `plate_px`, and the Pi's own journal has
+  nothing from 10-10 13:51 to 18:26): with the three-read rule,
+  **no arrival passage was judged departing at any read** (20 passages, ten of
+  them let in), and ten of fourteen departures were. The two-read rule judged
+  one arrival departing (10-13 13:37, the detector's box jumping 205 <-> 322
+  px; it was judged 1.1 s *after* its pulse, so no pulse was lost). The four
+  departures never judged: two only ever had two boxed reads (no grant), and
+  two are the same car standing beside the camera for ninety seconds with its
+  plate *growing*, 181 -> 390 px (10-11 10:47-10:49).
+
+**Timing.** The verdict is late by construction: three shrunk reads take about
+a second, and grants come early, often from the camera's still or a cloud
+answer. Replayed on the eighteen pulses through the real judgement (and
+through alarm -> sweep -> processor -> coordinator -> relay in
+`tests/test_departing_withhold.py`):
+
+| | departing (8) | arriving (10) |
+| --- | --- | --- |
+| judged departing when the grant came | 4 | 0 |
+| undecided when it came, departing within the hold | 3 (1.16, 1.25, 1.45 s) | 0 |
+| held at all | 3 | **0** |
+| pulsed | 1 (10-11 10:47, nothing boxed yet) | 10 |
+
+So the check sits at the coordinator, at the moment the pulse would go, and a
+grant waits only when its passage has boxed a plate it cannot yet place. It
+waits there, on the thread that decided the frame, under the coordinator's
+lock, polling the passage; the sweep reads on its own thread meanwhile, and
+nothing in the wait touches the network.
+Pulse-now alone would have caught four of eight; the hold catches three more
+and, on these days, cost no arrival anything. Its cost when it does land on an
+arrival is bounded at 2.0 s -- about a third again of the 5.5 s median from
+alarm to relay -- and it never runs past the grant's decision deadline or its
+frame's freshness, so a held arrival still pulses inside them.
+
+**A withheld car that was arriving** is not stuck. No pulse was sent, so the
+one-pulse hold (invariant 12) has nothing to hold it on. The sweep keeps
+reading (`departing` is a retry reason): once its plate grows back, or stands
+still at the gate for two seconds, the next authorised read is handed over
+and pulses. The next alarm and the camera's still start from its own reads.
+The fob, the keypad and the app's button are never asked, and a press at the
+app ends a hold at once rather than waiting behind it.
+
+**When to switch it on.** It ships in `shadow` because the widths it was
+tuned on are four days long and the three-read rule was chosen knowing the
+13:37 arrival, so its zero on that window is not independent evidence. Switch
+`GATE_DEPARTING_WITHHOLD=on` once the shadow journal covers **at least
+fourteen days and thirty arrivals let in**, and in that time:
+
+1. no `gate_actuation departure=shadow would=withhold` line, and no
+   `stage=settled would=withhold` line, belongs to an arrival -- checked
+   against the photo of the event (the direction scan's `passage_directions`
+   verdict, and by eye for any that is not `exiting` at 0.5 or more);
+2. no `would=hold` line on an arrival settled after more than 1.0 s.
+
+Any arrival judged departing resets the count and is a fault in the rule to
+be understood first, not a threshold to nudge.
 
 Each pass:
 

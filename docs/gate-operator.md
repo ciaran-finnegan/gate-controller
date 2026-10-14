@@ -88,7 +88,7 @@ withhold one.
 6. The proper fix for pulses landing on an open or moving gate is hardware: if
    the operator board has an open-only input (TOPENS `OPSW`+`COM`), move the
    relay to it. That input cannot stop or close the gate. Until then, the
-   direction work (#171) must keep departing cars from pulsing at all.
+   direction work (#171) must keep departing cars from pulsing at all: rule 8.
 7. One car, one automatic pulse. Once the relay has pulsed for a plate, no
    plate read pulses for it again until that plate has been out of the record
    for `GATE_REPULSE_UNSEEN_MINUTES` (10 min), whatever the cooldown says: a
@@ -97,6 +97,19 @@ withhold one.
    `GATE_AUTOMATIC_OPEN=off` pauses automatic opening altogether. Neither
    touches a person's command from the app. Neither is to be lowered or
    switched off for a test.
+8. No automatic pulse for a car that is leaving. A departing car shows the
+   camera its rear plate and is let out by the exit wand or auto-open, so a
+   pulse for it lands on an open or opening gate: from 2026-10-10 to 10-14,
+   eight of eighteen vehicle pulses did, and on 10-14 at 13:11 UTC one closed
+   a gate that had begun opening for the car eleven seconds earlier. Under
+   `GATE_DEPARTING_WITHHOLD=on` the coordinator withholds the pulse when the
+   sweep's plate widths say the car is receding, and holds an undecided grant
+   for at most 2 s while it reads on ([invariant 13](invariants.md),
+   [vehicle-direction.md](vehicle-direction.md#withholding-the-pulse)). It
+   ships in `shadow`, journalling what it would do; it can only withhold or
+   delay a pulse, and a person's command from the app is neither judged nor
+   kept waiting by it. It cannot see a departing car that stops beside the
+   camera, which is one more reason rule 6 is the real fix.
 
 ## Reading the gate from sound
 

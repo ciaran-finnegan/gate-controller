@@ -544,6 +544,7 @@ class AutomaticOpenPauseTests(OnePulsePerCarHarness):
             "automatic_open": False, "automatic_open_source": "environment",
             "repulse_unseen_minutes": 10.0,
             "automatic_cooldown_seconds": 90.0, "command_cooldown_seconds": 20.0,
+            "departing_withhold": "off", "departing_hold_seconds": None,
         })
 
 
