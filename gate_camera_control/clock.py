@@ -40,6 +40,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -58,9 +59,14 @@ MAX_REPORTED_SKEW_SECONDS = 10_000_000
 # What the camera's NTP block is put back to when a writer has switched it
 # off and left no server: the values the commissioning script writes.
 NTP_DEFAULTS = {"server": "pool.ntp.org", "port": 123, "interval": 60}
-# ``systemd-timesyncd`` touches this file on the first successful sync after
-# boot; it lives on tmpfs and so is absent until then.
+# ``systemd-timesyncd`` touches this file on each successful sync; it lives
+# on tmpfs and so is absent until the first one after boot.
 TIMESYNC_STAMP = "/run/systemd/timesync/synchronized"
+# A stamp older than this is not evidence the Pi is synced *now*: timesyncd
+# polls at most every 2048 s by default, so three missed polls is a clock
+# that has lost its source.
+STAMP_MAX_AGE_SECONDS = 3 * 2048
+TIMEDATECTL_TIMEOUT_SECONDS = 5.0
 # ``adjtimex(2)`` returns this clock state while the kernel clock is undisciplined.
 _TIME_ERROR = 5
 
@@ -277,26 +283,59 @@ class ClockWorker:
             self._stopped.wait(self._poll_seconds)
 
 
-def pi_clock_is_synced(*, stamp_path: str = TIMESYNC_STAMP, adjtimex=None) -> bool:
-    """Whether the Pi's own clock has been set by NTP since boot.
+def pi_clock_is_synced(*, stamp_path: str = TIMESYNC_STAMP, adjtimex=None,
+                       timedatectl=None, now=time.time,
+                       max_stamp_age: float = STAMP_MAX_AGE_SECONDS) -> bool:
+    """Whether the Pi's own clock is synced to NTP right now.
 
-    The kernel's own clock state from ``adjtimex`` is the live answer: it is
-    what ``timedatectl`` reports as "System clock synchronized", and it goes
-    back to ``TIME_ERROR`` when the clock has gone undisciplined again since
-    the last sync. When the service's sandbox refuses that syscall, the stamp
-    ``systemd-timesyncd`` leaves on tmpfs after its first successful sync
-    since boot stands in: evidence of a past sync, never contradicted by a
-    live reading. When neither can answer the clock is treated as not synced:
-    a camera left alone is recoverable on the next pass, a camera written
-    with a boot-time clock is wrong until then.
+    Three sources, in order of how live they are:
+
+    * The kernel's clock state from ``adjtimex``, which goes back to
+      ``TIME_ERROR`` when the clock has gone undisciplined since the last
+      sync. The service's sandbox (``ProtectClock=true``) refuses that
+      syscall, so in production this answers only outside the sandbox.
+    * ``timedatectl show -p NTPSynchronized`` over D-Bus, which asks
+      ``systemd-timedated`` for the same kernel state from a process that may
+      read it. This is the live answer inside the sandbox.
+    * The stamp ``systemd-timesyncd`` touches on each successful sync, taken
+      as evidence only while it is fresh: a stamp older than three of
+      timesyncd's longest polls is a clock that has lost its source, and one
+      dated in the future is a clock that has stepped backwards since.
+
+    When nothing can answer the clock is treated as not synced: a camera left
+    alone is recoverable on the next pass, a camera written with a boot-time
+    clock is wrong until then.
     """
     state = _adjtimex_state() if adjtimex is None else adjtimex()
     if state is not None:
         return 0 <= state < _TIME_ERROR
+    answer = _timedatectl_synced() if timedatectl is None else timedatectl()
+    if answer is not None:
+        return bool(answer)
     try:
-        return os.path.exists(stamp_path)
+        age = now() - os.stat(stamp_path).st_mtime
     except OSError:
         return False
+    return 0 <= age <= max_stamp_age
+
+
+def _timedatectl_synced() -> bool | None:
+    try:
+        completed = subprocess.run(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            capture_output=True, text=True, timeout=TIMEDATECTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip().lower()
+    if value == "yes":
+        return True
+    if value == "no":
+        return False
+    return None
 
 
 def _adjtimex_state() -> int | None:

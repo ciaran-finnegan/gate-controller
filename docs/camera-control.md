@@ -649,13 +649,18 @@ unsynchronised: a camera that agrees with an untrusted clock is not `ok`,
 and the camera's NTP is not touched either until the Pi is. The Pi has
 no RTC, and after a power cut this service is up before `systemd-timesyncd`
 has stepped the clock; the first pass used to run at once and could write the
-Pi's boot-time clock into a camera that was right. The check is the kernel
-clock state from `adjtimex` (what `timedatectl` reports as "System clock
-synchronized", and which goes back to unsynced when the clock has gone
-undisciplined since the last sync); when the service's sandbox refuses that
-syscall, the timesyncd stamp at `/run/systemd/timesync/synchronized` stands
-in; when neither can answer the clock is treated as unsynced, which is
-`pi_unsynced` every 5 min in the journal until it clears.
+Pi's boot-time clock into a camera that was right. The check asks, in
+order: the kernel clock state from `adjtimex` (which goes back to unsynced
+when the clock has gone undisciplined since the last sync; the service's
+`ProtectClock=true` sandbox refuses this syscall, so in production it does
+not answer); `timedatectl show -p NTPSynchronized` over D-Bus, which reads
+the same kernel state through `systemd-timedated` and is the live answer
+inside the sandbox; and the timesyncd stamp at
+`/run/systemd/timesync/synchronized`, touched on each successful sync and
+accepted only while it is fresher than three of timesyncd's longest polls
+(6144 s) and not dated in the future. When nothing can answer the clock is
+treated as unsynced, which is `pi_unsynced` every 5 min in the journal
+until it clears.
 
 A correction is `corrected` only when the read-back shows both the time
 within tolerance and the configuration UTC with DST off; a firmware that

@@ -342,25 +342,43 @@ class ClockReconcilerTests(unittest.TestCase):
 
 
 class PiClockIsSyncedTests(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    def _probe(self, stamp, *, adjtimex=None, timedatectl=None, stamp_age=None):
+        if stamp_age is not None:
+            open(stamp, "w").close()
+            os.utime(stamp, (self.NOW - stamp_age, self.NOW - stamp_age))
+        return pi_clock_is_synced(
+            stamp_path=stamp, adjtimex=lambda: adjtimex, timedatectl=lambda: timedatectl,
+            now=lambda: self.NOW,
+        )
+
     def test_the_live_kernel_clock_state_decides_when_it_can_be_read(self):
         with tempfile.TemporaryDirectory() as directory:
             stamp = os.path.join(directory, "synchronized")
-            self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 0))
-            self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 1), "a leap second pending is still synced")
-            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 5), "TIME_ERROR is an undisciplined clock")
+            self.assertTrue(self._probe(stamp, adjtimex=0, timedatectl=False))
+            self.assertTrue(self._probe(stamp, adjtimex=1, timedatectl=False), "a leap second pending is still synced")
+            self.assertFalse(self._probe(stamp, adjtimex=5, timedatectl=True, stamp_age=10), "TIME_ERROR is an undisciplined clock")
 
-    def test_a_stamp_from_an_earlier_sync_never_outranks_a_live_unsynced_reading(self):
+    def test_inside_the_sandbox_timedatectl_is_the_live_answer(self):
+        """ProtectClock=true refuses adjtimex to the service; timedated reads
+        the same kernel state for it over D-Bus, so a stamp from an earlier
+        sync never outranks a live `no`."""
         with tempfile.TemporaryDirectory() as directory:
             stamp = os.path.join(directory, "synchronized")
-            open(stamp, "w").close()
-            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: 5))
+            self.assertTrue(self._probe(stamp, timedatectl=True))
+            self.assertFalse(self._probe(stamp, timedatectl=False, stamp_age=10))
 
-    def test_the_stamp_stands_in_when_the_sandbox_refuses_adjtimex(self):
+    def test_without_a_live_answer_only_a_fresh_stamp_counts(self):
+        """timesyncd touches the stamp on every successful sync, so its age
+        says how long the Pi has been without one."""
         with tempfile.TemporaryDirectory() as directory:
             stamp = os.path.join(directory, "synchronized")
-            self.assertFalse(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: None), "nothing can answer: not trusted")
-            open(stamp, "w").close()
-            self.assertTrue(pi_clock_is_synced(stamp_path=stamp, adjtimex=lambda: None))
+            self.assertFalse(self._probe(stamp), "nothing can answer: not trusted")
+            self.assertTrue(self._probe(stamp, stamp_age=10))
+            self.assertTrue(self._probe(stamp, stamp_age=3 * 2048))
+            self.assertFalse(self._probe(stamp, stamp_age=3 * 2048 + 1), "three missed polls is a lost source")
+            self.assertFalse(self._probe(stamp, stamp_age=-60), "a stamp from the future is a clock that stepped back")
 
     def test_the_default_probe_runs_without_raising(self):
         # Whether this host is synced is the host's business; the probe must
