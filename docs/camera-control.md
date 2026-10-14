@@ -701,7 +701,7 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
 | `GATE_CAMERA_TALK_ENABLED` | no | `false` | exactly `true` or `false`; with `false` the service never opens the camera's port 9000 |
 | `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session; a request for longer is clamped to it |
-| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; hourly `GetTime`/`SetTime` reconcile of the camera clock to UTC |
+| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; the `GetTime`/`SetTime`/`GetNtp`/`SetNtp` reconcile of the camera clock to UTC, hourly when the clock is found right and every 5 min otherwise |
 | `GATE_CAMERA_NIGHT_VISION_ISP` | no | `true` | `true` or `false`; an IR lease to `Auto` also switches `Isp.dayNight` to `Black&White` and restores the block exactly when it ends. `false` is the IR-only lease |
 
 Validate a file without starting the service:
@@ -1171,23 +1171,33 @@ on-demand 4K still", and the app should not render a `Clearer` option at all
 (access-gate-ui#33 §4 hides it unless the controller reports the second path
 ready).
 
-## When only the DST flag moves
+## When the DST flag, or the zone, moves
 
-The reconciler will not touch a camera showing a zone somebody chose: the skew
-it measures then includes their offset, and "correcting" it would be wrong.
+Until 2026-09-18 the reconciler would not touch a camera showing anything
+but `timeZone 0` with DST off, on the reasoning that a zone somebody chose
+includes their offset in the measured skew and "correcting" it would be
+wrong. Until 2026-10 it still refused any zone other than `0`.
 
-`timeZone 0` with DST **on** is not that. It is the state this camera keeps
-being put back into by something outside the controller -- fixed on
-2026-09-16, back by 12:43 on the 17th -- and the firmware then counts the
-one-hour offset twice and sits two hours ahead of UTC. That is what rejected
-every webhook as `stale` and stopped recognition entirely in September.
+`timeZone 0` with DST **on** is the state this camera keeps being put back
+into by something outside the controller -- fixed on 2026-09-16, back by
+12:43 on the 17th -- and the firmware then counts the one-hour offset twice
+and sits two hours ahead of UTC. That is what rejected every webhook as
+`stale` and stopped recognition entirely in September. Refusing to act on
+it was the worst of both: the reconciler logged `skipped_config
+skew_seconds=+7200` every hour for sixteen hours, seeing the fault clearly
+and declining to do anything about it.
 
-Refusing to act on it was the worst of both: the reconciler logged
-`skipped_config skew_seconds=+7200` every hour for sixteen hours, seeing the
-fault clearly and declining to do anything about it. It now corrects that one
-case, turning DST off with the same write it already made.
+A foreign zone is no different in effect: the camera stamps every alarm
+`+0000` whatever it displays, so there is no zone this system can honour
+but UTC, and a phone app's "sync with phone time" from another zone is as
+much a fault as the NVR's DST push. The reconciler now corrects every
+configuration that is not `timeZone 0` with DST off (see
+[Camera clock reconcile](#camera-clock-reconcile)); `skipped_config` is
+no longer produced and stays in the outcome set only so an older state
+file still parses.
 
-It does not manage NTP. Enabling NTP is what pulled the clock back to within a
-second in under a minute on 2026-09-18, and it was found disabled at the same
-time DST was re-enabled, so both are worth checking after anyone has been in
-the camera's web interface.
+It also manages NTP. Enabling NTP is what pulled the clock back to within a
+second in under a minute on 2026-09-18, and it was found disabled at the
+same time DST was re-enabled, so each pass reads `GetNtp` and turns it back
+on when found off. Both are still worth checking by hand after anyone has
+been in the camera's web interface; the journal line says what was found.
