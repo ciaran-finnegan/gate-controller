@@ -71,6 +71,44 @@ names disappears.
   touch the same function, merge one, rebase the other, re-test.
 - A change to an invariant is a change to `docs/invariants.md` in the same PR.
 
+## The Pi has no fan
+
+The Pi 5 at the gate has no fan and no active cooler (confirmed by the owner
+on 2026-10-11; the board exposes no `cooling_fan` device). Its firmware
+throttles at 85 °C. The hourly `soc_temp_c` in D1 (`controller_health_hour`,
+kept from 2026-09-07) is the record:
+
+- **Normal running, every car's sweep included:** from 12 Sep to 11 Oct the
+  board averaged 54-65 °C a day, with daily peaks of 57-74 °C. 7-11 Sep ran
+  warmer, averaging 65-69 °C.
+- **Every reading above 75 °C was minutes of all-core work, never the plate
+  reader.** On 17 Sep (83-87 °C) and 21 Sep (78.8 °C), each came in the hour
+  a release was installed. On 10 Oct (84.2 °C, 07:55 IST), a video-decode
+  test ran the Pi out of memory.
+- **What the record cannot show:** each reading is a spot sample taken at a
+  heartbeat, so a few-second peak during a sweep would not appear. There are
+  no summer readings yet.
+
+What follows:
+
+- Do not decode video, run the full test suite, or run benchmarks lasting
+  minutes on the Pi. The on-device suite held it at 84 °C for six hours on
+  2026-09-07 ([deployment.md](docs/deployment.md)).
+- The reader works one frame at a time, and only while a camera event is
+  live. Do not add a continuous loop.
+- `GATE_LOCAL_OCR_THREADS=1` rests on the September benchmark in
+  [the thermal constraint](docs/local-recognition.md#the-thermal-constraint-which-is-the-real-constraint),
+  taken while the board idled at 71-74 °C. It has run 10-15 °C cooler
+  since. So raising the count is a measured change, not one that waits for a
+  cooler:
+  - First measure the peak of a short burst on the board, sampling the
+    thermal zone at least once a second, with no car about and a stop at
+    80 °C.
+  - Then watch `soc_temp_c` and the sweep's `read_fps` in live use.
+  - Fit the official Active Cooler if those numbers call for it.
+- Anything else that adds CPU per frame (a wider decode, a larger model) is
+  measured on a workstation first, then on the board in the same way.
+
 ## Other things that have bitten
 
 - Merging to `master` deploys to the Pi within ~5 minutes of CI passing.
