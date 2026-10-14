@@ -112,7 +112,9 @@ def scan_segment(model: GateSoundModel, path, started_at: datetime):
     the classifier called the motor that do not have the motor's band in them
     (``motor_seconds_heard``) -- a car's engine, or the camera's alarm sound.
     They are not movements; ``movements_from`` uses them only to move its
-    alternation (a car at a shut gate is an opening nobody heard).
+    alternation to open, whatever it was before (a car at the gate is an
+    opening nobody heard, and on 14 Oct 19:16 UTC the opening the relay had
+    just commanded ran inside the arriving car's engine).
 
     The two detectors cost wildly different amounts. YAMNet is a MobileNet and
     runs at a fraction of a core. ``analyse_frames`` is a pure-Python FFT over

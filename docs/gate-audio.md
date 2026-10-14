@@ -1062,16 +1062,44 @@ What this is not:
 
 A run that is not written still means a car was at the gate, and a car at a
 shut gate is the commonest reason an opening is not heard. So `movements_from`
-takes the engines as `vehicles`: one at a shut gate moves the alternation to
-open and nothing is written for it. Without that, each of those five closings
-would be read as an opening and counted as somebody's fob. It only ever
-points toward "open": a run is still only `shut` when a latch is heard at its
-end. It is wrong when a car arrives and the gate's opening *is* heard (14 Oct
-14:11: engine, then the opening at relay +3 s), which is read as a closing --
-exactly as it was before, when the engine was written as the opening. And the
-alternation does not carry from one scan to the next except through the last
-row written, so a car at the end of one quarter-hour scan and the closing in
-the next read the closing as an opening.
+takes the engines as `vehicles`: each one moves the alternation to open,
+whatever the scan believed before it (shut, open, or the `unknown` a scan
+starts from when nothing has been written), and nothing is written for it.
+Without that, each of those five closings would be read as an opening and
+counted as somebody's fob. It only ever points toward "open": a run is still
+only `shut` when a latch is heard at its end. It is wrong when a car arrives
+and the gate's opening *is* heard (14 Oct 14:11: engine, then the opening at
+relay +3 s), which is read as a closing -- exactly as it was before, when the
+engine was written as the opening. And the alternation does not carry from
+one scan to the next except through the last row written, so a car at the
+end of one quarter-hour scan and the closing in the next read the closing as
+an opening.
+
+**The commonest passage, as the Pi heard it on 14 Oct 19:16 UTC.** The relay
+pulsed at 19:16:18 for an arriving authorised car. Its engine ran from
+19:16:11 to 19:16:39 and the opening (relay +1-2 s, ~20 s) ran under it, so
+the whole run was set aside as not the motor (`motor_seconds=0.0`). The
+auto-close ran at 19:17:04, 25 s after the engine stopped, and was written
+`open`, `confirmed`, `uncommanded: False`, with no latch -- and the heartbeat
+then reported the gate open, with the left-open check at `possible` after
+ten minutes. That row is not the alternation reading the closing as an
+opening, though the row alone cannot show it: the engine had moved the
+alternation to open (the three scans before had ended `final_state=unknown`,
+which starts the scan from shut, and the engine moves it from there as from
+anywhere), so the run was read as a *closing*, and a closing with no clang
+within 4 s of its end is written `open` because nothing says the leaves met
+([2e](#2e-the-latch-why-closings-looked-unreliable); CLAUDE.md rule 1).
+`confirmed` is the relay firing 46 s before it: every run within 75 s of a
+firing is marked commanded, the auto-close included, which is why
+`uncommanded` is only ever asked of an opening. Before this work the engine
+would have been written as the opening and the same closing written `open`
+for the same want of a latch, so the heartbeat read the same. It is the
+ordinary missed latch of [2h](#2h-left-open-the-first-thing-a-person-is-told),
+shown and not pushed. `tests/test_gate_sound_engines.py::ACommandedOpeningUnderTheEngine`
+takes this passage through the real path from each starting state, with the
+latch (read shut) and without (one run, `possible`, never `likely`), with a
+pulse that lands inside the engine run or just before it, and without any
+pulse at all (a fob at a shut gate; a departing car the exit wand opens for).
 
 ### Runs are no longer cut at a whole minute
 

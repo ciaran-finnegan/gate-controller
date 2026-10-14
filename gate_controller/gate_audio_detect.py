@@ -442,13 +442,18 @@ def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut"
     ``vehicles`` are runs the classifier called the motor that turned out to
     be a car's engine (``motor_seconds_heard`` under
     ``MOTOR_MIN_SECONDS_HEARD``). They are not movements and
-    nothing is returned for them, but one at a shut gate moves the alternation
-    to open: a car at the gate is the commonest reason an opening is not
-    heard. On 12-14 Oct, five of the nine motor runs the scanner kept were
-    closings whose opening was under an idling or arriving engine; without
-    this every one of them would be read as an opening. The assumption only
-    ever points toward "open" -- a run is still only "shut" if a latch is
-    heard at its end -- so it can never be what says the property is secured.
+    nothing is returned for them, but each one moves the alternation to open,
+    whatever it was before: a car at the gate is the commonest reason an
+    opening is not heard, and when the relay fired inside the engine run
+    (14 Oct 19:16 UTC: pulse at +7 s, the auto-close 25 s after the engine
+    stopped) the opening it commanded is under that engine. On 12-14 Oct,
+    five of the nine motor runs the scanner kept were closings whose opening
+    was under an idling or arriving engine; without this every one of them
+    would be read as an opening, and the relay firing -- which marks every run
+    within ``COMMAND_AFTER_SECONDS`` of it as ``commanded``, the auto-close
+    included -- would not tell them apart. The assumption only ever points
+    toward "open" -- a run is still only "shut" if a latch is heard at its
+    end -- so it can never be what says the property is secured.
     """
     runs = sorted(runs, key=lambda run: run.start)
     clangs = list(clangs)

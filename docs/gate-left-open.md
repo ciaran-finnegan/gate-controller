@@ -172,7 +172,12 @@ The heartbeat's `gate.left_open` block reports two levels of confidence:
 * **`likely`** means the rule above fired. The app pushes it.
 * **`possible`** means the last movement was not confirmed shut and the gate
   has been quiet for N minutes since. This is the ordinary missed-latch case,
-  about 6 a week. The app shows it and does not push it.
+  about 6 a week. The app shows it and does not push it. 2026-10-14 19:17 UTC
+  is one: the auto-close after a commanded opening that ran under the
+  arriving car's engine, read as a closing and written `open` because no
+  latch was heard within 4 s of its end
+  ([gate-audio.md 2i](gate-audio.md#2i-engines-the-alarm-sound-and-split-runs)).
+  One run on its own is never `likely`.
 
 ## Running it
 
