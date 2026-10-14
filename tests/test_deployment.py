@@ -3922,7 +3922,7 @@ class DependencyLockTests(unittest.TestCase):
             # Their transitive closure, pinned to the same resolution.
             "numpy": "2.4.6",
             "opencv-python-headless": "5.0.0.93",
-            "protobuf": "7.36.1",
+            "protobuf": "7.36.2",
             "flatbuffers": "25.12.19",
             "packaging": "26.3",
             "PyYAML": "6.0.3",
