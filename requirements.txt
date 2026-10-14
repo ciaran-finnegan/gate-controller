@@ -4,9 +4,9 @@ watchdog==6.0.0
 
 # Exact transitive dependencies of requests; keep these aligned with its metadata.
 certifi==2026.7.22
-charset-normalizer==3.5.0
-idna==3.18
-urllib3==2.7.0
+charset-normalizer==3.5.2
+idna==3.20
+urllib3==2.8.0
 
 # RPi.GPIO-compatible gpiochip provider, including Raspberry Pi 5 support.
 rpi-lgpio==0.6; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
@@ -53,12 +53,12 @@ fast-plate-ocr==1.1.0; (platform_machine == "aarch64" or platform_machine == "ar
 # Same markers, so a release still installs nothing new on x86-64 CI.
 numpy==2.4.6; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 opencv-python-headless==5.0.0.93; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
-protobuf==7.36.1; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+protobuf==7.36.2; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 flatbuffers==25.12.19; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 packaging==26.3; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 PyYAML==6.0.3; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 rich==15.0.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
-tqdm==4.70.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
+tqdm==4.70.1; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 markdown-it-py==4.2.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 mdurl==0.1.2; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
 Pygments==2.21.0; (platform_machine == "aarch64" or platform_machine == "arm64") and python_version >= "3.11"
