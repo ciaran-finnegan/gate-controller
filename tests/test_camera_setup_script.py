@@ -183,9 +183,15 @@ class TheClock(unittest.TestCase):
             self.assertNotIn("SetTime", run.commands())
             self.assertNotIn("Dst", run.plan_text)
 
-    def test_a_camera_displaying_local_time_is_reported_not_corrected(self):
+    def test_a_camera_displaying_local_time_is_left_to_the_reconciler_not_the_ui(self):
+        """The correction belongs to gate-camera-control, which now puts any
+        zone or DST setting back to UTC itself. Sending the operator to the
+        camera's Date and Time page would prompt the very save that writes
+        the clock wrong."""
         with DryRun(AS_FITTED) as run:  # the fixture has DST on, as fitted
             self.assertIn("timeZone 0 with DST off", run.stdout)
+            self.assertIn("corrects this itself", run.stdout)
+            self.assertIn("do nothing in the camera UI", run.stdout)
             self.assertNotIn("SetTime", run.commands())
 
 

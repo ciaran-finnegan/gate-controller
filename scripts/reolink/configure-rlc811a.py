@@ -340,10 +340,12 @@ def configure_clock(session):
     print("  GetTime: timeZone=%s Dst.enable=%s (want 0 / 0, i.e. the camera displays UTC)" % (zone, dst))
     if zone != 0 or dst != 0:
         session.warn(
-            "camera is not on timeZone 0 with DST off, so gate-camera-control "
-            "will report skew and leave it alone. Fix it in the camera UI "
-            "(Date and Time), not from here: SetTime takes the displayed time "
-            "and the firmware adds the DST hour on top."
+            "camera is not on timeZone 0 with DST off. gate-camera-control "
+            "corrects this itself within minutes of its next pass (journal "
+            "stage=clock_reconcile), so do nothing in the camera UI: a save of "
+            "the Date and Time page is one of the writers that puts it wrong, "
+            "and SetTime is not sent from here because it takes the displayed "
+            "time and the firmware adds the DST hour on top."
         )
 
 

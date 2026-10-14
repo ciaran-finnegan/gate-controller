@@ -1570,18 +1570,19 @@ class ServiceFacadeTests(unittest.TestCase):
                          "night.py", "focus.py", "talk.py")
         )
 
-        # The clock reconcile adds exactly GetTime and SetTime: the camera's
-        # displayed time and DST block, nothing that touches the picture. The
-        # spotlight adds exactly GetWhiteLed and SetWhiteLed, and only ever
-        # sends `state` -- never the automation `mode` or the brightness. The
-        # refocus nudge adds exactly GetZoomFocus and StartZoomFocus, and only
-        # ever with the zoom operation: no focus position, no autofocus mode.
+        # The clock reconcile adds exactly GetTime, SetTime, GetNtp and SetNtp:
+        # the camera's displayed time, DST block and NTP switch, nothing that
+        # touches the picture. The spotlight adds exactly GetWhiteLed and
+        # SetWhiteLed, and only ever sends `state` -- never the automation
+        # `mode` or the brightness. The refocus nudge adds exactly
+        # GetZoomFocus and StartZoomFocus, and only ever with the zoom
+        # operation: no focus position, no autofocus mode.
         # Night vision adds exactly GetIsp and SetIsp, and SetIsp is sent from
         # one place with nothing but a whole block the camera gave us.
         self.assertEqual(frozenset({
             "Login", "GetIrLights", "SetIrLights", "GetWhiteLed", "SetWhiteLed",
             "Snap", "GetTime", "SetTime", "GetZoomFocus", "StartZoomFocus",
-            "GetIsp", "SetIsp",
+            "GetIsp", "SetIsp", "GetNtp", "SetNtp",
         }), ALLOWED_COMMANDS)
         self.assertIn('"WhiteLed": {"channel": 0, "state": 1 if state == "On" else 0}', text)
         self.assertEqual(1, text.count('self._command("SetIsp"'))

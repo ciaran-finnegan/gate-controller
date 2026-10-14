@@ -250,18 +250,34 @@ Guards:
 
 ## 8. The camera's clock is UTC, and the Pi owns it
 
-The camera displays UTC (zone 0, DST off), and the Pi corrects it hourly if it
-drifts more than 5 s. Camera alarms are matched to frames by time, so a camera
-clock that is wrong makes every alarm look stale. The camera's overlay is
-therefore an hour behind Irish summer time, on purpose.
+The camera displays UTC (zone 0, DST off), and the Pi checks it hourly and
+corrects it if it drifts more than 5 s or shows any other zone or DST setting;
+a correction, an unanswering camera or an unsynced Pi is looked at again after
+5 min. Camera alarms are stamped `+0000` whatever the camera displays and are
+matched to frames by time, so a camera clock that is wrong makes every alarm
+look stale. The camera's overlay is therefore an hour behind Irish summer
+time, on purpose.
+
+Nothing is written to the camera -- time, zone or NTP -- while the Pi's own
+clock is not synchronised (`pi_unsynced`): the Pi has no RTC, and a pass
+before timesyncd has stepped the clock would write its boot-time clock into a
+camera that was right. A correction is `corrected` only when the read-back
+shows UTC within tolerance; otherwise it is `correction_failed`, never
+`synced`.
 
 - **2026-09-16** -- the NVR pushed the camera a clock two hours out; every
   camera alarm was refused for four days. Fixed by #147.
+- **2026-10** -- a zone other than 0 was reported as the operator's choice and
+  left alone, so one phone "sync with phone time" or NVR push could stop
+  recognition for good. Fixed by #198, which also stopped writes from an
+  unsynced Pi and turns the camera's NTP back on when it is found off.
 
 Guards:
 
 - `tests/test_camera_clock.py::test_a_clock_two_hours_ahead_is_written_back_to_utc`
-- `tests/test_camera_clock.py::test_a_zone_somebody_chose_is_reported_but_never_written`
+- `tests/test_camera_clock.py::test_a_zone_somebody_chose_is_corrected_too`
+- `tests/test_camera_clock.py::test_a_correction_that_will_not_hold_is_reported_not_claimed`
+- `tests/test_camera_clock.py::test_nothing_is_written_while_the_pi_clock_is_unsynced`
 
 ## 9. The Pi only runs a release whose exact commit passed CI on master
 

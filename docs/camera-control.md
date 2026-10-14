@@ -40,12 +40,14 @@ lease and the block restored exactly afterwards; no exposure, shutter or gain
 value originates here ([Night vision](#night-vision-the-isp-half-of-the-ir-lease)).
 The `api.cgi` command allowlist is exactly `Login`, `GetIrLights`,
 `SetIrLights`, `GetWhiteLed`, `SetWhiteLed`, `Snap`, `GetTime`, `SetTime`,
-`GetZoomFocus`, `StartZoomFocus`, `GetIsp` and `SetIsp`, and no request body
-can widen it. `StartZoomFocus` is only ever sent with the operation `ZoomPos`:
-nothing in the service can write a focus position or change the autofocus mode
-(see [Refocus](#refocus)). `SetIsp` only ever takes a whole block `GetIsp`
-returned. The Baichuan (port 9000) message set used for
-push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
+`GetZoomFocus`, `StartZoomFocus`, `GetIsp`, `SetIsp`, `GetNtp` and `SetNtp`,
+and no request body can widen it. `StartZoomFocus` is only ever sent with the
+operation `ZoomPos`: nothing in the service can write a focus position or
+change the autofocus mode (see [Refocus](#refocus)). `SetIsp` only ever takes a
+whole block `GetIsp` returned. `GetNtp` and `SetNtp` belong to the clock
+reconcile, which only ever turns the camera's NTP back on (see
+[Camera clock reconcile](#camera-clock-reconcile)). The Baichuan (port 9000)
+message set used for push-to-talk is closed the same way — `Login`, `Logout`, `TalkAbility`,
 `TalkConfig`, `Talk`, `TalkReset` — and is never opened at all unless
 `GATE_CAMERA_TALK_ENABLED=true` (see [talkback.md](talkback.md)).
 
@@ -623,21 +625,65 @@ because the NVR that records the camera pushed it a clock two hours out (see
 [reviews/2026-09-16-rlc-811a-first-week.md](reviews/2026-09-16-rlc-811a-first-week.md)).
 The Pi is NTP-synced and already holds the only camera credentials, so this
 service owns the camera clock: with `GATE_CAMERA_CLOCK_SYNC=true` (the
-default) it reads `GetTime` once an hour and, when the displayed time is more
-than 5 s from UTC, writes `SetTime` with UTC. `GetTime` and `SetTime` are the
-only additions to the command allowlist.
+default) it reads `GetTime` once an hour and, when the camera is not
+displaying UTC to within 5 s, writes `SetTime` with UTC, `timeZone 0` and
+DST off. `GetTime`, `SetTime`, `GetNtp` and `SetNtp` are the only additions
+to the command allowlist.
 
-It only corrects a camera configured to *display* UTC: `timeZone 0` with DST
-disabled. `SetTime` takes the displayed time and the firmware shifts it by
-the DST hour when that flag changes in the same write, so any other
-configuration is reported as skew and left alone. A camera that would not
-answer is asked again after 5 min rather than an hour.
+The camera stamps every alarm `+0000` whatever it displays, so a camera that
+displays anything but UTC is a camera the controller cannot trust, and the
+reconciler treats every configuration that way: a zone pushed by the NVR's
+channel time sync, by a phone app's "sync with phone time" from another time
+zone, or by a save of the camera's Date and Time page is corrected, not
+reported and left. (Until 2026-10 a zone other than `0` was `skipped_config`
+and never touched, which is how one phone sync could stop recognition for
+good.) A correction is read back; because `SetTime` carries the *displayed*
+time and the firmware shifts it by the DST hour when that flag changes in the
+same write, a correction that did not land is written once more with the
+configuration now unchanged, and the residual is what the state reports. The
+camera's own NTP is read on every pass and turned back on when the same
+writer has switched it off.
+
+Nothing is written, and no verdict is given, while the Pi's own clock is
+unsynchronised: a camera that agrees with an untrusted clock is not `ok`,
+and the camera's NTP is not touched either until the Pi is. The Pi has
+no RTC, and after a power cut this service is up before `systemd-timesyncd`
+has stepped the clock; the first pass used to run at once and could write the
+Pi's boot-time clock into a camera that was right. The check asks, in
+order: the kernel clock state from `adjtimex` (which goes back to unsynced
+when the clock has gone undisciplined since the last sync; the service's
+`ProtectClock=true` sandbox refuses this syscall, so in production it does
+not answer); `timedatectl show -p NTPSynchronized` over D-Bus, which reads
+the same kernel state through `systemd-timedated` and is the live answer
+inside the sandbox; and the timesyncd stamp at
+`/run/systemd/timesync/synchronized`, touched on each successful sync and
+accepted only while it is fresher than three of timesyncd's longest polls
+(6144 s) and not dated in the future. When nothing can answer the clock is
+treated as unsynced, which is `pi_unsynced` every 5 min in the journal
+until it clears.
+
+A correction is `corrected` only when the read-back shows both the time
+within tolerance and the configuration UTC with DST off; a firmware that
+took the time but not the configuration gets one more write and is then
+`correction_failed`. A clock found right whose NTP could not be read is
+looked at again after 5 min rather than an hour.
+
+A clock found right is read again in an hour. Everything else (a correction,
+`pi_unsynced`, a camera that would not answer) is looked at again after
+5 min, so a writer that keeps moving the clock is caught within minutes and
+the journal shows the fight, rather than the camera being wrong for most of
+an hour between passes.
 
 State (`camera_control.clock`): `synced`, `outcome` (`not_checked`, `ok`,
-`corrected`, `skipped_config`, `camera_busy`, `camera_unreachable`,
-`camera_error`, `disabled`), `skew_seconds` (camera minus Pi, integer, null
-when unknown), `checked_at`, `corrections`. Journal:
-`gate_camera_control stage=clock_reconcile outcome=… skew_seconds=+N`.
+`corrected`, `correction_failed`, `skipped_config`, `pi_unsynced`,
+`camera_busy`, `camera_unreachable`, `camera_error`, `disabled`),
+`skew_seconds` (camera minus Pi, integer, null when unknown), `checked_at`,
+`corrections`. Journal: `gate_camera_control stage=clock_reconcile outcome=…
+skew_seconds=+N time_zone=Z dst=D ntp=on|restored|unknown`, where
+`time_zone` and `dst` are what the camera was found displaying (the NVR's
+signature is `0`/`1`, a phone's is its own zone in seconds, and `-1` is a
+field the camera did not report, which is never taken as UTC) and `ntp` says
+whether the camera's NTP was on or had to be restored.
 
 ## Environment
 
@@ -656,7 +702,7 @@ anything outside this table is rejected. Template:
 | `GATE_CAMERA_IR_LEASE_MAX_MINUTES` | no | `60` | 1–60 |
 | `GATE_CAMERA_TALK_ENABLED` | no | `false` | exactly `true` or `false`; with `false` the service never opens the camera's port 9000 |
 | `GATE_CAMERA_TALK_MAX_SECONDS` | no | `30` | whole seconds 5–60: the hard limit on one push-to-talk session; a request for longer is clamped to it |
-| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; hourly `GetTime`/`SetTime` reconcile of the camera clock to UTC |
+| `GATE_CAMERA_CLOCK_SYNC` | no | `true` | `true` or `false`; the `GetTime`/`SetTime`/`GetNtp`/`SetNtp` reconcile of the camera clock to UTC, hourly when the clock is found right and every 5 min otherwise |
 | `GATE_CAMERA_NIGHT_VISION_ISP` | no | `true` | `true` or `false`; an IR lease to `Auto` also switches `Isp.dayNight` to `Black&White` and restores the block exactly when it ends. `false` is the IR-only lease |
 
 Validate a file without starting the service:
@@ -1126,23 +1172,33 @@ on-demand 4K still", and the app should not render a `Clearer` option at all
 (access-gate-ui#33 §4 hides it unless the controller reports the second path
 ready).
 
-## When only the DST flag moves
+## When the DST flag, or the zone, moves
 
-The reconciler will not touch a camera showing a zone somebody chose: the skew
-it measures then includes their offset, and "correcting" it would be wrong.
+Until 2026-09-18 the reconciler would not touch a camera showing anything
+but `timeZone 0` with DST off, on the reasoning that a zone somebody chose
+includes their offset in the measured skew and "correcting" it would be
+wrong. Until 2026-10 it still refused any zone other than `0`.
 
-`timeZone 0` with DST **on** is not that. It is the state this camera keeps
-being put back into by something outside the controller -- fixed on
-2026-09-16, back by 12:43 on the 17th -- and the firmware then counts the
-one-hour offset twice and sits two hours ahead of UTC. That is what rejected
-every webhook as `stale` and stopped recognition entirely in September.
+`timeZone 0` with DST **on** is the state this camera keeps being put back
+into by something outside the controller -- fixed on 2026-09-16, back by
+12:43 on the 17th -- and the firmware then counts the one-hour offset twice
+and sits two hours ahead of UTC. That is what rejected every webhook as
+`stale` and stopped recognition entirely in September. Refusing to act on
+it was the worst of both: the reconciler logged `skipped_config
+skew_seconds=+7200` every hour for sixteen hours, seeing the fault clearly
+and declining to do anything about it.
 
-Refusing to act on it was the worst of both: the reconciler logged
-`skipped_config skew_seconds=+7200` every hour for sixteen hours, seeing the
-fault clearly and declining to do anything about it. It now corrects that one
-case, turning DST off with the same write it already made.
+A foreign zone is no different in effect: the camera stamps every alarm
+`+0000` whatever it displays, so there is no zone this system can honour
+but UTC, and a phone app's "sync with phone time" from another zone is as
+much a fault as the NVR's DST push. The reconciler now corrects every
+configuration that is not `timeZone 0` with DST off (see
+[Camera clock reconcile](#camera-clock-reconcile)); `skipped_config` is
+no longer produced and stays in the outcome set only so an older state
+file still parses.
 
-It does not manage NTP. Enabling NTP is what pulled the clock back to within a
-second in under a minute on 2026-09-18, and it was found disabled at the same
-time DST was re-enabled, so both are worth checking after anyone has been in
-the camera's web interface.
+It also manages NTP. Enabling NTP is what pulled the clock back to within a
+second in under a minute on 2026-09-18, and it was found disabled at the
+same time DST was re-enabled, so each pass reads `GetNtp` and turns it back
+on when found off. Both are still worth checking by hand after anyone has
+been in the camera's web interface; the journal line says what was found.
