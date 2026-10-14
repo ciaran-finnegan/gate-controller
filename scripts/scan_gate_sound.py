@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gate_controller.audio_segments import SegmentStore, load_segment_config  # noqa: E402
+from gate_controller.gate_alarm_sound import heard_rows  # noqa: E402
 from gate_controller.gate_sound_scan import (  # noqa: E402
     already_scanned, measure_listening, record, scan,
 )
@@ -120,11 +121,14 @@ def main(argv=None) -> int:
 def last_state(connection) -> str:
     """Where the gate was left, so the next scan's alternation starts right."""
     try:
-        row = connection.execute(
-            "SELECT outcome FROM gate_movements ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
+        # The camera's alarm sound is not the gate (gate_alarm_sound.py), so it
+        # cannot be where the gate was left.
+        row = next(heard_rows(connection, connection.execute(
+            "SELECT started_at, outcome FROM gate_movements ORDER BY started_at DESC LIMIT 48"
+        )), None)
     except sqlite3.Error:
         return "shut"
+    row = None if row is None else (row[1],)
     return row[0] if row and row[0] in {"shut", "open"} else "shut"
 
 

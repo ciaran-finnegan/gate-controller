@@ -32,6 +32,7 @@ import subprocess
 from .audio_segments import (
     GapLedger, SegmentStore, listening_gaps, segment_coverage, segment_started_at,
 )
+from .gate_alarm_sound import heard_rows
 from .gate_audio_detect import (
     CONFIRMED, FRAME_SAMPLES, UNCONFIRMED, analyse_frames, find_clangs,
     movements_from, summarise,
@@ -47,6 +48,9 @@ CHUNK_SECONDS = 60
 #: Stamped on every row, so a movement judged by the model trained on four
 #: cycles is never silently compared with one judged by its replacement.
 DETECTOR = "yamnet-linear-v2"
+#: How far back the heartbeat looks for the newest row that is the gate and
+#: not the camera's alarm sound (gate_alarm_sound.py).
+LAST_MOVEMENT_READ_LIMIT = 48
 
 
 @dataclass(frozen=True)
@@ -351,31 +355,25 @@ def gate_state(connection, *, now=None, recent_hours: int = 24,
     """
     moment = now or datetime.now(timezone.utc)
     try:
-        last = connection.execute(
+        # Rows that are the camera's own alarm sound (recorded at every
+        # vehicle alarm until 2026-10-10 15:27 IST; gate_alarm_sound.py) are
+        # not the gate, and are left out of the state and every count.
+        last = next(heard_rows(connection, connection.execute(
             "SELECT started_at, ended_at, outcome, confirmation FROM gate_movements"
-            " ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
+            " ORDER BY started_at DESC LIMIT ?", (LAST_MOVEMENT_READ_LIMIT,),
+        )), None)
         since = (moment - _seconds(recent_hours * 3600)).isoformat()
-        counts = dict(connection.execute(
-            "SELECT outcome, COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " GROUP BY outcome", (since,),
-        ))
-        uncommanded = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ? AND uncommanded = 1",
-            (since,),
-        ).fetchone()[0]
-        confirmed = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND confirmation = ?", (since, CONFIRMED),
-        ).fetchone()[0]
-        unconfirmed = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND confirmation = ?", (since, UNCONFIRMED),
-        ).fetchone()[0]
-        latches = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND latch_at IS NOT NULL", (since,),
-        ).fetchone()[0]
+        recent = list(heard_rows(connection, connection.execute(
+            "SELECT started_at, outcome, uncommanded, confirmation, latch_at"
+            " FROM gate_movements WHERE started_at >= ?", (since,),
+        )))
+        counts: dict = {}
+        for _started, outcome, _uncommanded, _confirmation, _latch in recent:
+            counts[outcome] = counts.get(outcome, 0) + 1
+        uncommanded = sum(1 for row in recent if row[2] == 1)
+        confirmed = sum(1 for row in recent if row[3] == CONFIRMED)
+        unconfirmed = sum(1 for row in recent if row[3] == UNCONFIRMED)
+        latches = sum(1 for row in recent if row[4] is not None)
         scanned = connection.execute(
             "SELECT COUNT(*), MAX(scanned_at) FROM gate_sound_scans"
         ).fetchone()

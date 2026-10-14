@@ -40,7 +40,10 @@ did** ([reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md)):
 - Overnight, motor-like runs at 23:24, 00:25 and 00:26, and a closing run with
   a latch at 01:32, were heard; the scanner wrote none of them.
 
-The alarm sound was switched off on 2026-10-10 at 15:27 IST.
+The alarm sound was switched off on 2026-10-10 at 15:27 IST. Since 2026-10-14
+every reader of `gate_movements`, this check included, sets aside the rows
+that were that sound, and the scanner no longer writes a car's engine as a
+motor run ([below](#replayed-again-2026-10-14)).
 
 ## The measurement: what the detector can and cannot see
 
@@ -112,6 +115,58 @@ Physically, an odd burst of three is "open, close, reverse open" with no
 closing after it. That is an auto-close interrupted by the photocell that
 never ran again. An even burst ends where it started.
 
+### Replayed again, 2026-10-14
+
+The same rule, at the shipped 10-minute threshold, over the same history
+(rows from 2026-09-21 to the moment the alarm sound went off), one change at
+a time:
+
+| Rows the rule reads | `likely` | Which |
+| --- | ---: | --- |
+| As the scanner wrote them | 4 | 09-21 08:07, 10-04 16:51, 10-08 17:30, 10-09 21:42 |
+| The camera's alarm sound set aside | 3 | 09-21 08:07, 10-04 16:51, **10-05 21:21** |
+| ...and runs the scan split at a whole minute joined | **1** | **09-21 08:07** |
+| ...and car engines left out, where the audio was available | 1 | 09-21 08:07 |
+
+What happened to each:
+
+* **2026-09-21 08:07** -- the remote test that crossed the leaves, the one
+  firing known to be real. All three runs are the motor on the reference
+  audio, and it stays `likely` at every step.
+* **2026-10-08 17:30** -- its first run started within 2 s of a camera alarm.
+  Without it the burst is two runs: `possible`.
+* **2026-10-09 21:42** -- the third run is the alarm sound. Two runs remain,
+  `possible`; on the audio both are car engines, so with the engine check
+  there is no row left at all.
+* **2026-10-04 16:51** -- 23 s, then a 40 s run the scan cut in two at
+  16:51:00 (8 s + 32 s). Joined, it is two runs: `possible`.
+* **2026-10-05 21:21** -- new at the second step. Its silence used to be
+  ended by the alarm sound of the next car at 21:31; without that row it
+  reached ten minutes. Its first two rows are one run the scan cut at
+  21:21:00: it starts 10.6 s *before* the relay fired, so it is the arriving
+  car's engine running into the opening. The third is the closing, with no
+  latch heard. Joined, it is two runs: `possible`.
+
+So over these 2.72 weeks the rule fired once, and that once was real. At 5,
+20 and 30 minutes the second step gives 3, 2 and 2; the joined rows give 1 at
+every threshold. Seventeen of the 291 rows yamnet-linear-v2 wrote are the
+second half of a run split at a whole minute, and the scanner now joins them
+([gate-audio.md 2i](gate-audio.md#2i-engines-the-alarm-sound-and-split-runs)).
+
+How far to trust this: the third and fourth rows are an approximation of
+what the new scanner would have written. Rows were joined where one ended
+within a second of a whole minute inside a segment and the next began on it,
+and the engine check was applied only to the bursts whose audio is still
+held (2026-09-21, the night of 9-10 Oct, and 12-14 Oct); the rest of the
+history is in R2 and was not re-scanned. Nothing in the database was
+rewritten: the rows written before this release keep their splits and their
+engine runs, and only the alarm-sound rows are set aside when they are read.
+
+From the sound going off to 2026-10-14 16:00 IST the rule fires twice on the
+rows as written (2026-10-10 17:18, five runs, and 20:27, three) and once with
+the splits joined (17:18). Neither has its audio left on the board, so
+neither is verified.
+
 The heartbeat's `gate.left_open` block reports two levels of confidence:
 
 * **`likely`** means the rule above fired. The app pushes it.
@@ -164,16 +219,24 @@ by about 22:11, ten minutes before the owner arrived at 22:21.
   rather than guessing.
 * **Its times run early inside a short segment**, by however much audio the
   camera dropped before the run (gate-audio.md 2g).
-* **It reads what the scanner writes, and the scanner has recorded the
-  camera's alarm sound and car engines as motor runs.** Until 2026-10-10 15:27
-  every vehicle alarm put a 9-15 s "run" into `gate_movements`. That sound is
-  now off, but an engine idling beside the camera still reads as a run and
-  hides the real motor. Until the scanner is fixed, a `likely` or `possible`
-  during a passage says little about the leaves.
-* **Three of the four alerts above are unverified** (2026-10-04 16:51,
-  2026-10-08 17:30 and 2026-10-09 21:42). Knowing what the gate did at the
-  first two would narrow the false-alert rate. It would not settle it: the 9 Oct
-  burst is a siren and an engine on the audio, and stays unknown.
+* **It reads what the scanner writes.** Until 2026-10-10 15:27 every vehicle
+  alarm put the camera's own alarm sound into `gate_movements` as a 9-15 s
+  "run". Those rows are set aside when they are read: a row that starts
+  before the sound went off and within 2 s of a camera vehicle alarm is not
+  the gate (`gate_controller/gate_alarm_sound.py`). That is the only rule
+  about alarms: after 15:27 the minutes after an alarm are exactly when the
+  real motor runs, and nothing is set aside then. Car engines were also
+  written as runs; since 2026-10-14 the scanner checks every run for the
+  motor's band and does not write one without it (gate-audio.md 2i). What no
+  check can do is hear the motor *under* an engine: an idling diesel beside
+  the camera sits at the motor's own level, so an opening for a car that
+  waits with its engine running is usually not heard at all, and only its
+  closing is.
+* **Of the four alerts above, only 2026-09-21 is known to be real**, and it
+  is the only one that survives the 2026-10-14 replay. The replay is two
+  and a half weeks, and the second half of the table rests on audio for only
+  part of it; a season of rows written by the new scanner is what would
+  validate the rule.
 
 ## The operator's settings
 

@@ -32,13 +32,15 @@ runs over 2.72 weeks of heard span, and 45 relay firings as ground truth
   commanded cycles, 5 produced a single run and 3 none at all. "The last
   movement was not confirmed shut, and nothing since" fires 8.1 times a week
   at a 10-minute threshold -- nearly every one a missed closing.
-* **An odd burst of three or more is reliable.** Open, close, reverse open --
-  and then silence -- is the physical signature of an interrupted auto-close
-  that never re-ran. Over the same history it fired four times: 2026-09-21
-  08:07 (the remote test that jammed the leaves), 2026-10-09 21:42 (the gate
-  that stood open for 39 minutes), and two unverified (2026-10-04 16:51,
-  2026-10-08 17:30, each followed by hours of silence). At most 0.7 false
-  alerts a week, and the same four at every threshold from 5 to 30 minutes.
+* **An odd burst of three or more is the signature.** Open, close, reverse
+  open -- and then silence -- is an interrupted auto-close that never re-ran.
+  On the rows as first written it fired four times over that history, and
+  three of the four rest on the scanner's mistakes: the camera's alarm sound
+  recorded as a run (2026-10-08, 2026-10-09), and one run cut in two at a
+  whole minute (2026-10-04). Replayed on 2026-10-14 with the alarm sound set
+  aside (gate_alarm_sound.py) and the split runs joined, it fires once, at
+  every threshold from 5 to 30 minutes: 2026-09-21 08:07, the remote test
+  that jammed the leaves (docs/gate-left-open.md, "Replayed again").
 
 So the heartbeat says ``likely`` only for that signature, which is what the
 app pushes, and ``possible`` for the ordinary "not confirmed shut", which it
@@ -48,6 +50,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from itertools import islice
+
+from .gate_alarm_sound import heard_rows
 
 #: The shipped switch and threshold. Ten minutes is well past a full cycle
 #: (opening ~20 s, hold 16-27 s, closing ~23 s, latched by about +70 s) and
@@ -71,6 +76,11 @@ BURST_GAP_SECONDS = 180
 #: longest burst in history is four runs; twelve leaves room and keeps the
 #: heartbeat's read bounded.
 MOVEMENT_LOOKBACK = 12
+#: How many rows are read to find those twelve. Rows that are the camera's
+#: alarm sound are skipped (gate_alarm_sound.py), and on the worst morning on
+#: record (2026-10-10) half the rows were; four times over is ample and still
+#: keeps the heartbeat's read bounded.
+MOVEMENT_READ_LIMIT = 4 * MOVEMENT_LOOKBACK
 #: Silence from a recorder that was not recording is not silence at the gate.
 #: Over the measured history the recorder held 70% of the wall clock, so the
 #: threshold must have been *heard*, not merely elapsed.
@@ -221,10 +231,15 @@ def evaluate(connection, config: LeftOpenConfig, *, now: datetime | None = None)
     if not config.enabled:
         return {**block, "state": "off"}
     try:
-        rows = connection.execute(
+        cursor = connection.execute(
             "SELECT started_at, ended_at, latch_at, outcome FROM gate_movements"
-            " ORDER BY started_at DESC LIMIT ?", (MOVEMENT_LOOKBACK,),
-        ).fetchall()
+            " ORDER BY started_at DESC LIMIT ?", (MOVEMENT_READ_LIMIT,),
+        )
+        # The camera's own alarm sound, recorded as a motor run at every
+        # vehicle alarm until 2026-10-10 15:27 IST, is not the gate
+        # (gate_alarm_sound.py). It is set aside before the burst is built, so
+        # it can neither add a run to one nor split one in two.
+        rows = list(islice(heard_rows(connection, cursor), MOVEMENT_LOOKBACK))
     except Exception:
         return {**block, "state": "unknown", "reason": "no_table"}
     runs = []

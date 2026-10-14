@@ -24,6 +24,7 @@ from .direction_signals import (
     HELD_OPEN_SECONDS, METHOD, SAME_ARRIVAL_SECONDS, SAME_PASSAGE_SECONDS, DirectionVerdict,
     Movement, PassageEvidence, combine, judge, unseen_departures,
 )
+from .gate_alarm_sound import heard_rows
 
 #: Events closer together than this are one vehicle. Not guessed: scored against
 #: the camera's own alarm identity over the week to 2026-09-21, 10 s reproduces
@@ -172,13 +173,15 @@ def judge_passages(connection, since: str) -> list:
             " WHERE e.received_at >= ? ORDER BY e.received_at, e.id", (floor,))
     ]
     rows = [row for row in rows if row["at"] is not None]
+    # The camera's alarm sound, recorded as a motor run at every vehicle alarm
+    # until 2026-10-10 15:27 IST, is not the gate (gate_alarm_sound.py).
     movements = tuple(
         Movement(started, ended, clang=bool(clang))
         for started, ended, clang in (
             (_moment(r[0]), _moment(r[1]), r[2])
-            for r in connection.execute(
+            for r in heard_rows(connection, connection.execute(
                 "SELECT started_at, ended_at, clang_at FROM gate_movements WHERE started_at >= ?"
-                " ORDER BY started_at", (floor,))
+                " ORDER BY started_at", (floor,)))
         ) if started is not None and ended is not None
     )
     scans = []
