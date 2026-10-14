@@ -3910,7 +3910,7 @@ class DependencyLockTests(unittest.TestCase):
             "requests": "2.34.2",
             "watchdog": "6.0.0",
             "certifi": "2026.7.22",
-            "charset-normalizer": "3.5.0",
+            "charset-normalizer": "3.5.2",
             "idna": "3.18",
             "urllib3": "2.7.0",
             "rpi-lgpio": "0.6",
