@@ -54,6 +54,7 @@ MOTOR = "motor-closing-2026-10-12T182135Z.wav"
 IDLING = "engine-idling-dmax-2026-10-10T091020Z.wav"
 ARRIVING = "engine-arriving-car-2026-10-13T140305Z.wav"
 ALARM = "camera-alarm-sound-2026-10-10T100413Z.wav"
+LATCH = "latch-2026-09-20T100652Z.wav"
 #: A fixed evening, offset from nothing on the wall clock (invariant 10).
 EVENING = datetime(2026, 10, 12, 17, 0, tzinfo=UTC)
 
@@ -93,7 +94,9 @@ class HearsWhateverIsNotSilent:
         return SoundWindow(started_at, probabilities)
 
 
-class EnginesAreNotTheGate(unittest.TestCase):
+class ScannedAtTheGate(unittest.TestCase):
+    """The real path, from the recorder's segments to the heartbeat."""
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -127,14 +130,15 @@ class EnginesAreNotTheGate(unittest.TestCase):
         last.write_bytes(b"\0")
         self.clips[last.name] = None
 
-    def run_scan(self, *, commanded_at=(), model=None):
+    def run_scan(self, *, commanded_at=(), model=None, initial_state="shut"):
         def decode(path, **_):
             return self.clips[Path(path).name]
 
         with patch.object(gate_sound_scan, "decode", decode), \
                 self.assertLogs("gate_controller.gate_sound_scan", logging.INFO) as logs:
             result, moves, scanned = scan(self.segments, model or EveryFrameTheMotor(),
-                                          commanded_at=commanded_at)
+                                          commanded_at=commanded_at,
+                                          initial_state=initial_state)
             record(self.connection, moves, scanned)
         self.logs = "\n".join(logs.output)
         return moves
@@ -144,6 +148,8 @@ class EnginesAreNotTheGate(unittest.TestCase):
             self.store, Prompt(), {}, relay=RelaySpy(), clock=lambda: now,
         )["gate"]
 
+
+class EnginesAreNotTheGate(ScannedAtTheGate):
     # -- the recorded sounds, one at a time ----------------------------------------
 
     def test_the_motor_is_still_a_gate_movement(self):
@@ -233,6 +239,122 @@ class EnginesAreNotTheGate(unittest.TestCase):
         self.assertEqual(left_open["runs"], 1)
         self.assertNotEqual(left_open.get("confidence"), LIKELY)
         self.assertEqual(left_open["confidence"], POSSIBLE)
+
+
+class ACommandedOpeningUnderTheEngine(ScannedAtTheGate):
+    """The commonest passage at this gate, as the Pi heard it on 14 Oct 19:16 UTC.
+
+    The relay pulsed at 19:16:18 for an arriving authorised car. Its engine ran
+    from 19:16:11 to 19:16:39 and the opening ran under it, so the scanner set
+    the whole run aside as not the motor. The auto-close followed at 19:17:04,
+    25 s after the engine stopped, and was written ``open``: no latch was heard
+    within 4 s of its end. That row is the ordinary missed latch of
+    docs/gate-left-open.md, and these pin what the state machine made of it:
+    the engine moved the alternation to open whatever the scan started from,
+    so the later run is a *closing* -- shut when its latch is heard, and never
+    somebody's fob. The pulse does not claim it as the opening.
+
+    The closing is the 10 s motor clip followed by a latch recorded at the
+    gate, so the clang falls where the state machine looks for it: within
+    ``CLANG_SEARCH_SECONDS`` of the run's end.
+    """
+
+    PULSE = 7
+    ENGINE_SECONDS = 10
+    CLOSING_AT = ENGINE_SECONDS + 25
+
+    def closing(self, *, latched):
+        return recorded(MOTOR) + (recorded(LATCH) if latched else [])
+
+    def passage(self, *, initial_state, latched=True, pulsed=True, engines=((0, ARRIVING),)):
+        for offset, name in engines:
+            self.recorder_with(offset, recorded(name))
+        self.recorder_with(self.CLOSING_AT, self.closing(latched=latched))
+        commanded_at = (EVENING + timedelta(seconds=self.PULSE),) if pulsed else ()
+        return self.run_scan(commanded_at=commanded_at, initial_state=initial_state)
+
+    def assert_read_as_the_closing(self, moves):
+        self.assertEqual(len(moves), 1, moves)
+        self.assertIn("not_the_motor=1", self.logs)
+        self.assertEqual(moves[0].outcome, "shut")
+        self.assertIsNotNone(moves[0].clang, "the latch was interpreted, so this was a closing")
+        self.assertFalse(moves[0].uncommanded)
+        self.assertIn("final_state=shut", self.logs)
+        gate = self.heartbeat(EVENING + timedelta(minutes=11))
+        self.assertEqual(gate["state"], "shut")
+        self.assertEqual(gate["movements_24h"], 1)
+        self.assertEqual(gate["uncommanded_24h"], 0)
+        self.assertEqual(gate["left_open"]["state"], "clear")
+        self.assertEqual(gate["left_open"]["runs"], 1)
+
+    def test_from_an_unknown_state_the_run_after_the_engine_is_the_closing(self):
+        """The three scans before 19:16 ended ``final_state=unknown``."""
+        moves = self.passage(initial_state="unknown")
+        self.assert_read_as_the_closing(moves)
+        self.assertEqual(moves[0].confirmation, "confirmed", "the relay fired for this cycle")
+
+    def test_from_a_shut_gate_the_run_after_the_engine_is_the_closing(self):
+        self.assert_read_as_the_closing(self.passage(initial_state="shut"))
+
+    def test_from_a_gate_left_open_the_run_after_the_engine_is_still_the_closing(self):
+        self.assert_read_as_the_closing(self.passage(initial_state="open"))
+
+    def test_a_pulse_just_before_the_engine_is_heard_reads_the_same(self):
+        """The relay row can be written before the engine is loud enough to hear."""
+        self.PULSE = -3
+        self.assert_read_as_the_closing(self.passage(initial_state="unknown"))
+
+    def test_with_no_latch_heard_the_closing_is_written_open_and_is_one_run_never_likely(self):
+        """The Pi's own row: a closing with no clang within 4 s of its end.
+
+        It is written ``open`` because nothing says the leaves met (CLAUDE.md
+        rule 1: a run without a clang is not proof of anything). What this pins
+        is the rest: it is a closing, not a fob, and on its own it is one run,
+        so the left-open check says ``possible`` (shown, not pushed), never
+        ``likely``.
+        """
+        moves = self.passage(initial_state="unknown", latched=False)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0].outcome, "open")
+        self.assertIsNone(moves[0].latch)
+        self.assertFalse(moves[0].uncommanded)
+        coverage = [{
+            "segment": f"gate-{EVENING + timedelta(minutes=5 * index):%Y%m%dT%H%M%S}Z.aac",
+            "started_at": EVENING + timedelta(minutes=5 * index),
+            "span_seconds": 300.0, "audio_seconds": 300.0, "missing_seconds": 0.0,
+        } for index in range(6)]
+        record(self.connection, [], [], listening=Listening(tuple(coverage), ()))
+        gate = self.heartbeat(EVENING + timedelta(minutes=20))
+        self.assertEqual(gate["state"], "open")
+        self.assertEqual(gate["uncommanded_24h"], 0)
+        self.assertEqual(gate["left_open"]["state"], "open")
+        self.assertEqual(gate["left_open"]["runs"], 1)
+        self.assertEqual(gate["left_open"]["confidence"], POSSIBLE)
+
+    # -- the other direction: no pulse from us --------------------------------------
+
+    def test_a_car_with_no_pulse_at_a_shut_gate_then_its_closing(self):
+        """#217's case: a fob or keypad opening under the engine, then the closing."""
+        moves = self.passage(initial_state="shut", pulsed=False)
+        self.assert_read_as_the_closing(moves)
+        self.assertEqual(moves[0].confirmation, "confirmed", "the latch was heard")
+
+    def test_a_departing_cars_engine_while_the_exit_wand_opens_for_it(self):
+        """A car leaving: it waits at the gate, the wand opens it, it drives out.
+
+        Two engine runs, no pulse from us, and the gate's state unknown going
+        in. Each engine run moves the alternation to open and none moves it
+        back, so the closing is still the closing.
+        """
+        moves = self.passage(
+            initial_state="unknown", pulsed=False,
+            engines=((0, IDLING), (self.ENGINE_SECONDS, ARRIVING)),
+        )
+        self.assertEqual(len(moves), 1, moves)
+        self.assertIn("not_the_motor=2", self.logs)
+        self.assertEqual(moves[0].outcome, "shut")
+        self.assertFalse(moves[0].uncommanded)
+        self.assertEqual(self.heartbeat(EVENING + timedelta(minutes=11))["state"], "shut")
 
 
 class TheBandCheckOnItsOwn(unittest.TestCase):
