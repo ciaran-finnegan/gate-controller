@@ -297,15 +297,45 @@ class DepartingPlateTests(unittest.TestCase):
         judge = DepartingPlate()
         return judge, [judge.note(width, at) for at, width in enumerate(widths)]
 
-    def test_the_2026_10_09_departures_are_caught_within_two_reads_of_the_peak(self):
+    def test_the_2026_10_09_departures_are_caught_within_three_reads_of_the_peak(self):
         # 11:58: 321, 203, 222, 203, 188 ... ; 14:33: 229, 333, 321, 279, 247, 229, 209 ...
         judge, verdicts = self._feed([321, 203, 222, 203, 188, 171, 157, 145])
-        self.assertEqual(verdicts, [False, False, True, True, True, True, True, True])
-        self.assertEqual(judge.since, 2)
+        self.assertEqual(verdicts, [False, False, False, True, True, True, True, True])
+        self.assertEqual(judge.since, 3)
         judge, verdicts = self._feed([229, 333, 321, 279, 247, 229, 209, 190, 172])
-        # 247 is 74 % of 333: not yet. 229 and 209 are the two reads under 70 %.
-        self.assertEqual(verdicts, [False] * 6 + [True] * 3)
+        # 247 is 74 % of 333: not yet. 229, 209 and 190 are the three reads under 70 %.
+        self.assertEqual(verdicts, [False] * 7 + [True] * 2)
         self.assertEqual(judge.peak_px, 333)
+
+    def test_the_2026_10_13_arrival_whose_box_jumped_never_reads_as_receding(self):
+        # 13:37 UTC, 11WH2571 arriving, let in at +1.9 s: the detector's box
+        # jumped between 205 and 322 px on a car that was coming closer. Two
+        # reads at 64 % of the spike judged it departing 1.1 s after the
+        # pulse; three in a row are needed now, and it never gets them.
+        widths = [110, 205, 322, 205, 205, 241, 322, 359, 386]
+        judge, verdicts = self._feed(widths)
+        self.assertEqual(verdicts, [False] * len(widths))
+        self.assertIsNone(judge.since)
+
+    def test_every_departure_the_journal_holds_from_10_to_14_october_is_still_caught(self):
+        # Each passage's boxed widths as the sweep read them, and the read
+        # (0-based) the three-read rule first says "departing" on.
+        departures = {
+            "10-11 14:14": ([250, 178, 231, 210, 186, 141, 131, 117], 7),
+            "10-11 16:19": ([383, 271, 250, 233, 195, 169, 164, 145], 4),
+            "10-12 12:59": ([366, 259, 241, 259, 212, 205, 181, 138], 6),
+            "10-12 15:48": ([278, 253, 229, 216, 178, 166, 159, 140], 6),
+            "10-13 08:48": ([367, 221, 141, 184, 159, 145, 128], 3),
+            "10-13 10:49": ([416, 409, 288, 293, 245, 229, 210, 186], 6),
+            "10-13 11:05": ([707, 583, 312, 290, 264, 212, 181], 4),
+            "10-13 16:08": ([283, 186, 272, 247, 209, 186, 169, 164], 7),
+            "10-14 13:11": ([379, 293, 250, 267, 293, 247, 222, 190, 178], 7),
+            "10-14 15:17": ([333, 293, 272, 260, 241, 236, 209, 190, 178], 8),
+        }
+        for when, (widths, first) in departures.items():
+            with self.subTest(passage=when):
+                _judge, verdicts = self._feed(widths)
+                self.assertEqual(verdicts.index(True), first, verdicts)
 
     def test_the_2026_10_09_arrival_never_reads_as_receding(self):
         # 15:05: the plate grew 138 -> 319 px with a 3.8 % dip at 159 -> 153.
@@ -325,34 +355,34 @@ class DepartingPlateTests(unittest.TestCase):
         self.assertEqual(verdicts, [False] * 5)
 
     def test_a_car_that_backs_off_and_comes_forward_again_is_no_longer_departing(self):
-        judge, verdicts = self._feed([300, 300, 200, 190, 310, 320])
-        self.assertEqual(verdicts, [False, False, False, True, False, False])
+        judge, verdicts = self._feed([300, 300, 200, 190, 185, 310, 320])
+        self.assertEqual(verdicts, [False, False, False, False, True, False, False])
         self.assertEqual(judge.peak_px, 320)
 
     def test_a_far_plate_is_not_measured(self):
         # Below the 150 px peak the shrink of a few pixels is jitter, not a car.
         judge, verdicts = self._feed([120, 80, 75, 70])
         self.assertEqual(verdicts, [False] * 4)
-        judge, verdicts = self._feed([150, 105, 100])
-        self.assertEqual(verdicts, [False, False, True])
+        judge, verdicts = self._feed([150, 105, 100, 95])
+        self.assertEqual(verdicts, [False, False, False, True])
 
     def test_a_verdict_is_honoured_for_ten_seconds_after_the_read_that_made_it(self):
         # The fallback frame and the camera's still reach the processor after
         # the sweep's window has closed; a passage nobody has read for a while
         # must not speak for the next car.
         judge = DepartingPlate()
-        for at, width in enumerate([300, 300, 200, 190]):
+        for at, width in enumerate([300, 300, 200, 190, 185]):
             judge.note(width, 100.0 + at)
-        self.assertTrue(judge.receding_at(103.0))
-        self.assertTrue(judge.receding_at(113.0))
-        self.assertFalse(judge.receding_at(113.1))
+        self.assertTrue(judge.receding_at(104.0))
+        self.assertTrue(judge.receding_at(114.0))
+        self.assertFalse(judge.receding_at(114.1))
         self.assertFalse(judge.receding_at(99.0), "a clock that went backwards")
         self.assertFalse(DepartingPlate().receding_at(0.0))
 
     def test_an_alarm_keeps_the_verdict_for_sweep_frames_and_withdraws_it_from_everything_else(self):
         judge = DepartingPlate()
-        for at, width in enumerate([300, 300, 200, 190]):
-            judge.note(width, 100.0 + at)
+        for at, width in enumerate([300, 300, 200, 190, 185]):
+            judge.note(width, 99.0 + at)
         self.assertTrue(judge.receding_at(103.5))
         self.assertTrue(judge.receding_since_alarm(103.5))
 
@@ -371,9 +401,9 @@ class DepartingPlateTests(unittest.TestCase):
         self.assertFalse(judge.receding_at(105.5))
         # Judged on its own passage from here: grow, then recede, and the
         # verdict speaks for stills again because its reads postdate the alarm.
-        for at, width in enumerate([240, 300, 200, 190]):
-            self.assertEqual(judge.note(width, 106.0 + at), at == 3)
-        self.assertTrue(judge.receding_since_alarm(109.5))
+        for at, width in enumerate([240, 300, 200, 190, 185]):
+            self.assertEqual(judge.note(width, 106.0 + at), at == 4)
+        self.assertTrue(judge.receding_since_alarm(110.5))
 
     def test_a_read_begun_before_the_alarm_stays_the_last_cars_however_late_it_finishes(self):
         # Reads are timed by when they began. An alarm that lands while the
@@ -381,8 +411,8 @@ class DepartingPlateTests(unittest.TestCase):
         # frame the next car's first read and wipe the verdict the sweep's
         # fallback is about to be handed over with.
         judge = DepartingPlate()
-        for at, width in enumerate([320, 320, 200, 190]):
-            judge.note(width, 100.0 + at)
+        for at, width in enumerate([320, 320, 200, 190, 185]):
+            judge.note(width, 99.0 + at)
         self.assertTrue(judge.receding_at(103.2))
         judge.alarm(103.3)                       # lands mid-read
         self.assertTrue(judge.note(180, 103.2), "the in-flight read began before the alarm")
@@ -486,7 +516,7 @@ class TriggerFrameCaptureTests(unittest.TestCase):
 
         def receding():
             judge = capture._passage.departing
-            for width in (320, 320, 200, 190):
+            for width in (320, 320, 200, 190, 185):
                 judge.note(width, clock["now"])
             return capture.departing_skip()
 
@@ -514,7 +544,7 @@ class TriggerFrameCaptureTests(unittest.TestCase):
             sweep_departing_skip="on",
         )
         passage = capture._passage
-        for width in (320, 320, 200, 190):
+        for width in (320, 320, 200, 190, 185):
             passage.departing.note(width, clock["now"])
             clock["now"] += 0.25
         self.assertEqual(capture.on_camera_event(event()), "scheduled")
@@ -535,7 +565,7 @@ class TriggerFrameCaptureTests(unittest.TestCase):
         )
         capture._passage = SweepPassage(ORIGIN_EARLY)
         judge = capture._passage.departing
-        for width in (320, 320, 200, 190):
+        for width in (320, 320, 200, 190, 185):
             judge.note(width, clock["now"])
         self.assertEqual(capture.departing_skip(), "on")
 

@@ -29,6 +29,9 @@ from time import monotonic
 from urllib.parse import urlsplit
 
 from .backpressure import NULL_GATE
+from .departure import (
+    APPROACHING, DEPARTING, FAR, STANDING, UNDECIDED, DirectionReading,
+)
 from .hot_stream import (
     FFMPEG_BINARY, MAX_FRAME_BYTES, HotStreamBuffer, HotStreamConfig,
     _ensure_private_directory, _is_decodable_jpeg, write_private_frame,
@@ -145,8 +148,8 @@ SWEEP_CLOUD_STOPPED_SPREAD = 0.08
 # the camera and recedes up the approach, so the plate the on-device detector
 # boxes *shrinks* read by read; an arriving car's plate only grows until it
 # stops at the gate, and the gate is opened for departures by the exit
-# mechanism, not by the Pi (the relay still fires for an authorised rear plate
-# the device reads, #171 -- that is a device grant and is untouched here).
+# mechanism, not by the Pi (a device grant on an authorised rear plate is not
+# touched here; withholding its *pulse* is the coordinator's business, below).
 # `DepartingPlate` holds the rule: once the widest plate of the passage is at
 # least SWEEP_DEPARTING_MIN_PEAK_PX wide, SWEEP_DEPARTING_READS consecutive
 # boxed reads each at most (1 - SWEEP_DEPARTING_SHRINK) of it say the car is
@@ -160,8 +163,19 @@ SWEEP_CLOUD_STOPPED_SPREAD = 0.08
 # to 9 October, on the one frame per event the dashboard keeps, the rule
 # fired in 0 of 24 arrivals (16 of them let in) and 6 of 15 departures, the
 # rest showing no boxed plate for it to measure. 30 % is three times the
-# stopped-car spread; 150 px keeps jitter on a far plate from counting; two
-# reads are a quarter of a second at the sweep's rate. The rule is not sticky:
+# stopped-car spread; 150 px keeps jitter on a far plate from counting. It
+# was two reads until 2026-10-14, and three since: on 2026-10-13 at 13:37 UTC
+# an authorised *arrival* boxed 110, 205, 322, 205, 205, 241, 322, 359 px --
+# the detector's box jumping between 205 and 322 on a car that was coming
+# closer -- and two reads at 64 % of the 322 spike judged it departing. Three
+# shrunk reads in a row clear that, and every departure the journal holds
+# from 2026-10-10 to 10-14 (ten judged) is still judged, 0.3-0.6 s later. A
+# plate that stands still -- `SWEEP_DIRECTION_STANDING_READS` reads within
+# the stopped-car spread across two seconds -- is never receding, however
+# far below the passage's peak it stands: a car waiting at the gate behind
+# a bigger one that left in the same alarm is not leaving. The same judgement
+# decides whether the relay may pulse (`direction_at`, gate_controller/
+# departure.py), so it is the one place both rules read. The rule is not sticky:
 # a car that backs off and comes forward again is an arrival once its plate
 # grows back, and gets its cloud fallback then. Shipped in `shadow`: the
 # verdict is judged, journalled (`stage=departing mode=shadow`, and
@@ -178,8 +192,25 @@ SWEEP_DEPARTING_SKIP_MODES = ("off", "shadow", "on")
 DEFAULT_SWEEP_DEPARTING_SKIP = "shadow"
 SWEEP_DEPARTING_SHRINK = 0.30
 SWEEP_DEPARTING_MIN_PEAK_PX = 150
-SWEEP_DEPARTING_READS = 2
+SWEEP_DEPARTING_READS = 3
 SWEEP_DEPARTING_GRACE_SECONDS = 10.0
+# A plate that has stood still: at least this many boxed reads in the last
+# SWEEP_DIRECTION_STANDING_WINDOW_SECONDS, spanning at least
+# SWEEP_DIRECTION_STANDING_SPAN_SECONDS, all within SWEEP_CLOUD_STOPPED_SPREAD
+# of each other. Stricter than the cloud hold's "stopped growing" (three
+# reads over a second): on 2026-10-12 at 12:59 a departing car read 259, 241,
+# 259 px over 1.4 s on its way out, and that must not read as a car standing
+# at the gate. No departure in the journal from 2026-10-10 to 10-14 holds
+# five reads within 8 % across two seconds while it recedes.
+SWEEP_DIRECTION_STANDING_READS = 5
+SWEEP_DIRECTION_STANDING_WINDOW_SECONDS = 2.5
+SWEEP_DIRECTION_STANDING_SPAN_SECONDS = 2.0
+# For whether an automatic grant waits (gate_controller/departure.py): the
+# passage is "undecided" while its first boxed plate is still its widest, or
+# its latest is more than this far below its widest -- the reads have not yet
+# shown the plate coming closer. Every arrival let in from 2026-10-10 to 10-14
+# had shown its plate growing by the time it was granted.
+SWEEP_DIRECTION_UNDECIDED_SHRINK = 0.15
 # How long the sweep polls for a fresh session frame before asking again.
 SWEEP_POLL_SECONDS = 0.05
 # The waiting phase: once the full-rate window has closed with the gate still
@@ -341,6 +372,12 @@ PRESENCE_RETRY_REASONS = frozenset({
     # A frame lost to shutdown never read the plate either; the loop leaves
     # on its own stop_event rather than treating this as a final answer.
     "service_stopping",
+    # The coordinator withheld the pulse because the plate reads as a car
+    # leaving (gate_controller/departure.py, #171). The judgement is not
+    # sticky: a car wrongly judged departing whose plate then grows back, or
+    # that stops and stands at the gate, is no longer judged so, and the
+    # passage must still be reading when it is.
+    "departing",
 })
 # Belt and braces behind note_dropped(): if a verdict never arrives at all the
 # session must not sit out the whole window with a vehicle at the gate. The
@@ -791,13 +828,19 @@ class DepartingPlate:
     (``SweepRead.plate_px``). ``receding`` is true while the latest
     ``SWEEP_DEPARTING_READS`` reads were each at most
     ``1 - SWEEP_DEPARTING_SHRINK`` of the widest plate the passage has shown,
-    once that widest plate reached ``SWEEP_DEPARTING_MIN_PEAK_PX``. The widest
-    plate is remembered for the whole passage; the verdict is only as old as
-    the latest read, so a plate that grows back ends it. See the constants for
-    the measurements behind each number.
+    once that widest plate reached ``SWEEP_DEPARTING_MIN_PEAK_PX``, and the
+    plate is not standing still. The widest plate is remembered for the whole
+    passage; the verdict is only as old as the latest read, so a plate that
+    grows back ends it. See the constants for the measurements behind each
+    number.
+
+    Two readers ask it. The sweep's cloud skip asks :meth:`receding_at` and
+    :meth:`receding_since_alarm`; the actuation coordinator asks
+    :meth:`direction_at` whether an automatic pulse may go (#171).
     """
 
-    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "alarm_at", "noticed")
+    __slots__ = ("peak_px", "shrunk", "receding", "since", "last_at", "alarm_at", "noticed",
+                 "first_px", "latest_px", "reads", "recent")
 
     def __init__(self) -> None:
         self.peak_px = 0
@@ -812,6 +855,12 @@ class DepartingPlate:
         self.alarm_at: float | None = None
         #: Whether this passage's recession has been journalled.
         self.noticed = False
+        #: The first and the latest boxed width since the measurement began,
+        #: how many there have been, and the last few (clock, width) pairs.
+        self.first_px = 0
+        self.latest_px = 0
+        self.reads = 0
+        self.recent: tuple = ()
 
     def alarm(self, now: float | None) -> None:
         """A new vehicle alarm: a new car is in view.
@@ -841,6 +890,10 @@ class DepartingPlate:
         self.since = None
         self.last_at = None
         self.noticed = False
+        self.first_px = 0
+        self.latest_px = 0
+        self.reads = 0
+        self.recent = ()
 
     def receding_at(self, now: float, grace: float = SWEEP_DEPARTING_GRACE_SECONDS) -> bool:
         """Whether the plate was receding on a read no older than ``grace`` seconds."""
@@ -865,6 +918,72 @@ class DepartingPlate:
             return self.alarm_at is None or self.last_at > self.alarm_at
         except TypeError:
             return False
+
+    def standing(self) -> bool:
+        """Whether the plate has stood still across the last couple of seconds.
+
+        ``SWEEP_DIRECTION_STANDING_READS`` reads or more inside
+        ``SWEEP_DIRECTION_STANDING_WINDOW_SECONDS`` of the latest, spanning at
+        least ``SWEEP_DIRECTION_STANDING_SPAN_SECONDS``, every one within
+        ``SWEEP_CLOUD_STOPPED_SPREAD`` of the others.
+        """
+        recent = self.recent
+        if len(recent) < SWEEP_DIRECTION_STANDING_READS:
+            return False
+        try:
+            latest = recent[-1][0]
+            window = [
+                (at, width) for at, width in recent
+                if latest - at <= SWEEP_DIRECTION_STANDING_WINDOW_SECONDS
+            ]
+            if len(window) < SWEEP_DIRECTION_STANDING_READS:
+                return False
+            if window[-1][0] - window[0][0] < SWEEP_DIRECTION_STANDING_SPAN_SECONDS:
+                return False
+            widths = [width for _at, width in window]
+            return max(widths) <= min(widths) * (1.0 + SWEEP_CLOUD_STOPPED_SPREAD)
+        except TypeError:
+            return False
+
+    def direction_at(self, now: float, *, since_alarm: bool,
+                     grace: float = SWEEP_DEPARTING_GRACE_SECONDS):
+        """What the reads say about which way the car is going, or None. Never raises.
+
+        None when there is nothing to judge by: no boxed read yet, the latest
+        older than ``grace``, or -- with ``since_alarm``, for a frame that is
+        not the sweep's own -- no read since the latest vehicle alarm. Else a
+        `departure.DirectionReading` whose ``state`` is ``departing`` (the
+        receding rule holds), ``standing``, ``far`` (nothing wide enough to
+        measure a shrink from), ``undecided`` (the first plate is still the
+        widest, or the latest is more than
+        ``SWEEP_DIRECTION_UNDECIDED_SHRINK`` below the widest) or
+        ``approaching``.
+        """
+        try:
+            last_at = self.last_at
+            if last_at is None or self.reads <= 0 or self.peak_px <= 0:
+                return None
+            if not 0.0 <= now - last_at <= grace:
+                return None
+            if since_alarm and self.alarm_at is not None and not last_at > self.alarm_at:
+                return None
+            peak, latest = self.peak_px, self.latest_px
+            if self.receding:
+                state = DEPARTING
+            elif self.standing():
+                state = STANDING
+            elif peak < SWEEP_DEPARTING_MIN_PEAK_PX:
+                state = FAR
+            elif (
+                self.first_px >= peak
+                or latest < peak * (1.0 - SWEEP_DIRECTION_UNDECIDED_SHRINK)
+            ):
+                state = UNDECIDED
+            else:
+                state = APPROACHING
+            return DirectionReading(state, peak_px=peak, latest_px=latest, reads=self.reads)
+        except Exception:
+            return None
 
     def note(self, plate_px, now: float | None = None) -> bool:
         """Take one boxed read; return whether the plate is receding now."""
@@ -894,6 +1013,12 @@ class DepartingPlate:
         if first_since_alarm:
             self.lapse()
         self.last_at = now
+        if self.reads == 0:
+            self.first_px = width
+        self.reads += 1
+        self.latest_px = width
+        if now is not None:
+            self.recent = (self.recent + ((now, width),))[-2 * SWEEP_DIRECTION_STANDING_READS:]
         if (
             self.peak_px >= SWEEP_DEPARTING_MIN_PEAK_PX
             and width <= self.peak_px * (1.0 - SWEEP_DEPARTING_SHRINK)
@@ -902,7 +1027,7 @@ class DepartingPlate:
         else:
             self.shrunk = 0
         self.peak_px = max(self.peak_px, width)
-        receding = self.shrunk >= SWEEP_DEPARTING_READS
+        receding = self.shrunk >= SWEEP_DEPARTING_READS and not self.standing()
         if receding and not self.receding:
             self.since = now
         self.receding = receding
@@ -916,15 +1041,36 @@ class CarriedDeparture:
     sweep injected: the passage's verdict at the moment of the hand-over,
     answered the same way for as long as the frame lives in the pipeline,
     whatever the passage's reads or the next alarm say by then.
+
+    It also carries the way back to the passage's *live* judgement,
+    :meth:`direction`, for the actuation coordinator (#171): the cloud skip
+    is decided once, at routing, but whether the relay may pulse is asked at
+    the moment it would, and a grant that is held waits for the reads that
+    come after the hand-over. Frozen or live, it is always this frame's own
+    passage that answers, never the next car's.
     """
 
-    __slots__ = ("verdict",)
+    __slots__ = ("verdict", "_judge", "_clock", "_since_alarm")
 
-    def __init__(self, verdict: str | None) -> None:
+    def __init__(self, verdict: str | None, judge: DepartingPlate | None = None,
+                 clock=None, *, since_alarm: bool = False) -> None:
         self.verdict = verdict if verdict in ("on", "shadow") else None
+        self._judge = judge
+        self._clock = clock
+        self._since_alarm = bool(since_alarm)
 
     def __call__(self) -> str | None:
         return self.verdict
+
+    def direction(self):
+        """The passage's `DepartingPlate.direction_at` now, or None. Never raises."""
+        judge, clock = self._judge, self._clock
+        if judge is None or clock is None:
+            return None
+        try:
+            return judge.direction_at(clock(), since_alarm=self._since_alarm)
+        except Exception:
+            return None
 
     def __repr__(self) -> str:
         return f"CarriedDeparture({self.verdict!r})"
@@ -1201,6 +1347,10 @@ class TriggerFrameCapture:
         # Conclusive reads of a different car so far, by plate: the session
         # settles on the CONCLUSIVE_AGREEING_READS-th of the same plate.
         self._session_conclusive: dict[str, int] = {}
+        # Whether a frame of this session was refused by the coordinator as a
+        # departing car's (GATE_DEPARTING_WITHHOLD=on). See `local_sweep`.
+        self._session_departing_withheld = False
+        self._sweep_departing_held_back = 0
         self._session_changed = Event()
         # The SDP already carries the codec parameters, so probing is skipped
         # (the default probe alone costs about two seconds at 4K), and the
@@ -1386,6 +1536,25 @@ class TriggerFrameCapture:
         except Exception:
             return None
 
+    def departure_reading(self):
+        """Which way the car in view is going, by the current passage's reads.
+
+        What the actuation coordinator asks for an automatic grant that did
+        not come with its own passage -- the camera's FTP still, above all
+        (#171). Judged from a read after the latest vehicle alarm only, so
+        the next car's still is never judged by the car before it. A
+        `departure.DirectionReading`, or None when there is nothing to judge
+        by. Independent of ``GATE_LOCAL_SWEEP_DEPARTING_SKIP``: that switch is
+        about the cloud. Never raises.
+        """
+        try:
+            passage = self._passage
+            if passage is None:
+                return None
+            return passage.departing.direction_at(self._clock(), since_alarm=True)
+        except Exception:
+            return None
+
     def on_early_trigger(self, features=None) -> str:
         """Ask for a local-only sweep ahead of the camera's alarm. Never blocks.
 
@@ -1483,6 +1652,7 @@ class TriggerFrameCapture:
             self._session_settled = None
             self._session_read_a_plate = False
             self._session_conclusive = {}
+            self._session_departing_withheld = False
             self._session_changed.clear()
 
     def local_sweep(self, event, scheduled_at, stop_event) -> int:
@@ -2030,6 +2200,15 @@ class TriggerFrameCapture:
                 # sweep. The read is not lost: it is counted, and if the
                 # outstanding frame is refused the next one goes in.
                 continue
+            if self._holding_back_departure(passage):
+                # The coordinator has already withheld a frame of this car
+                # as departing, and the plate still reads so: another would
+                # only be withheld too, and would spend one of the sweep's
+                # few authorised hand-overs. Kept back, never lost: the
+                # moment the reads stop saying "departing" the next
+                # authorised read goes in as usual.
+                self._sweep_departing_held_back += 1
+                continue
             path = hand_over(frame, captured_at, digest, read, source="sweep")
             if path is not None:
                 injected += 1
@@ -2092,14 +2271,19 @@ class TriggerFrameCapture:
                         sweep_started_at: float) -> None:
         """Feed one boxed read to the passage's departure rule; journal the first verdict.
 
-        Under ``off`` nothing is judged, journalled or counted.
+        Every boxed read is fed, whatever the cloud skip's mode: the
+        actuation coordinator asks the same judgement whether the relay may
+        pulse (`departure_reading`, `CarriedDeparture.direction`), under
+        ``GATE_DEPARTING_WITHHOLD``. Under a cloud skip of ``off`` the
+        verdict is neither journalled here nor counted, and `departing_skip`
+        answers None, as before.
         """
         mode = self.config.sweep_departing_skip
-        if mode not in ("on", "shadow"):
-            return
         try:
             receding = passage.departing.note(plate_px, read_at)
         except Exception:
+            return
+        if mode not in ("on", "shadow"):
             return
         if not receding or passage.departing.noticed:
             return
@@ -2110,6 +2294,23 @@ class TriggerFrameCapture:
             mode, passage.departing.peak_px, plate_px,
             round(max(0.0, self._clock() - sweep_started_at) * 1000),
         )
+
+    def _holding_back_departure(self, passage) -> bool:
+        """Whether to keep an authorised read of ``passage`` from the pipeline. Never raises.
+
+        Only once the coordinator has withheld a frame of this session as
+        departing -- which it does only under ``GATE_DEPARTING_WITHHOLD=on``
+        -- and only while the passage's own reads still say departing.
+        """
+        try:
+            with self._session_lock:
+                withheld = self._session_departing_withheld
+            if not withheld:
+                return False
+            reading = passage.departing.direction_at(self._clock(), since_alarm=False)
+        except Exception:
+            return False
+        return reading is not None and reading.state == DEPARTING
 
     def _cloud_reachable(self) -> bool:
         """False only when the probe answers a definite False; see `__init__`."""
@@ -2281,6 +2482,13 @@ class TriggerFrameCapture:
             if _read_a_plate(decision):
                 # Read and refused is not "nothing could read the plate".
                 self._session_read_a_plate = True
+            if getattr(result, "reason", None) == DEPARTING:
+                # Withheld because the car is leaving. The session goes on
+                # reading (it is a retry reason), and `local_sweep` hands no
+                # further authorised frame over while the passage still reads
+                # as departing -- so a car wrongly judged so, that stops at
+                # the gate, still has frames left to be let in on.
+                self._session_departing_withheld = True
             if self._session_settled is None:
                 if getattr(result, "opened", False):
                     self._session_settled = "opened"
@@ -2672,7 +2880,15 @@ class TriggerFrameCapture:
                 self._departing_mode(passage, since_alarm=True)
                 if departing is _NOT_CARRIED else departing
             )
-            extra["departing"] = CarriedDeparture(verdict)
+            # ...and the passage itself, for the coordinator's live question
+            # (may the relay pulse now?). The sweep's own hand-overs are of
+            # this passage's car whatever alarm follows; a frame the sweep did
+            # not read itself -- a presence frame -- may be the next car's
+            # once an alarm has come in, exactly as for the verdict above.
+            extra["departing"] = CarriedDeparture(
+                verdict, passage.departing, self._clock,
+                since_alarm=departing is _NOT_CARRIED,
+            )
         try:
             inject((path,), captured_at, trigger, **extra)
         except Exception:
@@ -2826,6 +3042,9 @@ class TriggerFrameCapture:
                 "cloud_held": self._sweep_cloud_held,
                 "departing_skip": self.config.sweep_departing_skip,
                 "departing": self._sweep_departing,
+                # Authorised reads kept from the pipeline because the
+                # coordinator had already withheld this car as departing.
+                "departing_held_back": self._sweep_departing_held_back,
                 "waiting_seconds": self.config.sweep_waiting_seconds,
                 "waiting_fps": self.config.sweep_waiting_fps,
                 "waiting_reads": self._sweep_waiting_reads,

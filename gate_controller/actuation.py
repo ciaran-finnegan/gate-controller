@@ -2,10 +2,13 @@ import inspect
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
-from time import monotonic
+from threading import Event, Lock, Thread
+from time import monotonic, sleep as _sleep
 
 from .automatic_open import AutomaticOpenConfig
+from .departure import (
+    DEPARTING as DEPARTING_STATE, HELD_STATES, DepartureConfig, read_direction, settle,
+)
 from .models import ActuationExecution, GateEvent, RepulseHold
 
 LOGGER = logging.getLogger(__name__)
@@ -56,9 +59,12 @@ REPULSE_HOLD = "repulse_hold"
 #: The ``actuation_outcome`` and ``reason`` of a grant refused because the
 #: owner has paused automatic opening.
 AUTOMATIC_PAUSED = "automatic_paused"
+#: The ``actuation_outcome`` and ``reason`` of a grant refused because the
+#: car is leaving (gate_controller/departure.py, #171).
+DEPARTING = DEPARTING_STATE
 #: Every terminal outcome that is a decision the coordinator chose not to act
 #: on: the relay was not asked, and nothing was attempted.
-WITHHELD_OUTCOMES = frozenset({"cooldown", REPULSE_HOLD, AUTOMATIC_PAUSED})
+WITHHELD_OUTCOMES = frozenset({"cooldown", REPULSE_HOLD, AUTOMATIC_PAUSED, DEPARTING})
 
 
 class ActuationCoordinator:
@@ -68,7 +74,8 @@ class ActuationCoordinator:
                  clock=None, monotonic_clock=None, boot_id: str | None = None,
                  activation_observer=None, *, command_cooldown: timedelta | None = None,
                  repulse_unseen: timedelta | None = DEFAULT_REPULSE_UNSEEN,
-                 automatic_open=None):
+                 automatic_open=None, departure: DepartureConfig | None = None,
+                 departure_reading=None, sleep=None, spawn=None):
         self._store = store
         self._relay = relay
         # The one-pulse-per-car hold (docs/invariants.md 12): ``None`` or a
@@ -83,6 +90,19 @@ class ActuationCoordinator:
         # grant so the app's setting takes effect without a restart. ``None``
         # is a controller with no switch: automatic opening is on.
         self._automatic_open = automatic_open
+        # The departure rule (#171, gate_controller/departure.py): its mode
+        # and hold, and where to ask which way the car in view is going when
+        # a grant does not carry its own passage (the camera's still). None
+        # is a controller that never asks -- every older caller.
+        self._departure = departure
+        self._departure_reading = departure_reading
+        self._sleep = sleep or _sleep
+        self._spawn = spawn or _spawn_daemon
+        # Set by a person's command on its way to the lock, cleared once it
+        # has it: a held automatic grant (``_departure_check``) ends its wait
+        # the moment this is set, so a press at the app is never kept waiting
+        # on the departure rule.
+        self._command_waiting = Event()
         # ``cooldown`` is the automatic window. The command window is never
         # longer than it unless a caller says so explicitly, so a coordinator
         # built with ``cooldown=0`` has no window for anyone.
@@ -153,7 +173,109 @@ class ActuationCoordinator:
             ),
             "automatic_cooldown_seconds": self._cooldown.total_seconds(),
             "command_cooldown_seconds": self._command_cooldown.total_seconds(),
+            "departing_withhold": (
+                self._departure.mode if self._departure is not None else "off"
+            ),
+            "departing_hold_seconds": (
+                self._departure.hold_seconds if self._departure is not None else None
+            ),
         }
+
+    def _departure_check(self, event: GateEvent, key: str, direction,
+                         hold_budget) -> tuple[bool, float]:
+        """Whether this automatic grant must be withheld as a departing car's,
+        and how long it was held first.
+
+        ``direction`` is the grant's own passage (a sweep frame carries it);
+        without one the capture's current passage is asked, judged from reads
+        since the latest alarm. Under ``on`` a grant whose passage is still
+        undecided is *held* here -- on the thread that decided the frame,
+        under the coordinator's lock, while the sweep keeps reading on its
+        own thread -- for up to the configured hold, never past
+        ``hold_budget`` (the seconds left before the grant's own deadline and
+        its frame's freshness), and no longer than until a person's command
+        reaches the lock; then judged on what the reads say. Under ``shadow``
+        nothing waits and nothing is withheld: the journal says what ``on``
+        would have done, the hold being followed on a thread of its own.
+        Never raises; a reader that fails answers nothing, and nothing
+        withholds nothing.
+        """
+        config = self._departure
+        if config is None or not config.active:
+            return False, 0.0
+        reader = direction if callable(direction) else self._departure_reading
+        try:
+            if config.mode == "shadow":
+                self._shadow_departure(config, event, key, reader)
+                return False, 0.0
+            reading, held = read_direction(reader), 0.0
+            first = reading
+            if reading is not None and reading.state in HELD_STATES and config.hold_seconds > 0:
+                reading, held = settle(
+                    reader, hold_seconds=config.hold_seconds, budget=hold_budget,
+                    clock=self._monotonic_clock, sleep=self._sleep, first=reading,
+                    stop=self._command_waiting.is_set,
+                )
+            withhold = reading is not None and reading.state == DEPARTING_STATE
+            if withhold or held > 0:
+                cut_short = (
+                    held > 0 and reading is not None and reading.state in HELD_STATES
+                    and self._command_waiting.is_set()
+                )
+                LOGGER.warning(
+                    "gate_actuation departure=on outcome=%s %s first=%s held_ms=%d "
+                    "plate=%s source=%s key=%s%s",
+                    "withheld" if withhold else "released",
+                    reading.describe() if reading is not None else "state=unjudged",
+                    first.state if first is not None else "unjudged", round(held * 1000),
+                    event.authorised_plate or "-", event.source, key,
+                    " cut_short=command" if cut_short else "",
+                )
+            return withhold, held
+        except Exception:
+            LOGGER.warning("gate_actuation departure=error key=%s", key, exc_info=True)
+            return False, 0.0
+
+    def _shadow_departure(self, config: DepartureConfig, event: GateEvent, key: str,
+                          reader) -> None:
+        """Journal what ``on`` would do with this grant; change nothing. Never raises."""
+        reading = read_direction(reader)
+        if reading is not None and reading.state == DEPARTING_STATE:
+            would = "withhold"
+        elif reading is not None and reading.state in HELD_STATES and config.hold_seconds > 0:
+            would = "hold"
+        else:
+            would = "pulse"
+        LOGGER.info(
+            "gate_actuation departure=shadow would=%s %s plate=%s source=%s key=%s",
+            would, reading.describe() if reading is not None else "state=unjudged",
+            event.authorised_plate or "-", event.source, key,
+        )
+        if would != "hold":
+            return
+        plate, source = event.authorised_plate or "-", event.source
+
+        def follow():
+            # The hold `on` would have made, followed alongside the pulse
+            # that went: the sweep reads on, for about as long as the relay's
+            # own pulse, so the reads `on` would have waited for still come.
+            settled, held = settle(
+                reader, hold_seconds=config.hold_seconds, budget=None,
+                clock=self._monotonic_clock, sleep=self._sleep, first=reading,
+            )
+            withheld = settled is not None and settled.state == DEPARTING_STATE
+            LOGGER.info(
+                "gate_actuation departure=shadow stage=settled would=%s %s held_ms=%d "
+                "plate=%s source=%s key=%s",
+                "withhold" if withheld else "pulse",
+                settled.describe() if settled is not None else "state=unjudged",
+                round(held * 1000), plate, source, key,
+            )
+
+        try:
+            self._spawn(follow)
+        except Exception:
+            LOGGER.warning("gate_actuation departure=shadow stage=unfollowed key=%s", key)
 
     def _is_automatic(self, event: GateEvent, command_ack) -> bool:
         return command_ack is None and event.source not in HUMAN_COMMAND_SOURCES
@@ -188,11 +310,20 @@ class ActuationCoordinator:
     def actuate(self, event: GateEvent, *, outbox_payload: dict | None = None,
                 command_ack: tuple[str, datetime] | None = None,
                 pre_activation_inhibit=None, on_activation=None,
-                on_deactivation=None) -> ActuationExecution:
+                on_deactivation=None, direction=None,
+                hold_budget=None) -> ActuationExecution:
         key = event.idempotency_key
         if not key:
             raise ValueError("actuation events require an idempotency key")
+        automatic = self._is_automatic(event, command_ack)
+        if not automatic:
+            # A person is on the way: a held automatic grant lets go of the
+            # lock at once (``_departure_check``). Cleared once the lock is
+            # had, so the next grant holds as usual.
+            self._command_waiting.set()
         with self._lock:
+            if not automatic:
+                self._command_waiting.clear()
             terminal = self._store.terminal_outcome(key)
             if terminal:
                 self._reconcile_outbox(terminal.event_id, outbox_payload)
@@ -248,7 +379,6 @@ class ActuationCoordinator:
                 )
                 return ActuationExecution(False, outcome, event_id, "failed", outcome)
 
-            automatic = self._is_automatic(event, command_ack)
             if automatic and not (pause := self.automatic_open_config()).enabled:
                 # The owner's switch, asked first and before any claim: every
                 # automatic path -- sweep frame, FTP still, presence frame,
@@ -362,9 +492,50 @@ class ActuationCoordinator:
                             False, "indeterminate_claim", None, "failed", "indeterminate_claim"
                         )
                     return ActuationExecution(False, detail, event_id, status, detail)
+            attempt_time = claim_time
+            if automatic:
+                departing, held = self._departure_check(event, key, direction, hold_budget)
+                if held > 0:
+                    # The grant waited. The pulse that may follow is recorded
+                    # at the moment it goes, not at the moment of the grant,
+                    # so the cooldowns measured from the record (after a
+                    # restart, when ``_last_attempt_monotonic`` is gone) run
+                    # their full length from the pulse.
+                    monotonic_now = self._monotonic_clock()
+                    attempt_time = self._clock()
+            else:
+                departing = False
+            if departing:
+                # The car is leaving (#171): the relay is on the step-by-step
+                # input, so a pulse now would land on a gate the exit wand or
+                # auto-open has opened -- closing it on the car, or stopping
+                # it dead. Asked after the cooldown and the one-pulse hold,
+                # so it names exactly the pulses they would have let through,
+                # and held and finalized like them, with nothing attempted.
+                # Recorded as the denial it is: the gate was not opened for
+                # this car by this event.
+                inhibition = inhibition_now()
+                if inhibition is None:
+                    terminal = _departing_event(event, key, self._clock())
+                    status, detail = "failed", DEPARTING
+                else:
+                    terminal = _inhibited_event(event, key, self._clock(), inhibition[1])
+                    status, detail = inhibition
+                try:
+                    event_id = self._store.finalize_actuation(
+                        claim, terminal, terminal_status=status,
+                        terminal_detail=detail, outbox_payload=outbox_payload,
+                        command_ack=command_ack,
+                        retain_activation_attempt=False,
+                    )
+                except Exception:
+                    return ActuationExecution(
+                        False, "indeterminate_claim", None, "failed", "indeterminate_claim"
+                    )
+                return ActuationExecution(False, detail, event_id, status, detail)
             try:
                 self._store.mark_actuation_attempt(
-                    claim, claim_time, event=event, outbox_payload=outbox_payload,
+                    claim, attempt_time, event=event, outbox_payload=outbox_payload,
                     command_ack=command_ack, attempted_monotonic=monotonic_now,
                     boot_id=self._boot_id,
                 )
@@ -522,6 +693,31 @@ def _paused_event(event: GateEvent, key: str, at: datetime) -> GateEvent:
         ocr_confidence=event.ocr_confidence, actuation_outcome=AUTOMATIC_PAUSED,
         near_miss_plate=event.near_miss_plate,
     )
+
+
+def _departing_event(event: GateEvent, key: str, at: datetime) -> GateEvent:
+    """The record of a grant withheld because the car is leaving (#171).
+
+    Written like a paused grant, not a cooldown one: the gate was not opened
+    for this car by this event or any earlier one, so ``opened`` is false and
+    the reason is ``departing``, with the plate and the score the reader
+    gave it. ``actuation_outcome`` says the same, so the local record is
+    unambiguous, and the app sees a departure as a departure rather than as
+    an entry that failed. It names the plate, so it keeps the plate "seen"
+    for the one-pulse hold exactly as any other read does; it is not a
+    pulse, so it never starts one.
+    """
+    return GateEvent(
+        source=event.source, reason=DEPARTING, opened=False, idempotency_key=key,
+        received_at=event.received_at, decision_at=at,
+        authorised_plate=event.authorised_plate, observed_plate=event.observed_plate,
+        ocr_confidence=event.ocr_confidence, actuation_outcome=DEPARTING,
+        near_miss_plate=event.near_miss_plate,
+    )
+
+
+def _spawn_daemon(target) -> None:
+    Thread(target=target, daemon=True, name="departure-shadow").start()
 
 
 def _inhibited_event(event: GateEvent, key: str, at: datetime, reason: str) -> GateEvent:

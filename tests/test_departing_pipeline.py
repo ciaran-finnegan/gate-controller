@@ -130,7 +130,7 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertEqual(cloud.posted, [], f"a departure was paid for:\n{text}")
         self.assertEqual(gate.relay_calls, [])
         self.assertEqual(gate.opened(), [])
-        self.assertIn("gate_local_sweep stage=departing mode=on peak_px=280 plate_px=170", text)
+        self.assertIn("gate_local_sweep stage=departing mode=on peak_px=280 plate_px=160", text)
         skipped = text.count("gate_ocr stage=cloud_skipped reason=departing")
         self.assertGreaterEqual(skipped, 2, f"hand-over and still were not both skipped:\n{text}")
         # Each skipped frame is on record, answered "no plate", as every skip is.
@@ -174,7 +174,10 @@ class DepartingPipelineTests(unittest.TestCase):
         self.assertEqual(gate.sweep_status()["departing"], 0)
 
     def test_a_departing_cars_authorised_rear_plate_still_opens_on_the_device(self):
-        # #171: the relay fires for an authorised rear plate the device reads.
+        # The cloud skip never touches a device grant: with no departure rule
+        # in the coordinator (as under GATE_DEPARTING_WITHHOLD=off or shadow)
+        # an authorised rear plate the device reads still pulses. Withholding
+        # that pulse is tests/test_departing_withhold.py (#171).
         frames, widths = receding_passage(range(230, 237), big=330)
         answers = {
             digest(crop_to_region(data, REGION)): (AUTHORISED_PLATE, 0.40) for data in frames

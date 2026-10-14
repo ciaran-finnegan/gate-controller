@@ -240,6 +240,62 @@ Both settings are rejected whole when unreadable, logged at ERROR and
 replaced by the shipped default, exactly as the cooldowns are. Neither can add
 a pulse: each can only withhold one.
 
+## No Pulse For A Car That Is Leaving
+
+A departing car comes from behind the camera, is let out by the exit wand or
+the auto-open, and shows the camera its rear plate -- which is on the same
+list. From 2026-10-10 to 10-14, eight of the eighteen vehicle pulses went to
+cars that were leaving, each into a gate that was open or opening (#171). The
+same coordinator asks, for every automatic grant the cooldown and the
+one-pulse hold would let through, whether the car is leaving:
+
+| Variable | Default | Accepted | What it does |
+| --- | --- | --- | --- |
+| `GATE_DEPARTING_WITHHOLD` | `shadow` | `off`, `shadow`, `on` | `on` withholds the pulse from a car judged leaving and holds an undecided one; `shadow` only journals what `on` would do; `off` asks nothing |
+| `GATE_DEPARTING_HOLD_SECONDS` | `2.0` | 0 to 3 | The longest an undecided grant waits for the sweep's reads |
+
+The judgement is the sweep's plate widths (`DepartingPlate`, the one the
+cloud skip reads): three boxed reads in a row at most 70 % of the passage's
+widest plate is a car leaving; a plate that has grown since it was first boxed
+and is near its widest is a car coming closer; a plate standing still for two
+seconds is a car waiting. A grant whose passage has not yet said -- the first
+plate still the widest, or the latest well short of it -- is held, under `on`,
+while the sweep keeps reading, never past the grant's own decision deadline or
+its frame's freshness, then pulsed or withheld on what the reads say. A
+passage with nothing boxed, or only far plates, is not held: the rule
+withholds only on evidence.
+
+The hold waits inside the coordinator, on the thread that decided the frame
+(the burst thread for a frame the device read, the cloud lane for a cloud
+answer), under the coordinator's lock; it polls the passage and sleeps, and
+never touches the network. The sweep is on its own thread and reads on; its
+reads are what end the hold. What waits behind a hold is another grant of the
+same passage -- the camera's still, a second authorised read -- which the
+hold's outcome settles anyway (the cooldown, or the same judgement). A pulse
+that follows a hold is recorded at the moment it went, so the cooldowns run
+their full length from the pulse.
+
+A withheld grant is recorded as the denial it is: `opened=false`,
+`reason="departing"`, the plate and the score kept, `actuation_outcome =
+"departing"` locally and `telemetry.actuation.claim = "departing"` on the wire.
+The journal says `gate_actuation departure=on outcome=withheld state=departing
+... first=... held_ms=...`. The sweep keeps reading (a car wrongly judged
+leaving that stops at the gate is let in once its plate stands still), and
+holds back further authorised frames only while the car still reads as
+leaving. A person's command from the app is never asked, and never waits on
+the rule: a command that arrives during a hold ends it at once
+(`cut_short=command` on the journal line), the held grant is judged on what
+the reads have said by then, and the command then meets whatever it would
+always have met -- the pulse's own two seconds, and the 20 s command cooldown
+if that grant pulsed.
+
+`shadow` journals, for every automatic pulse, `gate_actuation departure=shadow
+would=withhold|hold|pulse state=...`, and for one `on` would have held, `stage=settled
+would=withhold|pulse held_ms=...` once the hold it did not make is over. The
+heartbeat's `actuation` block gains `departing_withhold` and
+`departing_hold_seconds`. When to switch it on is in
+[vehicle-direction.md](vehicle-direction.md#withholding-the-pulse).
+
 ## FTP Upload Ownership
 
 Bootstrap adds `ftp-user` to the `gate-controller` group, configures
