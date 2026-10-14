@@ -681,7 +681,8 @@ State (`camera_control.clock`): `synced`, `outcome` (`not_checked`, `ok`,
 `corrections`. Journal: `gate_camera_control stage=clock_reconcile outcome=…
 skew_seconds=+N time_zone=Z dst=D ntp=on|restored|unknown`, where
 `time_zone` and `dst` are what the camera was found displaying (the NVR's
-signature is `0`/`1`, a phone's is its own zone in seconds) and `ntp` says
+signature is `0`/`1`, a phone's is its own zone in seconds, and `-1` is a
+field the camera did not report, which is never taken as UTC) and `ntp` says
 whether the camera's NTP was on or had to be restored.
 
 ## Environment

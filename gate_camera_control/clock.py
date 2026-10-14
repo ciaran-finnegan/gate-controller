@@ -356,7 +356,9 @@ def _adjtimex_state() -> int | None:
 
 
 def _config(fields: dict, dst: dict) -> tuple[int, int]:
-    return _int(fields.get("timeZone"), -1), _int(dst.get("enable"), 0)
+    # A field the camera did not report is unknown, not UTC: a clock whose
+    # zone or DST flag cannot be read is never "ok" and never "corrected".
+    return _int(fields.get("timeZone"), -1), _int(dst.get("enable"), -1)
 
 
 def _displays_utc(fields: dict, dst: dict) -> bool:

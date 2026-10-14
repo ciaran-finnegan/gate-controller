@@ -137,6 +137,24 @@ class ClockReconcilerTests(unittest.TestCase):
         self.assertEqual(snapshot["outcome"], "corrected")
         self.assertEqual((client.state["Time"]["timeZone"], client.state["Dst"]["enable"]), (0, 0))
 
+    def test_a_dst_flag_the_camera_does_not_report_is_not_taken_as_off(self):
+        """A UTC-looking time with no DST block is unconfirmed, not `ok`; and
+        a read-back that still lacks it is not `corrected`."""
+        class NoDstBlock(FakeClient):
+            def clock_state(self):
+                return {"Time": dict(self.state["Time"]), "Dst": {}}
+
+        client = NoDstBlock(camera_time(self.NOW), ntp=NTP_ON)
+        reconciler, journal = self._reconciler(client, retry_seconds=300)
+
+        snapshot = reconciler.reconcile()
+
+        self.assertEqual(len(client.writes), 2, "the configuration is written, read back, and written once more")
+        self.assertTrue(all(dst["enable"] == 0 for _fields, dst in client.writes))
+        self.assertEqual((snapshot["outcome"], snapshot["synced"]), ("correction_failed", False))
+        self.assertEqual(journal[-1][1]["dst"], -1)
+        self.assertEqual(reconciler._next_at, 1300.0)
+
     def test_utc_with_the_dst_flag_flipped_back_on_is_corrected(self):
         """Not a choice anybody makes.
 
