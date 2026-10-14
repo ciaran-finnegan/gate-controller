@@ -325,7 +325,10 @@ Guards:
 
 The sound scanner and the left-open check (`gate_left_open.py`) report what
 the gate seems to be doing; they never act on it. Neither imports the relay,
-the actuation coordinator or the command server. Neither sends a command or
+the actuation coordinator or the command server, and nor does the rule every
+reader of `gate_movements` applies to the camera's old alarm sound
+(`gate_alarm_sound.py`), nor the scanner's engine check: both can only leave a
+row out of what is reported. Neither sends a command or
 retries one, and nothing they report reaches the decision path. The only
 closing action the left-open alert offers is a person pressing the app's
 existing gate button. That goes through the app's command route, its
@@ -345,6 +348,7 @@ Guards:
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_it_never_reaches_the_relay_or_the_actuation_coordinator`
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_the_check_imports_nothing_that_can_move_the_gate`
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_a_malformed_setting_changes_nothing_about_plate_matching`
+- `tests/test_gate_alarm_sound.py::NothingThatReadsTheRowsCanMoveTheGate::test_the_classification_and_the_scanner_import_nothing_that_can_move_the_gate`
 
 ## 12. One car, one automatic pulse
 

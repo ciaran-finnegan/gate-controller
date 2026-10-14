@@ -516,13 +516,15 @@ place it is looked for now.
 ### What is not yet true of it
 
 * **A vehicle's engine reads much like the motor.** It is what put the 11:08
-  run 3.2 s early, and it is unresolved: separating them needs labelled engine
-  audio, which the retention fix has only just started collecting.
+  run 3.2 s early. Since 2026-10-14 a run without the motor's band in it is
+  not written (section 2i); a motor *under* an idling engine is still not
+  heard at all.
 * **The alternation is only as good as its first run.** A movement means
   "shut" because the gate was open, and a false positive early in a scan
   inverts every outcome after it.
 * **One travel can still be reported as two.** A dropout longer than 1.5 s
-  splits a run; the 14:20 closing came out as 15.4 s plus 9.6 s.
+  splits a run; the 14:20 closing came out as 15.4 s plus 9.6 s. (The scan's
+  own 60-second chunks used to split runs too; they no longer do, 2i.)
 * **The gate-motor classifier was trained on four cycles** from one
   afternoon. Replaced 2026-09-21 by one trained on 49.2 hours — see section
   2d, including what that retrain still does not cover.
@@ -961,11 +963,133 @@ number, and no latch on the last. Over 2.72 weeks of history that rule fired
 four times. Only one of them (2026-09-21) is known to be real: the 2026-10-09
 burst turned out to be the camera's alarm sound and car engines, so the rule
 is unvalidated until it is replayed on audio recorded with that sound off
-(see [gate-left-open.md](gate-left-open.md)).
+(see [gate-left-open.md](gate-left-open.md)). Replayed on 2026-10-14 with the
+alarm sound set aside and the scan's split runs joined (2i), it fires once
+over the same history: 2026-09-21, the real one.
 
 It is notify only. It reads `gate_movements` and `gate_listening` on the
 heartbeat's read-only connection and returns a dictionary. It can never
 reach the relay ([invariant 11](invariants.md)).
+
+## 2i. Engines, The Alarm Sound, And Split Runs
+
+Measured 2026-10-14, after the gate jam of 10 October
+([reviews/2026-10-10-gate-jam.md](reviews/2026-10-10-gate-jam.md)) showed
+that every `gate_movements` row of that morning was the camera's alarm sound
+or an idling D-Max, and that the scanner had missed the four overnight sounds
+that do match the motor. Three changes, all in what is written down; nothing
+here is on the decision path, and nothing that reads these rows can move the
+gate ([invariant 11](invariants.md)).
+
+### The camera's alarm sound, set aside when it is read
+
+Until 2026-10-10 15:27 IST the camera played an alarm through its speaker at
+every vehicle alarm, 0.2-1.9 s after it, for 9-15 s, clipping the microphone.
+The classifier wrote it as a motor run every time. Those rows are kept, and
+every reader of the table -- the heartbeat's state and counts, the left-open
+check, the direction scan, the early-trigger report and the scanner's own
+starting state -- skips a row that **starts before 15:27 that day and within
+2 s of a camera vehicle alarm** (`gate_controller/gate_alarm_sound.py`). The
+alarm times are the ones the controller already keeps in each frame's
+telemetry: received time less `delta_ms` is the moment the Pi received the
+alarm, and agrees with the early-trigger log to the millisecond on all 1001
+frames on the Pi. 40 rows are set aside (32 of the 218 the retrained detector
+wrote before 15:27). It is not a "near an alarm" rule: from 15:27 the minutes
+after an alarm are when the real motor runs, and nothing after 15:27 is set
+aside. Four alarms on 2026-10-02 produced no frame and so are not on record;
+a row beside one of them stays.
+
+### A car's engine, not written
+
+The classifier hears an engine as the motor. The motor puts most of its energy
+in 1.2-8 kHz; an idling diesel, or a car arriving or leaving, puts most of its
+in 150-1200 Hz. So each run is now checked: cut into half-second bins, a bin
+counts when no frame in it clipped and its median frame has at least half of
+the energy above the wind band (150 Hz) in 1.2-8 kHz. A run with fewer than
+four seconds of such bins is not written, and the scan journals
+`gate_sound stage=not_the_motor` with its start and how much motor it held.
+Counted rather than averaged, so a motor run an engine overlaps for part of
+its length still counts for the part it does not. It is pure arithmetic on
+the run's own seconds (`motor_seconds_heard`), about 0.3 s of CPU per second
+of run on the board.
+
+**The labelled set, and how far it goes.** Every run the shipped scanner
+writes on 17.3 hours of recorded audio, re-scanned on a laptop with the
+board's own model:
+
+| Audio | Hours | Runs | Labelled by |
+| --- | ---: | ---: | --- |
+| 2026-09-21 test cycles, no vehicle (R2 corpus) | 0.6 | 4 | the relay; the reference cycles |
+| 9 Oct 21:00 - 10 Oct 11:35 IST (copied off the board for the review) | 14.5 | 22 | the jam review, before this work |
+| 12-14 Oct, every segment holding a row, alarm or pulse | 2.3 | 20 | band timelines read by hand, relay times, latches |
+
+| Run | n | Seconds with the motor's band |
+| --- | ---: | --- |
+| the motor (test cycles, closings, one opening) | 12 | 7.5 - 23.0 |
+| a car's engine (idling, arriving, leaving) | 26 | 0.0 - 1.5 |
+| the camera's alarm sound (every bin clipped) | 8 | 0.0 |
+
+| | Before | After |
+| --- | ---: | ---: |
+| Runs written | 46 | 13 |
+| ...that are the motor | 12 | 13 |
+| ...that are an engine or the alarm sound | 34 | 0 |
+| Precision | 0.26 | 1.00 |
+| Motor runs found before that are still written | -- | 12 of 12 |
+
+The thirteenth motor run after is new: the commanded opening after the relay
+pulse of 13 Oct 17:08:39, 10.6 s from 17:08:55, whose two halves were each
+shorter than the 8 s floor until the chunk fix below joined them.
+
+What this is not:
+
+* **Small.** 12 motor runs and 34 others. Four seconds sits in a wide gap
+  (1.5 to 7.5), but a gap measured on 46 runs is a gap on 46 runs.
+* **Not independent for 12-14 Oct.** Those labels were read off the same
+  band levels the check uses. The two halves that are independent -- the
+  reference cycles (4 of 4 kept) and the review's morning (22 of 22 set
+  aside) -- agree with it.
+* **Recall is unchanged.** The check only removes runs. The four overnight
+  motor sounds of 9-10 Oct (23:24, 00:25, 00:26, 01:31:50-01:32:15 IST) are
+  still not found: the classifier never called them the motor, before or
+  after.
+* **A motor under an engine is still not heard.** An idling diesel beside the
+  camera sits at the motor's own level. Five of the nine motor runs kept on
+  12-14 Oct are closings whose opening was under the engine of the car it
+  opened for.
+
+### What the state machine makes of an engine
+
+A run that is not written still means a car was at the gate, and a car at a
+shut gate is the commonest reason an opening is not heard. So `movements_from`
+takes the engines as `vehicles`: one at a shut gate moves the alternation to
+open and nothing is written for it. Without that, each of those five closings
+would be read as an opening and counted as somebody's fob. It only ever
+points toward "open": a run is still only `shut` when a latch is heard at its
+end. It is wrong when a car arrives and the gate's opening *is* heard (14 Oct
+14:11: engine, then the opening at relay +3 s), which is read as a closing --
+exactly as it was before, when the engine was written as the opening. And the
+alternation does not carry from one scan to the next except through the last
+row written, so a car at the end of one quarter-hour scan and the closing in
+the next read the closing as an opening.
+
+### Runs are no longer cut at a whole minute
+
+The scan reads a segment a minute at a time, to keep the board's memory low,
+and used to find runs a minute at a time too. A travel across a minute
+boundary was written as two rows, or not at all when neither half reached
+8 s. Seventeen of the 291 rows yamnet-linear-v2 wrote are the second half of
+such a split, and in three of the left-open check's four `likely` bursts a
+split or an alarm sound supplied the odd run. Runs are now found over the
+whole segment's frames; the one frame YAMNet does not answer for at each
+boundary is entered as not heard, which the 1.5 s gap rule bridges like any
+other dropout. A split across two segments (two of the 17) is not joined.
+
+The rows already in the database are not re-scanned or rewritten: their
+splits and engine runs stay, and only the alarm-sound rows are set aside on
+read. Re-scanning the history would need its audio back from R2. What the
+three changes do to the left-open check's history is in
+[gate-left-open.md](gate-left-open.md#replayed-again-2026-10-14).
 
 ## 3. What Is Proposed
 
