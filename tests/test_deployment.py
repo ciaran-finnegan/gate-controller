@@ -3911,7 +3911,7 @@ class DependencyLockTests(unittest.TestCase):
             "watchdog": "6.0.0",
             "certifi": "2026.7.22",
             "charset-normalizer": "3.5.0",
-            "idna": "3.18",
+            "idna": "3.20",
             "urllib3": "2.7.0",
             "rpi-lgpio": "0.6",
             # On-device recognition, arm64 only: the versions measured on the
