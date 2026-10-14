@@ -32,11 +32,12 @@ import subprocess
 from .audio_segments import (
     GapLedger, SegmentStore, listening_gaps, segment_coverage, segment_started_at,
 )
+from .gate_alarm_sound import heard_rows
 from .gate_audio_detect import (
-    CONFIRMED, FRAME_SAMPLES, UNCONFIRMED, analyse_frames, find_clangs,
-    movements_from, summarise,
+    CONFIRMED, FRAME_SAMPLES, MOTOR_MIN_SECONDS_HEARD, UNCONFIRMED, analyse_frames,
+    find_clangs, motor_seconds_heard, movements_from, summarise,
 )
-from .sound_model import GateSoundModel, SAMPLE_RATE, motor_runs
+from .sound_model import GateSoundModel, HOP_SECONDS, SAMPLE_RATE, SoundWindow, motor_runs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,9 +45,14 @@ LOGGER = logging.getLogger(__name__)
 #: other work. Sixty seconds at a time keeps the resident set small, and the
 #: boundary costs the one 0.96 s patch that straddles it.
 CHUNK_SECONDS = 60
+#: YAMNet hops 0.48 s, so a 60 s chunk is exactly 125 hops.
+FRAMES_PER_CHUNK = round(CHUNK_SECONDS / HOP_SECONDS)
 #: Stamped on every row, so a movement judged by the model trained on four
 #: cycles is never silently compared with one judged by its replacement.
 DETECTOR = "yamnet-linear-v2"
+#: How far back the heartbeat looks for the newest row that is the gate and
+#: not the camera's alarm sound (gate_alarm_sound.py).
+LAST_MOVEMENT_READ_LIMIT = 48
 
 
 @dataclass(frozen=True)
@@ -102,6 +108,12 @@ CLANG_SEARCH_SECONDS = 4.0
 def scan_segment(model: GateSoundModel, path, started_at: datetime):
     """Every motor run and clang in one segment, in wall-clock time.
 
+    Returns ``(runs, clangs, frames, vehicles)``: ``vehicles`` are the runs
+    the classifier called the motor that do not have the motor's band in them
+    (``motor_seconds_heard``) -- a car's engine, or the camera's alarm sound.
+    They are not movements; ``movements_from`` uses them only to move its
+    alternation (a car at a shut gate is an opening nobody heard).
+
     The two detectors cost wildly different amounts. YAMNet is a MobileNet and
     runs at a fraction of a core. ``analyse_frames`` is a pure-Python FFT over
     a 1024-sample window hopped by half, which is 9,375 windows for a
@@ -114,23 +126,53 @@ def scan_segment(model: GateSoundModel, path, started_at: datetime):
     what the state machine does with it -- so only those few seconds are
     analysed, and the rest of the night costs nothing.
     """
-    import numpy as np
-
     samples = decode(path)
     if samples is None or len(samples) < SAMPLE_RATE:
-        return [], [], 0
+        return [], [], 0, []
 
-    runs, frames = [], 0
+    probabilities, frames = [], 0
     step = CHUNK_SECONDS * SAMPLE_RATE
-    for offset in range(0, len(samples), step):
+    for index, offset in enumerate(range(0, len(samples), step)):
         chunk = samples[offset:offset + step]
         if len(chunk) < SAMPLE_RATE:
             break
         at = started_at + _seconds(offset / SAMPLE_RATE)
-        scaled = np.ascontiguousarray(chunk, dtype=np.float32) / 32768.0
-        window = model.classify(scaled, at)
+        window = model.classify(_model_input(chunk), at)
         frames += len(window.probabilities)
-        runs.extend(motor_runs(window))
+        # One window for the whole segment, so a run is not cut in two where
+        # one chunk ends and the next begins. A chunk is exactly
+        # FRAMES_PER_CHUNK hops and YAMNet answers for one fewer (the patch
+        # that would straddle the boundary); that frame is entered as not
+        # heard, which `motor_runs` bridges like any other single dropout.
+        # Until 2026-10-14 runs were found chunk by chunk, and 17 of the 291
+        # rows the retrained detector wrote were the second half of a run
+        # split at a whole minute -- in three of the left-open check's
+        # `likely` bursts.
+        probabilities.extend([0.0] * max(0, index * FRAMES_PER_CHUNK - len(probabilities)))
+        probabilities.extend(window.probabilities)
+    found = motor_runs(SoundWindow(started_at, probabilities))
+
+    # The classifier hears a car's engine as the motor: an idling diesel
+    # beside the camera sits at the motor's own level, and every arriving and
+    # departing car produced a run (docs/reviews/2026-10-10-gate-jam.md). The
+    # motor's band is what tells them apart, so each run is checked against
+    # it before it is believed. Only the run's own seconds are analysed.
+    runs, vehicles = [], []
+    for run in found:
+        first = max(0, int((run.start - started_at).total_seconds() * SAMPLE_RATE))
+        last = min(len(samples), int((run.end - started_at).total_seconds() * SAMPLE_RATE))
+        heard = motor_seconds_heard(analyse_frames(
+            _as_list(samples[first:last]), SAMPLE_RATE,
+            started_at + _seconds(first / SAMPLE_RATE),
+        ))
+        if heard >= MOTOR_MIN_SECONDS_HEARD:
+            runs.append(run)
+            continue
+        vehicles.append(run)
+        LOGGER.info(
+            "gate_sound stage=not_the_motor start=%s seconds=%.1f motor_seconds=%.1f",
+            run.start.isoformat(), run.seconds, heard,
+        )
 
     clangs = []
     for run in runs:
@@ -140,9 +182,30 @@ def scan_segment(model: GateSoundModel, path, started_at: datetime):
         if last - first < FRAME_SAMPLES:
             continue
         clangs.extend(find_clangs(analyse_frames(
-            samples[first:last], SAMPLE_RATE, started_at + _seconds(first / SAMPLE_RATE),
+            _as_list(samples[first:last]), SAMPLE_RATE,
+            started_at + _seconds(first / SAMPLE_RATE),
         )))
-    return runs, clangs, frames
+    return runs, clangs, frames, vehicles
+
+
+def _model_input(chunk):
+    """YAMNet's input: float32 in [-1, 1].
+
+    numpy is what onnxruntime needs, and is on every board that can run the
+    model. Without it no model can be running either, and a plain list is
+    what any other classifier gets.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return [value / 32768.0 for value in _as_list(chunk)]
+    return np.ascontiguousarray(chunk, dtype=np.float32) / 32768.0
+
+
+def _as_list(samples):
+    """Plain integers: the pure-Python analysis indexes sample by sample, and a
+    numpy scalar per access is several times slower than an int."""
+    return samples.tolist() if hasattr(samples, "tolist") else list(samples)
 
 
 def _seconds(value: float):
@@ -173,24 +236,28 @@ def scan(store: SegmentStore, model: GateSoundModel, *, already_scanned=(),
     segments = store.segments()[:-1]
     pending = [segment for segment in segments if segment.path.name not in seen][:limit]
 
-    runs, clangs, frames, scanned = [], [], 0, []
+    runs, clangs, vehicles, frames, scanned = [], [], [], 0, []
     for segment in pending:
         started_at = segment_started_at(segment.path)
         if started_at is None:
             continue
-        found, heard, counted = scan_segment(model, segment.path, started_at)
+        found, heard, counted, engines = scan_segment(model, segment.path, started_at)
         runs.extend(found)
         clangs.extend(heard)
+        vehicles.extend(engines)
         frames += counted
         scanned.append((segment.path.name, counted))
 
     moves = movements_from(
         runs, clangs, commanded_at=commanded_at, initial_state=initial_state,
+        vehicles=vehicles,
     )
     LOGGER.info(
-        "gate_sound stage=scanned segments=%d frames=%d movements=%d uncommanded=%d final_state=%s",
+        "gate_sound stage=scanned segments=%d frames=%d movements=%d uncommanded=%d"
+        " not_the_motor=%d final_state=%s",
         len(scanned), frames, len(moves),
-        sum(1 for move in moves if move.uncommanded), summarise(moves).get("final_state"),
+        sum(1 for move in moves if move.uncommanded), len(vehicles),
+        summarise(moves).get("final_state"),
     )
     return ScanResult(len(scanned), frames, len(moves), len(segments) - len(pending)), moves, scanned
 
@@ -351,31 +418,25 @@ def gate_state(connection, *, now=None, recent_hours: int = 24,
     """
     moment = now or datetime.now(timezone.utc)
     try:
-        last = connection.execute(
+        # Rows that are the camera's own alarm sound (recorded at every
+        # vehicle alarm until 2026-10-10 15:27 IST; gate_alarm_sound.py) are
+        # not the gate, and are left out of the state and every count.
+        last = next(heard_rows(connection, connection.execute(
             "SELECT started_at, ended_at, outcome, confirmation FROM gate_movements"
-            " ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
+            " ORDER BY started_at DESC LIMIT ?", (LAST_MOVEMENT_READ_LIMIT,),
+        )), None)
         since = (moment - _seconds(recent_hours * 3600)).isoformat()
-        counts = dict(connection.execute(
-            "SELECT outcome, COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " GROUP BY outcome", (since,),
-        ))
-        uncommanded = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ? AND uncommanded = 1",
-            (since,),
-        ).fetchone()[0]
-        confirmed = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND confirmation = ?", (since, CONFIRMED),
-        ).fetchone()[0]
-        unconfirmed = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND confirmation = ?", (since, UNCONFIRMED),
-        ).fetchone()[0]
-        latches = connection.execute(
-            "SELECT COUNT(*) FROM gate_movements WHERE started_at >= ?"
-            " AND latch_at IS NOT NULL", (since,),
-        ).fetchone()[0]
+        recent = list(heard_rows(connection, connection.execute(
+            "SELECT started_at, outcome, uncommanded, confirmation, latch_at"
+            " FROM gate_movements WHERE started_at >= ?", (since,),
+        )))
+        counts: dict = {}
+        for _started, outcome, _uncommanded, _confirmation, _latch in recent:
+            counts[outcome] = counts.get(outcome, 0) + 1
+        uncommanded = sum(1 for row in recent if row[2] == 1)
+        confirmed = sum(1 for row in recent if row[3] == CONFIRMED)
+        unconfirmed = sum(1 for row in recent if row[3] == UNCONFIRMED)
+        latches = sum(1 for row in recent if row[4] is not None)
         scanned = connection.execute(
             "SELECT COUNT(*), MAX(scanned_at) FROM gate_sound_scans"
         ).fetchone()

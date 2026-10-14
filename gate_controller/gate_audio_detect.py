@@ -253,17 +253,24 @@ def analyse_frames(samples, sample_rate: int, started_at: datetime):
                   int(lo * FRAME_SAMPLES / sample_rate) + 1))
              for lo, hi in BANDS]
     for start in range(0, len(samples) - FRAME_SAMPLES, HOP_SAMPLES):
-        frame = [samples[start + i] / 32768.0 * window[i] for i in range(FRAME_SAMPLES)]
+        raw = samples[start:start + FRAME_SAMPLES]
+        frame = [raw[i] / 32768.0 * window[i] for i in range(FRAME_SAMPLES)]
         rms = math.sqrt(sum(v * v for v in frame) / FRAME_SAMPLES)
         power = [abs(c) ** 2 for c in _fft([complex(v, 0) for v in frame])[:FRAME_SAMPLES // 2]]
         band = [sum(power[a:b]) for a, b in edges]
         total = sum(band) or 1e-12
+        above_wind = (total - band[WIND_BAND]) or 1e-12
         yield {
             "at": started_at + timedelta(seconds=start / sample_rate),
             "dbfs": 20 * math.log10(rms) if rms > 1e-12 else -120.0,
             "hf_share": (band[MOTOR_BANDS[0]] + band[MOTOR_BANDS[1]]) / total,
             "high_share": band[CLANG_BAND] / total,
             "wind_share": band[WIND_BAND] / total,
+            # The motor's share of everything above the wind band. Wind is
+            # 70-99% below 150 Hz and comes and goes with the weather, so it
+            # is left out of the denominator; an engine's energy is not.
+            "motor_share": (band[MOTOR_BANDS[0]] + band[MOTOR_BANDS[1]]) / above_wind,
+            "peak": max(abs(int(value)) for value in raw) / 32768.0,
         }
 
 
@@ -334,6 +341,63 @@ def find_clangs(frames) -> list[Clang]:
     return found
 
 
+#: What separates the motor from a car's engine, measured 2026-10-14 over
+#: every run the scanner (yamnet-linear-v2) writes on 17.3 hours of recorded
+#: audio (docs/gate-audio.md 2i): the 21 Sep test cycles, the 9-10 Oct night
+#: and morning the jam review labelled, and every run on 12-14 Oct.
+#:
+#: The motor puts most of its energy in 1.2-8 kHz (the 1.1-1.5 kHz line and
+#: what rings above it); an engine idling beside the camera, or a car
+#: arriving or leaving, puts most of its energy in 150-1200 Hz. Taken over
+#: the energy above the wind band, in half-second bins:
+#:
+#: ======================================  ==  =========================
+#: run                                      n  seconds with share >= 0.5
+#: ======================================  ==  =========================
+#: the motor (test cycles, closings)       12  7.5 - 23.0
+#: an engine (idling, arriving, leaving)   26  0.0 - 1.5
+#: the camera's alarm sound (clipping)      8  0.0 (every bin clipped)
+#: ======================================  ==  =========================
+#:
+#: Four seconds sits in the empty space between 1.5 and 7.5, nearer the
+#: engine, because what this throws away is a motor run.
+MOTOR_SHARE = 0.5
+MOTOR_MIN_SECONDS_HEARD = 4.0
+MOTOR_BIN_SECONDS = 0.5
+#: A frame whose loudest sample is within half a decibel of full scale. The
+#: motor peaks at -25 to -46 dBFS; the camera's alarm sound and a car passing
+#: under the microphone clip it, and a clipped frame's band shares are the
+#: converter's, not the sound's.
+CLIPPED_PEAK = 10 ** (-0.5 / 20)
+
+
+def motor_seconds_heard(frames) -> float:
+    """How much of a stretch of audio sounds like the motor, in seconds.
+
+    The stretch is cut into half-second bins. A bin counts when no frame in it
+    clipped and the median frame puts at least ``MOTOR_SHARE`` of its energy
+    above the wind band into the motor's band. Counted rather than averaged,
+    so a real motor run that a car's engine overlaps for part of its length is
+    still heard for the part it is not.
+    """
+    bins: dict = {}
+    first = None
+    for frame in frames:
+        first = frame["at"] if first is None else first
+        index = int((frame["at"] - first).total_seconds() // MOTOR_BIN_SECONDS)
+        bins.setdefault(index, []).append(frame)
+    heard = 0
+    for members in bins.values():
+        if any(frame["peak"] >= CLIPPED_PEAK for frame in members):
+            continue
+        shares = sorted(frame["motor_share"] for frame in members)
+        middle = len(shares) // 2
+        median = shares[middle] if len(shares) % 2 else (shares[middle - 1] + shares[middle]) / 2
+        if median >= MOTOR_SHARE:
+            heard += 1
+    return heard * MOTOR_BIN_SECONDS
+
+
 def movements(frames, *, commanded_at=(), initial_state: str = "shut") -> list[GateMovement]:
     """What the gate did: one entry per motor run, with how it ended.
 
@@ -362,7 +426,8 @@ def movements(frames, *, commanded_at=(), initial_state: str = "shut") -> list[G
     )
 
 
-def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut") -> list[GateMovement]:
+def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut",
+                   vehicles=()) -> list[GateMovement]:
     """The same state machine, over runs and clangs found however you like.
 
     The band-ratio rule above finds both, and on a quiet night it saturates and
@@ -373,13 +438,28 @@ def movements_from(runs, clangs, *, commanded_at=(), initial_state: str = "shut"
 
     What neither of them can do is decide what a run *meant*. That needs the
     gate's alternation, and it lives here, once.
+
+    ``vehicles`` are runs the classifier called the motor that turned out to
+    be a car's engine (``motor_seconds_heard`` under
+    ``MOTOR_MIN_SECONDS_HEARD``). They are not movements and
+    nothing is returned for them, but one at a shut gate moves the alternation
+    to open: a car at the gate is the commonest reason an opening is not
+    heard. On 12-14 Oct, five of the nine motor runs the scanner kept were
+    closings whose opening was under an idling or arriving engine; without
+    this every one of them would be read as an opening. The assumption only
+    ever points toward "open" -- a run is still only "shut" if a latch is
+    heard at its end -- so it can never be what says the property is secured.
     """
     runs = sorted(runs, key=lambda run: run.start)
     clangs = list(clangs)
     commands = sorted(commanded_at)
     state = initial_state if initial_state in {"shut", "open"} else "shut"
+    masked = sorted(vehicles, key=lambda run: run.start)
     out: list[GateMovement] = []
     for run in runs:
+        while masked and masked[0].start < run.start:
+            masked.pop(0)
+            state = "open"
         closing = state == "open"
         # The loudest latch beside this run's end, found whatever the state
         # machine believes. It is recorded either way and only *interpreted*

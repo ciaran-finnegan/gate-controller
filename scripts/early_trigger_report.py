@@ -64,6 +64,7 @@ from gate_controller.early_trigger import (  # noqa: E402
     DEFAULT_FPS, KIND_CAMERA_ALARM, KIND_WOULD_TRIGGER, LOOK_NOT_ASKED, USEFUL_LEAD_SECONDS,
     clip_sees_vehicle, correlate, ensure_schema,
 )
+from gate_controller.gate_alarm_sound import heard_rows  # noqa: E402
 from gate_controller.gate_audio_detect import BANDS  # noqa: E402
 
 #: The session decoder takes about a second to deliver its first frame and a
@@ -464,10 +465,11 @@ def annotate_uncommanded(rows, events_database: Path) -> None:
     """Did the gate's motor run un-commanded just before? Then somebody is leaving."""
     try:
         with closing(sqlite3.connect(f"file:{events_database}?mode=ro", uri=True)) as connection:
+            # The camera's alarm sound is not somebody leaving (gate_alarm_sound.py).
             movements = [
                 datetime.fromisoformat(started).timestamp()
-                for (started,) in connection.execute(
-                    "SELECT started_at FROM gate_movements WHERE uncommanded = 1")
+                for (started,) in heard_rows(connection, connection.execute(
+                    "SELECT started_at FROM gate_movements WHERE uncommanded = 1"))
             ]
     except (sqlite3.Error, ValueError):
         return
