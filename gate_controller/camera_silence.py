@@ -1,19 +1,21 @@
-"""Say when the camera has stopped raising vehicle alarms. Report only.
+"""Say when no camera alarm has reached the Pi for a long time. Report only.
 
-From 2026-10-18 12:52 UTC to 2026-10-20 11:26 UTC the RLC-811A raised no
-AI-vehicle alarm: no webhook to the Pi and no FTP upload, the two silent and
-back together, so the fault was the camera's. Cars came -- the early
-trigger's thumbnails show them on 19 Oct at 09:02 and 22:17 UTC -- but every
-passage the app shows starts with a camera alarm, so Gate Mate showed two
-quiet days and nothing said otherwise. A camera that has stopped alarming
-looks exactly like a quiet drive.
+From 2026-10-18 12:52 UTC to 2026-10-20 11:26 UTC no AI-vehicle alarm from the
+RLC-811A reached the Pi: no webhook and no FTP upload, both silent and back
+at the same time. Every passage the app shows starts with a camera alarm, so
+Gate Mate showed two quiet days and nothing said why. Why the alarms stopped
+is not settled here. The camera may have stopped alarming, or there may have
+been no traffic: the gate operator may not have been working, so nobody drove
+up. The early trigger's thumbnails do show vehicles on 19 Oct at 09:02 and
+22:17 UTC. Either way, from the app a silent camera and an empty drive look
+the same, and this check says which numbers to look at.
 
 The early trigger is the independent witness. It watches the small stream on
 its own and writes every vision would-trigger and every camera alarm to
 ``early-trigger.db`` (``early_trigger_observations``, kinds ``would_trigger``
 and ``camera_alarm``). On an ordinary day the camera alarms 0.4-0.7 times per
 would-trigger; on 19 Oct it was 0 for 21. This module reads that record for
-the heartbeat and answers one question: has the camera been quiet for
+the heartbeat and answers one question: has no alarm come for
 ``GATE_CAMERA_ALARM_SILENCE_HOURS`` while the vision trigger fired at least
 ``GATE_CAMERA_ALARM_SILENCE_WOULD_TRIGGERS`` times since its last alarm?
 
@@ -200,7 +202,8 @@ class CameraAlarmSilence:
             LOGGER.warning(
                 "gate_camera_alarms stage=silent silent_since=%s hours=%.1f would_triggers=%d "
                 "threshold_hours=%g threshold_would_triggers=%d -- the camera has raised no "
-                "vehicle alarm while the early trigger kept seeing vehicles; check the camera",
+                "vehicle alarm that reached the Pi while the early trigger kept firing; check the "
+                "camera, its webhook and whether anything is using the drive",
                 block["silent_since"], block["hours_without_alarm"],
                 block["would_triggers_without_alarm"], self.hours, self.would_triggers,
             )

@@ -1,7 +1,7 @@
 """Camera-alarm silence, through the path production takes.
 
-From 2026-10-18 12:52 to 2026-10-20 11:26 UTC the camera raised no vehicle
-alarm while cars came, and the app showed two quiet days. Every test here
+From 2026-10-18 12:52 to 2026-10-20 11:26 UTC no camera alarm reached the Pi
+while the early trigger kept firing, and the app showed two quiet days. Every test here
 starts from what the early trigger writes -- the real `EarlyTriggerWorker`
 recording its would-triggers and the camera's alarms into the real
 `early-trigger.db` -- and ends with the payload the real `HeartbeatWorker`

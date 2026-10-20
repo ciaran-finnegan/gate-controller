@@ -591,20 +591,30 @@ If night fails and day passes: `GATE_EARLY_TRIGGER_HOURS=07:00-19:00`.
 
 ## Camera alarm silence
 
-From 2026-10-18 12:52 to 2026-10-20 11:26 UTC the RLC-811A raised no
-AI-vehicle alarm. The webhook to the Pi and the FTP upload went silent and came
-back together, so the fault was the camera's. Cars came: the thumbnails here
-show them on 19 Oct at 09:02 and 22:17. Every passage the app shows starts at
-a camera alarm, and early sweeps the camera never confirms end
+From 2026-10-18 12:52 to 2026-10-20 11:26 UTC no AI-vehicle alarm from the
+RLC-811A reached the Pi. The webhook and the FTP upload went silent and came
+back at the same time. Every passage the app shows starts at a camera alarm,
+and early sweeps the camera never confirms end
 `early_abort`/`early_unconfirmed` with no access-log row, so Gate Mate showed
-two quiet days and nothing flagged it. A camera that has stopped alarming
-looks exactly like a quiet drive.
+two quiet days and nothing flagged it. The thumbnails here show vehicles on
+19 Oct at 09:02 and 22:17.
+
+**Why the alarms stopped is not settled.** The camera may have stopped
+alarming. There may also have been almost no traffic: the audio record has
+the gate motor silent from 17 Oct ~16:19 UTC through relay pulses on 18 and
+20 Oct, which points to the gate operator not working, so that people stopped
+driving up. From the app a silent camera and an empty drive look the same.
+This check cannot tell them apart. It says that the camera's alarms and the
+vision rule disagree, and a person finds out why.
 
 This record is the second witness, because the vision rule watches the lane
 on its own. Its `camera_alarm` rows are the camera's alarm events as the Pi
 received them (the webhook pipeline's accepted events), so a silence means no
 alarm reached the Pi: a camera that stopped alarming, or a webhook that stopped
-arriving, as on 30 Sep to 4 Oct. The vsftpd log tells the two apart. `gate_controller/camera_silence.py` reads it on the heartbeat's
+arriving, as on 30 Sep to 4 Oct. The vsftpd log tells the two apart. A would-
+trigger is not proof of a vehicle (the vision rule also fires on light), so a
+quiet drive that still trips the vision rule can be flagged too; the
+thumbnails say which. `gate_controller/camera_silence.py` reads it on the heartbeat's
 thread, at most once a minute, read-only, and adds a `camera_alarms` block to
 `/api/controller/status`:
 
@@ -677,7 +687,7 @@ in the middle of a silence the journal line is written again.
 (`worker/routes/controller.ts`, `narrowed…Capabilities`), so `camera_alarms`
 is dropped until access-gate-ui learns it. That needs a narrower for the
 block, a line on the controller-health view ("The camera has raised no
-vehicle alarm since …, though the early trigger saw N vehicles"), and
+vehicle alarm since …, though the early trigger fired N times"), and
 probably a push on the transition to `silent`, keyed on `silent_since` the
 way `gate.left_open` is keyed on `since`.
 
