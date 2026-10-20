@@ -306,6 +306,48 @@ class MainConfigurationTests(unittest.TestCase):
         self.assertIn(hot_buffer, run_worker.call_args.kwargs["background_workers"])
         self.assertIs(hot_buffer, run_worker.call_args.kwargs["hot_frame_provider"])
 
+    def test_main_hands_the_heartbeat_a_camera_silence_check_on_the_early_triggers_record(self):
+        """2026-10-18 to 20: the camera stopped alarming and nothing said so.
+
+        The check is only worth anything if `main` gives it to the heartbeat,
+        reading the very file the early trigger writes. With the early trigger
+        off there is no second witness, so there is no check.
+        """
+        for mode, expected in (("shadow", True), ("off", False)):
+            environment = self.isolated_state_environment(GATE_EARLY_TRIGGER=mode)
+            with self.subTest(mode=mode), patch.dict(
+                os.environ, environment, clear=True
+            ), patch("sys.argv", ["gate-controller"]), patch.object(
+                gate_main, "require_python_version"
+            ), patch.object(
+                gate_main, "PiRelayAdapter", return_value=object()
+            ), patch.object(
+                gate_main, "RelayController"
+            ), patch.object(
+                gate_main, "LocalStore"
+            ), patch.object(
+                gate_main, "AuthorisedPlateCache"
+            ), patch.object(
+                gate_main, "build_background_workers",
+                return_value=((), object(), object()),
+            ) as build, patch.object(
+                gate_main, "PlateRecognizerClient", return_value=object()
+            ), patch.object(
+                gate_main, "GateProcessor", return_value=object()
+            ), patch.object(
+                gate_main, "run_worker"
+            ), no_live_state_access():
+                gate_main.main()
+
+                check = build.call_args.kwargs["camera_silence"]
+                if not expected:
+                    self.assertIsNone(check)
+                    continue
+                self.assertEqual(
+                    check.path,
+                    Path(environment["GATE_DATABASE"]).resolve().parent / "early-trigger.db",
+                )
+
     def test_status_exposes_only_nonsecret_effective_hot_stream_health(self):
         store = self.create_store()
 

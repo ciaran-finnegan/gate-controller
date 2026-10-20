@@ -1372,6 +1372,11 @@ class EarlyTriggerWorker:
             if callable(observe):
                 observe(self.note_sweep)
 
+    @property
+    def record_path(self) -> Path | None:
+        """Where the record is kept, for the heartbeat's camera-silence check to read."""
+        return None if self._store is None else self._store.path
+
     # -- what the rest of the controller tells it ---------------------------
     def set_clip_look(self, clip_look) -> None:
         """The image tower's ``look``, once the processor's policy has loaded it."""

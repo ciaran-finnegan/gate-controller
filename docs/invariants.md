@@ -324,12 +324,15 @@ Guards:
 ## 11. Nothing that watches the gate can move it
 
 The sound scanner and the left-open check (`gate_left_open.py`) report what
-the gate seems to be doing; they never act on it. Neither imports the relay,
-the actuation coordinator or the command server, and nor does the rule every
-reader of `gate_movements` applies to the camera's old alarm sound
-(`gate_alarm_sound.py`), nor the scanner's engine check: both can only leave a
-row out of what is reported. Neither sends a command or
-retries one, and nothing they report reaches the decision path. The only
+the gate seems to be doing, and the camera-silence check (`camera_silence.py`)
+reports that the camera has stopped alarming; they never act on it. None
+imports the relay, the actuation coordinator or the command server, and nor
+does the rule every reader of `gate_movements` applies to the camera's old
+alarm sound (`gate_alarm_sound.py`), nor the scanner's engine check: both can
+only leave a row out of what is reported. None sends a command or retries one,
+nothing they report reaches the decision path, and nothing tries to "recover"
+a silent camera by restarting or reconfiguring it (2026-10-18 to 20,
+[early-trigger.md](early-trigger.md#camera-alarm-silence)). The only
 closing action the left-open alert offers is a person pressing the app's
 existing gate button. That goes through the app's command route, its
 `operator` role check and the 20 s command cooldown, exactly as a manual open
@@ -349,6 +352,8 @@ Guards:
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_the_check_imports_nothing_that_can_move_the_gate`
 - `tests/test_gate_left_open.py::LeftOpenThroughTheHeartbeat::test_a_malformed_setting_changes_nothing_about_plate_matching`
 - `tests/test_gate_alarm_sound.py::NothingThatReadsTheRowsCanMoveTheGate::test_the_classification_and_the_scanner_import_nothing_that_can_move_the_gate`
+- `tests/test_camera_alarm_silence.py::CameraSilenceThroughTheHeartbeat::test_it_never_reaches_the_relay_or_the_actuation_coordinator`
+- `tests/test_camera_alarm_silence.py::CameraSilenceThroughTheHeartbeat::test_the_check_imports_nothing_that_can_move_the_gate`
 
 ## 12. One car, one automatic pulse
 
