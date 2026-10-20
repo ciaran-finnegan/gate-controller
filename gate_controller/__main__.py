@@ -31,6 +31,7 @@ from .direction import DirectionTracker, load_direction_config
 from .early_trigger import MODE_ON as EARLY_TRIGGER_ON
 from .early_trigger import build_worker as build_early_trigger
 from .early_trigger import load_mode as load_early_trigger_mode
+from .camera_silence import build_monitor as build_camera_silence
 from .host_metrics import read_host_metrics
 from .hot_stream import HotStreamBuffer, load_hot_stream_config
 from .local_recognizer import build_local_recognizer
@@ -301,6 +302,9 @@ def main() -> None:
         trigger_capture=trigger_capture, webhook=trigger_correlator,
         corpus=corpus, activity=activity, metrics=metrics, net_probe=net_probe,
         cloud_breaker=cloud_breaker, camera_focus=camera_refocus,
+        # Reads the early trigger's record on the heartbeat's thread to say
+        # when the camera has stopped alarming (2026-10-18 to 20). Report only.
+        camera_silence=build_camera_silence(os.environ, early_trigger),
     )
     # Shadow only: it reads boxes the pipeline already produced and journals
     # a verdict. It reaches no decision, spends no lookup and ends no
@@ -1023,7 +1027,8 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
                              hot_stream=None, match_policy=None,
                              local_recognizer=None, trigger_capture=None,
                              corpus=None, activity=None, metrics=None, webhook=None,
-                             net_probe=None, cloud_breaker=None, camera_focus=None):
+                             net_probe=None, cloud_breaker=None, camera_focus=None,
+                             camera_silence=None):
     environment = os.environ if environment is None else environment
     activity = activity if activity is not None else ActivityGate(
         quiet_seconds=_corpus_quiet_seconds(environment),
@@ -1093,6 +1098,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
             corpus=corpus, corpus_upload=corpus_upload, activity=activity,
             metrics=metrics, cloud_breaker=cloud_breaker, camera_focus=camera_focus,
             left_open_defaults=left_open_defaults, coordinator=coordinator,
+            camera_silence=camera_silence,
         )
         heartbeat_worker = HeartbeatWorker(
             CloudflareStatusReporter(cloudflare_client, controller_id), status,
@@ -1141,7 +1147,7 @@ def build_background_workers(store, relay, *, environment=None, latest_image=Non
         hot_stream=hot_stream, local_recognizer=local_recognizer,
         trigger_capture=trigger_capture, webhook=webhook, net_probe=net_probe,
         corpus=corpus, activity=activity, camera_focus=camera_focus,
-        left_open_defaults=left_open_defaults,
+        left_open_defaults=left_open_defaults, camera_silence=camera_silence,
     )
 
 
@@ -1255,7 +1261,7 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
                        heartbeat=None, plates=None,
                        corpus=None, corpus_upload=None, activity=None, metrics=None,
                        cloud_breaker=None, camera_focus=None, left_open_defaults=None,
-                       coordinator=None,
+                       coordinator=None, camera_silence=None,
                        media_capabilities_path=Path("/run/gate-media/capabilities.json"),
                        camera_control_state_path=CAMERA_CONTROL_STATE_PATH,
                        module_path=Path(__file__),
@@ -1337,6 +1343,13 @@ def _controller_status(store, prompt_player, latest_image, authorised=None, *, r
     actuation_status = _actuation_status(coordinator)
     if actuation_status is not None:
         status["actuation"] = actuation_status
+    # Additive, like `actuation`: whether the camera has stopped raising
+    # vehicle alarms while the early trigger kept seeing vehicles. Absent when
+    # the early trigger is off, because then nothing can tell a dead camera
+    # from a quiet drive.
+    camera_alarms = _bounded_status(camera_silence) if camera_silence is not None else None
+    if camera_alarms:
+        status["camera_alarms"] = camera_alarms
     return status
 
 

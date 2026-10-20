@@ -293,7 +293,8 @@ luma_jump=… peak=… persistence=… contrast=… spread=…`; `stage=refused
 reason=illumination|unlit …` once per appearance the vision rule itself turned
 away; plus `stage=paused`, `stage=backoff`, and `stage=status` every ten
 minutes (with cumulative `samples`, `confirmed`, `unconfirmed` and `refused`).
-Nothing is added to the heartbeat.
+The heartbeat carries one thing read from this record: whether the camera has
+stopped alarming ([below](#camera-alarm-silence)).
 
 **Pictures.** Each row keeps a before/after pair of the patch, 320x90 grey
 JPEG, about 6 KB, in `early-trigger-thumbnails/`. At most 500 files
@@ -587,6 +588,108 @@ Proposed bar for `on`, per light, over at least 20 passages:
   on the second fortnight, worst hour 5 and 4.
 
 If night fails and day passes: `GATE_EARLY_TRIGGER_HOURS=07:00-19:00`.
+
+## Camera alarm silence
+
+From 2026-10-18 12:52 to 2026-10-20 11:26 UTC no AI-vehicle alarm from the
+RLC-811A reached the Pi. The webhook and the FTP upload went silent and came
+back at the same time. Every passage the app shows starts at a camera alarm,
+and early sweeps the camera never confirms end
+`early_abort`/`early_unconfirmed` with no access-log row, so Gate Mate showed
+two quiet days and nothing flagged it. The thumbnails here show vehicles on
+19 Oct at 09:02 and 22:17.
+
+**Why the alarms stopped is not settled.** The camera may have stopped
+alarming. There may also have been almost no traffic: the audio record has
+the gate motor silent from 17 Oct ~16:19 UTC through relay pulses on 18 and
+20 Oct, which points to the gate operator not working, so that people stopped
+driving up. From the app a silent camera and an empty drive look the same.
+This check cannot tell them apart. It says that the camera's alarms and the
+vision rule disagree, and a person finds out why.
+
+This record is the second witness, because the vision rule watches the lane
+on its own. Its `camera_alarm` rows are the camera's alarm events as the Pi
+received them (the webhook pipeline's accepted events), so a silence means no
+alarm reached the Pi: a camera that stopped alarming, or a webhook that stopped
+arriving, as on 30 Sep to 4 Oct. The vsftpd log tells the two apart. A would-
+trigger is not proof of a vehicle (the vision rule also fires on light), so a
+quiet drive that still trips the vision rule can be flagged too; the
+thumbnails say which. `gate_controller/camera_silence.py` reads it on the heartbeat's
+thread, at most once a minute, read-only, and adds a `camera_alarms` block to
+`/api/controller/status`:
+
+| Key | Meaning |
+| --- | --- |
+| `state` | `silent`, `clear`, or `unknown` (no record yet, or it could not be read) |
+| `silent_since` | the camera's last alarm (or the first observation, if it has never alarmed) while `silent`; `null` otherwise. The episode key: the next alarm clears it |
+| `last_alarm_at` | the newest `camera_alarm` row |
+| `hours_without_alarm`, `would_triggers_without_alarm` | since that alarm |
+| `threshold_hours`, `threshold_would_triggers` | the rule in force |
+
+The rule: **`silent` when there has been no camera alarm for 20 hours and the
+vision rule has fired at least 16 times since the last one.** The journal says
+`gate_camera_alarms stage=silent silent_since=…` once when a silence is first
+seen and `stage=cleared` once when the next alarm ends it. It is only a
+report. Nothing restarts, reconfigures or pulses anything (CLAUDE.md rule 3,
+[invariant 11](invariants.md)); a person looks at the camera.
+
+| Variable | Default | Accepted |
+| --- | --- | --- |
+| `GATE_CAMERA_ALARM_SILENCE_HOURS` | `20` | 2-168 |
+| `GATE_CAMERA_ALARM_SILENCE_WOULD_TRIGGERS` | `16` | 1-1000 |
+
+With `GATE_EARLY_TRIGGER=off` there is no record and no block: nothing else on
+the Pi sees a vehicle the camera did not report.
+
+**Why 20 hours and 16.** The rule was replayed over every row from 2026-09-22
+to 2026-10-20: 1,026 rows, 782 would-triggers and 244 camera alarms. On most
+ordinary days the camera alarms 0.4-0.9 times per would-trigger, but single
+days run from 0.15 (28 Sep) to 1.5 (11 Oct), so a daily ratio does not
+separate a dead camera from a quiet day either. The record holds three real
+silences:
+
+| Silence (UTC) | Length | Would-triggers in it | Flagged after |
+| --- | ---: | ---: | ---: |
+| 30 Sep 20:52 to 2 Oct 09:29 (the degraded network, [deployment.md](deployment.md#slow-ftp-uploads)) | 36.6 h | 57 | 23.8 h |
+| 2 Oct 16:03 to 4 Oct 10:56 (the same, with 3 Oct's sun patches) | 42.9 h | 226 | 20.0 h |
+| 18 Oct 12:52 to 20 Oct 11:26 | 46.6 h | 35 | 25.3 h (19 Oct 14:10) |
+
+Every other gap between two alarms is a night or a quiet day. The longest was
+23.1 h with 7 would-triggers (Sunday 27-28 Sep). The busiest held 15 in 17.7 h
+(10-11 Oct): the vision rule also fires at night with no car at the gate
+(0.69 false an hour by night over the second fortnight). So neither a time nor a count on its own separates a
+dead camera from a quiet night:
+
+| Rule | Ordinary gaps flagged | Real silences flagged |
+| --- | ---: | ---: |
+| 6-16 h and 12 | 3-4 | 3 |
+| 20 h and 8-10 | 1 | 3 |
+| 20 h and 12 | 0 | 3, the 18 Oct one after 20.3 h |
+| **20 h and 16** | **0** | **3, the 18 Oct one after 25.3 h** |
+| 24 h and anything up to 12 | 0 | 3, after 24 h |
+
+At 20 h, no ordinary gap had more than 10 would-triggers. A plain 24 h rule
+would have been 0.9 h from flagging that Sunday. 20 h and 12 would have
+flagged the 18 Oct silence five hours sooner, but with a margin of two
+would-triggers over the busiest long night. 20 h and 16 has a margin of six
+over the long nights and one over the busiest short night, which never
+reached 20 h. Each silence is still flagged the afternoon after it began,
+long before it ended. A count too low to separate a quiet night from a dead
+camera says nothing. One much higher only delays a true flag by a few hours.
+
+**What it cannot see.** A camera that stops alarming while the early trigger is
+also blind (stream down, `paused` for hours) stays `clear`: no would-triggers,
+no evidence. A silence shorter than 20 h, such as a camera that drops out for
+an afternoon, is not flagged. The state is held in memory, so after a restart
+in the middle of a silence the journal line is written again.
+
+**What the app would need.** The Worker narrows the heartbeat block by block
+(`worker/routes/controller.ts`, `narrowed…Capabilities`), so `camera_alarms`
+is dropped until access-gate-ui learns it. That needs a narrower for the
+block, a line on the controller-health view ("The camera has raised no
+vehicle alarm since …, though the early trigger fired N times"), and
+probably a push on the transition to `silent`, keyed on `silent_since` the
+way `gate.left_open` is keyed on `since`.
 
 ## A live audio pre-arm: not built
 
