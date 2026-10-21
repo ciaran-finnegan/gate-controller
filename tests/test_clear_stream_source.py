@@ -1,4 +1,6 @@
+import os
 import subprocess
+import time
 import unittest
 from io import BytesIO
 from threading import Event
@@ -51,7 +53,7 @@ class Stdout:
     def __init__(self, chunks):
         self.chunks = list(chunks)
 
-    def read(self, _size):
+    def read1(self, _size):
         return self.chunks.pop(0) if self.chunks else b""
 
 
@@ -188,7 +190,7 @@ class ClearStreamSourceTests(unittest.TestCase):
             def __init__(self):
                 self.index = 0
 
-            def read(self, _size):
+            def read1(self, _size):
                 if self.index >= len(jpegs):
                     done.wait(1)
                     return b""
@@ -384,7 +386,7 @@ class ClearStreamSourceTests(unittest.TestCase):
         never = Event()
 
         class SilentStdout:
-            def read(self, _size):
+            def read1(self, _size):
                 never.wait(0.05)
                 return b"" if never.is_set() else b""
 
@@ -477,7 +479,7 @@ class ClearStreamSourceTests(unittest.TestCase):
         class OpenStdout:
             """The session decoder's pipe: nothing yet, and not closed either."""
 
-            def read(self, _size):
+            def read1(self, _size):
                 session_over.wait(5)
                 return b""
 
@@ -505,3 +507,88 @@ class ClearStreamSourceTests(unittest.TestCase):
         self.assertFalse(source.scene.status()["available"])
         session_over.set()
         source.stop_session("test")
+
+
+class PipeEnd:
+    """The write end of a real OS pipe, closed with the test."""
+
+    def __init__(self):
+        read_fd, self.write_fd = os.pipe()
+        # Exactly what Popen gives the session: a buffered reader on a pipe.
+        self.reader = os.fdopen(read_fd, "rb")
+
+    def write(self, data):
+        os.write(self.write_fd, data)
+
+    def close(self):
+        if self.write_fd is not None:
+            os.close(self.write_fd)
+            self.write_fd = None
+
+
+class SessionPipeTests(unittest.TestCase):
+    """The session over real pipes that stay open, as ffmpeg's do mid-session.
+
+    A picture of this stream is about 70 KB at 6 fps. Read in blocking 64 KB
+    pieces, the tail of each one waited for the next picture to push it
+    through, on both sides of the decoder, and the sweep read every frame
+    later than the camera took it (2.0-2.3 s, measured 2026-10-21).
+    """
+
+    def setUp(self):
+        self.clock = [100.0]
+        self.packets = PipeEnd()
+        self.pictures = PipeEnd()
+        self.copy = FakeProcess()
+        self.copy.stdout = self.packets.reader
+        self.decoder = FakeProcess()
+        self.decoder.stdout = self.pictures.reader
+        # Cleanups run last-first: stop the session, then end both pipes as
+        # ffmpeg exiting would, and only then close the readers -- closing a
+        # reader that a session thread is blocked in would wait on it.
+        self.addCleanup(self.packets.reader.close)
+        self.addCleanup(self.pictures.reader.close)
+        self.addCleanup(self.packets.close)
+        self.addCleanup(self.pictures.close)
+
+        def factory(command):
+            if "copy" in command:
+                return self.copy
+            if "pipe:0" in command and "-frames:v" not in command:
+                return self.decoder
+            return FakeProcess(output=jpeg())
+
+        self.source = ClearStreamSource(
+            "rtsp://127.0.0.1:8554/clear", popen=RecordingPopen(factory),
+            clock=lambda: self.clock[0], source_fps=6.0, session_fps=5.0,
+        )
+        self.addCleanup(self.source.stop_session, "test")
+
+    def wait_for(self, condition, what):
+        for _ in range(200):
+            if condition():
+                return
+            time.sleep(0.01)
+        self.fail(f"not within 2 s: {what}")
+
+    def test_a_picture_reaches_the_decoder_as_soon_as_it_arrives(self):
+        self.assertTrue(self.source.start_session())
+        self.packets.write(STREAM)  # a few hundred bytes, and the copy runs on
+        self.wait_for(lambda: b"key" in self.decoder.stdin.written, "the keyframe fed to the decoder")
+
+    def test_a_decoded_frame_reaches_the_sweep_as_soon_as_the_decoder_writes_it(self):
+        self.assertTrue(self.source.start_session())
+        self.pictures.write(jpeg())  # one small frame, and the decoder runs on
+        self.wait_for(lambda: self.source.status()["session"]["frames"] == 1, "the frame in the ring")
+        self.assertIsNotNone(self.source.latest())
+
+    def test_the_session_journals_how_long_its_pipeline_held_each_picture(self):
+        self.assertTrue(self.source.start_session())
+        self.packets.write(STREAM)  # three pictures, arriving at t=100.0
+        self.wait_for(lambda: b"p2" in self.decoder.stdin.written, "the pictures fed to the decoder")
+        self.clock[0] = 100.4
+        self.pictures.write(jpeg())  # the first picture, out of the decoder at t=100.4
+        self.wait_for(lambda: self.source.status()["session"]["frames"] == 1, "the frame in the ring")
+        with self.assertLogs("gate_controller.clear_stream_source", level="INFO") as logs:
+            self.source.stop_session("test")
+        self.assertIn("pipeline_ms_p50=400 pipeline_ms_max=400", logs.output[0])

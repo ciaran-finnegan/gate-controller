@@ -32,7 +32,8 @@ from threading import Event, Lock, Thread
 from time import monotonic
 
 from .clear_stream import (
-    HevcPacketRing, IrapStartGate, decode_command, decode_frames, record_command,
+    HevcPacketRing, IrapStartGate, PictureCounter, decode_command, decode_frames,
+    record_command,
 )
 from .hot_stream import FFMPEG_BINARY, HotFrameRing, JpegStreamParser
 from .scene import SceneBaseline, frame_thumbnail, thumbnail_difference
@@ -53,6 +54,11 @@ DEFAULT_BASELINE_SECONDS = 30.0
 DEFAULT_SOURCE_FPS = 10.0
 SESSION_RING_FRAMES = 12
 KEYFRAME_DECODE_TIMEOUT = 3.0
+# An upper bound per read, never a wait: every pipe here is read with
+# ``read1``, which returns what has arrived. ``read(n)`` on a pipe blocks
+# until n bytes are in, and a 6 fps picture of this stream is about 70 KB, so
+# a 64 KB ``read`` held the tail of each one until the next picture pushed it
+# through -- on both sides of the session decoder.
 SESSION_CHUNK_BYTES = 64 * 1024
 # Enough of the decoder's complaint to name it in the stop line. A decoder
 # that rejects the pipe says so in one line and then exits.
@@ -122,6 +128,7 @@ class ClearStreamSource:
         self._session_frames = 0
         self._session_gate_open = False
         self._session_stderr = ""
+        self._session_timing: _SessionTiming | None = None
         self._last_baseline_at: float | None = None
         self._closed = False
 
@@ -135,7 +142,7 @@ class ClearStreamSource:
                 )
                 self._process = process
                 while not stop_event.is_set():
-                    chunk = process.stdout.read(64 * 1024)
+                    chunk = process.stdout.read1(SESSION_CHUNK_BYTES)
                     if not chunk:
                         break
                     self.ring.feed(chunk)
@@ -283,9 +290,12 @@ class ClearStreamSource:
             self._session_frames = 0
             self._session_gate_open = False
             self._session_stderr = ""
+            self._session_timing = timing = _SessionTiming()
             stop = self._session_stop
             ring = self._session_ring
-        thread = Thread(target=self._run_session, args=(ring, stop), name="gate-clear-session", daemon=True)
+        thread = Thread(
+            target=self._run_session, args=(ring, stop, timing), name="gate-clear-session", daemon=True,
+        )
         with self._session_lock:
             self._session_thread = thread
         thread.start()
@@ -300,6 +310,7 @@ class ClearStreamSource:
             frames = self._session_frames
             keyframe_start = self._session_gate_open
             decoder_error = self._session_stderr
+            timing = self._session_timing
             self._session_ring = None
             self._session_process = None
             self._session_source_process = None
@@ -312,11 +323,14 @@ class ClearStreamSource:
             # decoder could turn into a picture, so it is a fault however
             # tidily it ended - a decoder that rejected the pipe outright
             # otherwise reads as an ordinary `stream_ended`.
+            p50, worst = timing.summary() if timing is not None else (None, None)
             LOGGER.log(
                 logging.INFO if keyframe_start else logging.WARNING,
                 "gate_clear_stream session=stopped reason=%s frames=%d keyframe_start=%s "
-                "decoder_error=%s",
+                "decoder_error=%s pipeline_ms_p50=%s pipeline_ms_max=%s",
                 reason, frames, keyframe_start, decoder_error or "none",
+                "-" if p50 is None else round(p50 * 1000),
+                "-" if worst is None else round(worst * 1000),
             )
 
     def _session_commands(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -334,7 +348,7 @@ class ClearStreamSource:
             ),
         )
 
-    def _run_session(self, ring: HotFrameRing, stop: Event) -> None:
+    def _run_session(self, ring: HotFrameRing, stop: Event, timing: "_SessionTiming") -> None:
         source_command, decode = self._session_commands()
         try:
             source = self._popen(
@@ -366,7 +380,7 @@ class ClearStreamSource:
             self._session_source_process = source
             self._session_process = decoder
         feeder = Thread(
-            target=self._feed_session, args=(source, decoder, stop),
+            target=self._feed_session, args=(source, decoder, stop, timing),
             name="gate-clear-session-feed", daemon=True,
         )
         feeder.start()
@@ -377,11 +391,13 @@ class ClearStreamSource:
         parser = JpegStreamParser(self._max_frame_bytes)
         try:
             while not stop.is_set():
-                chunk = decoder.stdout.read(SESSION_CHUNK_BYTES)
+                chunk = decoder.stdout.read1(SESSION_CHUNK_BYTES)
                 if not chunk:
                     break
                 for frame in parser.feed(chunk):
-                    ring.add(frame, captured_at=self._clock())
+                    emitted = self._clock()
+                    timing.emitted(self._session_frames, emitted, self.source_fps / self.session_fps)
+                    ring.add(frame, captured_at=emitted)
                     self._session_frames += 1
         except (OSError, ValueError):
             pass
@@ -393,7 +409,7 @@ class ClearStreamSource:
             if still_current and not stop.is_set():
                 self.stop_session("stream_ended")
 
-    def _feed_session(self, source, decoder, stop: Event) -> None:
+    def _feed_session(self, source, decoder, stop: Event, timing: "_SessionTiming") -> None:
         """Copy packets into the decoder, starting at the first keyframe.
 
         ``-c:v copy`` already drops the leading non-keyframe packets, so the
@@ -404,11 +420,13 @@ class ClearStreamSource:
         frame that passes every downstream check and costs a plate lookup.
         """
         gate = IrapStartGate()
+        pictures = PictureCounter()
         try:
             while not stop.is_set():
-                chunk = source.stdout.read(SESSION_CHUNK_BYTES)
+                chunk = source.stdout.read1(SESSION_CHUNK_BYTES)
                 if not chunk:
                     break
+                arrived = self._clock()
                 payload = gate.feed(chunk)
                 if not payload:
                     continue
@@ -417,6 +435,7 @@ class ClearStreamSource:
                         self._session_gate_open = True
                 decoder.stdin.write(payload)
                 decoder.stdin.flush()
+                timing.arrived(pictures.feed(payload), arrived)
         except (OSError, ValueError):
             pass
         finally:
@@ -486,6 +505,38 @@ class ClearStreamSource:
         self._process = None
         if process is not None:
             _terminate(process)
+
+
+class _SessionTiming:
+    """How long the session's own pipeline held each picture.
+
+    The feeder notes when each picture's bytes arrived from the packet copy;
+    the reader notes when each JPEG came out of the decoder. A raw Annex-B
+    pipe carries no picture identity through the decoder, so output ``n`` is
+    matched to the picture the ``fps`` filter keeps for it, ``round(n x
+    source/session)``: right to within a picture (167 ms at 6 fps), which is
+    why it is journaled and never used to judge a frame's age. It leaves out
+    the ~0.3 s from the camera's sensor to the Pi (measured 2026-10-21).
+    """
+
+    def __init__(self):
+        self._arrivals: list[float] = []
+        self._held: list[float] = []
+
+    def arrived(self, pictures: int, at: float) -> None:
+        self._arrivals.extend([at] * pictures)
+
+    def emitted(self, index: int, at: float, ratio: float) -> None:
+        picture = round(index * ratio)
+        # Only the feeder thread appends, so a length read here stays true.
+        if picture < len(self._arrivals):
+            self._held.append(at - self._arrivals[picture])
+
+    def summary(self) -> tuple[float | None, float | None]:
+        held = sorted(self._held)
+        if not held:
+            return None, None
+        return held[len(held) // 2], held[-1]
 
 
 def _terminate(process) -> None:
