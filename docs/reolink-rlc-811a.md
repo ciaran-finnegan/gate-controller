@@ -240,6 +240,42 @@ means fewer bits each, and the binding constraint on recognition at this site
 is plate size -- measured at 135-170 px at the stopping position on
 2026-09-17, against the 300 px the lens could give after re-aiming.
 
+### Frames reached the reader two seconds late, 2026-10-21
+
+Every frame carries the camera's own time on the overlay, and the camera's
+clock was within 0.3 s of the Pi's (GetTime polled across a second boundary).
+Setting the overlay against the journal showed the sweep reading each frame
+**2.0-2.3 s** after the camera took it. On 20 Oct a car that drove straight
+through was gone from the picture before the sweep's second frame.
+
+Where the time went, measured without decoding video on the Pi. The packet
+copy was recorded there with arrival times, and the recording was decoded on
+a workstation:
+
+| Stage | Held | At 6 fps |
+| --- | --- | --- |
+| Camera to the Pi's packet copy | -- | ~0.3 s |
+| ffmpeg frame threading, about one picture per thread (five threads on the Pi 5) | ~5 pictures | ~0.8 s |
+| The raw H.265 parser, which closes a picture when the next one starts | 1-2 pictures | 0.2-0.3 s |
+| `stdout.read(65536)` on both sides of the decoder, waiting for 64 KB of a ~70 KB picture | ~1 picture each side | ~0.3 s |
+| ffmpeg's output buffer holding the tail of each JPEG | ~1 picture | ~0.2 s |
+
+Changed: the decoder runs `-thread_type slice` (no frame threading; the
+hardware does the decoding), every pipe is read with `read1`, and both ffmpeg
+outputs flush per packet. The session's stop line now journals
+`pipeline_ms_p50` and `pipeline_ms_max`, the time from a picture's arrival at
+the copy to its JPEG leaving the decoder. That pairs pictures by count, so it
+is good to about one picture, and the ~0.3 s before the Pi is not in it.
+
+Two things are left, both because the pipe is raw H.265:
+
+- the parser's one-picture look-ahead;
+- `captured_at` is stamped as the JPEG leaves the decoder, so a stream
+  frame's `frame_age_ms` understates its true age by whatever the pipeline
+  held it.
+
+A container with packet timestamps removes both (#222).
+
 ## Webhook Capture And Keyframes
 
 The delayed capture series above grabs frames from the clear stream on

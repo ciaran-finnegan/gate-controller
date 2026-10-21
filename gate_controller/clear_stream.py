@@ -125,10 +125,10 @@ class IrapStartGate:
     stream. Reframing was measurably worse than useless: a splitter can only
     release a NAL once the *next* start code arrives, and this camera codes
     two slices per picture, so access unit N would not close until N+1 landed
-    about 100 ms later, on top of the 64 KB blocking read in front of it.
-    ``captured_at`` is stamped when a frame is emitted, so that delay does
-    not show up as latency anywhere - it silently subtracts 150-250 ms from
-    every ``frame_age_ms`` the journal reports.
+    about 100 ms later. ``captured_at`` is stamped when a frame is emitted,
+    so that delay does not show up as latency anywhere - it silently
+    subtracts 150-250 ms from every ``frame_age_ms`` the journal reports.
+    ``PictureCounter`` is how the session measures the delay that remains.
     """
 
     def __init__(self, max_prefix_bytes: int = MAX_START_PREFIX_BYTES):
@@ -194,6 +194,38 @@ class IrapStartGate:
             # it rather than hold the whole pre-keyframe stream in memory.
             del held[:-2]
         return b""
+
+
+class PictureCounter:
+    """Count the pictures that start in an Annex-B stream, chunk by chunk.
+
+    A picture starts at a VCL NAL whose first_slice_segment_in_pic_flag is
+    set; a start code split across two chunks is counted once, when the
+    bytes that decide it arrive. Nothing is copied or reframed - the session
+    feeder hands the decoder its chunks exactly as before and asks this only
+    when each picture *arrived*, so a decoded frame can be set against it.
+    """
+
+    def __init__(self):
+        self._tail = b""
+
+    def feed(self, chunk: bytes) -> int:
+        data = self._tail + chunk
+        count = 0
+        position = 0
+        keep = None
+        while True:
+            start = data.find(START_CODE, position)
+            if start < 0:
+                break
+            if start + 6 > len(data):
+                keep = start  # header or slice byte still to come
+                break
+            if ((data[start + 3] >> 1) & 0x3F) < 32 and data[start + 5] & 0x80:
+                count += 1
+            position = start + 3
+        self._tail = data[keep if keep is not None else max(position, len(data) - 2):]
+        return count
 
 
 class HevcPacketRing:
@@ -329,7 +361,10 @@ def record_command(source_url: str, ffmpeg: str = "ffmpeg",
         "-rtsp_transport", "tcp", "-analyzeduration", "0", "-probesize", "32",
         "-i", source_url, "-map", "0:v:0", "-an",
         *(("-t", f"{duration:g}") if duration else ()),
-        "-c:v", "copy", "-f", "hevc", "pipe:1",
+        # Each packet goes down the pipe as it is muxed, not when ffmpeg's
+        # 32 KB output buffer next fills: otherwise the tail of every picture
+        # waits for the start of the one after it.
+        "-c:v", "copy", "-flush_packets", "1", "-f", "hevc", "pipe:1",
     )
 
 
@@ -348,16 +383,30 @@ def decode_command(*, ffmpeg: str = "ffmpeg", decoder_arguments: tuple[str, ...]
     default probe costs about two seconds at 4K, buying nothing the pipe does
     not already state. ``-fpsprobesize 0`` goes with them - the frame rate is
     ``-r``'s to state, not the probe's to guess.
+
+    Frame threading is off (``-thread_type slice``). It is libavcodec's
+    default, and it holds one picture back per thread: about five on the
+    Pi 5, which at the camera's 6 fps is over 0.8 s on every frame the sweep
+    reads. It buys throughput the hardware decoder does not need, and slice
+    threading still splits this camera's two slices a picture if the decode
+    ever falls back to software. Measured on 2026-10-21 by replaying a clip
+    recorded on the Pi at 6 fps: four frame threads held six pictures back
+    until more input arrived, and slice threading held two -- the raw
+    parser's own look-ahead, which only a container can remove.
+    ``-flush_packets 1`` writes each JPEG out whole as soon as it is encoded
+    instead of leaving its tail in the output buffer until the next one.
     """
     return (
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-analyzeduration", "0", "-probesize", "32", "-fpsprobesize", "0",
+        "-thread_type", "slice",
         *decoder_arguments,
         *(("-r", f"{input_framerate:g}") if input_framerate else ()),
         "-f", "hevc", "-i", "pipe:0", "-map", "0:v:0", "-an",
         *(("-frames:v", str(frames)) if frames else ()),
         *(("-vf", ",".join(filters)) if filters else ()),
-        "-vsync", "0", "-q:v", "2", "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1",
+        "-vsync", "0", "-q:v", "2", "-c:v", "mjpeg",
+        "-flush_packets", "1", "-f", "image2pipe", "pipe:1",
     )
 
 

@@ -5,8 +5,8 @@ from io import BytesIO
 from PIL import Image
 
 from gate_controller.clear_stream import (
-    NAL_SPS, AnnexBSplitter, HevcPacketRing, IrapStartGate, decode_command, decode_frames,
-    nal_type, record_command,
+    NAL_SPS, AnnexBSplitter, HevcPacketRing, IrapStartGate, PictureCounter, decode_command,
+    decode_frames, nal_type, record_command,
 )
 
 
@@ -183,6 +183,32 @@ class IrapStartGateTests(unittest.TestCase):
         self.assertEqual(gate.feed(stream(VPS, SPS, PPS, IDR)), stream(VPS, SPS, PPS, IDR))
 
 
+class PictureCounterTests(unittest.TestCase):
+    def test_each_picture_is_counted_once_wherever_the_chunks_split_it(self):
+        # Two slices a picture, as this camera codes them, and parameter sets
+        # ahead of the keyframe: three pictures, whatever the pipe hands over.
+        second = lambda kind, payload: nal(kind, payload, first_slice=False)
+        data = stream(
+            VPS, SPS, PPS, IDR, second(19, b"key2"),
+            P, second(1, b"p1b"), nal(1, b"p2"), second(1, b"p2b"), four_byte=True,
+        )
+        for split in range(len(data) + 1):
+            for step in (1, 2, 3, 7):
+                counter = PictureCounter()
+                chunks = [data[:split]] + [
+                    data[at:at + step] for at in range(split, len(data), step)
+                ]
+                total = sum(counter.feed(chunk) for chunk in chunks)
+                self.assertEqual(total, 3, f"split at {split}, then {step}-byte chunks")
+
+    def test_a_picture_is_counted_as_soon_as_its_slice_header_byte_arrives(self):
+        counter = PictureCounter()
+        data = stream(IDR)
+        self.assertEqual(counter.feed(data[:5]), 0, "the header, not yet the slice byte")
+        self.assertEqual(counter.feed(data[5:6]), 1)
+        self.assertEqual(counter.feed(data[6:]), 0)
+
+
 class DecodeTests(unittest.TestCase):
     def test_commands_copy_without_decoding_and_decode_from_stdin(self):
         record = record_command("rtsp://127.0.0.1:8554/clear")
@@ -196,6 +222,20 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(decode[decode.index("-vf") + 1], "hwdownload,fps=5")
         self.assertEqual(decode[decode.index("-frames:v") + 1], "1")
         self.assertNotIn("-r", decode)
+
+    def test_no_stage_holds_a_picture_back_for_the_next_one(self):
+        # Contract only; the session tests drive the pipes themselves. Frame
+        # threading holds a picture per thread (over 0.8 s at 6 fps on the
+        # Pi), and an unflushed pipe holds each picture's tail until the next
+        # one fills the buffer behind it.
+        decode = decode_command(decoder_arguments=("-hwaccel", "drm"))
+        self.assertEqual(decode[decode.index("-thread_type") + 1], "slice")
+        self.assertLess(decode.index("-thread_type"), decode.index("-i"), "a decoder option")
+        self.assertEqual(decode[decode.index("-flush_packets") + 1], "1")
+        self.assertLess(decode.index("-i"), decode.index("-flush_packets"), "an output option")
+        record = record_command("rtsp://127.0.0.1:8554/clear")
+        self.assertEqual(record[record.index("-flush_packets") + 1], "1")
+        self.assertLess(record.index("-i"), record.index("-flush_packets"), "an output option")
 
     def test_the_decoder_does_not_probe_the_pipe_it_is_handed(self):
         # The default probe costs about two seconds at 4K and learns nothing
