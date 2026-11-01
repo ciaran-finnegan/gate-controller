@@ -1,6 +1,6 @@
 Pillow==12.3.0
 requests==2.34.2
-watchdog==6.0.0
+watchdog==7.0.0
 
 # Exact transitive dependencies of requests; keep these aligned with its metadata.
 certifi==2026.7.22
